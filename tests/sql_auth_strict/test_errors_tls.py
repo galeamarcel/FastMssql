@@ -14,6 +14,7 @@ from fastmssql import (
     SqlError,
     SslConfig,
     TlsError,
+    Transaction,
 )
 import pytest
 
@@ -275,12 +276,13 @@ async def test_sql_error_exposes_code_message_and_state(
 @case("ERR-010")
 @pytest.mark.asyncio
 async def test_connection_error_exposes_safe_host_and_port() -> None:
+    password = "NotARealCredential_2026!"
     connection = Connection(
         server="127.0.0.1",
         port=1,
         database="master",
         username="strict_closed_port",
-        password="NotARealCredential_2026!",
+        password=password,
         ssl_config=SslConfig.development(),
         pool_config=PoolConfig(
             max_size=1,
@@ -289,13 +291,33 @@ async def test_connection_error_exposes_safe_host_and_port() -> None:
             retry_connection=False,
         ),
     )
-    with pytest.raises(SqlConnectionError) as captured:
+    with pytest.raises(SqlConnectionError) as pooled:
         await connection.connect()
-    text = str(captured.value)
-    assert "127.0.0.1" in text
-    assert "1" in text
-    assert "NotARealCredential_2026!" not in text
-    assert isinstance(captured.value.message, str)
+
+    with pytest.raises(SqlConnectionError) as batch:
+        await connection.execute_batch([("SELECT 1", None)])
+
+    transaction = Transaction(
+        server="127.0.0.1",
+        port=1,
+        database="master",
+        username="strict_closed_port",
+        password=password,
+        ssl_config=SslConfig.development(),
+    )
+    try:
+        with pytest.raises(SqlConnectionError) as dedicated:
+            await transaction.begin()
+    finally:
+        await transaction.close()
+
+    for captured in (pooled, batch, dedicated):
+        text = str(captured.value)
+        assert "127.0.0.1" in text
+        assert "1" in text
+        assert password not in text
+        assert isinstance(captured.value.message, str)
+        assert "127.0.0.1:1" in captured.value.message
 
 
 @case("ERR-011", "TLS-005")
@@ -398,8 +420,10 @@ async def test_credentials_absent_from_error_strings(
         password=wrong_password,
     )
     try:
-        with pytest.raises(SqlConnectionError) as login:
+        with pytest.raises((SqlError, SqlConnectionError)) as login:
             await failed_login.connect()
+        if isinstance(login.value, SqlError):
+            assert login.value.code == 18456
         errors.append(login.value)
     finally:
         await failed_login.disconnect()

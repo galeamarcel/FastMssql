@@ -54,7 +54,10 @@ impl std::ops::DerefMut for ManagedConnection {
 /// Error type for `AzureConnectionManager`.
 #[derive(Debug)]
 pub enum PoolConnectionError {
-    Io(std::io::Error),
+    Io {
+        source: std::io::Error,
+        address: Option<String>,
+    },
     Tiberius(tiberius::error::Error),
     Auth(String),
 }
@@ -62,7 +65,16 @@ pub enum PoolConnectionError {
 impl fmt::Display for PoolConnectionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PoolConnectionError::Io(e) => write!(f, "I/O error: {e}"),
+            PoolConnectionError::Io {
+                source,
+                address: Some(address),
+            } => {
+                write!(f, "I/O error connecting to {address}: {source}")
+            }
+            PoolConnectionError::Io {
+                source,
+                address: None,
+            } => write!(f, "I/O error: {source}"),
             PoolConnectionError::Tiberius(e) => write!(f, "SQL error: {e}"),
             PoolConnectionError::Auth(e) => write!(f, "Auth error: {e}"),
         }
@@ -72,8 +84,11 @@ impl fmt::Display for PoolConnectionError {
 impl std::error::Error for PoolConnectionError {}
 
 impl From<std::io::Error> for PoolConnectionError {
-    fn from(e: std::io::Error) -> Self {
-        PoolConnectionError::Io(e)
+    fn from(source: std::io::Error) -> Self {
+        PoolConnectionError::Io {
+            source,
+            address: None,
+        }
     }
 }
 
@@ -91,7 +106,16 @@ impl From<PoolConnectionError> for pyo3::PyErr {
     fn from(e: PoolConnectionError) -> Self {
         match e {
             PoolConnectionError::Tiberius(terr) => create_sql_error(terr, "Connection error"),
-            PoolConnectionError::Io(err) => create_connection_error(format!("I/O error: {err}")),
+            PoolConnectionError::Io {
+                source,
+                address: Some(address),
+            } => create_connection_error(format!(
+                "I/O error connecting to {address}: {source}"
+            )),
+            PoolConnectionError::Io {
+                source,
+                address: None,
+            } => create_connection_error(format!("I/O error: {source}")),
             PoolConnectionError::Auth(msg) => {
                 create_connection_error(format!("Authentication error: {msg}"))
             }
@@ -145,7 +169,13 @@ impl bb8::ManageConnection for AzureConnectionManager {
             config.authentication(auth_method);
         }
 
-        let tcp = tokio::net::TcpStream::connect(config.get_addr()).await?;
+        let address = config.get_addr();
+        let tcp = tokio::net::TcpStream::connect(&address)
+            .await
+            .map_err(|source| PoolConnectionError::Io {
+                source,
+                address: Some(address),
+            })?;
         tcp.set_nodelay(true)?;
 
         let client = match tiberius::Client::connect(config.clone(), tcp.compat_write()).await {
@@ -154,7 +184,13 @@ impl bb8::ManageConnection for AzureConnectionManager {
             Err(tiberius::error::Error::Routing { host, port }) => {
                 config.host(&host);
                 config.port(port);
-                let tcp = tokio::net::TcpStream::connect(config.get_addr()).await?;
+                let address = config.get_addr();
+                let tcp = tokio::net::TcpStream::connect(&address)
+                    .await
+                    .map_err(|source| PoolConnectionError::Io {
+                        source,
+                        address: Some(address),
+                    })?;
                 tcp.set_nodelay(true)?;
                 tiberius::Client::connect(config, tcp.compat_write()).await?
             }
