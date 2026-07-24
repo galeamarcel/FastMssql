@@ -17,7 +17,7 @@ import pytest
 
 from sql_auth_strict.cases import case
 from sql_auth_strict.config import SqlAuthConfig
-from sql_auth_strict.helpers import scalar
+from sql_auth_strict.helpers import quote_identifier, scalar
 
 
 pytestmark = [pytest.mark.sql_auth_strict, pytest.mark.integration]
@@ -656,3 +656,122 @@ async def test_rapid_context_lifecycle_does_not_leak_sessions(
             break
         await asyncio.sleep(0.05)
     assert remaining == set()
+
+
+@case("POOL-018")
+@pytest.mark.asyncio
+async def test_checkout_reset_rolls_back_leaked_local_transaction(
+    sql_auth_config: SqlAuthConfig,
+    unique_sql_name: Callable[[str], str],
+) -> None:
+    table = quote_identifier(unique_sql_name("strict_pool_reset_tx"))
+    connection = _connection(
+        sql_auth_config,
+        PoolConfig(
+            max_size=1,
+            min_idle=1,
+            max_lifetime_secs=None,
+            idle_timeout_secs=None,
+            connection_timeout_secs=2,
+            test_on_check_out=False,
+            retry_connection=False,
+        ),
+    )
+
+    async with connection:
+        await connection.execute(f"CREATE TABLE {table} (id INT NOT NULL PRIMARY KEY)")
+        first_session = int(await scalar(connection, "SELECT @@SPID"))
+
+        try:
+            leaked_transaction = await connection.simple_query(
+                f"""
+                BEGIN TRANSACTION;
+                INSERT INTO {table} (id) VALUES (1);
+                SELECT @@SPID AS session_id;
+                """
+            )
+            leaked_row = leaked_transaction.fetchone()
+            assert leaked_row is not None
+            assert leaked_row["session_id"] == first_session
+
+            observed = (
+                await connection.query(
+                    f"""
+                    SELECT
+                        @@SPID AS session_id,
+                        @@TRANCOUNT AS transaction_count,
+                        XACT_STATE() AS transaction_state,
+                        COUNT_BIG(*) AS visible_rows
+                    FROM {table}
+                    """
+                )
+            ).fetchone()
+            assert observed is not None
+            assert observed.to_dict() == {
+                "session_id": first_session,
+                "transaction_count": 0,
+                "transaction_state": 0,
+                "visible_rows": 0,
+            }
+        finally:
+            await connection.simple_query(
+                f"""
+                IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+                DROP TABLE IF EXISTS {table};
+                """
+            )
+
+
+@case("POOL-019")
+@pytest.mark.asyncio
+async def test_nonfatal_sql_error_still_resets_session_state(
+    sql_auth_config: SqlAuthConfig,
+) -> None:
+    connection = _connection(
+        sql_auth_config,
+        PoolConfig(
+            max_size=1,
+            min_idle=1,
+            max_lifetime_secs=None,
+            idle_timeout_secs=None,
+            connection_timeout_secs=2,
+            test_on_check_out=False,
+            retry_connection=False,
+        ),
+    )
+
+    async with connection:
+        first_session = int(await scalar(connection, "SELECT @@SPID"))
+
+        with pytest.raises(SqlError) as captured:
+            await connection.simple_query(
+                """
+                EXEC sys.sp_set_session_context
+                    @key = N'fastmssql_pool_reset_after_error',
+                    @value = N'contaminated',
+                    @read_only = 1;
+                THROW 51019, N'expected reset reproduction', 1;
+                """
+            )
+        assert captured.value.code == 51019
+        assert captured.value.severity == 16
+
+        observed = (
+            await connection.query(
+                """
+                SELECT
+                    @@SPID AS session_id,
+                    CONVERT(
+                        NVARCHAR(128),
+                        SESSION_CONTEXT(
+                            N'fastmssql_pool_reset_after_error'
+                        )
+                    ) AS leaked_value
+                """
+            )
+        ).fetchone()
+        assert observed is not None
+        assert observed.to_dict() == {
+            "session_id": first_session,
+            "leaked_value": None,
+        }

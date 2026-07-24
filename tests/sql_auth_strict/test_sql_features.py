@@ -27,9 +27,44 @@ def _single_session_connection(config: SqlAuthConfig) -> Connection:
             max_lifetime_secs=None,
             idle_timeout_secs=None,
             connection_timeout_secs=2,
+            test_on_check_out=False,
             retry_connection=False,
         ),
     )
+
+
+_SESSION_STATE_SQL = """
+SELECT
+    @@SPID AS session_id,
+    DB_NAME() AS database_name,
+    @@OPTIONS AS options_mask,
+    @@DATEFIRST AS date_first,
+    @@LANGUAGE AS language_name,
+    @@LOCK_TIMEOUT AS lock_timeout_ms,
+    CONTEXT_INFO() AS context_info,
+    CONVERT(
+        NVARCHAR(128),
+        SESSION_CONTEXT(N'fastmssql_pool_reset')
+    ) AS session_context_value,
+    session_state.transaction_isolation_level,
+    session_state.deadlock_priority,
+    session_state.date_format
+FROM sys.dm_exec_sessions AS session_state
+WHERE session_state.session_id = @@SPID
+"""
+
+
+async def _session_state(connection: Connection, operation: str = "query") -> dict:
+    if operation == "query":
+        result = await connection.query(_SESSION_STATE_SQL)
+    elif operation == "simple_query":
+        result = await connection.simple_query(_SESSION_STATE_SQL)
+    else:  # pragma: no cover - constrained by the test parameterization
+        raise AssertionError(f"unsupported operation: {operation}")
+
+    row = result.fetchone()
+    assert row is not None
+    return row.to_dict()
 
 
 @case("SQL-001")
@@ -553,15 +588,34 @@ async def test_identity_sequence_default_and_computed_columns(
 
 @case("SQL-021")
 @pytest.mark.asyncio
-async def test_local_temp_table_on_single_connection_pool(
+async def test_local_temp_table_is_isolated_between_pool_leases(
     sql_auth_config: SqlAuthConfig,
 ) -> None:
     connection = _single_session_connection(sql_auth_config)
     async with connection:
-        await connection.execute("CREATE TABLE #strict_local (value INT NOT NULL)")
-        await connection.execute("INSERT INTO #strict_local VALUES (29)")
-        assert await scalar(connection, "SELECT value FROM #strict_local") == 29
-        await connection.execute("DROP TABLE #strict_local")
+        created = await connection.simple_query(
+            """
+            CREATE TABLE #strict_local (value INT NOT NULL);
+            INSERT INTO #strict_local VALUES (29);
+            SELECT @@SPID AS session_id, value
+            FROM #strict_local;
+            """
+        )
+        created_row = created.fetchone()
+        assert created_row is not None
+        assert created_row["value"] == 29
+
+        observed = await connection.query(
+            """
+            SELECT
+                @@SPID AS session_id,
+                OBJECT_ID(N'tempdb..#strict_local') AS temp_object_id
+            """
+        )
+        observed_row = observed.fetchone()
+        assert observed_row is not None
+        assert observed_row["session_id"] == created_row["session_id"]
+        assert observed_row["temp_object_id"] is None
 
 
 @case("SQL-022")
@@ -601,27 +655,46 @@ async def test_multiple_result_sets_return_first_set(
 
 @case("SQL-024")
 @pytest.mark.asyncio
-async def test_session_set_state_on_single_connection_pool(
+@pytest.mark.parametrize("observation_operation", ["query", "simple_query"])
+async def test_session_state_is_reset_between_pool_leases(
     sql_auth_config: SqlAuthConfig,
+    observation_operation: str,
 ) -> None:
     connection = _single_session_connection(sql_auth_config)
     async with connection:
-        await connection.simple_query("SET NOCOUNT ON")
-        assert (
-            await scalar(
-                connection,
-                "SELECT CASE WHEN (@@OPTIONS & 512) = 512 THEN 1 ELSE 0 END",
-            )
-            == 1
+        baseline = await _session_state(connection, observation_operation)
+
+        contaminated = await connection.simple_query(
+            """
+            SET LANGUAGE French;
+            SET DATEFIRST 3;
+            SET DATEFORMAT ymd;
+            SET LOCK_TIMEOUT 731;
+            SET DEADLOCK_PRIORITY HIGH;
+            SET NOCOUNT ON;
+            SET XACT_ABORT ON;
+            SET ANSI_NULLS OFF;
+            SET ANSI_WARNINGS OFF;
+            SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+            USE tempdb;
+            SET CONTEXT_INFO 0x464153544D5353514C;
+            EXEC sys.sp_set_session_context
+                @key = N'fastmssql_pool_reset',
+                @value = N'contaminated',
+                @read_only = 1;
+            SELECT @@SPID AS session_id;
+            """
         )
-        await connection.simple_query("SET NOCOUNT OFF")
-        assert (
-            await scalar(
-                connection,
-                "SELECT CASE WHEN (@@OPTIONS & 512) = 512 THEN 1 ELSE 0 END",
-            )
-            == 0
-        )
+        contaminated_row = contaminated.fetchone()
+        assert contaminated_row is not None
+        assert contaminated_row["session_id"] == baseline["session_id"]
+
+        restored = await _session_state(connection, observation_operation)
+
+        # Pool safety must not be implemented by silently replacing the
+        # physical session. The same SPID is reset to its login baseline.
+        assert restored["session_id"] == baseline["session_id"]
+        assert restored == baseline
 
 
 @case("SQL-025")
