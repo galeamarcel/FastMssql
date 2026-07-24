@@ -9,7 +9,11 @@ import pytest
 
 from sql_auth_strict.cases import case
 from sql_auth_strict.config import SqlAuthConfig
-from sql_auth_strict.helpers import event_loop_ticks, scalar
+from sql_auth_strict.helpers import (
+    event_loop_ticks,
+    max_event_loop_gap,
+    scalar,
+)
 
 
 pytestmark = [pytest.mark.sql_auth_strict, pytest.mark.integration]
@@ -37,6 +41,11 @@ def _connection(
             retry_connection=False,
         ),
     )
+
+
+def test_event_loop_gap_contract_accepts_fast_workload() -> None:
+    ticks = [0.010, 0.020, 0.030, 0.040]
+    assert max_event_loop_gap(0.0, 0.045, ticks) == pytest.approx(0.010)
 
 
 async def _wait_for_active(
@@ -406,6 +415,8 @@ async def test_concurrent_result_conversion_has_bounded_loop_stalls(
     connection = _connection(sql_auth_config, max_size=4)
     stop = asyncio.Event()
     ticker = asyncio.create_task(event_loop_ticks(stop, interval=0.01))
+    await asyncio.sleep(0)
+    started = time.monotonic()
 
     async def query_and_convert(seed: int) -> tuple[int, int]:
         result = await connection.query(
@@ -431,14 +442,10 @@ async def test_concurrent_result_conversion_has_bounded_loop_stalls(
         outcomes = await asyncio.gather(
             *(query_and_convert(seed) for seed in range(4))
         )
+        finished = time.monotonic()
     finally:
         stop.set()
         ticks = await ticker
         await connection.disconnect()
     assert outcomes == [(0, 500), (1, 500), (2, 500), (3, 500)]
-    assert len(ticks) >= 5
-    gaps = [
-        later - earlier for earlier, later in zip(ticks, ticks[1:])
-    ]
-    assert gaps
-    assert max(gaps) < 0.5
+    assert max_event_loop_gap(started, finished, ticks) < 0.5

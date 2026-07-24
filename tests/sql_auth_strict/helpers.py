@@ -68,6 +68,21 @@ async def event_loop_ticks(
     return ticks
 
 
+def max_event_loop_gap(
+    started: float,
+    finished: float,
+    ticks: list[float],
+) -> float:
+    timeline = [
+        started,
+        *(tick for tick in ticks if started < tick < finished),
+        finished,
+    ]
+    return max(
+        later - earlier for earlier, later in zip(timeline, timeline[1:])
+    )
+
+
 def assert_dedicated_container(name: str) -> None:
     if name != "fastmssql-sql-auth-dev":
         raise RuntimeError(f"refusing disruptive Docker action for {name!r}")
