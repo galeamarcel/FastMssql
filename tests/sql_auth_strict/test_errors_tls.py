@@ -64,7 +64,9 @@ def _assert_sql_error(
     assert str(error) == error.message
 
 
-async def _session_security(connection: Connection) -> tuple[str, str]:
+async def _session_security(
+    connection: Connection | Transaction,
+) -> tuple[str, str]:
     row = (
         await connection.query(
             """
@@ -77,6 +79,52 @@ async def _session_security(connection: Connection) -> tuple[str, str]:
         )
     ).fetchone()
     return row["principal"], row["encrypt_option"]
+
+
+def _connection_string_for_tls_policy(
+    config: SqlAuthConfig,
+    tls_options: str,
+) -> str:
+    suffix = f";{tls_options.strip(';')}" if tls_options else ""
+    return (
+        f"Server={config.host},{config.port};"
+        f"Database={config.database};"
+        f"User Id={config.owner_user};"
+        f"Password={config.owner_password}{suffix}"
+    )
+
+
+def _tls_policy_client(
+    kind: str,
+    connection_string: str,
+    *,
+    ssl_config: SslConfig | None = None,
+) -> Connection | Transaction:
+    if kind == "connection":
+        return Connection(
+            connection_string,
+            ssl_config=ssl_config,
+            pool_config=PoolConfig(
+                max_size=1,
+                min_idle=1,
+                max_lifetime_secs=None,
+                idle_timeout_secs=None,
+                connection_timeout_secs=2,
+                retry_connection=False,
+            ),
+        )
+    if kind == "transaction":
+        return Transaction(connection_string, ssl_config=ssl_config)
+    raise AssertionError(f"unsupported TLS policy client kind: {kind}")
+
+
+async def _close_tls_policy_client(
+    client: Connection | Transaction,
+) -> None:
+    if isinstance(client, Connection):
+        await client.disconnect()
+    else:
+        await client.close()
 
 
 @case("ERR-001")
@@ -567,3 +615,113 @@ async def test_tls_settings_do_not_change_sql_principal(
             assert encrypt_option == expected_encryption
         finally:
             await connection.disconnect()
+
+
+@case("TLS-009")
+@pytest.mark.parametrize("client_kind", ("connection", "transaction"))
+@pytest.mark.asyncio
+async def test_connection_string_without_encrypt_defaults_to_required(
+    sql_auth_config: SqlAuthConfig,
+    client_kind: str,
+) -> None:
+    client = _tls_policy_client(
+        client_kind,
+        _connection_string_for_tls_policy(
+            sql_auth_config,
+            "TrustServerCertificate=True",
+        ),
+    )
+    try:
+        principal, encrypt_option = await _session_security(client)
+        assert principal == sql_auth_config.owner_user
+        assert encrypt_option == "TRUE"
+    finally:
+        await _close_tls_policy_client(client)
+
+
+@case("TLS-010")
+@pytest.mark.parametrize("client_kind", ("connection", "transaction"))
+@pytest.mark.asyncio
+async def test_ssl_config_is_applied_to_connection_string(
+    sql_auth_config: SqlAuthConfig,
+    client_kind: str,
+) -> None:
+    client = _tls_policy_client(
+        client_kind,
+        _connection_string_for_tls_policy(sql_auth_config, ""),
+        ssl_config=SslConfig.development(),
+    )
+    try:
+        principal, encrypt_option = await _session_security(client)
+        assert principal == sql_auth_config.owner_user
+        assert encrypt_option == "TRUE"
+    finally:
+        await _close_tls_policy_client(client)
+
+
+@case("TLS-011")
+@pytest.mark.parametrize("client_kind", ("connection", "transaction"))
+def test_connection_string_and_ssl_config_tls_sources_conflict(
+    sql_auth_config: SqlAuthConfig,
+    client_kind: str,
+) -> None:
+    connection_string = _connection_string_for_tls_policy(
+        sql_auth_config,
+        "Encrypt=True;TrustServerCertificate=True",
+    )
+    with pytest.raises(
+        ValueError,
+        match="TLS settings cannot be provided in both",
+    ):
+        _tls_policy_client(
+            client_kind,
+            connection_string,
+            ssl_config=SslConfig.development(),
+        )
+
+
+@case("TLS-012")
+@pytest.mark.parametrize("client_kind", ("connection", "transaction"))
+def test_connection_string_trust_conflict_is_value_error(
+    sql_auth_config: SqlAuthConfig,
+    client_kind: str,
+) -> None:
+    connection_string = _connection_string_for_tls_policy(
+        sql_auth_config,
+        (
+            "TrustServerCertificate=True;"
+            "TrustServerCertificateCA=/definitely/missing/fastmssql-ca.pem"
+        ),
+    )
+    with pytest.raises(
+        ValueError,
+        match="TrustServerCertificate and TrustServerCertificateCA are mutually exclusive",
+    ):
+        _tls_policy_client(client_kind, connection_string)
+
+
+@case("TLS-013")
+@pytest.mark.parametrize("client_kind", ("connection", "transaction"))
+@pytest.mark.parametrize(
+    "tls_options",
+    (
+        "Encrypt=False;TrustServerCertificate=True",
+        "Encrypt=DANGER_PLAINTEXT",
+    ),
+)
+@pytest.mark.asyncio
+async def test_connection_string_explicit_encryption_opt_out(
+    sql_auth_config: SqlAuthConfig,
+    client_kind: str,
+    tls_options: str,
+) -> None:
+    client = _tls_policy_client(
+        client_kind,
+        _connection_string_for_tls_policy(sql_auth_config, tls_options),
+    )
+    try:
+        principal, encrypt_option = await _session_security(client)
+        assert principal == sql_auth_config.owner_user
+        assert encrypt_option == "FALSE"
+    finally:
+        await _close_tls_policy_client(client)

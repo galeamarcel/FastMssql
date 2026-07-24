@@ -435,6 +435,16 @@ numbers are recorded because AMD64 emulation can add host-specific variance.
 - `TLS-006`: invalid CA path/content/extension.
 - `TLS-007`: mutually exclusive trust options.
 - `TLS-008`: TLS settings do not change the SQL-auth principal.
+- `TLS-009`: omitting `Encrypt` from a connection string defaults to required
+  full-session encryption.
+- `TLS-010`: `ssl_config` remains effective when authentication and endpoint
+  settings are supplied through a connection string.
+- `TLS-011`: TLS settings cannot be split between a connection string and
+  `ssl_config`; mixed sources fail before network I/O.
+- `TLS-012`: conflicting trust-all and custom-CA connection-string options
+  raise `ValueError`, never a Rust panic exposed through PyO3.
+- `TLS-013`: login-only and plaintext modes remain available only through an
+  explicit encryption opt-out.
 
 ### RES — fault and recovery
 
