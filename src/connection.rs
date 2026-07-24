@@ -94,7 +94,7 @@ impl PyConnection {
 
         match operation {
             Ok(result) => {
-                conn.complete();
+                conn.complete_with_result(&result);
                 result
             }
             Err(driver_panic) => Err(driver_panic),
@@ -123,7 +123,7 @@ impl PyConnection {
 
         match operation {
             Ok(result) => {
-                conn.complete();
+                conn.complete_with_result(&result);
                 result
             }
             Err(driver_panic) => Err(driver_panic),
@@ -152,7 +152,7 @@ impl PyConnection {
 
         match operation {
             Ok(result) => {
-                conn.complete();
+                conn.complete_with_result(&result);
                 result
             }
             Err(driver_panic) => Err(driver_panic),

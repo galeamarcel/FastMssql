@@ -249,7 +249,7 @@ pub fn query_batch<'p>(
             catch_driver_panic(query_batch_on_connection(&mut conn, batch_queries)).await;
         let all_results = match operation {
             Ok(result) => {
-                conn.complete();
+                conn.complete_with_result(&result);
                 result?
             }
             Err(driver_panic) => return Err(driver_panic),
@@ -497,6 +497,7 @@ pub fn bulk_insert<'p>(
                 Ok(result) => result,
                 Err(error) => {
                     let primary = create_sql_error(error, "Batch execution failed");
+                    conn.observe_error(&primary);
                     let rollback = consume_simple_command(
                         &mut conn,
                         "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION",
