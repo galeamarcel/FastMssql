@@ -7,9 +7,11 @@ import time
 from fastmssql import (
     Connection,
     PoolConfig,
+    ProtocolError,
     SqlConnectionError,
     SqlError,
     SslConfig,
+    TlsError,
 )
 import pytest
 
@@ -108,6 +110,46 @@ async def _server_connection_id(
     )
     assert isinstance(value, str)
     return value
+
+
+async def _wait_for_session_absent(
+    sa_connection: Connection, session_id: int, *, timeout: float = 2.0
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        count = await scalar(
+            sa_connection,
+            """
+            SELECT COUNT_BIG(*)
+            FROM sys.dm_exec_sessions
+            WHERE session_id = @P1
+            """,
+            [session_id],
+        )
+        if count == 0:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"session {session_id} was not terminated")
+
+
+async def _wait_for_active_request(
+    sa_connection: Connection, session_id: int, *, timeout: float = 2.0
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        count = await scalar(
+            sa_connection,
+            """
+            SELECT COUNT_BIG(*)
+            FROM sys.dm_exec_requests
+            WHERE session_id = @P1
+            """,
+            [session_id],
+        )
+        if count == 1:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"session {session_id} did not start its request")
 
 
 @case("POOL-001")
@@ -518,10 +560,15 @@ async def test_checkout_validation_preserves_healthy_connection(
 
 
 @case("POOL-016")
+@pytest.mark.parametrize(
+    "operation",
+    ("query", "simple_query", "execute", "query_batch"),
+)
 @pytest.mark.asyncio
-async def test_broken_connection_is_not_reused(
+async def test_operation_error_discards_broken_connection_without_checkout_validation(
     sa_connection: Connection,
     sql_auth_config: SqlAuthConfig,
+    operation: str,
 ) -> None:
     connection = _connection(
         sql_auth_config,
@@ -529,21 +576,46 @@ async def test_broken_connection_is_not_reused(
             max_size=1,
             min_idle=1,
             connection_timeout_secs=2,
-            test_on_check_out=True,
+            test_on_check_out=False,
             retry_connection=False,
         ),
     )
-    first_session = int(await scalar(connection, "SELECT @@SPID"))
-    first_connection_id = await _server_connection_id(
-        sa_connection, first_session
-    )
-    await sa_connection.execute(f"KILL {first_session}")
-    second_session = int(await scalar(connection, "SELECT @@SPID"))
-    second_connection_id = await _server_connection_id(
-        sa_connection, second_session
-    )
-    assert second_connection_id != first_connection_id
-    assert await connection.disconnect() is True
+    try:
+        first_session = int(await scalar(connection, "SELECT @@SPID"))
+        first_connection_id = await _server_connection_id(sa_connection, first_session)
+
+        async def run_faulting_operation() -> None:
+            delayed_select = "WAITFOR DELAY '00:00:05'; SELECT 1"
+            if operation == "query":
+                await connection.query(delayed_select)
+            elif operation == "simple_query":
+                await connection.simple_query(delayed_select)
+            elif operation == "execute":
+                await connection.execute(delayed_select)
+            else:
+                await connection.query_batch([(delayed_select, None)])
+
+        fault_task = asyncio.create_task(run_faulting_operation())
+        await _wait_for_active_request(sa_connection, first_session)
+        await sa_connection.execute(f"KILL {first_session}")
+
+        with pytest.raises((SqlConnectionError, ProtocolError, SqlError, TlsError)):
+            await asyncio.wait_for(fault_task, timeout=3.0)
+        await _wait_for_session_absent(sa_connection, first_session)
+
+        second_session = int(
+            await asyncio.wait_for(scalar(connection, "SELECT @@SPID"), timeout=3.0)
+        )
+        second_connection_id = await _server_connection_id(
+            sa_connection, second_session
+        )
+        assert second_connection_id != first_connection_id
+        stats = await connection.pool_stats()
+        _assert_pool_invariants(stats)
+        assert stats["connections"] == 1
+        assert stats["idle_connections"] == 1
+    finally:
+        assert await connection.disconnect() is True
 
 
 @case("POOL-017")
