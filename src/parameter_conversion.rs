@@ -3,7 +3,10 @@ use crate::type_mapping;
 use chrono::{NaiveDate, NaiveDateTime};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyBytes, PyFloat, PyInt, PyList, PyString};
+use pyo3::types::{
+    PyBool, PyByteArray, PyByteArrayMethods, PyBytes, PyFloat, PyInt, PyList,
+    PyMemoryView, PyString,
+};
 use smallvec::SmallVec;
 
 #[derive(Debug, Clone)]
@@ -62,6 +65,13 @@ pub fn python_to_fast_parameter(obj: &Bound<PyAny>) -> PyResult<FastParameter> {
     }
     if let Ok(py_by) = obj.cast::<PyBytes>() {
         return Ok(FastParameter::Bytes(py_by.as_bytes().to_vec()));
+    }
+    if let Ok(py_by) = obj.cast::<PyByteArray>() {
+        return Ok(FastParameter::Bytes(py_by.to_vec()));
+    }
+    if obj.is_instance_of::<PyMemoryView>() {
+        let py_by = PyByteArray::from(obj)?;
+        return Ok(FastParameter::Bytes(py_by.to_vec()));
     }
     if let Ok(py_date) = obj.extract::<NaiveDate>() {
         return Ok(FastParameter::Date(py_date));
