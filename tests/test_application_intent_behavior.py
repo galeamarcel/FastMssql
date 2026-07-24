@@ -23,7 +23,7 @@ async def test_readonly_intent_rejects_write_operations(test_config: Config):
         conn = Connection(
             ssl_config=SslConfig.development(),
             application_intent=ApplicationIntent.READ_ONLY,
-            **test_config.asdict(),
+            **test_config.individual_connection_options(),
         )
 
         assert await conn.connect()
@@ -59,7 +59,7 @@ async def test_readwrite_intent_allows_write_operations(test_config: Config):
         conn = Connection(
             ssl_config=SslConfig.development(),
             application_intent=ApplicationIntent.READ_WRITE,
-            **test_config.asdict(),
+            **test_config.individual_connection_options(),
         )
 
         assert await conn.connect()
@@ -93,7 +93,10 @@ async def test_default_intent_allows_write_operations(test_config: Config):
     try:
         # Create connection without specifying application_intent
         # Should default to ReadWrite behavior
-        conn = Connection(ssl_config=SslConfig.development(), **test_config.asdict())
+        conn = Connection(
+            ssl_config=SslConfig.development(),
+            **test_config.individual_connection_options(),
+        )
 
         assert await conn.connect()
         assert await conn.is_connected()
