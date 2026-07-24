@@ -10,6 +10,7 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use crate::azure_auth::PyAzureCredential;
 use crate::batch::{execute_batch_on_connection, parse_batch_items, query_batch_on_connection};
+use crate::connection_config::config_from_ado_string;
 use crate::helpers::{
     catch_driver_panic, execute_unparameterized_command, requires_direct_batch, wrap_query_stream,
 };
@@ -71,8 +72,7 @@ impl Transaction {
         let server_param = server.clone();
 
         let config = if let Some(conn_str) = connection_string {
-            Config::from_ado_string(&conn_str)
-                .map_err(|e| PyValueError::new_err(format!("Invalid connection string: {}", e)))?
+            config_from_ado_string(&conn_str, ssl_config.as_ref())?
         } else if let Some(srv) = server {
             let mut config = Config::new();
             config.host(&srv);

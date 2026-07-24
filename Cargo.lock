@@ -320,6 +320,7 @@ dependencies = [
  "bb8",
  "bytes",
  "chrono",
+ "connection-string",
  "futures-util",
  "mimalloc",
  "pyo3",

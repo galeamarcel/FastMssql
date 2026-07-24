@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 
 use crate::azure_auth::PyAzureCredential;
 use crate::batch::{bulk_insert, execute_batch, query_batch};
+use crate::connection_config::config_from_ado_string;
 use crate::helpers::{
     catch_driver_panic, execute_unparameterized_command, requires_direct_batch, wrap_query_stream,
 };
@@ -179,8 +180,7 @@ impl PyConnection {
         application_name: Option<String>,
     ) -> PyResult<Self> {
         let config = if let Some(conn_str) = connection_string {
-            Config::from_ado_string(&conn_str)
-                .map_err(|e| PyValueError::new_err(format!("Invalid connection string: {}", e)))?
+            config_from_ado_string(&conn_str, ssl_config.as_ref())?
         } else if let Some(ref srv) = server {
             let mut config = Config::new();
             config.host(srv);

@@ -34,6 +34,7 @@ tokio-util = { version = "0.7.18", features = ["compat"] }
 tiberius = { version = "0.12.3", features = ["chrono", "tds73", "rustls"], default-features = false }
 bb8 = "0.9.1"
 futures-util = "0.3.31"
+connection-string = "0.2.0"
 
 chrono = { version = "0.4.45" }
 uuid = { version = "1.23.5" }

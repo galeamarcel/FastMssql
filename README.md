@@ -467,7 +467,23 @@ Choose `Transaction` when you need guaranteed transaction isolation; use `Connec
 
 ### SSL/TLS
 
-For `Required` and `LoginOnly` encryption, you must specify how to validate the server certificate:
+Full-session encryption is required by default for both connection strings and
+individual connection parameters. If a connection string omits `Encrypt`,
+FastMssql treats it as `Encrypt=True`. Certificate verification uses the system
+trust store unless you configure one of the following policies.
+
+Choose exactly one source for TLS settings:
+
+- put `Encrypt`, `TrustServerCertificate`, and
+  `TrustServerCertificateCA` in the connection string; or
+- omit all three connection-string options and pass `ssl_config`.
+
+Mixing the two sources raises `ValueError`. `TrustServerCertificate=True` only
+disables certificate verification; it does not by itself opt out of
+full-session encryption.
+
+For required or login-only encryption, specify how to validate the server
+certificate:
 
 **Option 1: Trust Server Certificate** (development/self-signed certs):
 
@@ -505,6 +521,10 @@ Helpers:
 - `SslConfig.with_ca_certificate(path)` – use custom CA
 - `SslConfig.login_only()` / `SslConfig.disabled()` – legacy modes
 - `SslConfig.disabled()` – no encryption (not recommended)
+
+Legacy modes must be selected explicitly, either with
+`SslConfig.login_only()` / `SslConfig.disabled()` or with
+`Encrypt=False` / `Encrypt=DANGER_PLAINTEXT` in the connection string.
 
 ## Performance tips
 

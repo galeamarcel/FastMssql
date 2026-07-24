@@ -69,13 +69,16 @@ class Connection:
         Initialize a new SQL Server connection.
 
         Args:
-            connection_string: Complete ADO.NET-style connection string (takes precedence)
+            connection_string: Complete ADO.NET-style connection string. Full-session
+                encryption is required when Encrypt is omitted.
             server: SQL Server hostname or IP address
             database: Database name
             username: Username for SQL authentication (required when using individual parameters)
             password: Password for SQL authentication
             pool_config: Connection pool configuration
-            ssl_config: SSL/TLS configuration
+            ssl_config: SSL/TLS configuration. Do not combine it with Encrypt,
+                TrustServerCertificate, or TrustServerCertificateCA in the
+                connection string.
             azure_credential: Azure Active Directory credential for authentication
             application_intent: Sets ApplicationIntent to "ReadOnly" or "ReadWrite" (default: ReadWrite)
             port: TCP port number (default: 1433)
@@ -86,6 +89,7 @@ class Connection:
             - Either connection_string OR individual parameters must be provided
             - When using individual parameters, either username/password OR azure_credential must be provided
             - azure_credential and username/password are mutually exclusive
+            - Weaker TLS modes require an explicit ssl_config or Encrypt opt-out
         """
         ...
 
@@ -250,7 +254,12 @@ class Transaction:
         instance_name: Optional[str] = None,
         application_name: Optional[str] = None,
     ) -> None:
-        """Initialize a dedicated non-pooled connection for transactions."""
+        """Initialize a dedicated non-pooled connection for transactions.
+
+        A connection string without Encrypt requires full-session encryption.
+        TLS options must come from either the connection string or ssl_config,
+        never both.
+        """
         ...
 
     def query(
