@@ -481,9 +481,12 @@ impl Transaction {
     ) -> PyResult<()> {
         let mut conn_guard = conn.lock().await;
         if conn_guard.is_none() {
-            let tcp_stream = TcpStream::connect(config.get_addr()).await.map_err(|e| {
-                        create_connection_error(format!("Failed to connect to server: {}", e))
-                    })?;
+            let address = config.get_addr();
+            let tcp_stream = TcpStream::connect(&address).await.map_err(|e| {
+                create_connection_error(format!(
+                    "Failed to connect to server {address}: {e}"
+                ))
+            })?;
 
             // Disable Nagle algorithm — identical to pool connections in pool_manager.rs.
             // Without this, small TDS packets (common for parameterised queries) may be

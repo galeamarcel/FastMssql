@@ -13,6 +13,16 @@ create_exception!(crate::fastmssql, TlsError, PyException);
 create_exception!(crate::fastmssql, ProtocolError, PyException);
 create_exception!(crate::fastmssql, ConversionError, PyException);
 
+fn is_tls_io_failure(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("certificate")
+        || lower.contains("tls")
+        || lower.contains("ssl")
+        || lower.contains("handshake")
+        || lower.contains("invalid peer")
+        || lower.contains("unknown issuer")
+}
+
 pub fn create_sql_error(err: TError, base: &'static str) -> PyErr {
     match err {
         TError::Server(s) => {
@@ -30,16 +40,20 @@ pub fn create_sql_error(err: TError, base: &'static str) -> PyErr {
                 exc
             })
         }
-        TError::Io { kind: _, message } => Python::attach(|py| {
-            let exc = SqlConnectionError::new_err(format!("{base}: {message}"));
-            let _ = exc.value(py).setattr("message", message.as_str());
-            exc
-        }),
-        TError::Tls(msg) => Python::attach(|py| {
-            let exc = TlsError::new_err(format!("{base}: {msg}"));
-            let _ = exc.value(py).setattr("message", msg.as_str());
-            exc
-        }),
+        TError::Io { kind: _, message } if is_tls_io_failure(&message) => {
+            create_tls_error(format!("{base}: {message}"), message)
+        }
+        TError::Io { kind: _, message } => {
+            Python::attach(|py| {
+                let exc =
+                    SqlConnectionError::new_err(format!("{base}: {message}"));
+                let _ = exc.value(py).setattr("message", message.as_str());
+                exc
+            })
+        }
+        TError::Tls(message) => {
+            create_tls_error(format!("{base}: {message}"), message)
+        }
         TError::Routing { host, port } => {
             let message = format!("server redirected to {host}:{port}");
             Python::attach(|py| {
@@ -91,6 +105,19 @@ pub fn create_connection_error(message: impl Into<String>) -> PyErr {
     })
 }
 
+fn create_tls_error(
+    rendered_message: impl Into<String>,
+    detail: impl Into<String>,
+) -> PyErr {
+    let rendered_message = rendered_message.into();
+    let detail = detail.into();
+    Python::attach(|py| {
+        let exc = TlsError::new_err(rendered_message);
+        let _ = exc.value(py).setattr("message", detail.as_str());
+        exc
+    })
+}
+
 pub fn create_protocol_error(message: impl Into<String>) -> PyErr {
     let message = message.into();
     Python::attach(|py| {
@@ -98,6 +125,22 @@ pub fn create_protocol_error(message: impl Into<String>) -> PyErr {
         let _ = exc.value(py).setattr("message", message.as_str());
         exc
     })
+}
+
+#[cfg(test)]
+mod error_classification_tests {
+    use super::is_tls_io_failure;
+
+    #[test]
+    fn certificate_and_handshake_io_messages_are_tls_failures() {
+        assert!(is_tls_io_failure(
+            "invalid peer certificate: Other(UnsupportedCertVersion)"
+        ));
+        assert!(is_tls_io_failure("TLS handshake failed"));
+        assert!(is_tls_io_failure("unknown issuer"));
+        assert!(!is_tls_io_failure("Connection refused (os error 61)"));
+        assert!(!is_tls_io_failure("connection reset by peer"));
+    }
 }
 
 /// Memory-optimized to share column metadata across all rows in a result set.

@@ -174,9 +174,14 @@ pub fn execute_batch<'p>(
         // because batch operations are inherently heavy and latency-tolerant.
         // ───────────────────────────────────────────────────────────────────────────
 
-        let tcp = TcpStream::connect(config.get_addr())
+        let address = config.get_addr();
+        let tcp = TcpStream::connect(&address)
             .await
-            .map_err(|e| create_connection_error(format!("Failed to connect to server: {}", e)))?;
+            .map_err(|e| {
+                create_connection_error(format!(
+                    "Failed to connect to server {address}: {e}"
+                ))
+            })?;
 
         // Disable Nagle — same rationale as pool_manager.rs and transaction.rs.
         tcp.set_nodelay(true)
