@@ -1,6 +1,6 @@
 use crate::py_parameters::Parameters;
 use crate::type_mapping;
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{
@@ -73,11 +73,14 @@ pub fn python_to_fast_parameter(obj: &Bound<PyAny>) -> PyResult<FastParameter> {
         let py_by = PyByteArray::from(obj)?;
         return Ok(FastParameter::Bytes(py_by.to_vec()));
     }
-    if let Ok(py_date) = obj.extract::<NaiveDate>() {
-        return Ok(FastParameter::Date(py_date));
-    }
     if let Ok(py_dt) = obj.extract::<NaiveDateTime>() {
         return Ok(FastParameter::DateTime(py_dt));
+    }
+    if let Ok(py_dt) = obj.extract::<DateTime<FixedOffset>>() {
+        return Ok(FastParameter::DateTime(py_dt.naive_local()));
+    }
+    if let Ok(py_date) = obj.extract::<NaiveDate>() {
+        return Ok(FastParameter::Date(py_date));
     }
 
     // Fallback for custom types
