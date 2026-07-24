@@ -10,7 +10,14 @@ import tomllib
 
 import pytest
 
+from fastmssql import Connection
 from sql_auth_strict.cases import case
+from sql_auth_strict.framework_apps import (
+    FrameworkState,
+    session_count,
+    wait_for_pool_active,
+)
+from sql_auth_strict.helpers import scalar
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -73,3 +80,39 @@ print(json.dumps(sorted(name for name in blocked if name in sys.modules)))
         text=True,
     )
     assert json.loads(completed.stdout) == []
+
+
+def test_framework_state_uses_explicit_unique_application_name(
+    sql_auth_config,
+    unique_sql_name,
+) -> None:
+    application_name = unique_sql_name("strict_frame_state")
+    state = FrameworkState.create(
+        sql_auth_config,
+        application_name=application_name,
+    )
+    assert isinstance(state.connection, Connection)
+    assert state.application_name == application_name
+    assert state.loops == []
+
+
+@pytest.mark.asyncio
+async def test_framework_session_helpers_observe_real_pool(
+    sql_auth_config,
+    sa_connection,
+    unique_sql_name,
+) -> None:
+    application_name = unique_sql_name("strict_frame_session")
+    state = FrameworkState.create(
+        sql_auth_config,
+        application_name=application_name,
+    )
+    try:
+        await state.connection.connect()
+        assert await scalar(state.connection, "SELECT 1") == 1
+        assert await session_count(sa_connection, application_name) >= 1
+        assert (
+            await wait_for_pool_active(state.connection, expected=0)
+        )["active_connections"] == 0
+    finally:
+        await state.connection.disconnect()
