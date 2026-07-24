@@ -28,7 +28,8 @@ def test_dependency_security_workflow_is_triggered_with_least_privilege() -> Non
 def test_dependency_security_toolchain_and_actions_are_pinned() -> None:
     workflow = _read_required(WORKFLOW)
 
-    assert "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683" in workflow
+    assert "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" in workflow
+    assert "# v7.0.1" in workflow
     assert 'RUST_TOOLCHAIN: "1.94.0"' in workflow
     assert 'CARGO_AUDIT_VERSION: "0.22.2"' in workflow
     assert "cargo install cargo-audit" in workflow
