@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from collections import Counter
 from collections.abc import Iterable
 from pathlib import Path
 import re
@@ -26,7 +27,11 @@ def spec_case_ids(path: Path) -> frozenset[str]:
 
 
 def source_case_ids(paths: Iterable[Path]) -> frozenset[str]:
-    found: set[str] = set()
+    return frozenset(source_case_occurrences(paths))
+
+
+def source_case_occurrences(paths: Iterable[Path]) -> Counter[str]:
+    found: Counter[str] = Counter()
     for path in paths:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
@@ -39,5 +44,5 @@ def source_case_ids(paths: Iterable[Path]) -> frozenset[str]:
                     isinstance(argument, ast.Constant)
                     and isinstance(argument.value, str)
                 ):
-                    found.add(argument.value)
-    return frozenset(found)
+                    found[argument.value] += 1
+    return found

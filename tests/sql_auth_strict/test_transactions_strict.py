@@ -1,0 +1,652 @@
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Callable
+import time
+
+from fastmssql import Connection, PoolConfig, SqlError, SslConfig
+import pytest
+
+from sql_auth_strict.cases import case
+from sql_auth_strict.config import SqlAuthConfig
+from sql_auth_strict.helpers import CleanupRegistry, quote_identifier, scalar
+
+
+pytestmark = [pytest.mark.sql_auth_strict, pytest.mark.integration]
+
+
+def _observer_connection(config: SqlAuthConfig) -> Connection:
+    return Connection(
+        server=config.host,
+        port=config.port,
+        database=config.database,
+        username=config.owner_user,
+        password=config.owner_password,
+        ssl_config=SslConfig.development(),
+        pool_config=PoolConfig(
+            max_size=1,
+            min_idle=1,
+            max_lifetime_secs=None,
+            idle_timeout_secs=None,
+            connection_timeout_secs=2,
+            retry_connection=False,
+        ),
+    )
+
+
+async def _wait_for_request(
+    sa_connection: Connection,
+    token: str,
+    *,
+    present: bool,
+    timeout: float = 3.0,
+) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        count = await scalar(
+            sa_connection,
+            """
+            SELECT COUNT(*)
+            FROM sys.dm_exec_requests AS request
+            CROSS APPLY sys.dm_exec_sql_text(request.sql_handle) AS sql_text
+            WHERE request.session_id <> @@SPID
+              AND sql_text.text LIKE @P1
+            """,
+            [f"%{token}%"],
+        )
+        if (count > 0) is present:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError(
+        f"request token {token!r} did not reach present={present}"
+    )
+
+
+@case("TX-001")
+@pytest.mark.asyncio
+async def test_dedicated_session_id_remains_constant(
+    transaction_factory: Callable,
+) -> None:
+    transaction = transaction_factory()
+    try:
+        await transaction.begin()
+        first_session = await scalar(transaction, "SELECT @@SPID")
+        first_connection_id = await scalar(
+            transaction,
+            """
+            SELECT connection_id
+            FROM sys.dm_exec_connections
+            WHERE session_id = @@SPID
+            """,
+        )
+        second_session = await scalar(transaction, "SELECT @@SPID")
+        second_connection_id = await scalar(
+            transaction,
+            """
+            SELECT connection_id
+            FROM sys.dm_exec_connections
+            WHERE session_id = @@SPID
+            """,
+        )
+        assert second_session == first_session
+        assert second_connection_id == first_connection_id
+        await transaction.rollback()
+    finally:
+        await transaction.close()
+
+
+@case("TX-002", "TX-003")
+@pytest.mark.asyncio
+async def test_explicit_commit_and_rollback_persistence(
+    owner_connection: Connection,
+    transaction_factory: Callable,
+    unique_sql_name: Callable[[str], str],
+    cleanup_registry: CleanupRegistry,
+) -> None:
+    table = quote_identifier(unique_sql_name("strict_tx_explicit"))
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
+    await owner_connection.execute(f"CREATE TABLE {table} (id INT PRIMARY KEY)")
+
+    transaction = transaction_factory()
+    try:
+        await transaction.begin()
+        await transaction.execute(f"INSERT INTO {table} VALUES (1)")
+        await transaction.commit()
+        assert (
+            await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}")
+            == 1
+        )
+
+        await transaction.begin()
+        await transaction.execute(f"INSERT INTO {table} VALUES (2)")
+        await transaction.rollback()
+        assert (
+            await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}")
+            == 1
+        )
+        assert await scalar(owner_connection, f"SELECT id FROM {table}") == 1
+    finally:
+        await transaction.close()
+
+
+@case("TX-004")
+@pytest.mark.asyncio
+async def test_context_manager_auto_begin_and_commit(
+    owner_connection: Connection,
+    transaction_factory: Callable,
+    unique_sql_name: Callable[[str], str],
+    cleanup_registry: CleanupRegistry,
+) -> None:
+    table = quote_identifier(unique_sql_name("strict_tx_context_commit"))
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
+    await owner_connection.execute(f"CREATE TABLE {table} (id INT PRIMARY KEY)")
+    transaction = transaction_factory()
+    async with transaction:
+        assert transaction.is_connected() is True
+        assert await scalar(transaction, "SELECT @@TRANCOUNT") == 1
+        await transaction.execute(f"INSERT INTO {table} VALUES (1)")
+    assert transaction.is_connected() is False
+    assert await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}") == 1
+
+
+@case("TX-005")
+@pytest.mark.asyncio
+async def test_context_exception_rolls_back_and_propagates(
+    owner_connection: Connection,
+    transaction_factory: Callable,
+    unique_sql_name: Callable[[str], str],
+    cleanup_registry: CleanupRegistry,
+) -> None:
+    table = quote_identifier(unique_sql_name("strict_tx_context_rollback"))
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
+    await owner_connection.execute(f"CREATE TABLE {table} (id INT PRIMARY KEY)")
+    transaction = transaction_factory()
+    with pytest.raises(RuntimeError, match="force strict rollback"):
+        async with transaction:
+            await transaction.execute(f"INSERT INTO {table} VALUES (1)")
+            raise RuntimeError("force strict rollback")
+    assert transaction.is_connected() is False
+    assert await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}") == 0
+
+
+@case("TX-006")
+@pytest.mark.asyncio
+async def test_manual_commit_and_rollback_inside_context(
+    owner_connection: Connection,
+    transaction_factory: Callable,
+    unique_sql_name: Callable[[str], str],
+    cleanup_registry: CleanupRegistry,
+) -> None:
+    table = quote_identifier(unique_sql_name("strict_tx_manual_context"))
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
+    await owner_connection.execute(f"CREATE TABLE {table} (id INT PRIMARY KEY)")
+
+    committed = transaction_factory()
+    async with committed:
+        await committed.execute(f"INSERT INTO {table} VALUES (1)")
+        await committed.commit()
+
+    rolled_back = transaction_factory()
+    async with rolled_back:
+        await rolled_back.execute(f"INSERT INTO {table} VALUES (2)")
+        await rolled_back.rollback()
+
+    rows = await owner_connection.query(f"SELECT id FROM {table} ORDER BY id")
+    assert [row["id"] for row in rows.rows()] == [1]
+
+
+@case("TX-007")
+@pytest.mark.asyncio
+async def test_repeated_transaction_state_errors(
+    transaction_factory: Callable,
+) -> None:
+    committed = transaction_factory()
+    try:
+        with pytest.raises(RuntimeError, match="has not begun"):
+            await committed.commit()
+        with pytest.raises(RuntimeError, match="has not begun"):
+            await committed.rollback()
+        await committed.begin()
+        with pytest.raises(RuntimeError, match="already begun"):
+            await committed.begin()
+        await committed.commit()
+        with pytest.raises(RuntimeError, match="already committed"):
+            await committed.commit()
+        with pytest.raises(RuntimeError, match="already committed"):
+            await committed.rollback()
+    finally:
+        await committed.close()
+
+    rolled_back = transaction_factory()
+    try:
+        await rolled_back.begin()
+        await rolled_back.rollback()
+        with pytest.raises(RuntimeError, match="already rolled back"):
+            await rolled_back.rollback()
+        with pytest.raises(RuntimeError, match="already rolled back"):
+            await rolled_back.commit()
+    finally:
+        await rolled_back.close()
+
+
+@case("TX-008")
+@pytest.mark.asyncio
+async def test_close_and_reuse_opens_new_physical_connection(
+    transaction_factory: Callable,
+) -> None:
+    transaction = transaction_factory()
+    assert transaction.is_connected() is False
+    await transaction.close()
+    assert transaction.is_connected() is False
+
+    await transaction.begin()
+    first_connection_id = await scalar(
+        transaction,
+        """
+        SELECT connection_id
+        FROM sys.dm_exec_connections
+        WHERE session_id = @@SPID
+        """,
+    )
+    await transaction.rollback()
+    await transaction.close()
+    assert transaction.is_connected() is False
+
+    try:
+        await transaction.begin()
+        second_connection_id = await scalar(
+            transaction,
+            """
+            SELECT connection_id
+            FROM sys.dm_exec_connections
+            WHERE session_id = @@SPID
+            """,
+        )
+        assert second_connection_id != first_connection_id
+        await transaction.rollback()
+    finally:
+        await transaction.close()
+
+
+@case("TX-009")
+@pytest.mark.asyncio
+async def test_sequential_reuse_preserves_dedicated_session(
+    owner_connection: Connection,
+    transaction_factory: Callable,
+    unique_sql_name: Callable[[str], str],
+    cleanup_registry: CleanupRegistry,
+) -> None:
+    table = quote_identifier(unique_sql_name("strict_tx_reuse"))
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
+    await owner_connection.execute(f"CREATE TABLE {table} (id INT PRIMARY KEY)")
+    transaction = transaction_factory()
+    try:
+        await transaction.begin()
+        first_session = await scalar(transaction, "SELECT @@SPID")
+        await transaction.execute(f"INSERT INTO {table} VALUES (1)")
+        await transaction.commit()
+
+        await transaction.begin()
+        second_session = await scalar(transaction, "SELECT @@SPID")
+        await transaction.execute(f"INSERT INTO {table} VALUES (2)")
+        await transaction.rollback()
+        assert second_session == first_session
+        assert (
+            await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}")
+            == 1
+        )
+    finally:
+        await transaction.close()
+
+
+@case("TX-010")
+@pytest.mark.asyncio
+async def test_query_simple_query_and_execute_forwarding(
+    transaction_factory: Callable,
+) -> None:
+    transaction = transaction_factory()
+    try:
+        await transaction.begin()
+        await transaction.execute(
+            "CREATE TABLE #strict_tx_forward (id INT PRIMARY KEY)"
+        )
+        assert (
+            await transaction.execute(
+                "INSERT INTO #strict_tx_forward VALUES (@P1)", [1]
+            )
+            == 1
+        )
+        assert (
+            await scalar(
+                transaction, "SELECT id FROM #strict_tx_forward WHERE id=@P1", [1]
+            )
+            == 1
+        )
+        raw = await transaction.simple_query(
+            "SELECT CAST(2 AS INT) AS raw_value"
+        )
+        assert raw.fetchone()["raw_value"] == 2
+        await transaction.rollback()
+    finally:
+        await transaction.close()
+
+
+@case("TX-011")
+@pytest.mark.asyncio
+async def test_query_and_execute_batch_forwarding(
+    owner_connection: Connection,
+    transaction_factory: Callable,
+    unique_sql_name: Callable[[str], str],
+    cleanup_registry: CleanupRegistry,
+) -> None:
+    table = quote_identifier(unique_sql_name("strict_tx_batches"))
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
+    await owner_connection.execute(f"CREATE TABLE {table} (id INT PRIMARY KEY)")
+    transaction = transaction_factory()
+    try:
+        await transaction.begin()
+        counts = await transaction.execute_batch(
+            [
+                (f"INSERT INTO {table} VALUES (@P1)", [1]),
+                (f"INSERT INTO {table} VALUES (@P1)", [2]),
+            ]
+        )
+        assert counts == [1, 1]
+        results = await transaction.query_batch(
+            [
+                (f"SELECT COUNT(*) AS value FROM {table}", None),
+                (f"SELECT MAX(id) AS value FROM {table}", None),
+            ]
+        )
+        assert [result.fetchone()["value"] for result in results] == [2, 2]
+        await transaction.commit()
+        assert (
+            await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}")
+            == 2
+        )
+    finally:
+        await transaction.close()
+
+
+@case("TX-012")
+@pytest.mark.asyncio
+async def test_local_temp_table_and_session_state(
+    transaction_factory: Callable,
+) -> None:
+    transaction = transaction_factory()
+    try:
+        await transaction.begin()
+        await transaction.execute(
+            "CREATE TABLE #strict_tx_session (value INT NOT NULL)"
+        )
+        await transaction.execute(
+            "INSERT INTO #strict_tx_session VALUES (41)"
+        )
+        await transaction.simple_query("SET NOCOUNT ON")
+        assert (
+            await scalar(
+                transaction, "SELECT value FROM #strict_tx_session"
+            )
+            == 41
+        )
+        assert (
+            await scalar(
+                transaction,
+                "SELECT CASE WHEN (@@OPTIONS & 512) = 512 THEN 1 ELSE 0 END",
+            )
+            == 1
+        )
+        await transaction.rollback()
+    finally:
+        await transaction.close()
+
+
+@case("TX-013")
+@pytest.mark.asyncio
+async def test_ddl_is_rolled_back(
+    owner_connection: Connection,
+    transaction_factory: Callable,
+    unique_sql_name: Callable[[str], str],
+    cleanup_registry: CleanupRegistry,
+) -> None:
+    raw_table = unique_sql_name("strict_tx_ddl")
+    table = quote_identifier(raw_table)
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
+    transaction = transaction_factory()
+    try:
+        await transaction.begin()
+        await transaction.execute(f"CREATE TABLE {table} (id INT PRIMARY KEY)")
+        assert await scalar(transaction, "SELECT OBJECT_ID(@P1)", [raw_table])
+        await transaction.rollback()
+        assert (
+            await scalar(owner_connection, "SELECT OBJECT_ID(@P1)", [raw_table])
+            is None
+        )
+    finally:
+        await transaction.close()
+
+
+@case("TX-014")
+@pytest.mark.asyncio
+async def test_savepoint_behavior_through_raw_sql(
+    owner_connection: Connection,
+    transaction_factory: Callable,
+    unique_sql_name: Callable[[str], str],
+    cleanup_registry: CleanupRegistry,
+) -> None:
+    table = quote_identifier(unique_sql_name("strict_tx_savepoint"))
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
+    await owner_connection.execute(f"CREATE TABLE {table} (id INT PRIMARY KEY)")
+    transaction = transaction_factory()
+    try:
+        await transaction.begin()
+        await transaction.execute(f"INSERT INTO {table} VALUES (1)")
+        await transaction.simple_query("SAVE TRANSACTION strict_savepoint")
+        await transaction.execute(f"INSERT INTO {table} VALUES (2)")
+        await transaction.simple_query(
+            "ROLLBACK TRANSACTION strict_savepoint"
+        )
+        await transaction.commit()
+        rows = await owner_connection.query(
+            f"SELECT id FROM {table} ORDER BY id"
+        )
+        assert [row["id"] for row in rows.rows()] == [1]
+    finally:
+        await transaction.close()
+
+
+@case("TX-015")
+@pytest.mark.asyncio
+async def test_read_uncommitted_and_read_committed_visibility(
+    owner_connection: Connection,
+    transaction_factory: Callable,
+    sql_auth_config: SqlAuthConfig,
+    unique_sql_name: Callable[[str], str],
+    cleanup_registry: CleanupRegistry,
+) -> None:
+    table = quote_identifier(unique_sql_name("strict_tx_visibility"))
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
+    await owner_connection.execute(f"CREATE TABLE {table} (id INT PRIMARY KEY)")
+    writer = transaction_factory()
+    observer = _observer_connection(sql_auth_config)
+    try:
+        await writer.begin()
+        await writer.execute(f"INSERT INTO {table} VALUES (1)")
+        await observer.connect()
+        await observer.simple_query(
+            "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED"
+        )
+        assert await scalar(observer, f"SELECT COUNT(*) FROM {table}") == 1
+        await writer.rollback()
+        await observer.simple_query(
+            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
+        )
+        assert await scalar(observer, f"SELECT COUNT(*) FROM {table}") == 0
+    finally:
+        await writer.close()
+        await observer.disconnect()
+
+
+@case("TX-016")
+@pytest.mark.asyncio
+async def test_blocking_lock_releases_after_commit(
+    owner_connection: Connection,
+    transaction_factory: Callable,
+    sql_auth_config: SqlAuthConfig,
+    unique_sql_name: Callable[[str], str],
+    cleanup_registry: CleanupRegistry,
+) -> None:
+    table = quote_identifier(unique_sql_name("strict_tx_blocking"))
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
+    await owner_connection.execute(
+        f"CREATE TABLE {table} (id INT PRIMARY KEY, value INT NOT NULL)"
+    )
+    await owner_connection.execute(f"INSERT INTO {table} VALUES (1, 10)")
+    writer = transaction_factory()
+    observer = _observer_connection(sql_auth_config)
+    try:
+        await writer.begin()
+        await writer.execute(f"UPDATE {table} SET value = 20 WHERE id = 1")
+        blocked_read = asyncio.create_task(
+            scalar(observer, f"SELECT value FROM {table} WHERE id = 1")
+        )
+        await asyncio.sleep(0.25)
+        assert blocked_read.done() is False
+        await writer.commit()
+        assert await asyncio.wait_for(blocked_read, timeout=3.0) == 20
+    finally:
+        await writer.close()
+        await observer.disconnect()
+
+
+@case("TX-017")
+@pytest.mark.asyncio
+async def test_deterministic_deadlock_reports_victim_1205(
+    owner_connection: Connection,
+    transaction_factory: Callable,
+    unique_sql_name: Callable[[str], str],
+    cleanup_registry: CleanupRegistry,
+) -> None:
+    table = quote_identifier(unique_sql_name("strict_tx_deadlock"))
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
+    await owner_connection.execute(
+        f"CREATE TABLE {table} (id INT PRIMARY KEY, value INT NOT NULL)"
+    )
+    await owner_connection.execute(
+        f"INSERT INTO {table} VALUES (1, 0), (2, 0)"
+    )
+    first = transaction_factory()
+    second = transaction_factory()
+    try:
+        await first.begin()
+        await second.begin()
+        await first.execute(f"UPDATE {table} SET value = 1 WHERE id = 1")
+        await second.execute(f"UPDATE {table} SET value = 2 WHERE id = 2")
+
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(
+                first.execute(f"UPDATE {table} SET value = 1 WHERE id = 2"),
+                second.execute(f"UPDATE {table} SET value = 2 WHERE id = 1"),
+                return_exceptions=True,
+            ),
+            timeout=10.0,
+        )
+        errors = [
+            (index, outcome)
+            for index, outcome in enumerate(outcomes)
+            if isinstance(outcome, BaseException)
+        ]
+        successes = [
+            outcome
+            for outcome in outcomes
+            if not isinstance(outcome, BaseException)
+        ]
+        assert len(errors) == 1
+        assert len(successes) == 1
+        assert successes == [1]
+        victim_index, victim_error = errors[0]
+        assert isinstance(victim_error, SqlError)
+        assert victim_error.code == 1205
+
+        survivor = second if victim_index == 0 else first
+        await survivor.commit()
+        assert await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}") == 2
+    finally:
+        await first.close()
+        await second.close()
+
+
+@case("TX-018")
+@pytest.mark.asyncio
+async def test_cancellation_is_explicitly_closed_and_recoverable(
+    owner_connection: Connection,
+    sa_connection: Connection,
+    transaction_factory: Callable,
+    unique_sql_name: Callable[[str], str],
+    cleanup_registry: CleanupRegistry,
+) -> None:
+    table = quote_identifier(unique_sql_name("strict_tx_cancel"))
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
+    await owner_connection.execute(f"CREATE TABLE {table} (id INT PRIMARY KEY)")
+    token = unique_sql_name("strict_tx_wait")
+    transaction = transaction_factory()
+    try:
+        await transaction.begin()
+        await transaction.execute(f"INSERT INTO {table} VALUES (1)")
+        wait_task = asyncio.create_task(
+            transaction.query(
+                "WAITFOR DELAY '00:00:02'; "
+                f"SELECT CAST(1 AS INT) AS value; -- {token}"
+            )
+        )
+        await _wait_for_request(sa_connection, token, present=True)
+        wait_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await wait_task
+
+        await asyncio.wait_for(transaction.close(), timeout=4.0)
+        await _wait_for_request(sa_connection, token, present=False)
+        assert (
+            await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}")
+            == 0
+        )
+
+        await transaction.begin()
+        await transaction.execute(f"INSERT INTO {table} VALUES (2)")
+        await transaction.commit()
+        assert await scalar(owner_connection, f"SELECT id FROM {table}") == 2
+    finally:
+        await transaction.close()
+
+
+@case("TX-019")
+@pytest.mark.asyncio
+async def test_concurrent_calls_serialize_on_dedicated_client(
+    transaction_factory: Callable,
+) -> None:
+    transaction = transaction_factory()
+    try:
+        await transaction.begin()
+
+        async def delayed_value(value: int):
+            result = await transaction.query(
+                """
+                WAITFOR DELAY '00:00:00.200';
+                SELECT @P1 AS value;
+                """,
+                [value],
+            )
+            return result.fetchone()["value"]
+
+        started = time.monotonic()
+        values = await asyncio.gather(
+            delayed_value(1),
+            delayed_value(2),
+            delayed_value(3),
+        )
+        elapsed = time.monotonic() - started
+        assert values == [1, 2, 3]
+        assert 0.5 <= elapsed < 2.0
+        await transaction.rollback()
+    finally:
+        await transaction.close()

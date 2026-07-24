@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
+from collections import defaultdict
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -9,14 +11,14 @@ from fastmssql import Connection, Transaction
 import pytest
 import pytest_asyncio
 
-from sql_auth_strict.cases import CASE_MARKER
+from sql_auth_strict.cases import CASE_MARKER, spec_case_ids
 from sql_auth_strict.config import SqlAuthConfig
 from sql_auth_strict.helpers import CleanupRegistry
 from sql_auth_strict.helpers import unique_sql_name as make_unique_sql_name
 
 
 ROOT = Path(__file__).resolve().parents[2]
-RESULTS_PATH = ROOT / ".artifacts/sql-auth/strict-results.json"
+DEFAULT_RESULTS_PATH = ROOT / ".artifacts/sql-auth/strict-results.json"
 _RESULTS: dict[str, dict[str, Any]] = {}
 _PASSWORDS: tuple[str, ...] = ()
 _OUTCOME_PRIORITY = {"passed": 0, "skipped": 1, "failed": 2}
@@ -101,15 +103,59 @@ def pytest_sessionfinish(
     session: pytest.Session, exitstatus: int | pytest.ExitCode
 ) -> None:
     del session, exitstatus
-    RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    results_path = Path(
+        os.getenv("FASTMSSQL_SQL_AUTH_RESULTS_PATH", str(DEFAULT_RESULTS_PATH))
+    )
+    results_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema_version": 1,
         "cases": dict(sorted(_RESULTS.items())),
     }
-    RESULTS_PATH.write_text(
+    results_path.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+
+
+def pytest_collection_finish(session: pytest.Session) -> None:
+    strict_root = ROOT / "tests/sql_auth_strict"
+    strict_sources = {
+        path.resolve()
+        for path in strict_root.glob("test_*.py")
+        if path.name != "test_matrix_contract.py"
+    }
+    collected_sources = {
+        Path(str(item.path)).resolve()
+        for item in session.items
+        if Path(str(item.path)).resolve().parent == strict_root.resolve()
+    }
+    if not strict_sources.issubset(collected_sources):
+        return
+
+    spec = ROOT / (
+        "docs/superpowers/specs/"
+        "2026-07-24-fastmssql-sql-auth-validation-design.md"
+    )
+    expected = spec_case_ids(spec)
+    case_nodes: dict[str, set[str]] = defaultdict(set)
+    for item in session.items:
+        base_nodeid = item.nodeid.split("[", 1)[0]
+        for case_id in _case_ids(item):
+            case_nodes[case_id].add(base_nodeid)
+
+    collected = frozenset(case_nodes)
+    duplicates = {
+        case_id: sorted(nodeids)
+        for case_id, nodeids in case_nodes.items()
+        if len(nodeids) != 1
+    }
+    missing = sorted(expected - collected)
+    extra = sorted(collected - expected)
+    if missing or extra or duplicates:
+        raise pytest.UsageError(
+            "invalid collected SQL-auth matrix: "
+            f"missing={missing}, extra={extra}, duplicates={duplicates}"
+        )
 
 
 @pytest.fixture(scope="session")
