@@ -681,8 +681,20 @@ async def test_checkout_reset_rolls_back_leaked_local_transaction(
     async with connection:
         await connection.execute(f"CREATE TABLE {table} (id INT NOT NULL PRIMARY KEY)")
         first_session = int(await scalar(connection, "SELECT @@SPID"))
+        baseline = (
+            await connection.query(
+                f"""
+                SELECT
+                    XACT_STATE() AS transaction_state,
+                    COUNT_BIG(*) AS visible_rows
+                FROM {table}
+                """
+            )
+        ).fetchone()
+        assert baseline is not None
+        assert baseline["visible_rows"] == 0
         baseline_transaction_state = int(
-            await scalar(connection, "SELECT XACT_STATE()")
+            baseline["transaction_state"]
         )
 
         try:
