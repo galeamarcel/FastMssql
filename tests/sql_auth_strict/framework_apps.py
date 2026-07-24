@@ -8,6 +8,7 @@ import time
 
 from fastmssql import Connection, PoolConfig, SslConfig, Transaction
 from fastapi import FastAPI
+from flask import Flask, jsonify
 from pydantic import BaseModel
 from starlette.responses import PlainTextResponse
 
@@ -254,5 +255,73 @@ def create_fastapi_app(
                 "Internal Server Error",
                 status_code=500,
             )
+
+    return app
+
+
+def create_flask_app(state: FrameworkState) -> Flask:
+    app = Flask(__name__)
+    delays = {
+        "none": "",
+        "short": "WAITFOR DELAY '00:00:01';",
+        "long": "WAITFOR DELAY '00:00:02';",
+    }
+
+    async def delayed(value: int, profile: str = "short") -> int:
+        prefix = delays[profile]
+        return await scalar(
+            state.connection,
+            f"/* {state.application_name} */ {prefix} SELECT @P1",
+            [value],
+        )
+
+    @app.get("/principal")
+    async def principal():
+        value = await scalar(
+            state.connection,
+            "SELECT CAST(SUSER_SNAME() AS NVARCHAR(128))",
+        )
+        return jsonify(principal=value)
+
+    @app.get("/value/<int:value>")
+    async def value(value: int):
+        return jsonify(value=await delayed(value, "none"))
+
+    @app.get("/loop")
+    async def loop():
+        running = asyncio.get_running_loop()
+        state.loops.append(running)
+        return jsonify(
+            loop_id=id(running),
+            sql_value=await delayed(15, "none"),
+        )
+
+    @app.get("/gather")
+    async def gather():
+        sequential_started = time.monotonic()
+        sequential = [await delayed(value) for value in range(4)]
+        sequential_elapsed = time.monotonic() - sequential_started
+        concurrent_started = time.monotonic()
+        concurrent = await asyncio.gather(
+            *(delayed(value) for value in range(4))
+        )
+        concurrent_elapsed = time.monotonic() - concurrent_started
+        return jsonify(
+            sequential=sequential,
+            concurrent=concurrent,
+            sequential_seconds=sequential_elapsed,
+            concurrent_seconds=concurrent_elapsed,
+        )
+
+    @app.get("/wait/<int:value>")
+    async def wait(value: int):
+        return jsonify(value=await delayed(value, "long"))
+
+    @app.get("/sql-error")
+    async def sql_error():
+        await state.connection.query(
+            "SELECT * FROM dbo.strict_framework_missing_table"
+        )
+        raise AssertionError("unreachable after missing-table query")
 
     return app

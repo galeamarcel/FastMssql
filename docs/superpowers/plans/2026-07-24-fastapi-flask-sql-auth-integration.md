@@ -1193,7 +1193,7 @@ source .env.sql-auth.local
 set +a
 PYTHONPATH=python .venv/bin/pytest \
   tests/sql_auth_strict/test_framework_integration.py \
-  -k 'flask and wsgi and not adapted' -vv
+  -k 'flask and not adapted' -vv
 ```
 
 Expected: import fails because `create_flask_app` does not exist.

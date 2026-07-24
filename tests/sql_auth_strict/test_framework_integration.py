@@ -11,6 +11,7 @@ import time
 import tomllib
 
 from asgi_lifespan import LifespanManager
+from flask import Flask
 import pytest
 import pytest_asyncio
 
@@ -21,6 +22,7 @@ from sql_auth_strict.framework_apps import (
     FrameworkState,
     IntentionalRollback,
     create_fastapi_app,
+    create_flask_app,
     session_count,
     wait_for_pool_active,
     wait_for_sql_request,
@@ -52,6 +54,14 @@ def asgi_client(app, *, raise_app_exceptions: bool = True) -> AsyncClient:
         ),
         base_url="http://framework.test",
     )
+
+
+async def flask_request(app: Flask, path: str):
+    def request_once():
+        with app.test_client() as client:
+            return client.get(path)
+
+    return await asyncio.to_thread(request_once)
 
 
 @case("FRAME-001")
@@ -400,4 +410,137 @@ async def test_fastapi_request_cancellation_recovers_immediately(
         "FRAME-011",
         cancellation_seconds=cancellation_elapsed,
         pool_after=pool_after,
+    )
+
+
+@pytest.fixture
+def framework_flask_app(sql_auth_config, unique_sql_name):
+    state = FrameworkState.create(
+        sql_auth_config,
+        application_name=unique_sql_name("strict_flask_wsgi"),
+    )
+    return create_flask_app(state), state
+
+
+@case("FRAME-014")
+@pytest.mark.asyncio
+async def test_flask_async_wsgi_view_executes_real_query(
+    framework_flask_app,
+) -> None:
+    app, state = framework_flask_app
+    try:
+        response = await flask_request(app, "/value/14")
+        assert response.status_code == 200
+        assert response.get_json() == {"value": 14}
+    finally:
+        await state.connection.disconnect()
+
+
+@case("FRAME-015")
+@pytest.mark.asyncio
+async def test_flask_shared_pool_crosses_distinct_request_loops(
+    framework_flask_app,
+    record_framework_metric,
+) -> None:
+    app, state = framework_flask_app
+    try:
+        first = await flask_request(app, "/loop")
+        second = await flask_request(app, "/loop")
+        assert first.status_code == second.status_code == 200
+        assert len(state.loops) == 2
+        assert state.loops[0] is not state.loops[1]
+        assert first.get_json()["sql_value"] == 15
+        assert second.get_json()["sql_value"] == 15
+        assert await scalar(state.connection, "SELECT 15") == 15
+        record_framework_metric(
+            "FRAME-015",
+            distinct_request_loops=True,
+            loop_ids=[id(loop) for loop in state.loops],
+        )
+    finally:
+        await state.connection.disconnect()
+
+
+@case("FRAME-016")
+@pytest.mark.asyncio
+async def test_flask_one_async_view_overlaps_database_operations(
+    framework_flask_app,
+    record_framework_metric,
+) -> None:
+    app, state = framework_flask_app
+    try:
+        response = await flask_request(app, "/gather")
+        payload = response.get_json()
+        assert payload["sequential"] == [0, 1, 2, 3]
+        assert payload["concurrent"] == [0, 1, 2, 3]
+        assert payload["concurrent_seconds"] < (
+            payload["sequential_seconds"] * 0.65
+        )
+        record_framework_metric("FRAME-016", **payload)
+    finally:
+        await state.connection.disconnect()
+
+
+@case("FRAME-017")
+@pytest.mark.asyncio
+async def test_flask_wsgi_worker_requests_are_correct_and_measured(
+    framework_flask_app,
+    record_framework_metric,
+) -> None:
+    app, state = framework_flask_app
+    try:
+        started = time.monotonic()
+        responses = await asyncio.gather(
+            *(flask_request(app, f"/wait/{value}") for value in range(4))
+        )
+        elapsed = time.monotonic() - started
+        assert [response.get_json()["value"] for response in responses] == list(
+            range(4)
+        )
+        record_framework_metric(
+            "FRAME-017",
+            execution_model="WSGI worker-bound",
+            requests=4,
+            elapsed_seconds=elapsed,
+        )
+    finally:
+        await state.connection.disconnect()
+
+
+@case("FRAME-018")
+@pytest.mark.asyncio
+async def test_flask_wsgi_error_is_typed_redacted_and_pool_recovers(
+    framework_flask_app,
+    sql_auth_config,
+) -> None:
+    app, state = framework_flask_app
+    app.testing = True
+    try:
+        with pytest.raises(SqlError) as captured:
+            await flask_request(app, "/sql-error")
+        assert captured.value.code == 208
+        assert sql_auth_config.owner_password not in str(captured.value)
+        assert await scalar(state.connection, "SELECT 18") == 18
+    finally:
+        await state.connection.disconnect()
+
+
+@case("FRAME-019")
+@pytest.mark.asyncio
+async def test_flask_wsgi_explicit_shutdown_removes_app_sessions(
+    framework_flask_app,
+    sa_connection,
+) -> None:
+    app, state = framework_flask_app
+    try:
+        response = await flask_request(app, "/value/19")
+        assert response.get_json() == {"value": 19}
+        assert await session_count(sa_connection, state.application_name) >= 1
+    finally:
+        await state.connection.disconnect()
+    assert await state.connection.is_connected() is False
+    await wait_for_session_count(
+        sa_connection,
+        state.application_name,
+        expected=0,
     )
