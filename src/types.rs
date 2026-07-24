@@ -29,6 +29,7 @@ pub fn create_sql_error(err: TError, base: &'static str) -> PyErr {
             let code = s.code();
             let message = s.message().to_string();
             let state = s.state();
+            let severity = s.class();
             Python::attach(|py| {
                 let exc = SqlError::new_err(message.clone());
                 {
@@ -36,6 +37,8 @@ pub fn create_sql_error(err: TError, base: &'static str) -> PyErr {
                     let _ = value.setattr("code", code);
                     let _ = value.setattr("message", message.as_str());
                     let _ = value.setattr("state", state);
+                    let _ = value.setattr("class", severity);
+                    let _ = value.setattr("severity", severity);
                 }
                 exc
             })

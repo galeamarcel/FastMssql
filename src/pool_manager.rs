@@ -1,6 +1,6 @@
 use crate::azure_auth::PyAzureCredential;
 use crate::pool_config::PyPoolConfig;
-use crate::types::{create_connection_error, create_sql_error};
+use crate::types::{SqlError, create_connection_error, create_sql_error};
 use bb8::Pool;
 use pyo3::prelude::*;
 use std::fmt;
@@ -15,25 +15,82 @@ use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 type TiberiusClient = tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectionDisposition {
+    /// A newly authenticated session on which no application operation ran yet.
+    Clean,
+    /// The TDS stream is synchronized, but application-visible session state may
+    /// have changed and must be reset before cross-lease reuse.
+    NeedsReset,
+    /// The transport or TDS stream is not safe for another operation.
+    Broken,
+}
+
+impl ConnectionDisposition {
+    fn after_sql_server_severity(severity: u8) -> Self {
+        match severity {
+            // SQL Server severities 20-25 are fatal system errors. Lower
+            // severities are application/server errors that leave the TDS
+            // stream synchronized, though the session still needs reset.
+            0..=19 => Self::NeedsReset,
+            20.. => Self::Broken,
+        }
+    }
+
+    fn after_python_error(error: &PyErr) -> Self {
+        Python::attach(|py| {
+            if error.is_instance_of::<SqlError>(py) {
+                let severity = error
+                    .value(py)
+                    .getattr("severity")
+                    .and_then(|value| value.extract::<u8>());
+
+                severity
+                    .map(Self::after_sql_server_severity)
+                    .unwrap_or(Self::Broken)
+            } else {
+                // I/O, TLS, protocol, conversion, runtime, or an unclassified
+                // internal error is conservatively unsafe to reuse.
+                Self::Broken
+            }
+        })
+    }
+}
+
 pub struct ManagedConnection {
     client: TiberiusClient,
-    reusable: bool,
+    disposition: ConnectionDisposition,
 }
 
 impl ManagedConnection {
     fn new(client: TiberiusClient) -> Self {
         Self {
             client,
-            reusable: true,
+            disposition: ConnectionDisposition::Clean,
         }
     }
 
     pub(crate) fn mark_unusable(&mut self) {
-        self.reusable = false;
+        self.disposition = ConnectionDisposition::Broken;
+    }
+
+    fn mark_needs_reset(&mut self) {
+        if self.disposition != ConnectionDisposition::Broken {
+            self.disposition = ConnectionDisposition::NeedsReset;
+        }
+    }
+
+    fn apply_operation_error(&mut self, error: &PyErr) {
+        match ConnectionDisposition::after_python_error(error) {
+            ConnectionDisposition::Broken => self.mark_unusable(),
+            ConnectionDisposition::Clean | ConnectionDisposition::NeedsReset => {
+                self.mark_needs_reset();
+            }
+        }
     }
 
     pub(crate) fn is_reusable(&self) -> bool {
-        self.reusable
+        self.disposition != ConnectionDisposition::Broken
     }
 }
 
@@ -235,7 +292,20 @@ impl<'a> PooledOperationGuard<'a> {
     }
 
     pub(crate) fn complete(&mut self) {
+        self.connection.mark_needs_reset();
         self.completed = true;
+    }
+
+    pub(crate) fn complete_with_result<T>(&mut self, result: &PyResult<T>) {
+        match result {
+            Ok(_) => self.connection.mark_needs_reset(),
+            Err(error) => self.connection.apply_operation_error(error),
+        }
+        self.completed = true;
+    }
+
+    pub(crate) fn observe_error(&mut self, error: &PyErr) {
+        self.connection.apply_operation_error(error);
     }
 }
 
@@ -401,4 +471,29 @@ pub async fn warmup_pool(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod connection_disposition_tests {
+    use super::ConnectionDisposition;
+
+    #[test]
+    fn nonfatal_sql_server_errors_need_reset_but_remain_synchronized() {
+        for severity in [0, 10, 16, 19] {
+            assert_eq!(
+                ConnectionDisposition::after_sql_server_severity(severity),
+                ConnectionDisposition::NeedsReset
+            );
+        }
+    }
+
+    #[test]
+    fn fatal_sql_server_errors_are_broken() {
+        for severity in [20, 21, 24, 25, u8::MAX] {
+            assert_eq!(
+                ConnectionDisposition::after_sql_server_severity(severity),
+                ConnectionDisposition::Broken
+            );
+        }
+    }
 }
