@@ -22,8 +22,10 @@ DEFAULT_RESULTS_PATH = ROOT / ".artifacts/sql-auth/strict-results.json"
 DEFAULT_FRAMEWORK_METRICS_PATH = (
     ROOT / ".artifacts/sql-auth/framework-metrics.json"
 )
+DEFAULT_LOAD_METRICS_PATH = ROOT / ".artifacts/sql-auth/load-metrics.json"
 _RESULTS: dict[str, dict[str, Any]] = {}
 _FRAMEWORK_METRICS: dict[str, dict[str, object]] = {}
+_LOAD_METRICS: dict[str, dict[str, object]] = {}
 _PASSWORDS: tuple[str, ...] = ()
 _OUTCOME_PRIORITY = {"passed": 0, "skipped": 1, "failed": 2}
 
@@ -44,6 +46,7 @@ def pytest_configure(config: pytest.Config) -> None:
     )
     _RESULTS.clear()
     _FRAMEWORK_METRICS.clear()
+    _LOAD_METRICS.clear()
     sql_auth_config = SqlAuthConfig.from_env(require_all=False)
     _PASSWORDS = tuple(
         password
@@ -140,6 +143,26 @@ def pytest_sessionfinish(
             + "\n",
             encoding="utf-8",
         )
+    if _LOAD_METRICS:
+        metrics_path = Path(
+            os.getenv(
+                "FASTMSSQL_LOAD_METRICS_PATH",
+                str(DEFAULT_LOAD_METRICS_PATH),
+            )
+        )
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        metrics_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "cases": dict(sorted(_LOAD_METRICS.items())),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
 
 def pytest_collection_finish(session: pytest.Session) -> None:
@@ -199,6 +222,24 @@ def record_framework_metric():
         if overlap:
             raise ValueError(
                 f"duplicate framework metric keys for {case_id}: "
+                f"{sorted(overlap)}"
+            )
+        existing.update(values)
+
+    return record
+
+
+@pytest.fixture
+def record_load_metric():
+    def record(case_id: str, **values: object) -> None:
+        if not case_id.startswith("LOAD-"):
+            raise ValueError(f"not a load case ID: {case_id}")
+        json.dumps(values)
+        existing = _LOAD_METRICS.setdefault(case_id, {})
+        overlap = existing.keys() & values.keys()
+        if overlap:
+            raise ValueError(
+                f"duplicate load metric keys for {case_id}: "
                 f"{sorted(overlap)}"
             )
         existing.update(values)

@@ -117,6 +117,20 @@ def test_report_generator_preserves_not_run_and_redacts(
         ),
         encoding="utf-8",
     )
+    (artifact_dir / "load-metrics.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "cases": {
+                    "LOAD-008": {
+                        "transaction_count": 1_000,
+                        "transactions_per_second": 500.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     matrix_output = tmp_path / "matrix.md"
     report_output = tmp_path / "report.md"
     environment = os.environ.copy()
@@ -149,7 +163,7 @@ def test_report_generator_preserves_not_run_and_redacts(
     matrix = matrix_output.read_text(encoding="utf-8")
     report = report_output.read_text(encoding="utf-8")
     assert (
-        sum(line.startswith("| `") for line in matrix.splitlines()) == 250
+        sum(line.startswith("| `") for line in matrix.splitlines()) == 251
     )
     assert "| `ENV-001` | PASS |" in matrix
     assert "| `AUTH-001` | FAIL |" in matrix
@@ -170,6 +184,10 @@ def test_report_generator_preserves_not_run_and_redacts(
     assert "Fixed exclusions" in report
     assert "FRAME-009" in report
     assert "0.25" in report
+    assert "Load metrics" in report
+    assert "LOAD-008" in report
+    assert "transactions_per_second" in report
+    assert "500.0" in report
 
 
 def test_report_generator_can_require_complete_evidence(
@@ -212,10 +230,10 @@ def test_report_generator_can_require_complete_evidence(
     )
 
     assert completed.returncode == 1
-    assert "missing evidence for 250 case(s)" in completed.stderr
+    assert "missing evidence for 251 case(s)" in completed.stderr
     assert matrix_output.is_file()
     assert report_output.is_file()
-    assert "| NOT RUN | 250 |" in report_output.read_text(encoding="utf-8")
+    assert "| NOT RUN | 251 |" in report_output.read_text(encoding="utf-8")
 
 
 def test_config_redacts_password(monkeypatch) -> None:
@@ -226,13 +244,13 @@ def test_config_redacts_password(monkeypatch) -> None:
     assert "NeverPrintMe_2026!" not in repr(config)
 
 
-def test_approved_spec_contains_250_unique_case_ids() -> None:
+def test_approved_spec_contains_251_unique_case_ids() -> None:
     spec = ROOT / (
         "docs/superpowers/specs/"
         "2026-07-24-fastmssql-sql-auth-validation-design.md"
     )
     ids = spec_case_ids(spec)
-    assert len(ids) == 250
+    assert len(ids) == 251
 
 
 def test_framework_contract_is_wired_into_runner_and_report() -> None:
@@ -253,6 +271,52 @@ def test_framework_contract_is_wired_into_runner_and_report() -> None:
     assert "Flask via WsgiToAsgi" in report_source
     assert "framework-metrics.json" in report_source
     assert "framework:" in pyproject
+
+
+def test_load_metrics_are_wired_into_runner_and_report() -> None:
+    runner = (ROOT / "scripts/sql_auth/run_all.sh").read_text(
+        encoding="utf-8"
+    )
+    report_source = (
+        ROOT / "scripts/sql_auth/generate_report.py"
+    ).read_text(encoding="utf-8")
+    assert "FASTMSSQL_LOAD_METRICS_PATH" in runner
+    assert "load-metrics.json" in runner
+    assert "load-metrics.json" in report_source
+    assert "Load metrics" in report_source
+
+
+def test_extended_transaction_stress_harness_is_bounded_and_opt_in() -> None:
+    python_runner = ROOT / "scripts/sql_auth/transaction_stress.py"
+    shell_runner = ROOT / "scripts/sql_auth/run_transaction_stress.sh"
+    assert python_runner.is_file()
+    assert shell_runner.is_file()
+    assert shell_runner.stat().st_mode & 0o111
+    source = python_runner.read_text(encoding="utf-8")
+    assert "99_999" in source
+    assert "--profiles" in source
+    assert "--connection-strategy" in source
+    assert "per-transaction" in source
+    assert "transactions must be between 1 and 99,999" in source
+    assert "concurrency must be between 1 and 500" in source
+    shell_source = shell_runner.read_text(encoding="utf-8")
+    assert ".env.sql-auth.local" in shell_source
+    assert "10_000:100,99_999:100" in shell_source
+    assert "99_999:200" in shell_source
+    assert "--connection-strategy persistent" in shell_source
+    assert "transaction_stress.py" in shell_source
+    assert "run_transaction_stress.sh" not in (
+        ROOT / "scripts/sql_auth/run_all.sh"
+    ).read_text(encoding="utf-8")
+
+    completed = subprocess.run(
+        [sys.executable, str(python_runner), "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "--profiles" in completed.stdout
 
 
 def test_result_messages_redact_every_nonempty_password() -> None:

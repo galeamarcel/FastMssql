@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "scope": {
+    "authentication": "SQL Server username/password",
+    "client_under_test": "FastMssql",
+    "container": "fastmssql-sql-auth-dev",
+    "database": "fastmssql_validation",
+    "platform_note": "SQL Server linux/amd64 executes under emulation on an ARM64 macOS host",
+    "purpose": "driver correctness and resource behavior, not a SQL Server capacity benchmark"
+  },
+  "required_gate": {
+    "committed": 500,
+    "concurrency": 50,
+    "distinct_sampled_sessions": 35,
+    "elapsed_seconds": 1.6284495829604566,
+    "remaining_application_sessions": 0,
+    "rolled_back": 500,
+    "transactions": 1000,
+    "transactions_per_second": 614.0810317148657
+  },
+  "persistent_session_profiles": [
+    {
+      "committed": 5000,
+      "concurrency": 100,
+      "connection_strategy": "persistent",
+      "distinct_sampled_sessions": 100,
+      "elapsed_seconds": 2.8381800000788644,
+      "event_loop_ticks": 281,
+      "physical_connection_count": 100,
+      "post_load_smoke": "PASS",
+      "remaining_application_sessions": 0,
+      "rolled_back": 5000,
+      "rss_after_bytes": 49725440,
+      "rss_before_bytes": 32407552,
+      "rss_growth_bytes": 17317888,
+      "transactions": 10000,
+      "transactions_per_second": 3523.384704184418
+    },
+    {
+      "committed": 50000,
+      "concurrency": 100,
+      "connection_strategy": "persistent",
+      "distinct_sampled_sessions": 100,
+      "elapsed_seconds": 27.093962542014197,
+      "event_loop_ticks": 2679,
+      "physical_connection_count": 100,
+      "post_load_smoke": "PASS",
+      "remaining_application_sessions": 0,
+      "rolled_back": 49999,
+      "rss_after_bytes": 61767680,
+      "rss_before_bytes": 49758208,
+      "rss_growth_bytes": 12009472,
+      "transactions": 99999,
+      "transactions_per_second": 3690.8222577237666
+    },
+    {
+      "committed": 50000,
+      "concurrency": 200,
+      "connection_strategy": "persistent",
+      "distinct_sampled_sessions": 200,
+      "elapsed_seconds": 30.77752254193183,
+      "event_loop_ticks": 3034,
+      "physical_connection_count": 200,
+      "post_load_smoke": "PASS",
+      "remaining_application_sessions": 0,
+      "rolled_back": 49999,
+      "rss_after_bytes": 78610432,
+      "rss_before_bytes": 60801024,
+      "rss_growth_bytes": 17809408,
+      "transactions": 99999,
+      "transactions_per_second": 3249.0919262185457
+    }
+  ],
+  "per_transaction_connection_churn": {
+    "attempts": 2,
+    "concurrency": 100,
+    "connection_strategy": "per-transaction",
+    "container_health_after_each_attempt": "healthy",
+    "exception_message": "Failed to connect to database: failed to fill whole buffer",
+    "exception_type": "SqlConnectionError",
+    "outcome": "FAIL",
+    "remaining_application_sessions": 0,
+    "remaining_stress_tables": 0,
+    "server_log_rejection_observed": false,
+    "transactions_requested": 10000
+  }
+}

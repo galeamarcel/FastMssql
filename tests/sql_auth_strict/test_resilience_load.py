@@ -370,7 +370,7 @@ def test_docker_target_safety_contract() -> None:
 @pytest.mark.asyncio
 async def test_thousand_short_queries_at_concurrency_twenty(
     sql_auth_config: SqlAuthConfig,
-    record_property,
+    record_load_metric,
 ) -> None:
     connection = _connection(
         sql_auth_config,
@@ -393,8 +393,11 @@ async def test_thousand_short_queries_at_concurrency_twenty(
         stats = await connection.pool_stats()
         assert stats["active_connections"] == 0
         assert stats["connections"] <= 20
-        record_property("load_001_elapsed_seconds", elapsed)
-        record_property("load_001_queries_per_second", 1000 / elapsed)
+        record_load_metric(
+            "LOAD-001",
+            elapsed_seconds=elapsed,
+            queries_per_second=1000 / elapsed,
+        )
     finally:
         await connection.disconnect()
 
@@ -404,7 +407,7 @@ async def test_thousand_short_queries_at_concurrency_twenty(
 @pytest.mark.asyncio
 async def test_large_result_memory_has_recorded_bound(
     owner_connection: Connection,
-    record_property,
+    record_load_metric,
 ) -> None:
     process = psutil.Process()
     rss_before = process.memory_info().rss
@@ -435,10 +438,13 @@ async def test_large_result_memory_has_recorded_bound(
     rss_growth = max(0, rss_after - rss_before)
     assert rss_growth < 256 * 1024 * 1024
     assert peak < 256 * 1024 * 1024
-    record_property("load_002_rss_before_bytes", rss_before)
-    record_property("load_002_rss_after_bytes", rss_after)
-    record_property("load_002_python_current_bytes", current)
-    record_property("load_002_python_peak_bytes", peak)
+    record_load_metric(
+        "LOAD-002",
+        rss_before_bytes=rss_before,
+        rss_after_bytes=rss_after,
+        python_current_bytes=current,
+        python_peak_bytes=peak,
+    )
 
 
 @case("LOAD-003")
@@ -446,7 +452,7 @@ async def test_large_result_memory_has_recorded_bound(
 @pytest.mark.asyncio
 async def test_repeated_result_conversion_has_bounded_growth(
     owner_connection: Connection,
-    record_property,
+    record_load_metric,
 ) -> None:
     tracemalloc.start()
     samples: list[int] = []
@@ -477,9 +483,12 @@ async def test_repeated_result_conversion_has_bounded_growth(
     assert len(samples) == 10
     assert max(samples) - min(samples) < 8 * 1024 * 1024
     assert samples[-1] - samples[0] < 8 * 1024 * 1024
-    record_property("load_003_python_current_bytes", current)
-    record_property("load_003_python_peak_bytes", peak)
-    record_property("load_003_samples_bytes", samples)
+    record_load_metric(
+        "LOAD-003",
+        python_current_bytes=current,
+        python_peak_bytes=peak,
+        samples_bytes=samples,
+    )
 
 
 @case("LOAD-004")
@@ -488,7 +497,7 @@ async def test_repeated_result_conversion_has_bounded_growth(
 async def test_bulk_insert_increasing_sizes_and_correctness(
     owner_connection: Connection,
     unique_sql_name: Callable[[str], str],
-    record_property,
+    record_load_metric,
 ) -> None:
     raw_table = unique_sql_name("strict_load_bulk")
     table = quote_identifier(raw_table)
@@ -518,7 +527,7 @@ async def test_bulk_insert_increasing_sizes_and_correctness(
             owner_connection,
             f"SELECT SUM(CAST(value AS BIGINT)) FROM {table}",
         ) == sum(index * 2 for index in range(sum(sizes)))
-        record_property("load_004_elapsed_by_size", elapsed_by_size)
+        record_load_metric("LOAD-004", elapsed_by_size=elapsed_by_size)
     finally:
         await owner_connection.execute(f"DROP TABLE IF EXISTS {table}")
 
@@ -530,7 +539,7 @@ async def test_rapid_lifecycle_does_not_grow_sql_sessions(
     sa_connection: Connection,
     sql_auth_config: SqlAuthConfig,
     unique_sql_name: Callable[[str], str],
-    record_property,
+    record_load_metric,
 ) -> None:
     application_name = unique_sql_name("strict_load_lifecycle")
     baseline = await _application_session_count(
@@ -556,9 +565,12 @@ async def test_rapid_lifecycle_does_not_grow_sql_sessions(
             break
         await asyncio.sleep(0.1)
     assert observed == baseline
-    record_property("load_005_elapsed_seconds", elapsed)
-    record_property("load_005_baseline_sessions", baseline)
-    record_property("load_005_final_sessions", observed)
+    record_load_metric(
+        "LOAD-005",
+        elapsed_seconds=elapsed,
+        baseline_sessions=baseline,
+        final_sessions=observed,
+    )
 
 
 @case("LOAD-006")
@@ -568,7 +580,7 @@ async def test_five_hundred_mixed_operations(
     owner_connection: Connection,
     transaction_factory: Callable,
     unique_sql_name: Callable[[str], str],
-    record_property,
+    record_load_metric,
 ) -> None:
     table = quote_identifier(unique_sql_name("strict_load_mixed"))
     await owner_connection.execute(
@@ -619,8 +631,11 @@ async def test_five_hundred_mixed_operations(
         assert await scalar(
             owner_connection, f"SELECT SUM(value) FROM {table}"
         ) == 100
-        record_property("load_006_elapsed_seconds", elapsed)
-        record_property("load_006_operation_count", 500)
+        record_load_metric(
+            "LOAD-006",
+            elapsed_seconds=elapsed,
+            operation_count=500,
+        )
     finally:
         await owner_connection.execute(f"DROP TABLE IF EXISTS {table}")
 
@@ -657,3 +672,90 @@ async def test_post_load_smoke_query_and_pool_state(
         assert stats["idle_connections"] >= 2
     finally:
         await connection.disconnect()
+
+
+@case("LOAD-008")
+@pytest.mark.load
+@pytest.mark.asyncio
+async def test_concurrent_write_transactions_preserve_exact_state(
+    owner_connection: Connection,
+    transaction_factory: Callable,
+    unique_sql_name: Callable[[str], str],
+    record_load_metric,
+) -> None:
+    transaction_count = 1_000
+    concurrency = 50
+    wait_seconds = 0.02
+    table = quote_identifier(unique_sql_name("strict_load_transactions"))
+    await owner_connection.execute(
+        f"CREATE TABLE {table} (id INT PRIMARY KEY, value INT NOT NULL)"
+    )
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def write_transaction(value: int) -> tuple[int, int]:
+        async with semaphore:
+            transaction = transaction_factory()
+            try:
+                await transaction.begin()
+                assert (
+                    await transaction.execute(
+                        f"INSERT INTO {table} (id, value) VALUES (@P1, @P2)",
+                        [value, value * 10],
+                    )
+                    == 1
+                )
+                session_id = await scalar(
+                    transaction,
+                    "WAITFOR DELAY '00:00:00.020'; SELECT @@SPID",
+                )
+                if value % 2 == 0:
+                    await transaction.commit()
+                else:
+                    await transaction.rollback()
+                return value, session_id
+            finally:
+                await transaction.close()
+
+    try:
+        started = time.monotonic()
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(
+                *(write_transaction(value) for value in range(transaction_count))
+            ),
+            timeout=30.0,
+        )
+        elapsed = time.monotonic() - started
+        committed = tuple(range(0, transaction_count, 2))
+        sequential_wait_floor = transaction_count * wait_seconds
+
+        assert sorted(value for value, _ in outcomes) == list(
+            range(transaction_count)
+        )
+        assert len({session_id for _, session_id in outcomes}) >= concurrency // 2
+        assert elapsed < sequential_wait_floor * 0.5
+        assert await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}") == len(
+            committed
+        )
+        assert await scalar(
+            owner_connection,
+            f"SELECT SUM(value) FROM {table}",
+        ) == sum(value * 10 for value in committed)
+        assert (
+            await scalar(
+                owner_connection,
+                f"SELECT COUNT(*) FROM {table} WHERE id % 2 = 1",
+            )
+            == 0
+        )
+        record_load_metric(
+            "LOAD-008",
+            elapsed_seconds=elapsed,
+            transaction_count=transaction_count,
+            concurrency=concurrency,
+            distinct_session_count=len(
+                {session_id for _, session_id in outcomes}
+            ),
+            transactions_per_second=transaction_count / elapsed,
+        )
+    finally:
+        await owner_connection.execute(f"DROP TABLE IF EXISTS {table}")

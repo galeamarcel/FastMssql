@@ -162,8 +162,8 @@ def load_lanes(artifact_dir: Path, secrets: tuple[str, ...]) -> list[dict]:
     return lanes
 
 
-def load_framework_metrics(artifact_dir: Path) -> dict[str, dict]:
-    path = artifact_dir / "framework-metrics.json"
+def load_case_metrics(artifact_dir: Path, filename: str) -> dict[str, dict]:
+    path = artifact_dir / filename
     if not path.is_file():
         return {}
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -224,6 +224,7 @@ def render_report(
     results: dict[str, dict[str, object]],
     lanes: list[dict],
     framework_metrics: dict[str, dict],
+    load_metrics: dict[str, dict],
     secrets: tuple[str, ...],
 ) -> str:
     counts = Counter(
@@ -334,6 +335,22 @@ def render_report(
             f"| `{case_id}` | "
             f"{markdown_cell(json.dumps(metrics, sort_keys=True), secrets)} |"
         )
+    lines.extend(
+        [
+            "",
+            "## Load metrics",
+            "",
+            "| Case | Metrics |",
+            "|---|---|",
+        ]
+    )
+    if not load_metrics:
+        lines.append("| none | NOT RUN |")
+    for case_id, metrics in sorted(load_metrics.items()):
+        lines.append(
+            f"| `{case_id}` | "
+            f"{markdown_cell(json.dumps(metrics, sort_keys=True), secrets)} |"
+        )
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -362,7 +379,10 @@ def main(argv: list[str] | None = None) -> int:
         secrets,
     )
     lanes = load_lanes(args.artifact_dir, secrets)
-    framework_metrics = load_framework_metrics(args.artifact_dir)
+    framework_metrics = load_case_metrics(
+        args.artifact_dir, "framework-metrics.json"
+    )
+    load_metrics = load_case_metrics(args.artifact_dir, "load-metrics.json")
     root = Path(__file__).resolve().parents[2]
     matrix = render_matrix(cases, results, secrets)
     report = render_report(
@@ -371,6 +391,7 @@ def main(argv: list[str] | None = None) -> int:
         results,
         lanes,
         framework_metrics,
+        load_metrics,
         secrets,
     )
     args.matrix_output.parent.mkdir(parents=True, exist_ok=True)
