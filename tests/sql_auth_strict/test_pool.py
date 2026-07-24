@@ -878,6 +878,9 @@ async def test_impersonated_session_is_retired_before_next_checkout(
                 )
             ).fetchone()
             assert baseline is not None
+            baseline_connection_id = await _server_connection_id(
+                sa_connection, int(baseline["session_id"])
+            )
 
             impersonated = (
                 await connection.simple_query(
@@ -906,7 +909,10 @@ async def test_impersonated_session_is_retired_before_next_checkout(
                 )
             ).fetchone()
             assert restored is not None
-            assert restored["session_id"] != baseline["session_id"]
+            restored_connection_id = await _server_connection_id(
+                sa_connection, int(restored["session_id"])
+            )
+            assert restored_connection_id != baseline_connection_id
             assert (
                 restored["database_principal"]
                 == baseline["database_principal"]
