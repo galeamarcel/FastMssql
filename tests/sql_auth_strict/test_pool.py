@@ -885,7 +885,7 @@ async def test_impersonated_session_is_retired_before_next_checkout(
             impersonated = (
                 await connection.simple_query(
                     f"""
-                    EXECUTE AS USER = N'{user_name}';
+                    EXECUTE AS USER = N'{user_name}' WITH NO REVERT;
                     SELECT
                         @@SPID AS session_id,
                         USER_NAME() AS database_principal;
@@ -918,5 +918,153 @@ async def test_impersonated_session_is_retired_before_next_checkout(
                 == baseline["database_principal"]
             )
             assert restored["server_principal"] == baseline["server_principal"]
+    finally:
+        await sa_connection.execute(f"DROP USER IF EXISTS {quoted_user}")
+
+
+@case("POOL-022")
+@pytest.mark.asyncio
+async def test_faulting_impersonation_batch_retires_session(
+    sa_connection: Connection,
+    sql_auth_config: SqlAuthConfig,
+    unique_sql_name: Callable[[str], str],
+) -> None:
+    user_name = unique_sql_name("strict_pool_faulted_impersonation")
+    quoted_user = quote_identifier(user_name)
+    await sa_connection.execute(f"CREATE USER {quoted_user} WITHOUT LOGIN")
+
+    try:
+        connection = _connection(
+            sql_auth_config,
+            PoolConfig(
+                max_size=1,
+                min_idle=1,
+                max_lifetime_secs=None,
+                idle_timeout_secs=None,
+                connection_timeout_secs=2,
+                test_on_check_out=False,
+                retry_connection=False,
+            ),
+        )
+        async with connection:
+            baseline = (
+                await connection.query(
+                    """
+                    SELECT
+                        @@SPID AS session_id,
+                        USER_NAME() AS database_principal,
+                        SUSER_SNAME() AS server_principal
+                    """
+                )
+            ).fetchone()
+            assert baseline is not None
+            baseline_connection_id = await _server_connection_id(
+                sa_connection, int(baseline["session_id"])
+            )
+
+            with pytest.raises(SqlError) as captured:
+                await connection.simple_query(
+                    f"""
+                    EXECUTE AS USER = N'{user_name}' WITH NO REVERT;
+                    THROW 51022, N'expected impersonation failure', 1;
+                    """
+                )
+            assert captured.value.code == 51022
+            assert captured.value.severity == 16
+
+            restored = (
+                await connection.query(
+                    """
+                    SELECT
+                        @@SPID AS session_id,
+                        USER_NAME() AS database_principal,
+                        SUSER_SNAME() AS server_principal
+                    """
+                )
+            ).fetchone()
+            assert restored is not None
+            restored_connection_id = await _server_connection_id(
+                sa_connection, int(restored["session_id"])
+            )
+            assert restored_connection_id != baseline_connection_id
+            assert (
+                restored["database_principal"]
+                == baseline["database_principal"]
+            )
+            assert restored["server_principal"] == baseline["server_principal"]
+    finally:
+        await sa_connection.execute(f"DROP USER IF EXISTS {quoted_user}")
+
+
+@case("POOL-023")
+@pytest.mark.asyncio
+async def test_dynamic_impersonation_is_scope_bound(
+    sa_connection: Connection,
+    sql_auth_config: SqlAuthConfig,
+    unique_sql_name: Callable[[str], str],
+) -> None:
+    user_name = unique_sql_name("strict_pool_dynamic_impersonation")
+    quoted_user = quote_identifier(user_name)
+    await sa_connection.execute(f"CREATE USER {quoted_user} WITHOUT LOGIN")
+
+    try:
+        connection = _connection(
+            sql_auth_config,
+            PoolConfig(
+                max_size=1,
+                min_idle=1,
+                max_lifetime_secs=None,
+                idle_timeout_secs=None,
+                connection_timeout_secs=2,
+                test_on_check_out=False,
+                retry_connection=False,
+            ),
+        )
+        async with connection:
+            baseline = (
+                await connection.query(
+                    """
+                    SELECT
+                        @@SPID AS session_id,
+                        USER_NAME() AS database_principal,
+                        SUSER_SNAME() AS server_principal
+                    """
+                )
+            ).fetchone()
+            assert baseline is not None
+            baseline_connection_id = await _server_connection_id(
+                sa_connection, int(baseline["session_id"])
+            )
+
+            scoped_result = (
+                await connection.simple_query(
+                    f"""
+                    EXEC(N'EXECUTE AS USER = N''{user_name}'';');
+                    SELECT
+                        @@SPID AS session_id,
+                        USER_NAME() AS database_principal,
+                        SUSER_SNAME() AS server_principal;
+                    """
+                )
+            ).fetchone()
+            assert scoped_result is not None
+            assert scoped_result.to_dict() == baseline.to_dict()
+
+            next_lease = (
+                await connection.query(
+                    """
+                    SELECT
+                        @@SPID AS session_id,
+                        USER_NAME() AS database_principal,
+                        SUSER_SNAME() AS server_principal
+                    """
+                )
+            ).fetchone()
+            assert next_lease is not None
+            next_connection_id = await _server_connection_id(
+                sa_connection, int(next_lease["session_id"])
+            )
+            assert next_connection_id == baseline_connection_id
+            assert next_lease.to_dict() == baseline.to_dict()
     finally:
         await sa_connection.execute(f"DROP USER IF EXISTS {quoted_user}")
