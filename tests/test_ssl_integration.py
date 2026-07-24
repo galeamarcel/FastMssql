@@ -130,17 +130,19 @@ class TestSslConnectionStrings:
     """Test SSL configuration with connection strings."""
 
     def test_connection_string_with_ssl_config(self):
-        """Test that SSL config overrides connection string encryption settings."""
+        """TLS settings cannot be split across two configuration sources."""
         conn_string = (
             "Server=localhost;Database=test;Integrated Security=true;Encrypt=false"
         )
         ssl_config = SslConfig(
             encryption_level=EncryptionLevel.Required, trust_server_certificate=True
-        )  # Should override Encrypt=false
+        )
 
-        connection = Connection(connection_string=conn_string, ssl_config=ssl_config)
-
-        assert connection is not None
+        with pytest.raises(
+            ValueError,
+            match="TLS settings cannot be provided in both",
+        ):
+            Connection(connection_string=conn_string, ssl_config=ssl_config)
 
     def test_connection_string_with_trust_certificate(self):
         """Test connection string with SSL config that trusts server certificate."""
@@ -152,7 +154,7 @@ class TestSslConnectionStrings:
         assert connection is not None
 
     def test_encrypted_connection_string_with_ssl_config(self):
-        """Test encrypted connection string enhanced with SSL config."""
+        """An encrypted connection string is already one complete TLS source."""
         conn_string = (
             "Server=localhost;Database=test;Integrated Security=true;Encrypt=true"
         )
@@ -161,9 +163,11 @@ class TestSslConnectionStrings:
             trust_server_certificate=True,
         )
 
-        connection = Connection(connection_string=conn_string, ssl_config=ssl_config)
-
-        assert connection is not None
+        with pytest.raises(
+            ValueError,
+            match="TLS settings cannot be provided in both",
+        ):
+            Connection(connection_string=conn_string, ssl_config=ssl_config)
 
 
 class TestSslConfigCombinations:

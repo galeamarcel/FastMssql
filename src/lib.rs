@@ -8,6 +8,7 @@ use pyo3::prelude::*;
 mod azure_auth;
 mod batch;
 mod connection;
+mod connection_config;
 mod helpers;
 mod parameter_conversion;
 mod pool_config;
