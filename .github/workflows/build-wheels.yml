@@ -10,7 +10,11 @@ permissions:
   contents: read
 
 jobs:
+  dependency-security:
+    uses: ./.github/workflows/dependency-security.yml
+
   build-wheels:
+      needs: dependency-security
       name: Build wheels on ${{ matrix.os }} (${{ matrix.arch }} - ${{ matrix.manylinux || 'auto' }})
       runs-on: ${{ matrix.runner }}
       strategy:
@@ -75,6 +79,7 @@ jobs:
             path: ./wheelhouse/*.whl
 
   build-sdist:
+    needs: dependency-security
     name: Build source distribution
     runs-on: ubuntu-latest
     steps:
@@ -97,7 +102,7 @@ jobs:
 
   publish:
     name: Publish to PyPI
-    needs: [build-wheels, build-sdist]
+    needs: [dependency-security, build-wheels, build-sdist]
     runs-on: ubuntu-latest
     permissions:
       id-token: write
