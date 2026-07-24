@@ -103,6 +103,20 @@ def test_report_generator_preserves_not_run_and_redacts(
         '<testsuite tests="3" failures="0" errors="0" skipped="1"/>',
         encoding="utf-8",
     )
+    (artifact_dir / "framework-metrics.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "cases": {
+                    "FRAME-009": {
+                        "ratio": 0.25,
+                        "redaction_probe": secret,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     matrix_output = tmp_path / "matrix.md"
     report_output = tmp_path / "report.md"
     environment = os.environ.copy()
@@ -135,7 +149,7 @@ def test_report_generator_preserves_not_run_and_redacts(
     matrix = matrix_output.read_text(encoding="utf-8")
     report = report_output.read_text(encoding="utf-8")
     assert (
-        sum(line.startswith("| `") for line in matrix.splitlines()) == 226
+        sum(line.startswith("| `") for line in matrix.splitlines()) == 250
     )
     assert "| `ENV-001` | PASS |" in matrix
     assert "| `AUTH-001` | FAIL |" in matrix
@@ -150,6 +164,12 @@ def test_report_generator_preserves_not_run_and_redacts(
     assert "Windows authentication" in report
     assert "strict" in report
     assert "upstream" in report
+    assert "FastAPI/native ASGI" in report
+    assert "Flask/WSGI" in report
+    assert "Flask via WsgiToAsgi" in report
+    assert "Fixed exclusions" in report
+    assert "FRAME-009" in report
+    assert "0.25" in report
 
 
 def test_config_redacts_password(monkeypatch) -> None:
@@ -160,13 +180,33 @@ def test_config_redacts_password(monkeypatch) -> None:
     assert "NeverPrintMe_2026!" not in repr(config)
 
 
-def test_approved_spec_contains_226_unique_case_ids() -> None:
+def test_approved_spec_contains_250_unique_case_ids() -> None:
     spec = ROOT / (
         "docs/superpowers/specs/"
         "2026-07-24-fastmssql-sql-auth-validation-design.md"
     )
     ids = spec_case_ids(spec)
-    assert len(ids) == 226
+    assert len(ids) == 250
+
+
+def test_framework_contract_is_wired_into_runner_and_report() -> None:
+    runner = (ROOT / "scripts/sql_auth/run_all.sh").read_text(
+        encoding="utf-8"
+    )
+    report_source = (
+        ROOT / "scripts/sql_auth/generate_report.py"
+    ).read_text(encoding="utf-8")
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert "tests/sql_auth_strict/test_framework_integration.py" in runner
+    assert "record framework \\" in runner
+    assert "FASTMSSQL_FRAMEWORK_METRICS_PATH" in runner
+    assert "framework-results.json" in runner
+    assert "framework.xml" in runner
+    assert "FastAPI/native ASGI" in report_source
+    assert "Flask/WSGI" in report_source
+    assert "Flask via WsgiToAsgi" in report_source
+    assert "framework-metrics.json" in report_source
+    assert "framework:" in pyproject
 
 
 def test_result_messages_redact_every_nonempty_password() -> None:

@@ -91,6 +91,12 @@ record async \
   uv run pytest tests/sql_auth_strict/test_async_strict.py \
   --junitxml="${artifact_dir}/async.xml" -vv
 
+record framework \
+  env FASTMSSQL_SQL_AUTH_RESULTS_PATH="${artifact_dir}/framework-results.json" \
+  FASTMSSQL_FRAMEWORK_METRICS_PATH="${artifact_dir}/framework-metrics.json" \
+  uv run pytest tests/sql_auth_strict/test_framework_integration.py \
+  --junitxml="${artifact_dir}/framework.xml" -vv
+
 record resilience \
   env FASTMSSQL_SQL_AUTH_RESULTS_PATH="${artifact_dir}/resilience-results.json" \
   uv run pytest tests/sql_auth_strict/test_resilience_load.py \
