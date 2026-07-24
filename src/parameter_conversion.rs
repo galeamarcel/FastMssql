@@ -9,6 +9,10 @@ use pyo3::types::{
 };
 use smallvec::SmallVec;
 
+/// SQL Server's RPC parameter ceiling includes the two parameters that
+/// Tiberius adds for `sp_executesql`: `@stmt` and `@params`.
+pub(crate) const MAX_USER_QUERY_PARAMETERS: usize = 2_098;
+
 #[derive(Debug, Clone)]
 pub enum FastParameter {
     Null(TypedNull),
@@ -134,10 +138,10 @@ fn python_params_to_fast_parameters(
 ) -> PyResult<SmallVec<[FastParameter; 16]>> {
     let len = params.len();
 
-    // SQL Server has a hard limit of 2,100 parameters per query
-    if len > 2100 {
+    if len > MAX_USER_QUERY_PARAMETERS {
         return Err(PyValueError::new_err(format!(
-            "Too many parameters: {} provided, but SQL Server supports maximum 2,100 parameters",
+            "Too many parameters: {} provided, but FastMssql supports maximum 2,098 user \
+             parameters per query (SQL Server RPC limit 2,100 minus 2 internal parameters)",
             len
         )));
     }
@@ -151,7 +155,7 @@ fn python_params_to_fast_parameters(
     for param in params.iter() {
         if type_mapping::is_expandable_iterable(&param)? {
             // Calculate remaining budget and pass it to prevent unbounded generator expansion
-            let remaining = (2100_usize).saturating_sub(result.len());
+            let remaining = MAX_USER_QUERY_PARAMETERS.saturating_sub(result.len());
             expand_iterable_to_fast_params(&param, &mut result, remaining)?;
         } else {
             result.push(python_to_fast_parameter(&param)?);
@@ -159,9 +163,9 @@ fn python_params_to_fast_parameters(
     }
 
     // Final validation: ensure we haven't exceeded the limit
-    if result.len() > 2100 {
+    if result.len() > MAX_USER_QUERY_PARAMETERS {
         return Err(PyValueError::new_err(format!(
-            "SQL Server parameter limit exceeded: {} parameters (max: 2,100)",
+            "FastMssql user parameter limit exceeded: {} parameters (max: 2,098)",
             result.len()
         )));
     }
@@ -185,7 +189,7 @@ where
         for item in list.iter() {
             if remaining == 0 {
                 return Err(PyValueError::new_err(
-                    "Parameter expansion exceeded SQL Server limit of 2,100 parameters"
+                    "Parameter expansion exceeded FastMssql limit of 2,098 user parameters per query"
                 ));
             }
             let param = python_to_fast_parameter(&item)?;
@@ -199,7 +203,7 @@ where
         for item in tuple.iter() {
             if remaining == 0 {
                 return Err(PyValueError::new_err(
-                    "Parameter expansion exceeded SQL Server limit of 2,100 parameters"
+                    "Parameter expansion exceeded FastMssql limit of 2,098 user parameters per query"
                 ));
             }
             let param = python_to_fast_parameter(&item)?;
@@ -221,7 +225,7 @@ where
             Ok(item) => {
                 if remaining == 0 {
                     return Err(PyValueError::new_err(
-                        "Parameter expansion exceeded SQL Server limit of 2,100 parameters"
+                        "Parameter expansion exceeded FastMssql limit of 2,098 user parameters per query"
                     ));
                 }
                 batch.push(python_to_fast_parameter(&item)?);

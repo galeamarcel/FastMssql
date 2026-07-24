@@ -414,21 +414,25 @@ async def test_parameter_order_and_repeated_placeholders(
 
 @case("PARAM-022")
 @pytest.mark.asyncio
-async def test_sql_server_2100_parameter_boundary(
+async def test_sql_server_rpc_parameter_boundary(
     owner_connection: Connection,
 ) -> None:
-    at_limit = list(range(2100))
+    # Tiberius executes parameterized statements through sp_executesql and
+    # contributes the internal @stmt and @params RPC parameters. That leaves
+    # 2,098 user parameters inside SQL Server's 2,100-parameter RPC ceiling.
+    at_limit = list(range(2098))
     result = await owner_connection.query(
-        "SELECT @P2100 AS boundary_value", at_limit
+        "SELECT @P2098 AS boundary_value", at_limit
     )
-    assert result.fetchone()["boundary_value"] == 2099
+    assert result.fetchone()["boundary_value"] == 2097
 
-    above_limit = list(range(2101))
+    above_limit = list(range(2099))
     with pytest.raises(
         ValueError,
         match=(
-            "^Too many parameters: 2101 provided, "
-            "but SQL Server supports maximum 2,100 parameters$"
+            "^Too many parameters: 2099 provided, but FastMssql supports "
+            "maximum 2,098 user parameters per query "
+            r"\(SQL Server RPC limit 2,100 minus 2 internal parameters\)$"
         ),
     ):
         await owner_connection.query("SELECT 1", above_limit)
@@ -436,8 +440,8 @@ async def test_sql_server_2100_parameter_boundary(
     with pytest.raises(
         ValueError,
         match=(
-            "^Parameter expansion exceeded SQL Server limit "
-            "of 2,100 parameters$"
+            "^Parameter expansion exceeded FastMssql limit of 2,098 "
+            "user parameters per query$"
         ),
     ):
         await owner_connection.query("SELECT 1", [above_limit])
