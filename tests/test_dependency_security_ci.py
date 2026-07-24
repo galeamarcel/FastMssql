@@ -4,6 +4,7 @@ import stat
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "dependency-security.yml"
+BUILD_WORKFLOW = ROOT / ".github" / "workflows" / "build-wheels.yml"
 AUDIT_SCRIPT = ROOT / "scripts" / "security" / "audit_dependencies.sh"
 
 
@@ -18,6 +19,7 @@ def test_dependency_security_workflow_is_triggered_with_least_privilege() -> Non
     assert "push:" in workflow
     assert "pull_request:" in workflow
     assert "workflow_dispatch:" in workflow
+    assert "workflow_call:" in workflow
     assert "permissions:\n  contents: read" in workflow
     assert "continue-on-error: true" not in workflow
     assert "|| true" not in workflow
@@ -41,3 +43,12 @@ def test_dependency_security_script_is_strict_and_shared_with_ci() -> None:
     assert "set -euo pipefail" in audit_script
     assert 'cargo audit --deny warnings "$@"' in audit_script
     assert "scripts/security/audit_dependencies.sh" in workflow
+
+
+def test_release_build_and_publish_depend_on_dependency_security() -> None:
+    build_workflow = _read_required(BUILD_WORKFLOW)
+
+    assert "dependency-security:" in build_workflow
+    assert "uses: ./.github/workflows/dependency-security.yml" in build_workflow
+    assert build_workflow.count("needs: dependency-security") >= 2
+    assert "needs: [dependency-security, build-wheels, build-sdist]" in build_workflow
