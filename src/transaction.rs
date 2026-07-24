@@ -10,7 +10,7 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use crate::azure_auth::PyAzureCredential;
 use crate::batch::{execute_batch_on_connection, parse_batch_items, query_batch_on_connection};
-use crate::helpers::wrap_query_stream;
+use crate::helpers::{execute_unparameterized_command, requires_direct_batch, wrap_query_stream};
 use crate::parameter_conversion::{convert_parameters_to_fast, params_as_sql_refs};
 use crate::ssl_config::PySslConfig;
 use crate::types::{create_connection_error, create_sql_error};
@@ -147,13 +147,12 @@ impl Transaction {
             handles.ensure_connected().await?;
 
             let execution_result = {
-                let tiberius_params = params_as_sql_refs(&fast_parameters);
-
                 let mut conn_guard = handles.conn.lock().await;
                 let conn_ref = conn_guard
                     .as_mut()
                     .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
 
+                let tiberius_params = params_as_sql_refs(&fast_parameters);
                 let result = conn_ref
                     .query(&query, &tiberius_params)
                     .await
@@ -221,20 +220,25 @@ impl Transaction {
             handles.ensure_connected().await?;
 
             let affected = {
-                let tiberius_params = params_as_sql_refs(&fast_parameters);
-
                 let mut conn_guard = handles.conn.lock().await;
                 let conn_ref = conn_guard
                     .as_mut()
                     .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
 
-                let result = conn_ref
-                    .execute(&command, &tiberius_params)
-                    .await
-                    .map_err(|e| create_sql_error(e, "Command execution failed"))?;
+                let affected = if fast_parameters.is_empty() && requires_direct_batch(&command) {
+                    execute_unparameterized_command(conn_ref, &command, "Command execution failed")
+                        .await?
+                } else {
+                    let tiberius_params = params_as_sql_refs(&fast_parameters);
+                    conn_ref
+                        .execute(&command, &tiberius_params)
+                        .await
+                        .map_err(|e| create_sql_error(e, "Command execution failed"))?
+                        .total()
+                };
 
                 drop(conn_guard);
-                result.total()
+                affected
             };
 
             Ok(affected)
@@ -446,4 +450,3 @@ impl Transaction {
         Ok(())
     }
 }
-

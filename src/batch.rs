@@ -1,6 +1,7 @@
 use std::fmt::Write;
 
 use crate::azure_auth::PyAzureCredential;
+use crate::helpers::{execute_unparameterized_command, requires_direct_batch};
 use crate::parameter_conversion::{
     FastParameter, MAX_USER_QUERY_PARAMETERS, TypedNull,
     convert_parameters_to_fast, params_as_sql_refs, python_to_fast_parameter,
@@ -76,18 +77,18 @@ pub async fn execute_batch_on_connection(
     for (sql, parameters) in batch_commands {
         // Fast path: skip SmallVec construction entirely for parameter-free statements
         // (common for DDL like CREATE TABLE inside a batch).
-        let result = if parameters.is_empty() {
-            conn.execute(sql, &[])
-                .await
-                .map_err(|e| create_sql_error(e, "Batch item failed"))?
+        let affected = if parameters.is_empty() && requires_direct_batch(&sql) {
+            execute_unparameterized_command(conn, &sql, "Batch item failed").await?
         } else {
             let tiberius_params = params_as_sql_refs(&parameters);
             conn.execute(sql, &tiberius_params)
                 .await
                 .map_err(|e| create_sql_error(e, "Batch item failed"))?
+                .rows_affected()
+                .iter()
+                .sum()
         };
 
-        let affected: u64 = result.rows_affected().iter().sum();
         all_results.push(affected);
     }
 
