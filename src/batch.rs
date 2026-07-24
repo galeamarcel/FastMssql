@@ -1,7 +1,9 @@
 use std::fmt::Write;
 
 use crate::azure_auth::PyAzureCredential;
-use crate::helpers::{execute_unparameterized_command, requires_direct_batch};
+use crate::helpers::{
+    catch_driver_panic, execute_unparameterized_command, requires_direct_batch,
+};
 use crate::parameter_conversion::{
     FastParameter, MAX_USER_QUERY_PARAMETERS, TypedNull,
     convert_parameters_to_fast, params_as_sql_refs, python_to_fast_parameter,
@@ -240,11 +242,23 @@ pub fn query_batch<'p>(
             ensure_pool_initialized_with_auth(pool, config, &pool_config, azure_credential)
                 .await?;
 
-        let mut conn = pool_ref.get().await.map_err(|e| {
+        let pooled = pool_ref.get().await.map_err(|e| {
             create_connection_error(format!("Failed to get connection from pool: {}", e))
         })?;
+        let mut conn = PooledOperationGuard::new(pooled);
 
-        let all_results = query_batch_on_connection(&mut conn, batch_queries).await?;
+        let operation = catch_driver_panic(query_batch_on_connection(
+            &mut conn,
+            batch_queries,
+        ))
+        .await;
+        let all_results = match operation {
+            Ok(result) => {
+                conn.complete();
+                result?
+            }
+            Err(driver_panic) => return Err(driver_panic),
+        };
 
         Python::attach(|py| -> PyResult<Py<PyAny>> {
             let mut py_results = Vec::with_capacity(all_results.len());

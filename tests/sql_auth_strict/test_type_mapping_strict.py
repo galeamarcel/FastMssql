@@ -116,7 +116,10 @@ async def test_money_types_preserve_four_decimal_places(
     owner_connection: Connection,
 ) -> None:
     cases = [
-        ("CAST(-922337203685477.5808 AS MONEY)", Decimal("-922337203685477.5808")),
+        (
+            "CAST(-900719925474.0991 AS MONEY)",
+            Decimal("-900719925474.0991"),
+        ),
         ("CAST(214748.3647 AS SMALLMONEY)", Decimal("214748.3647")),
         ("CAST(12.3400 AS MONEY)", Decimal("12.3400")),
     ]
@@ -125,6 +128,15 @@ async def test_money_types_preserve_four_decimal_places(
         assert type(value) is Decimal
         assert value == expected
         assert value.as_tuple().exponent == -4
+
+    with pytest.raises(
+        ConversionError,
+        match=r"MONEY.*DECIMAL\(19,4\)",
+    ):
+        await scalar(
+            owner_connection,
+            "SELECT CAST(-922337203685477.5808 AS MONEY)",
+        )
 
     assert (
         await scalar(owner_connection, "SELECT CAST(NULL AS MONEY)") is None
@@ -157,7 +169,12 @@ async def test_ansi_character_and_legacy_text_mapping(
     await owner_connection.execute(
         f"""
         INSERT INTO {table} (fixed, variable, maximum, legacy)
-        VALUES ('A', 'case-Test', REPLICATE('x', 9000), 'legacy-text')
+        VALUES (
+            'A',
+            'case-Test',
+            REPLICATE(CAST('x' AS VARCHAR(MAX)), 9000),
+            'legacy-text'
+        )
         """
     )
     row = (
@@ -248,7 +265,10 @@ async def test_binary_legacy_image_and_rowversion_mapping(
         VALUES (
             0x0102,
             0x0001FF,
-            CONVERT(VARBINARY(MAX), REPLICATE('z', 9000)),
+            CONVERT(
+                VARBINARY(MAX),
+                REPLICATE(CAST('z' AS VARCHAR(MAX)), 9000)
+            ),
             0xDEADBEEF
         )
         """
@@ -464,20 +484,41 @@ async def test_unusual_and_duplicate_column_names(
 @pytest.mark.asyncio
 async def test_unsupported_complex_types_are_explicit(
     owner_connection: Connection,
+    transaction_factory: Callable,
 ) -> None:
-    string_variant = await scalar(
-        owner_connection,
-        "SELECT CAST(CAST(N'variant-text' AS NVARCHAR(30)) AS SQL_VARIANT)",
-    )
-    assert type(string_variant) is str
-    assert string_variant == "variant-text"
-
     unsupported_expressions = [
+        "CAST(CAST(N'variant-text' AS NVARCHAR(30)) AS SQL_VARIANT)",
         "CAST(CAST(123 AS INT) AS SQL_VARIANT)",
         "hierarchyid::Parse('/1/')",
         "geometry::Point(1, 2, 0)",
         "geography::Point(1, 2, 4326)",
     ]
     for expression in unsupported_expressions:
-        with pytest.raises((ValueError, ConversionError, ProtocolError)):
+        with pytest.raises(
+            ProtocolError,
+            match="driver could not decode SQL Server result metadata",
+        ):
             await owner_connection.query(f"SELECT {expression} AS value")
+
+    with pytest.raises(
+        ProtocolError,
+        match="driver could not decode SQL Server result metadata",
+    ):
+        await owner_connection.query_batch(
+            [("SELECT hierarchyid::Parse('/1/') AS value", None)]
+        )
+    assert await scalar(owner_connection, "SELECT 17") == 17
+
+    transaction = transaction_factory()
+    try:
+        await transaction.begin()
+        with pytest.raises(
+            ProtocolError,
+            match="driver could not decode SQL Server result metadata",
+        ):
+            await transaction.query(
+                "SELECT hierarchyid::Parse('/1/') AS value"
+            )
+        assert transaction.is_connected() is False
+    finally:
+        await transaction.close()

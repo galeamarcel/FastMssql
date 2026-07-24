@@ -320,6 +320,7 @@ dependencies = [
  "bb8",
  "bytes",
  "chrono",
+ "futures-util",
  "mimalloc",
  "pyo3",
  "pyo3-async-runtimes",

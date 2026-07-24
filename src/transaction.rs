@@ -10,7 +10,10 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use crate::azure_auth::PyAzureCredential;
 use crate::batch::{execute_batch_on_connection, parse_batch_items, query_batch_on_connection};
-use crate::helpers::{execute_unparameterized_command, requires_direct_batch, wrap_query_stream};
+use crate::helpers::{
+    catch_driver_panic, execute_unparameterized_command, requires_direct_batch,
+    wrap_query_stream,
+};
 use crate::parameter_conversion::{convert_parameters_to_fast, params_as_sql_refs};
 use crate::ssl_config::PySslConfig;
 use crate::types::{create_connection_error, create_sql_error};
@@ -153,13 +156,23 @@ impl Transaction {
                     .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
 
                 let tiberius_params = params_as_sql_refs(&fast_parameters);
-                let result = conn_ref
-                    .query(&query, &tiberius_params)
-                    .await
-                    .map_err(|e| create_sql_error(e, "Query execution failed"))?
-                    .into_first_result()
-                    .await
-                    .map_err(|e| create_sql_error(e, "Failed to get results"))?;
+                let operation = catch_driver_panic(async {
+                    conn_ref
+                        .query(&query, &tiberius_params)
+                        .await
+                        .map_err(|e| create_sql_error(e, "Query execution failed"))?
+                        .into_first_result()
+                        .await
+                        .map_err(|e| create_sql_error(e, "Failed to get results"))
+                })
+                .await;
+                let result = match operation {
+                    Ok(result) => result?,
+                    Err(driver_panic) => {
+                        conn_guard.take();
+                        return Err(driver_panic);
+                    }
+                };
 
                 drop(conn_guard);
                 result
@@ -188,13 +201,23 @@ impl Transaction {
                     .as_mut()
                     .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
 
-                let result = conn_ref
-                    .simple_query(&query)
-                    .await
-                    .map_err(|e| create_sql_error(e, "Query execution failed"))?
-                    .into_first_result()
-                    .await
-                    .map_err(|e| create_sql_error(e, "Failed to get results"))?;
+                let operation = catch_driver_panic(async {
+                    conn_ref
+                        .simple_query(&query)
+                        .await
+                        .map_err(|e| create_sql_error(e, "Query execution failed"))?
+                        .into_first_result()
+                        .await
+                        .map_err(|e| create_sql_error(e, "Failed to get results"))
+                })
+                .await;
+                let result = match operation {
+                    Ok(result) => result?,
+                    Err(driver_panic) => {
+                        conn_guard.take();
+                        return Err(driver_panic);
+                    }
+                };
 
                 drop(conn_guard);
                 result
@@ -225,16 +248,33 @@ impl Transaction {
                     .as_mut()
                     .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
 
-                let affected = if fast_parameters.is_empty() && requires_direct_batch(&command) {
-                    execute_unparameterized_command(conn_ref, &command, "Command execution failed")
-                        .await?
-                } else {
-                    let tiberius_params = params_as_sql_refs(&fast_parameters);
-                    conn_ref
-                        .execute(&command, &tiberius_params)
+                let operation = catch_driver_panic(async {
+                    if fast_parameters.is_empty() && requires_direct_batch(&command) {
+                        execute_unparameterized_command(
+                            conn_ref,
+                            &command,
+                            "Command execution failed",
+                        )
                         .await
-                        .map_err(|e| create_sql_error(e, "Command execution failed"))?
-                        .total()
+                    } else {
+                        let tiberius_params =
+                            params_as_sql_refs(&fast_parameters);
+                        conn_ref
+                            .execute(&command, &tiberius_params)
+                            .await
+                            .map(|result| result.total())
+                            .map_err(|e| {
+                                create_sql_error(e, "Command execution failed")
+                            })
+                    }
+                })
+                .await;
+                let affected = match operation {
+                    Ok(result) => result?,
+                    Err(driver_panic) => {
+                        conn_guard.take();
+                        return Err(driver_panic);
+                    }
                 };
 
                 drop(conn_guard);
@@ -266,7 +306,17 @@ impl Transaction {
                     .as_mut()
                     .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
 
-                execute_batch_on_connection(conn_ref, batch_commands).await?
+                let operation = catch_driver_panic(
+                    execute_batch_on_connection(conn_ref, batch_commands),
+                )
+                .await;
+                match operation {
+                    Ok(result) => result?,
+                    Err(driver_panic) => {
+                        conn_guard.take();
+                        return Err(driver_panic);
+                    }
+                }
             };
 
             Python::attach(|py| {
@@ -296,7 +346,17 @@ impl Transaction {
                     .as_mut()
                     .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
 
-                query_batch_on_connection(conn_ref, batch_queries).await?
+                let operation = catch_driver_panic(
+                    query_batch_on_connection(conn_ref, batch_queries),
+                )
+                .await;
+                match operation {
+                    Ok(result) => result?,
+                    Err(driver_panic) => {
+                        conn_guard.take();
+                        return Err(driver_panic);
+                    }
+                }
             };
 
             Python::attach(|py| -> PyResult<Py<PyAny>> {

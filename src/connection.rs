@@ -8,7 +8,10 @@ use tokio::sync::RwLock;
 
 use crate::azure_auth::PyAzureCredential;
 use crate::batch::{bulk_insert, execute_batch, query_batch};
-use crate::helpers::{execute_unparameterized_command, requires_direct_batch, wrap_query_stream};
+use crate::helpers::{
+    catch_driver_panic, execute_unparameterized_command, requires_direct_batch,
+    wrap_query_stream,
+};
 use crate::parameter_conversion::{convert_parameters_to_fast, params_as_sql_refs, FastParameter};
 use crate::pool_config::PyPoolConfig;
 use crate::pool_manager::{
@@ -76,7 +79,7 @@ impl PyConnection {
         let mut conn = Self::get_pool_connection(pool).await?;
         let tiberius_params = params_as_sql_refs(parameters);
 
-        let operation = async {
+        let operation = catch_driver_panic(async {
             let stream = conn
                 .query(query, &tiberius_params)
                 .await
@@ -86,11 +89,16 @@ impl PyConnection {
                 .into_first_result()
                 .await
                 .map_err(|e| create_sql_error(e, "Failed to get results"))
-        }
+        })
         .await;
 
-        conn.complete();
-        operation
+        match operation {
+            Ok(result) => {
+                conn.complete();
+                result
+            }
+            Err(driver_panic) => Err(driver_panic),
+        }
     }
 
     #[inline]
@@ -100,7 +108,7 @@ impl PyConnection {
     ) -> PyResult<Vec<Row>> {
         let mut conn = Self::get_pool_connection(pool).await?;
 
-        let operation = async {
+        let operation = catch_driver_panic(async {
             let stream = conn
                 .simple_query(query)
                 .await
@@ -110,11 +118,16 @@ impl PyConnection {
                 .into_first_result()
                 .await
                 .map_err(|e| create_sql_error(e, "Failed to get results"))
-        }
+        })
         .await;
 
-        conn.complete();
-        operation
+        match operation {
+            Ok(result) => {
+                conn.complete();
+                result
+            }
+            Err(driver_panic) => Err(driver_panic),
+        }
     }
 
     #[inline]
@@ -124,17 +137,31 @@ impl PyConnection {
         parameters: &[FastParameter],
     ) -> PyResult<u64> {
         let mut conn = Self::get_pool_connection(pool).await?;
-        let operation = if parameters.is_empty() && requires_direct_batch(query) {
-            execute_unparameterized_command(&mut conn, query, "Command execution failed").await
-        } else {
-            let tiberius_params = params_as_sql_refs(parameters);
-            conn.execute(query, &tiberius_params)
+        let operation = catch_driver_panic(async {
+            if parameters.is_empty() && requires_direct_batch(query) {
+                execute_unparameterized_command(
+                    &mut conn,
+                    query,
+                    "Command execution failed",
+                )
                 .await
-                .map(|result| result.rows_affected().iter().sum())
-                .map_err(|e| create_sql_error(e, "Command execution failed"))
-        };
-        conn.complete();
-        operation
+            } else {
+                let tiberius_params = params_as_sql_refs(parameters);
+                conn.execute(query, &tiberius_params)
+                    .await
+                    .map(|result| result.rows_affected().iter().sum())
+                    .map_err(|e| create_sql_error(e, "Command execution failed"))
+            }
+        })
+        .await;
+
+        match operation {
+            Ok(result) => {
+                conn.complete();
+                result
+            }
+            Err(driver_panic) => Err(driver_panic),
+        }
     }
 }
 
