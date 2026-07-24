@@ -584,13 +584,20 @@ git commit -m "fix: preserve connection endpoint in errors"
 
 ### Task 7: PR-06 — Anulare sigură și connection disposition
 
-**Priority:** P0, blocked until hardening is complete
+**Priority:** P0, `Broken` verificat; upstream rămâne blocat până la
+`NeedsReset`, fault matrix completă și reconcilierea tranzacțiilor
 
-**Source commit:** `e07c3a0dc976728cb7bde3066c0651a65fbdfdfe`
+**Source commits:**
+
+- `e07c3a0dc976728cb7bde3066c0651a65fbdfdfe` — protecția inițială pentru
+  anulare;
+- `c779304` — reproducerea reutilizării conexiunii omorâte;
+- `bb70f32` — controlul fără connection churn pentru eroare SQL non-fatală;
+- `85e295f` — clasificarea și eliminarea conexiunilor fatale.
 
 **Proposed branch:** `fix/upstream-pooled-cancellation-disposition`
 
-**Proposed title:** `fix: discard unsafe pooled connections after cancellation`
+**Proposed title:** `fix: discard unsafe pooled connections after cancellation and fatal errors`
 
 **Files:**
 
@@ -607,7 +614,17 @@ git commit -m "fix: preserve connection endpoint in errors"
   `NeedsReset | Broken | CommitOutcomeUnknown`, cu returnare în pool numai
   pentru stările sigure.
 
-- [ ] **Step 1: Nu cherry-pick-ui commitul în forma actuală**
+**Stare verificată pe fork:**
+
+- `Clean | NeedsReset | Broken` există în Rust;
+- severitățile SQL Server 20–25 și toate erorile interne ne-SQL sunt
+  fail-closed;
+- 4/4 reproduceri au fost RED înainte de fix și GREEN după fix;
+- o eroare SQL de severitate non-fatală păstrează același `connection_id`;
+- `CommitOutcomeUnknown` și resetarea efectivă pentru `NeedsReset` nu sunt încă
+  implementate.
+
+- [x] **Step 1: Nu cherry-pick-ui commitul în forma actuală**
 
 Problema rămasă:
 
@@ -630,6 +647,11 @@ enum ConnectionDisposition {
 }
 ```
 
+`85e295f` finalizează `Broken` și urmărește `NeedsReset`.
+`CommitOutcomeUnknown` rămâne obligatoriu pe branch-ul tranzacțiilor, iar
+`NeedsReset` nu poate fi bifat până când bitul TDS `RESETCONNECTION` este
+trimis efectiv.
+
 - [ ] **Step 3: Adaugă fault injection**
 
 Testele obligatorii:
@@ -642,7 +664,17 @@ Testele obligatorii:
 - query sănătos după fiecare fault;
 - pool-ul revine la capacitatea completă.
 
-- [ ] **Step 4: Definește comportamentul până la TDS ATTENTION**
+Acoperire curentă:
+
+- [x] anulare în timpul `WAITFOR`;
+- [ ] anulare după primirea parțială a unui result set;
+- [x] `KILL SPID` în timpul unui request activ;
+- [ ] reset TCP dedicat în această matrice;
+- [x] eroare fatală cu `test_on_check_out=False`;
+- [x] query sănătos imediat după fault;
+- [x] pool revenit la capacitate.
+
+- [x] **Step 4: Definește comportamentul până la TDS ATTENTION**
 
 În lipsa unui API Tiberius public pentru ATTENTION:
 
@@ -663,7 +695,7 @@ git diff upstream/master...upstream/improve-transactions -- \
 
 Orice suprapunere se reconciliază după starea curentă a PR-ului #121.
 
-- [ ] **Step 6: Rulează suita de faulturi și toate gate-urile**
+- [x] **Step 6: Rulează suita de faulturi și toate gate-urile**
 
 ```bash
 uv run pytest \
@@ -675,7 +707,17 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-PR-ul poate fi propus numai după aceste rezultate.
+Rezultate pe `85e295f`:
+
+- focalizat: 5/5 PASS;
+- pool: 20/20 PASS;
+- connection/async/batch/pool: 75/75 PASS;
+- strict non-disruptiv: 298 PASS, 14 deselectate;
+- upstream SQL-auth aplicabil: 896/896 PASS;
+- Rust: 7/7, format și Clippy PASS.
+
+PR-ul nu este încă propus: Step 2, restul Step 3 și reconcilierea Step 5 sunt
+deschise.
 
 ---
 
@@ -779,6 +821,13 @@ Nu se trimite upstream numai cu euristici de substring. Sunt necesare:
 - handshake întrerupt;
 - connection reset fără cauză TLS;
 - connection refused.
+
+Reproducerea `KILL SPID` din `c779304` a adăugat un caz concret: după ce
+conexiunea TLS era deja stabilită, `rustls` a raportat
+`peer closed connection without sending TLS close_notify`, iar euristica
+curentă l-a expus ca `TlsError`. Disposition este corect `Broken`, dar
+taxonomia corectă pentru această fază este `SqlConnectionError`; acest caz
+trebuie adăugat la testele PR-11.
 
 Acceptance:
 
