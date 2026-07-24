@@ -1,0 +1,33 @@
+name: fastmssql-sql-auth
+
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: linux/amd64
+    container_name: fastmssql-sql-auth-dev
+    hostname: fastmssql-sql-auth-dev
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: "Developer"
+      MSSQL_SA_PASSWORD: "${FASTMSSQL_SQL_AUTH_SA_PASSWORD:?set in .env.sql-auth.local}"
+    ports:
+      - "127.0.0.1:14334:1433"
+    volumes:
+      - fastmssql_sql_auth_data:/var/opt/mssql
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          /opt/mssql-tools18/bin/sqlcmd
+          -S localhost -U sa -P "$$MSSQL_SA_PASSWORD"
+          -C -b -Q "SET NOCOUNT ON; SELECT 1" >/dev/null
+          || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  fastmssql_sql_auth_data:
+    name: fastmssql_sql_auth_data
