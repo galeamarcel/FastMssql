@@ -2,8 +2,8 @@ use std::fmt::Write;
 
 use crate::azure_auth::PyAzureCredential;
 use crate::parameter_conversion::{
-    FastParameter, TypedNull, convert_parameters_to_fast, params_as_sql_refs,
-    python_to_fast_parameter,
+    FastParameter, MAX_USER_QUERY_PARAMETERS, TypedNull,
+    convert_parameters_to_fast, params_as_sql_refs, python_to_fast_parameter,
 };
 use crate::pool_config::PyPoolConfig;
 use crate::pool_manager::{ConnectionPool, ensure_pool_initialized_with_auth};
@@ -51,9 +51,9 @@ pub fn parse_batch_items<'p>(
             })?
         };
 
-        if fast_params.len() > 2100 {
+        if fast_params.len() > MAX_USER_QUERY_PARAMETERS {
             return Err(PyValueError::new_err(format!(
-                "Batch item {} exceeds SQL Server parameter limit: {} parameters provided, maximum is 2,100",
+                "Batch item {} exceeds FastMssql user parameter limit: {} parameters provided, maximum is 2,098",
                 batch_index,
                 fast_params.len()
             )));
