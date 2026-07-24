@@ -248,8 +248,8 @@ evidence reference.
   before the physical connection is reused.
 - `POOL-020`: checkout validation resets the prior lease before its health
   probe and preserves the healthy physical SQL Server session.
-- `POOL-021`: checkout reset reverts database-user impersonation before the
-  physical SQL Server session crosses a lease boundary.
+- `POOL-021`: a session that executes database-user impersonation is retired
+  before another pool lease can observe that security context.
 
 ### SQL — query and command execution
 

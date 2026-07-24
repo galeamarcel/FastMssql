@@ -844,7 +844,7 @@ async def test_checkout_validation_resets_state_before_health_probe(
 
 @case("POOL-021")
 @pytest.mark.asyncio
-async def test_checkout_reset_reverts_database_impersonation(
+async def test_impersonated_session_is_retired_before_next_checkout(
     sa_connection: Connection,
     sql_auth_config: SqlAuthConfig,
     unique_sql_name: Callable[[str], str],
@@ -906,6 +906,11 @@ async def test_checkout_reset_reverts_database_impersonation(
                 )
             ).fetchone()
             assert restored is not None
-            assert restored.to_dict() == baseline.to_dict()
+            assert restored["session_id"] != baseline["session_id"]
+            assert (
+                restored["database_principal"]
+                == baseline["database_principal"]
+            )
+            assert restored["server_principal"] == baseline["server_principal"]
     finally:
         await sa_connection.execute(f"DROP USER IF EXISTS {quoted_user}")
