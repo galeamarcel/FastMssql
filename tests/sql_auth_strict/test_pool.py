@@ -681,6 +681,9 @@ async def test_checkout_reset_rolls_back_leaked_local_transaction(
     async with connection:
         await connection.execute(f"CREATE TABLE {table} (id INT NOT NULL PRIMARY KEY)")
         first_session = int(await scalar(connection, "SELECT @@SPID"))
+        baseline_transaction_state = int(
+            await scalar(connection, "SELECT XACT_STATE()")
+        )
 
         try:
             leaked_transaction = await connection.simple_query(
@@ -710,7 +713,7 @@ async def test_checkout_reset_rolls_back_leaked_local_transaction(
             assert observed.to_dict() == {
                 "session_id": first_session,
                 "transaction_count": 0,
-                "transaction_state": 0,
+                "transaction_state": baseline_transaction_state,
                 "visible_rows": 0,
             }
         finally:
