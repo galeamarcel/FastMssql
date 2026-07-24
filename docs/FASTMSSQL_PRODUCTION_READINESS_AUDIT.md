@@ -5,8 +5,8 @@ Fork auditat: `https://github.com/galeamarcel/FastMssql.git`
 Branch: `test/sql-auth-validation`  
 Commit: `3cc5700b5142f3e84c83767e2ff114f87a19c5dd`
 
-Ultima actualizare live: 24 iulie 2026
-Ultimul fix verificat: `fix/tls-secure-defaults` la `0b5d6ca`
+Ultima actualizare live: 25 iulie 2026
+Ultimul fix verificat: `fix/dependency-rustsec` la `5ada01e`
 
 ## Concluzie
 
@@ -63,9 +63,60 @@ Dovada executată pe același source tree:
 - `cargo fmt --check`, `cargo test --locked` (5/5) și
   `cargo clippy --locked --all-targets -- -D warnings`: PASS.
 
-Acest fix închide cele două constatări de comportament TLS de mai jos, dar nu
-închide încă P0-ul de securitate în ansamblu: vulnerabilitățile din ramura
-Tiberius/rustls rămân un release gate separat.
+Acest fix închide cele două constatări de comportament TLS de mai jos.
+
+### Dependențe și RustSec — runtime remediat, automatizarea CI rămâne deschisă
+
+Branchurile și commiturile sunt separate:
+
+- `test/dependency-security-policy`
+  - `2f202a5` — contracte statice pentru dependențe și pragurile RustSec;
+  - `b110277` — corectarea contractului astfel încât `quinn-proto` să fie
+    interzis ca dependență directă, nu ca intrare opțională în lockfile;
+- `fix/dependency-rustsec`
+  - `5ada01e` — lockfile modernizat și patch Tiberius local cu Rustls 0.23.
+
+Baseline-ul verificat cu baza oficială RustSec avea 12 vulnerabilități și un
+warning de mentenanță:
+
+- 5 advisory-uri prin `aws-lc-sys 0.36.0`;
+- 7 advisory-uri prin cele două versiuni `rustls-webpki`;
+- `rustls-pemfile 1.0.4` marcat neîntreținut.
+
+Remedierea:
+
+- elimină declarația directă și neutilizată `quinn-proto`;
+- unifică runtime-ul TLS pe `rustls 0.23.42`,
+  `rustls-webpki 0.103.13`, `tokio-rustls 0.26.4` și
+  `aws-lc-sys 0.43.0`;
+- elimină `rustls-pemfile`;
+- folosește o copie locală minimală a Tiberius 0.12.3, cu fișierul TLS luat
+  byte-for-byte din commitul tehnic
+  `d46e4c028e5b55cbd362506f24b5ef5fe645c5d5` al
+  [Tiberius PR #419](https://github.com/prisma/tiberius/pull/419);
+- păstrează sursa, licențele și proveniența în repository, fără a crea sau
+  publica un fork Tiberius.
+
+Dovada executată:
+
+- contractele de dependențe: 3/3 PASS;
+- `cargo audit --deny warnings`: 219 crate-uri scanate, zero vulnerabilități
+  și zero warning-uri de policy;
+- `cargo test --locked`: 5/5 PASS;
+- `cargo fmt --check` și
+  `cargo clippy --locked --all-targets -- -D warnings`: PASS;
+- TLS + connection + transaction SQL-auth pe MSSQL Docker: 70/70 PASS;
+- suitele SSL upstream relevante: 94/94 PASS;
+- regresia upstream non-disruptivă: 962 PASS, 1 SKIP; cele 3 teste rămase
+  folosesc simultan TLS în connection string și `ssl_config` și trebuie
+  corectate pe un branch separat de test-harness;
+- sdist-ul include vendorul și licențele, se reconstruiește offline într-un
+  director gol, iar wheel-ul instalat într-un virtualenv separat execută un
+  query SQL-auth real.
+
+Gate-ul runtime/lockfile este închis. Mai rămân separat automatizarea
+`cargo audit` în CI, SBOM/provenance pentru artefactele de release și revenirea
+la o dependență crates.io după publicarea unei versiuni Tiberius echivalente.
 
 ## Corecții și nuanțări față de primul audit
 
@@ -97,7 +148,7 @@ Tiberius/rustls rămân un release gate separat.
 |---|---|---|---|
 | TLS | Un connection string fără `Encrypt` a produs live `encrypt_option=FALSE`. `TrustServerCertificate=True` nu activează singur criptarea completă. | Criptare obligatorie implicit, cu opt-out explicit și vizibil pentru plaintext. | **REMEDIAT și verificat** în `0b5d6ca`. |
 | Configurație TLS | Când se folosește `connection_string`, `ssl_config` este ignorat. Combinația CA + trust necondiționat poate ajunge la panic Rust expus ca `PanicException`. | O singură sursă TLS, validare înainte de Tiberius, conflicte returnate ca `ValueError` și niciun panic peste FFI. | **REMEDIAT și verificat** în `0b5d6ca`. |
-| Dependențe | Lockfile-ul actual are 12 potriviri RustSec și un warning de mentenanță. | Eliminarea `quinn-proto` neutilizat, actualizarea lockfile-ului și modernizarea ramurii TLS Tiberius. | **DESCHIS**. |
+| Dependențe | Lockfile-ul inițial avea 12 vulnerabilități RustSec și un warning de mentenanță. | Eliminarea dependenței directe `quinn-proto`, actualizarea lockfile-ului și modernizarea ramurii TLS Tiberius. | **REMEDIAT la nivel runtime/lockfile** în `5ada01e`: audit zero; CI/SBOM rămân deschise. |
 | Izolarea sesiunilor | `SESSION_CONTEXT` a rămas vizibil următorului utilizator al aceleiași conexiuni. Un simplu `ROLLBACK` nu curăță temp tables, `SET` options, isolation level, `CONTEXT_INFO`, `USE`, impersonation etc. | Reset TDS înainte de reutilizare și teste de contaminare între lease-uri. | **DESCHIS**. |
 | Conexiuni defecte | Guard-ul curent poate marca operația drept completă chiar când Python primește o eroare internă de protocol/I/O. O conexiune omorâtă a putut fi reutilizată și a eșuat repetat cu EOF. | Dispoziție explicită `NeedsReset`, `Broken`, `CommitOutcomeUnknown`; conexiunile suspecte sunt eliminate. | **DESCHIS**. |
 | Tranzacții | `Transaction` deschide conexiuni directe, în afara pool-ului, limitelor și metricilor. Două apeluri concurente `begin()` au produs `@@TRANCOUNT=2`. | Stare de tranzacție păstrată în Rust și tranzacție pornită pe un lease din pool. | **DESCHIS**. |
@@ -105,8 +156,8 @@ Tiberius/rustls rămân un release gate separat.
 
 ### Dependențe și RustSec
 
-Lockfile-ul curent include 12 advisory matches. Într-o copie temporară, o
-actualizare normală a eliminat nouă, dar au rămas trei vulnerabilități
+Înainte de `5ada01e`, lockfile-ul includea 12 vulnerabilități. Într-o copie
+temporară, o actualizare normală elimina nouă, dar rămâneau trei vulnerabilități
 `rustls-webpki` și un warning pentru `rustls-pemfile` neîntreținut, prin:
 
 ```text
@@ -131,10 +182,22 @@ Tiberius `main` este încă versiunea `0.12.3` și declară `tokio-rustls 0.24`,
 eliminate complet numai printr-un refresh al lockfile-ului FastMssql:
 [Cargo.toml Tiberius](https://github.com/prisma/tiberius/blob/main/Cargo.toml).
 
-`quinn-proto` este declarat direct în [Cargo.toml](../Cargo.toml#L34), dar nu
-este utilizat de codul FastMssql. Eliminarea lui reduce o ramură suplimentară
-`quinn/rustls/aws-lc` și elimină majoritatea advisory-urilor după actualizarea
-lockfile-ului.
+`quinn-proto` era declarat direct în `Cargo.toml`, dar nu era utilizat de
+codul FastMssql. Declarația directă a fost eliminată. Numele poate rămâne în
+lockfile ca dependență opțională a unui alt crate; politica verifică graful
+runtime și dependențele directe, nu simpla prezență inertă în lockfile.
+
+Starea live după `5ada01e` este:
+
+```text
+tiberius (path local, bază 0.12.3)
+  └── tokio-rustls 0.26.4
+        └── rustls 0.23.42
+              └── rustls-webpki 0.103.13
+```
+
+`cargo audit --deny warnings` scanează 219 dependențe și se încheie cu cod zero,
+fără vulnerabilități sau warning-uri de policy.
 
 ## Arhitectura recomandată
 
@@ -291,8 +354,8 @@ eșecurile de conectare.
   implicit cu `-n1`, sau trebuie să primească resurse SQL izolate per worker.
 - Wheel-urile și sdist-ul trebuie instalate și testate după build, înainte de
   publicare.
-- Trebuie adăugate `cargo audit`, SBOM/provenance și teste CPython
-  free-threaded.
+- `cargo audit` este verde local; trebuie adăugat ca gate CI. Mai rămân
+  SBOM/provenance și teste CPython free-threaded.
 - Stuburile declară greșit `typing.StrEnum`, ordinea argumentelor
   `Connection`, streamingul async, return type pentru bulk și forma
   `query_batch`.
@@ -420,10 +483,10 @@ funcție ar necesita lucru la nivelul driverului TDS:
 
 ## Ordinea recomandată a branch-urilor
 
-1. `fix/dependency-rustsec`
+1. `fix/dependency-rustsec` — **finalizat și verificat**
 2. `fix/tls-secure-defaults` — **finalizat și verificat**
 3. `fix/connection-disposition`
-4. extensie Tiberius locală pentru rustls modern și `RESETCONNECTION`
+4. extensie Tiberius locală pentru `RESETCONNECTION`
 5. `fix/transaction-state`
 6. `feat/session-lease`
 7. `feat/timeouts-lifecycle-observability`
@@ -444,7 +507,7 @@ upstream fără aprobarea explicită a proprietarului forkului.
 
 Înainte de a declara versiunea pregătită pentru producție:
 
-- [ ] `cargo audit` nu raportează vulnerabilități;
+- [x] `cargo audit` nu raportează vulnerabilități;
 - [x] conexiunea implicită produce `encrypt_option=TRUE`;
 - [x] configurațiile TLS conflictuale nu pot produce panic;
 - [ ] un SPID omorât este eliminat și pool-ul se recuperează;
