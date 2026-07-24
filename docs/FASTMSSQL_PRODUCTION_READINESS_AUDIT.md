@@ -7,6 +7,8 @@ Commit: `3cc5700b5142f3e84c83767e2ff114f87a19c5dd`
 
 Ultima actualizare live: 25 iulie 2026
 Ultimul fix verificat: `fix/dependency-rustsec` la `5ada01e`
+Ultimul gate CI verificat: `ci/dependency-security-gate` la `3887ddd`, cu
+checkout menținut la `1d13280`
 
 ## Concluzie
 
@@ -65,7 +67,7 @@ Dovada executată pe același source tree:
 
 Acest fix închide cele două constatări de comportament TLS de mai jos.
 
-### Dependențe și RustSec — runtime remediat, automatizarea CI rămâne deschisă
+### Dependențe și RustSec — runtime și gate CI remediate
 
 Branchurile și commiturile sunt separate:
 
@@ -74,7 +76,19 @@ Branchurile și commiturile sunt separate:
   - `b110277` — corectarea contractului astfel încât `quinn-proto` să fie
     interzis ca dependență directă, nu ca intrare opțională în lockfile;
 - `fix/dependency-rustsec`
-  - `5ada01e` — lockfile modernizat și patch Tiberius local cu Rustls 0.23.
+  - `5ada01e` — lockfile modernizat și patch Tiberius local cu Rustls 0.23;
+- `test/upstream-tls-source-harness`
+  - `e085336` — upstream folosește o singură sursă TLS și revine complet
+    verde;
+- `test/dependency-security-ci-contract`
+  - `88ef5bd` — contractul least-privilege și pin-urile CI;
+  - `76a661d` — publicarea depinde obligatoriu de audit;
+- `ci/dependency-security-gate`
+  - `3887ddd` — workflow reutilizabil și gate înainte de wheel/sdist/publish;
+- `test/checkout-action-policy`
+  - `ac66048` — checkout-ul trebuie să fie menținut și pin-uit;
+- `ci/checkout-v7`
+  - `1d13280` — `actions/checkout` v7.0.1 pin-uit la SHA-ul oficial.
 
 Baseline-ul verificat cu baza oficială RustSec avea 12 vulnerabilități și un
 warning de mentenanță:
@@ -107,16 +121,20 @@ Dovada executată:
   `cargo clippy --locked --all-targets -- -D warnings`: PASS;
 - TLS + connection + transaction SQL-auth pe MSSQL Docker: 70/70 PASS;
 - suitele SSL upstream relevante: 94/94 PASS;
-- regresia upstream non-disruptivă: 962 PASS, 1 SKIP; cele 3 teste rămase
-  folosesc simultan TLS în connection string și `ssl_config` și trebuie
-  corectate pe un branch separat de test-harness;
+- reproducerea harness-ului TLS: 3/3 FAIL înainte, 3/3 PASS după corecție;
+- regresia upstream non-disruptivă: 965 PASS, 1 SKIP, zero FAIL;
 - sdist-ul include vendorul și licențele, se reconstruiește offline într-un
   director gol, iar wheel-ul instalat într-un virtualenv separat execută un
-  query SQL-auth real.
+  query SQL-auth real;
+- contractul CI: 4/4 PASS, sintaxă YAML și `actionlint 1.7.7` PASS pentru
+  workflow-ul nou;
+- rularea hosted
+  [Dependency security #30129899056](https://github.com/galeamarcel/FastMssql/actions/runs/30129899056)
+  pe `0df518f` a trecut complet în 3m05s, inclusiv auditul RustSec.
 
-Gate-ul runtime/lockfile este închis. Mai rămân separat automatizarea
-`cargo audit` în CI, SBOM/provenance pentru artefactele de release și revenirea
-la o dependență crates.io după publicarea unei versiuni Tiberius echivalente.
+Gate-urile runtime/lockfile și CI sunt închise. Mai rămân separat
+SBOM/provenance pentru artefactele de release și revenirea la o dependență
+crates.io după publicarea unei versiuni Tiberius echivalente.
 
 ## Corecții și nuanțări față de primul audit
 
@@ -148,7 +166,7 @@ la o dependență crates.io după publicarea unei versiuni Tiberius echivalente.
 |---|---|---|---|
 | TLS | Un connection string fără `Encrypt` a produs live `encrypt_option=FALSE`. `TrustServerCertificate=True` nu activează singur criptarea completă. | Criptare obligatorie implicit, cu opt-out explicit și vizibil pentru plaintext. | **REMEDIAT și verificat** în `0b5d6ca`. |
 | Configurație TLS | Când se folosește `connection_string`, `ssl_config` este ignorat. Combinația CA + trust necondiționat poate ajunge la panic Rust expus ca `PanicException`. | O singură sursă TLS, validare înainte de Tiberius, conflicte returnate ca `ValueError` și niciun panic peste FFI. | **REMEDIAT și verificat** în `0b5d6ca`. |
-| Dependențe | Lockfile-ul inițial avea 12 vulnerabilități RustSec și un warning de mentenanță. | Eliminarea dependenței directe `quinn-proto`, actualizarea lockfile-ului și modernizarea ramurii TLS Tiberius. | **REMEDIAT la nivel runtime/lockfile** în `5ada01e`: audit zero; CI/SBOM rămân deschise. |
+| Dependențe | Lockfile-ul inițial avea 12 vulnerabilități RustSec și un warning de mentenanță. | Eliminarea dependenței directe `quinn-proto`, actualizarea lockfile-ului și modernizarea ramurii TLS Tiberius. | **REMEDIAT și verificat** în `5ada01e`; gate CI hosted verde prin `3887ddd`/`1d13280`; SBOM rămâne separat. |
 | Izolarea sesiunilor | `SESSION_CONTEXT` a rămas vizibil următorului utilizator al aceleiași conexiuni. Un simplu `ROLLBACK` nu curăță temp tables, `SET` options, isolation level, `CONTEXT_INFO`, `USE`, impersonation etc. | Reset TDS înainte de reutilizare și teste de contaminare între lease-uri. | **DESCHIS**. |
 | Conexiuni defecte | Guard-ul curent poate marca operația drept completă chiar când Python primește o eroare internă de protocol/I/O. O conexiune omorâtă a putut fi reutilizată și a eșuat repetat cu EOF. | Dispoziție explicită `NeedsReset`, `Broken`, `CommitOutcomeUnknown`; conexiunile suspecte sunt eliminate. | **DESCHIS**. |
 | Tranzacții | `Transaction` deschide conexiuni directe, în afara pool-ului, limitelor și metricilor. Două apeluri concurente `begin()` au produs `@@TRANCOUNT=2`. | Stare de tranzacție păstrată în Rust și tranzacție pornită pe un lease din pool. | **DESCHIS**. |
@@ -354,8 +372,8 @@ eșecurile de conectare.
   implicit cu `-n1`, sau trebuie să primească resurse SQL izolate per worker.
 - Wheel-urile și sdist-ul trebuie instalate și testate după build, înainte de
   publicare.
-- `cargo audit` este verde local; trebuie adăugat ca gate CI. Mai rămân
-  SBOM/provenance și teste CPython free-threaded.
+- `cargo audit` este verde local și gate CI hosted înainte de build/publish.
+  Mai rămân SBOM/provenance și teste CPython free-threaded.
 - Stuburile declară greșit `typing.StrEnum`, ordinea argumentelor
   `Connection`, streamingul async, return type pentru bulk și forma
   `query_batch`.
@@ -485,16 +503,17 @@ funcție ar necesita lucru la nivelul driverului TDS:
 
 1. `fix/dependency-rustsec` — **finalizat și verificat**
 2. `fix/tls-secure-defaults` — **finalizat și verificat**
-3. `fix/connection-disposition`
-4. extensie Tiberius locală pentru `RESETCONNECTION`
-5. `fix/transaction-state`
-6. `feat/session-lease`
-7. `feat/timeouts-lifecycle-observability`
-8. `feat/typed-parameters`
-9. `feat/resultsets-streaming`
-10. `feat/batch-bulk`
-11. `fix/named-instance`
-12. `test/production-framework-matrix`
+3. `ci/dependency-security-gate` — **finalizat și verificat hosted**
+4. `fix/connection-disposition`
+5. extensie Tiberius locală pentru `RESETCONNECTION`
+6. `fix/transaction-state`
+7. `feat/session-lease`
+8. `feat/timeouts-lifecycle-observability`
+9. `feat/typed-parameters`
+10. `feat/resultsets-streaming`
+11. `feat/batch-bulk`
+12. `fix/named-instance`
+13. `test/production-framework-matrix`
 
 Orice remediere FastMssql va fi făcută numai pe forkul
 `galeamarcel/FastMssql`.
@@ -508,6 +527,7 @@ upstream fără aprobarea explicită a proprietarului forkului.
 Înainte de a declara versiunea pregătită pentru producție:
 
 - [x] `cargo audit` nu raportează vulnerabilități;
+- [x] build-ul și publicarea depind de gate-ul RustSec hosted;
 - [x] conexiunea implicită produce `encrypt_option=TRUE`;
 - [x] configurațiile TLS conflictuale nu pot produce panic;
 - [ ] un SPID omorât este eliminat și pool-ul se recuperează;
