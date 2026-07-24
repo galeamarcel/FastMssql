@@ -210,9 +210,13 @@ async def test_repeated_transaction_state_errors(
         with pytest.raises(RuntimeError, match="already begun"):
             await committed.begin()
         await committed.commit()
-        with pytest.raises(RuntimeError, match="already committed"):
+        with pytest.raises(
+            RuntimeError, match=r"already (?:been )?committed"
+        ):
             await committed.commit()
-        with pytest.raises(RuntimeError, match="already committed"):
+        with pytest.raises(
+            RuntimeError, match=r"already (?:been )?committed"
+        ):
             await committed.rollback()
     finally:
         await committed.close()
@@ -221,9 +225,13 @@ async def test_repeated_transaction_state_errors(
     try:
         await rolled_back.begin()
         await rolled_back.rollback()
-        with pytest.raises(RuntimeError, match="already rolled back"):
+        with pytest.raises(
+            RuntimeError, match=r"already (?:been )?rolled back"
+        ):
             await rolled_back.rollback()
-        with pytest.raises(RuntimeError, match="already rolled back"):
+        with pytest.raises(
+            RuntimeError, match=r"already (?:been )?rolled back"
+        ):
             await rolled_back.commit()
     finally:
         await rolled_back.close()

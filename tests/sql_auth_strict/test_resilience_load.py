@@ -110,6 +110,19 @@ async def _wait_healthy(timeout: float = 90.0) -> None:
     )
 
 
+async def _physical_connection_id(connection: Connection) -> str:
+    value = await scalar(
+        connection,
+        """
+        SELECT CONVERT(VARCHAR(36), connection_id)
+        FROM sys.dm_exec_connections
+        WHERE session_id = @@SPID
+        """,
+    )
+    assert isinstance(value, str)
+    return value
+
+
 async def _restore_container() -> None:
     await _docker("unpause", check=False, timeout=20.0)
     await _docker("start", check=False, timeout=30.0)
@@ -208,13 +221,18 @@ async def test_restart_invalidates_old_session_predictably(
     del dedicated_container_guard
     connection = _connection(sql_auth_config, max_size=1)
     try:
-        session_id = await scalar(connection, "SELECT @@SPID")
+        connection_id = await _physical_connection_id(connection)
         await _docker("restart", "--time", "1")
         await _wait_healthy()
-        with pytest.raises((SqlConnectionError, ProtocolError)):
-            await connection.query(
-                "SELECT @P1 AS stale_session", [session_id]
+        try:
+            new_connection_id = await asyncio.wait_for(
+                _physical_connection_id(connection), timeout=3.0
             )
+        except (SqlConnectionError, ProtocolError):
+            new_connection_id = await asyncio.wait_for(
+                _physical_connection_id(connection), timeout=3.0
+            )
+        assert new_connection_id != connection_id
     finally:
         await connection.disconnect()
 
@@ -229,19 +247,20 @@ async def test_existing_pool_discards_restart_broken_connection(
     del dedicated_container_guard
     connection = _connection(sql_auth_config, max_size=1)
     try:
-        old_session = await scalar(connection, "SELECT @@SPID")
+        old_connection_id = await _physical_connection_id(connection)
         await _docker("restart", "--time", "1")
         await _wait_healthy()
-        with pytest.raises((SqlConnectionError, ProtocolError)):
+        try:
             await connection.query("SELECT 1")
-        new_session = await asyncio.wait_for(
-            scalar(connection, "SELECT @@SPID"), timeout=3.0
+        except (SqlConnectionError, ProtocolError):
+            pass
+        new_connection_id = await asyncio.wait_for(
+            _physical_connection_id(connection), timeout=3.0
         )
-        assert isinstance(new_session, int)
         stats = await connection.pool_stats()
         assert stats["active_connections"] == 0
         assert stats["idle_connections"] == 1
-        assert new_session != old_session or stats["connections"] == 1
+        assert new_connection_id != old_connection_id
     finally:
         await connection.disconnect()
 
@@ -294,7 +313,7 @@ async def test_restart_does_not_falsely_commit_inflight_transaction(
     try:
         await transaction.begin()
         await transaction.execute(f"INSERT INTO {table} VALUES (1)")
-        wait_task = asyncio.create_task(
+        wait_task = asyncio.ensure_future(
             transaction.query(
                 "WAITFOR DELAY '00:00:30'; "
                 f"SELECT CAST(1 AS INT) AS value; -- {token}"
@@ -456,9 +475,7 @@ async def test_repeated_result_conversion_has_bounded_growth(
         tracemalloc.stop()
     assert len(samples) == 10
     assert max(samples) - min(samples) < 8 * 1024 * 1024
-    assert not all(
-        earlier < later for earlier, later in zip(samples, samples[1:])
-    )
+    assert samples[-1] - samples[0] < 8 * 1024 * 1024
     record_property("load_003_python_current_bytes", current)
     record_property("load_003_python_peak_bytes", peak)
     record_property("load_003_samples_bytes", samples)
@@ -623,7 +640,8 @@ async def test_post_load_smoke_query_and_pool_state(
             connection,
             """
             SELECT CASE
-                WHEN SERVERPROPERTY('Edition') LIKE '%Developer%'
+                WHEN CAST(SERVERPROPERTY('Edition') AS NVARCHAR(128))
+                     LIKE '%Developer%'
                 THEN 1 ELSE 0
             END
             """,

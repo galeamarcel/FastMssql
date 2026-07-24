@@ -28,6 +28,9 @@ ELSE
     ALTER LOGIN [fastmssql_denied]
       WITH PASSWORD = N'$(DeniedPassword)', CHECK_POLICY = OFF;
 
+GRANT VIEW SERVER STATE TO [fastmssql_owner];
+GRANT VIEW SERVER PERFORMANCE STATE TO [fastmssql_owner];
+
 USE [fastmssql_validation];
 
 IF USER_ID(N'fastmssql_owner') IS NULL
