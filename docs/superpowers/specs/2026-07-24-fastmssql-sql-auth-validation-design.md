@@ -456,6 +456,54 @@ numbers are recorded because AMD64 emulation can add host-specific variance.
 - `LOAD-006`: mixed query/execute/transaction workload.
 - `LOAD-007`: post-load smoke query proves recovery.
 
+### FRAME — framework integration
+
+- `FRAME-001`: framework dependencies are development-only and their locked
+  versions are recorded.
+- `FRAME-002`: importing FastMssql does not import FastAPI, Flask, HTTPX, or
+  asgiref.
+- `FRAME-003`: every framework lane authenticates as `fastmssql_owner` using
+  SQL authentication.
+- `FRAME-004`: credentials are absent from HTTP responses, exception strings,
+  and captured framework logs.
+- `FRAME-005`: FastAPI lifespan connects one shared pool and disconnects it on
+  shutdown.
+- `FRAME-006`: FastAPI parameterized read/write routes return correct HTTP and
+  persisted database results.
+- `FRAME-007`: FastAPI request-scoped transaction commits on success.
+- `FRAME-008`: FastAPI request-scoped transaction rolls back on failure.
+- `FRAME-009`: FastAPI concurrent `WAITFOR` requests beat a measured sequential
+  baseline with the configured pool size.
+- `FRAME-010`: the Python event loop continues ticking during FastAPI SQL waits.
+- `FRAME-011`: cancelling a FastAPI request does not leak pool capacity or
+  poison the next query.
+- `FRAME-012`: a FastMssql SQL error propagates through FastAPI with its class
+  and code intact when application exceptions are enabled.
+- `FRAME-013`: the normal FastAPI 500 response and logs do not disclose SQL
+  credentials.
+- `FRAME-014`: Flask executes a real parameterized FastMssql query from an
+  `async def` WSGI view.
+- `FRAME-015`: one shared FastMssql connection remains correct across
+  sequential Flask requests with different per-request event loops.
+- `FRAME-016`: concurrent FastMssql operations inside one Flask async view
+  overlap and return independent results.
+- `FRAME-017`: concurrent Flask WSGI worker requests return correct independent
+  SQL results; worker-bound timing is recorded without an ASGI claim.
+- `FRAME-018`: Flask WSGI SQL failures remain typed, redact credentials, and
+  leave the shared pool usable.
+- `FRAME-019`: explicit Flask WSGI test shutdown disconnects the shared pool
+  and leaves no test-owned active SQL sessions.
+- `FRAME-020`: Flask wrapped by `WsgiToAsgi` executes real FastMssql SQL-auth
+  queries.
+- `FRAME-021`: sequential adapted Flask requests reuse the persistent ASGI
+  event loop.
+- `FRAME-022`: concurrent adapted Flask requests all complete correctly and
+  their measured timing is reported without native-ASGI equivalence.
+- `FRAME-023`: cancelling an adapted Flask request has a bounded outcome and
+  the FastMssql pool remains usable afterward.
+- `FRAME-024`: adapted Flask startup and shutdown leave the FastMssql pool
+  disconnected and no test-owned active SQL sessions.
+
 Performance results are diagnostic unless a correctness/resource invariant is
 violated. No marketing claim is declared proven from a single emulated host.
 

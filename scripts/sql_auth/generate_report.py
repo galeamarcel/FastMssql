@@ -161,6 +161,16 @@ def load_lanes(artifact_dir: Path, secrets: tuple[str, ...]) -> list[dict]:
     return lanes
 
 
+def load_framework_metrics(artifact_dir: Path) -> dict[str, dict]:
+    path = artifact_dir / "framework-metrics.json"
+    if not path.is_file():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schema_version") != 1:
+        raise ValueError("unsupported framework metrics schema")
+    return dict(payload.get("cases", {}))
+
+
 def _git_commit(root: Path) -> str:
     completed = subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -212,6 +222,7 @@ def render_report(
     cases: list[tuple[str, str]],
     results: dict[str, dict[str, object]],
     lanes: list[dict],
+    framework_metrics: dict[str, dict],
     secrets: tuple[str, ...],
 ) -> str:
     counts = Counter(
@@ -285,6 +296,43 @@ def render_report(
                     "",
                 ]
             )
+
+    lines.extend(
+        [
+            "",
+            "## Framework execution models",
+            "",
+            "- **FastAPI/native ASGI:** true-async end-to-end only when "
+            "`FRAME-005` through `FRAME-013` pass.",
+            "- **Flask/WSGI:** functional async-view compatibility; each "
+            "request remains worker-bound.",
+            "- **Flask via WsgiToAsgi:** persistent event-loop compatibility; "
+            "the application remains adapted WSGI, not native ASGI.",
+            "",
+            "### Fixed exclusions",
+            "",
+            "- Production deployment tuning for Gunicorn, uWSGI, Hypercorn, "
+            "or Uvicorn.",
+            "- WebSockets.",
+            "- Framework authentication, authorization, serialization, or "
+            "ORM behavior.",
+            "- Quart, gevent, eventlet, or non-`asyncio` event loops.",
+            "- Multi-process pool sharing; each process must own its own pool.",
+            "- Windows or Azure SQL authentication.",
+            "",
+            "### Framework metrics",
+            "",
+            "| Case | Metrics |",
+            "|---|---|",
+        ]
+    )
+    if not framework_metrics:
+        lines.append("| none | NOT RUN |")
+    for case_id, metrics in sorted(framework_metrics.items()):
+        lines.append(
+            f"| `{case_id}` | "
+            f"{markdown_cell(json.dumps(metrics, sort_keys=True), secrets)} |"
+        )
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -308,9 +356,17 @@ def main(argv: list[str] | None = None) -> int:
         secrets,
     )
     lanes = load_lanes(args.artifact_dir, secrets)
+    framework_metrics = load_framework_metrics(args.artifact_dir)
     root = Path(__file__).resolve().parents[2]
     matrix = render_matrix(cases, results, secrets)
-    report = render_report(root, cases, results, lanes, secrets)
+    report = render_report(
+        root,
+        cases,
+        results,
+        lanes,
+        framework_metrics,
+        secrets,
+    )
     args.matrix_output.parent.mkdir(parents=True, exist_ok=True)
     args.report_output.parent.mkdir(parents=True, exist_ok=True)
     args.matrix_output.write_text(matrix, encoding="utf-8")
