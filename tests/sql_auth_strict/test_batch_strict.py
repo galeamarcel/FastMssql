@@ -709,7 +709,7 @@ async def test_batch_and_bulk_cancellation_cleanup(
         f"CREATE TABLE {batch_table} (id INT PRIMARY KEY)"
     )
     batch_token = unique_sql_name("strict_batch_wait")
-    batch_task = asyncio.create_task(
+    batch_task = asyncio.ensure_future(
         owner_connection.execute_batch(
             [
                 (f"INSERT INTO {batch_table} VALUES (1)", None),
@@ -756,7 +756,7 @@ async def test_batch_and_bulk_cancellation_cleanup(
     bulk_connection = _isolated_connection(sql_auth_config)
     try:
         await bulk_connection.connect()
-        bulk_task = asyncio.create_task(
+        bulk_task = asyncio.ensure_future(
             bulk_connection.bulk_insert(raw_bulk_table, ["id"], [[1]])
         )
         await _wait_for_request(
