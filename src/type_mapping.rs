@@ -1,7 +1,10 @@
 use std::sync::OnceLock;
 
 use pyo3::exceptions::PyValueError;
-use pyo3::types::{PyBytes, PyFrozenSet, PyList, PySet, PyString, PyTuple};
+use pyo3::types::{
+    PyByteArray, PyBytes, PyFrozenSet, PyList, PyMemoryView, PySet, PyString,
+    PyTuple,
+};
 use pyo3::{IntoPyObjectExt, Py, PyAny, prelude::*};
 use tiberius::{ColumnType, Row};
 
@@ -378,7 +381,11 @@ pub fn sql_to_python(
 
 pub fn is_expandable_iterable(obj: &Bound<PyAny>) -> PyResult<bool> {
     // Fast path: scalar types
-    if obj.is_instance_of::<PyString>() || obj.is_instance_of::<PyBytes>() {
+    if obj.is_instance_of::<PyString>()
+        || obj.is_instance_of::<PyBytes>()
+        || obj.is_instance_of::<PyByteArray>()
+        || obj.is_instance_of::<PyMemoryView>()
+    {
         return Ok(false);
     }
 
