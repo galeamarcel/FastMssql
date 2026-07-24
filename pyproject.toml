@@ -89,6 +89,9 @@ python_functions = ["test_*"]
 markers = [
     "asyncio: marks tests as async tests",
     "integration: marks tests that require a database connection",
+    "sql_auth_strict: strict SQL-authentication validation matrix",
+    "resilience: disruptive tests targeting only fastmssql-sql-auth-dev",
+    "load: bounded load and resource tests",
     "performance: marks tests that measure performance characteristics",
     "stress: marks tests that perform stress testing",
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
