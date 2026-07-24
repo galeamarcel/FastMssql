@@ -19,7 +19,7 @@ impl Parameter {
     pub fn new(value: Py<PyAny>, sql_type: Option<String>) -> Self {
         let is_expanded = Python::attach(|py| {
             let value_bound = value.bind(py);
-            type_mapping::is_expandable_iterable(&value_bound).unwrap_or(false)
+            type_mapping::is_expandable_iterable(value_bound).unwrap_or(false)
         });
 
         Parameter {

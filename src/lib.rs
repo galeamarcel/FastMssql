@@ -24,7 +24,10 @@ pub use pool_config::PyPoolConfig;
 pub use py_parameters::{Parameter, Parameters};
 pub use ssl_config::{EncryptionLevel, PySslConfig};
 pub use transaction::Transaction;
-pub use types::{PyFastRow, PyQueryStream, SqlError, SqlConnectionError, TlsError, ProtocolError, ConversionError};
+pub use types::{
+    ConversionError, ProtocolError, PyFastRow, PyQueryStream, SqlConnectionError, SqlError,
+    TlsError,
+};
 
 use crate::parameter_conversion::TypedNull;
 
@@ -45,7 +48,7 @@ fn fastmssql(m: &Bound<'_, PyModule>) -> PyResult<()> {
         .enable_all()
         // Async I/O workload: 1× CPU workers is optimal. More workers increase work-stealing
         // contention without improving throughput for DB-latency-bound operations.
-        .worker_threads(cpu_count.max(4).min(16))
+        .worker_threads(cpu_count.clamp(4, 16))
         // No spawn_blocking is used anywhere in this codebase — all DB I/O is async.
         // A small ceiling gives a safety margin for any future sync work without
         // ballooning virtual memory (2 MB stack × N threads).
@@ -73,7 +76,7 @@ fn fastmssql(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAzureCredential>()?;
     m.add_class::<AzureCredentialType>()?;
     m.add_class::<TypedNull>()?;
-    
+
     {
         let py = m.py();
         m.add("SqlError", py.get_type::<SqlError>())?;

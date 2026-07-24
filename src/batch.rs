@@ -1,12 +1,10 @@
 use std::fmt::Write;
 
 use crate::azure_auth::PyAzureCredential;
-use crate::helpers::{
-    catch_driver_panic, execute_unparameterized_command, requires_direct_batch,
-};
+use crate::helpers::{catch_driver_panic, execute_unparameterized_command, requires_direct_batch};
 use crate::parameter_conversion::{
-    FastParameter, MAX_USER_QUERY_PARAMETERS, TypedNull,
-    convert_parameters_to_fast, params_as_sql_refs, python_to_fast_parameter,
+    FastParameter, MAX_USER_QUERY_PARAMETERS, TypedNull, convert_parameters_to_fast,
+    params_as_sql_refs, python_to_fast_parameter,
 };
 use crate::pool_config::PyPoolConfig;
 use crate::pool_manager::{
@@ -175,13 +173,9 @@ pub fn execute_batch<'p>(
         // ───────────────────────────────────────────────────────────────────────────
 
         let address = config.get_addr();
-        let tcp = TcpStream::connect(&address)
-            .await
-            .map_err(|e| {
-                create_connection_error(format!(
-                    "Failed to connect to server {address}: {e}"
-                ))
-            })?;
+        let tcp = TcpStream::connect(&address).await.map_err(|e| {
+            create_connection_error(format!("Failed to connect to server {address}: {e}"))
+        })?;
 
         // Disable Nagle — same rationale as pool_manager.rs and transaction.rs.
         tcp.set_nodelay(true)
@@ -244,19 +238,15 @@ pub fn query_batch<'p>(
 
     future_into_py(py, async move {
         let pool_ref =
-            ensure_pool_initialized_with_auth(pool, config, &pool_config, azure_credential)
-                .await?;
+            ensure_pool_initialized_with_auth(pool, config, &pool_config, azure_credential).await?;
 
         let pooled = pool_ref.get().await.map_err(|e| {
             create_connection_error(format!("Failed to get connection from pool: {}", e))
         })?;
         let mut conn = PooledOperationGuard::new(pooled);
 
-        let operation = catch_driver_panic(query_batch_on_connection(
-            &mut conn,
-            batch_queries,
-        ))
-        .await;
+        let operation =
+            catch_driver_panic(query_batch_on_connection(&mut conn, batch_queries)).await;
         let all_results = match operation {
             Ok(result) => {
                 conn.complete();
@@ -370,6 +360,7 @@ fn fix_bulk_null_types(flat_data: &mut [FastParameter], col_count: usize) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn bulk_insert<'p>(
     pool: Arc<RwLock<Option<ConnectionPool>>>,
     config: Arc<Config>,
@@ -436,8 +427,7 @@ pub fn bulk_insert<'p>(
 
     future_into_py(py, async move {
         let pool_ref =
-            ensure_pool_initialized_with_auth(pool, config, &pool_config, azure_credential)
-                .await?;
+            ensure_pool_initialized_with_auth(pool, config, &pool_config, azure_credential).await?;
 
         let pooled = pool_ref
             .get()
@@ -506,8 +496,7 @@ pub fn bulk_insert<'p>(
             let result = match conn.execute(sql, &params).await {
                 Ok(result) => result,
                 Err(error) => {
-                    let primary =
-                        create_sql_error(error, "Batch execution failed");
+                    let primary = create_sql_error(error, "Batch execution failed");
                     let rollback = consume_simple_command(
                         &mut conn,
                         "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION",

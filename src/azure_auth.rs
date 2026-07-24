@@ -204,6 +204,7 @@ impl PyAzureCredential {
     }
 
     #[staticmethod]
+    #[allow(clippy::should_implement_trait)]
     pub fn default() -> PyResult<Self> {
         let client = build_http_client()
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to build HTTP client: {}", e)))?;
@@ -248,10 +249,10 @@ impl PyAzureCredential {
         if let Some(num) = json[key].as_u64() {
             return num;
         }
-        if let Some(s) = json[key].as_str() {
-            if let Ok(parsed) = s.parse::<u64>() {
-                return parsed;
-            }
+        if let Some(s) = json[key].as_str()
+            && let Ok(parsed) = s.parse::<u64>()
+        {
+            return parsed;
         }
         3600 // Safe default: 1 hour
     }
@@ -263,7 +264,7 @@ impl PyAzureCredential {
             if let Ok(expires_dt) = chrono::DateTime::parse_from_rfc3339(timestamp_str) {
                 let now = chrono::Utc::now();
                 let expires_utc = expires_dt.with_timezone(&chrono::Utc);
-                
+
                 // Calculate duration in seconds. If already expired, return 0.
                 if let Ok(duration) = expires_utc.signed_duration_since(now).to_std() {
                     return duration.as_secs();
@@ -286,12 +287,12 @@ impl PyAzureCredential {
         // 2. Fast Path Read Lock
         {
             let read_guard = self.token_cache.read().await;
-            if let Some(cached) = read_guard.as_ref() {
-                if Self::is_token_still_valid(cached) {
-                    return Ok(AuthMethod::aad_token(
-                        cached.access_token.as_str().to_string(),
-                    ));
-                }
+            if let Some(cached) = read_guard.as_ref()
+                && Self::is_token_still_valid(cached)
+            {
+                return Ok(AuthMethod::aad_token(
+                    cached.access_token.as_str().to_string(),
+                ));
             }
         }
 
@@ -301,12 +302,12 @@ impl PyAzureCredential {
         // Double check cache
         {
             let read_guard = self.token_cache.read().await;
-            if let Some(cached) = read_guard.as_ref() {
-                if Self::is_token_still_valid(cached) {
-                    return Ok(AuthMethod::aad_token(
-                        cached.access_token.as_str().to_string(),
-                    ));
-                }
+            if let Some(cached) = read_guard.as_ref()
+                && Self::is_token_still_valid(cached)
+            {
+                return Ok(AuthMethod::aad_token(
+                    cached.access_token.as_str().to_string(),
+                ));
             }
         }
 
@@ -339,8 +340,7 @@ impl PyAzureCredential {
 
         // Enforce safety buffers against premature expiration
         let buffer_secs = ((expires_in as f64 * 0.10) as u64)
-            .max(30)
-            .min(600)
+            .clamp(30, 600)
             .min(expires_in);
         let expires_at =
             Instant::now() + Duration::from_secs(expires_in.saturating_sub(buffer_secs));
@@ -474,9 +474,9 @@ impl PyAzureCredential {
         // On Windows, also treat drive-relative paths like `C:az.cmd` as explicit paths
         // (they contain no separators but are still path-like).
         let path = Path::new(&az_path);
-        let is_bare_name = !az_path.contains('/')
-            && !az_path.contains('\\')
-            && !(cfg!(windows) && az_path.contains(':'));
+        let is_bare_name = !(az_path.contains('/')
+            || az_path.contains('\\')
+            || cfg!(windows) && az_path.contains(':'));
         if is_bare_name {
             // Bare program name - let the OS resolve it via PATH
             return Ok(az_path);
@@ -503,10 +503,7 @@ impl PyAzureCredential {
         {
             use std::os::unix::fs::PermissionsExt;
             let metadata = std::fs::metadata(&az_path).map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "Cannot access Azure CLI at '{}': {}",
-                    az_path, e
-                ))
+                PyRuntimeError::new_err(format!("Cannot access Azure CLI at '{}': {}", az_path, e))
             })?;
             let permissions = metadata.permissions();
             if permissions.mode() & 0o111 == 0 {
