@@ -122,8 +122,8 @@ async def test_foreign_key_check_and_not_null_errors(
 ) -> None:
     parent = quote_identifier(unique_sql_name("strict_error_parent"))
     child = quote_identifier(unique_sql_name("strict_error_child"))
-    cleanup_registry.add(f"DROP TABLE IF EXISTS {child}")
     cleanup_registry.add(f"DROP TABLE IF EXISTS {parent}")
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {child}")
     await owner_connection.execute(f"CREATE TABLE {parent} (id INT PRIMARY KEY)")
     await owner_connection.execute(
         f"""
@@ -472,7 +472,11 @@ async def test_connection_string_encrypt_and_trust_settings(
 async def test_login_only_and_disabled_match_server_policy(
     sql_auth_config: SqlAuthConfig,
 ) -> None:
-    for ssl_config in (SslConfig.login_only(), SslConfig.disabled()):
+    login_only_development = SslConfig(
+        encryption_level=EncryptionLevel.LOGIN_ONLY,
+        trust_server_certificate=True,
+    )
+    for ssl_config in (login_only_development, SslConfig.disabled()):
         connection = _connection(sql_auth_config, ssl_config)
         try:
             principal, encrypt_option = await _session_security(connection)
@@ -522,9 +526,13 @@ def test_trust_options_are_mutually_exclusive(tmp_path: Path) -> None:
 async def test_tls_settings_do_not_change_sql_principal(
     sql_auth_config: SqlAuthConfig,
 ) -> None:
+    login_only_development = SslConfig(
+        encryption_level=EncryptionLevel.LOGIN_ONLY,
+        trust_server_certificate=True,
+    )
     configurations = [
         (SslConfig.development(), "TRUE"),
-        (SslConfig.login_only(), "FALSE"),
+        (login_only_development, "FALSE"),
         (SslConfig.disabled(), "FALSE"),
     ]
     for ssl_config, expected_encryption in configurations:

@@ -504,6 +504,7 @@ async def test_application_intent_readonly(test_config: Config):
             database=test_config.database,
             username=test_config.username,
             password=test_config.password,
+            port=test_config.port,
             ssl_config=SslConfig.development(),
             application_intent=ApplicationIntent.READ_ONLY,
         )
@@ -533,6 +534,7 @@ async def test_application_intent_readwrite(test_config: Config):
             database=test_config.database,
             username=test_config.username,
             password=test_config.password,
+            port=test_config.port,
             ssl_config=SslConfig.development(),
             application_intent=ApplicationIntent.READ_WRITE,
         )
@@ -562,6 +564,7 @@ async def test_application_intent_default(test_config: Config):
             database=test_config.database,
             username=test_config.username,
             password=test_config.password,
+            port=test_config.port,
             ssl_config=SslConfig.development(),
         )
 
@@ -590,6 +593,7 @@ async def test_application_intent_as_string(test_config: Config):
             database=test_config.database,
             username=test_config.username,
             password=test_config.password,
+            port=test_config.port,
             ssl_config=SslConfig.development(),
             application_intent="READ_ONLY",
         )
@@ -619,6 +623,7 @@ async def test_application_intent_case_insensitive(test_config: Config):
             database=test_config.database,
             username=test_config.username,
             password=test_config.password,
+            port=test_config.port,
             ssl_config=SslConfig.development(),
             application_intent="read_write",
         )
@@ -634,6 +639,7 @@ async def test_application_intent_case_insensitive(test_config: Config):
             database=test_config.database,
             username=test_config.username,
             password=test_config.password,
+            port=test_config.port,
             ssl_config=SslConfig.development(),
             application_intent="Read_Only",
         )
@@ -649,6 +655,7 @@ async def test_application_intent_case_insensitive(test_config: Config):
             database=test_config.database,
             username=test_config.username,
             password=test_config.password,
+            port=test_config.port,
             ssl_config=SslConfig.development(),
             application_intent="READONLY",
         )
@@ -720,6 +727,7 @@ async def test_connection_with_application_name(test_config: Config):
             database=test_config.database,
             username=test_config.username,
             password=test_config.password,
+            port=test_config.port,
             ssl_config=SslConfig.development(),
             application_name="TestApp123",
         )
@@ -847,6 +855,7 @@ async def test_application_name_with_connection_string(test_config: Config):
             database=test_config.database,
             username=test_config.username,
             password=test_config.password,
+            port=test_config.port,
             ssl_config=SslConfig.development(),
             application_name="ConnStrAppTest",
         )
@@ -871,6 +880,7 @@ async def test_multiple_connections_different_app_names(test_config: Config):
                 database=test_config.database,
                 username=test_config.username,
                 password=test_config.password,
+                port=test_config.port,
                 ssl_config=SslConfig.development(),
                 application_name=app_name,
             )

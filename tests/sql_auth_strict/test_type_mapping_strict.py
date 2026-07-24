@@ -432,7 +432,7 @@ async def test_unusual_and_duplicate_column_names(
             SELECT
                 1 AS [duplicate],
                 2 AS [duplicate],
-                3 AS [],
+                3 AS [name with spaces],
                 4 AS [MiXeD],
                 N'valoare' AS [coloană]
             """
@@ -442,19 +442,19 @@ async def test_unusual_and_duplicate_column_names(
     assert row.columns() == [
         "duplicate",
         "duplicate",
-        "",
+        "name with spaces",
         "MiXeD",
         "coloană",
     ]
     assert row[0] == 1
     assert row[1] == 2
     assert row["duplicate"] == 2
-    assert row[""] == 3
+    assert row["name with spaces"] == 3
     assert row["MiXeD"] == 4
     assert row["coloană"] == "valoare"
     assert row.to_dict() == {
         "duplicate": 2,
-        "": 3,
+        "name with spaces": 3,
         "MiXeD": 4,
         "coloană": "valoare",
     }

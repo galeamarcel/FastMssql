@@ -206,33 +206,25 @@ class TestParameterExpansionMemorySafety:
     @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_expansion_rejects_at_exact_limit_boundary(self, test_config: Config):
-        """Test that 2101 items is rejected but 2100 is accepted."""
+        """The Tiberius RPC path allows 2,098 user parameters."""
         try:
             async with Connection(test_config.connection_string) as conn:
-                # Test 2100 items - should succeed (at limit)
-                list_2100 = list(range(2100))
-                try:
-                    # Just test that parameters are accepted, don't worry about query success
-                    await conn.query("SELECT 1", list_2100)
-                except ValueError as e:
-                    if "too many parameters" in str(e).lower():
-                        pytest.fail(f"2100 items should be allowed: {e}")
-                    # Other errors (DB errors, etc) are OK
-                except Exception:
-                    # Other exceptions are fine - we're just testing parameter limit
-                    pass
+                at_limit = list(range(2098))
+                result = await conn.query(
+                    "SELECT @P2098 AS boundary_value", at_limit
+                )
+                assert result.fetchone()["boundary_value"] == 2097
 
-                # Test 2101 items - should fail
-                list_2101 = list(range(2101))
+                above_limit = list(range(2099))
                 with pytest.raises(ValueError) as exc_info:
-                    await conn.query("SELECT 1", list_2101)
+                    await conn.query("SELECT 1", above_limit)
 
                 error_msg = str(exc_info.value).lower()
                 assert (
                     "too many parameters" in error_msg
                     or "exceed" in error_msg
-                    or "2100" in error_msg
-                    or "2101" in error_msg
+                    or "2098" in error_msg
+                    or "2099" in error_msg
                 )
         except Exception as e:
             if "database not available" not in str(e).lower():
