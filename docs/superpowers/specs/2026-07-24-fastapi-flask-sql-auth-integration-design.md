@@ -90,6 +90,11 @@ Every route used for evidence also checks `SUSER_SNAME()` or
 `ORIGINAL_LOGIN()` at least once per application lifecycle so the report proves
 that the intended SQL-auth principal executed the work.
 
+Each app instance receives a unique SQL Server application name in its
+connection configuration. Session cleanup assertions query SQL Server DMVs by
+that exact application name, so they do not count unrelated owner-login
+sessions or rely only on client-side pool statistics.
+
 ## 4. Application and resource lifecycle
 
 ### 4.1 FastAPI
@@ -114,10 +119,11 @@ created explicitly; pooled queries use the process-level `Connection`.
 The Flask app owns one lazy shared `Connection`. Normal Flask test clients
 exercise actual WSGI request dispatch and `async def` views.
 
-The suite records the running event-loop identity for sequential requests and
-expects Flask's per-request loop behavior rather than requiring loop reuse.
-It verifies that FastMssql's Rust/Tokio-backed pool remains correct when Python
-awaitables are created from different request loops.
+The suite records and retains strong references to the running event loops for
+two sequential requests. It requires distinct loop objects, avoiding false
+identity reuse after Python deallocates an earlier loop. It verifies that
+FastMssql's Rust/Tokio-backed pool remains correct when Python awaitables are
+created from different request loops.
 
 Concurrency is tested in two distinct ways:
 
@@ -143,6 +149,13 @@ the adapted application to reuse the continually running ASGI loop. Concurrent
 requests must all return correct database results, but timing is recorded
 separately from FastAPI because the WSGI adapter may retain WSGI serialization
 or worker constraints.
+
+For adapted-request cancellation, client cancellation must surface within
+500 ms. The WSGI work is allowed to finish its already-started two-second SQL
+wait because cancelling an ASGI caller cannot forcibly terminate a synchronous
+WSGI worker. Pool capacity must return within 3.5 seconds of cancellation, and
+the same application connection must then execute `SELECT 1`. This bounded
+contract is intentionally different from native FastAPI cancellation.
 
 The report labels this lane “persistent ASGI loop around Flask/WSGI”, not
 “native ASGI”.
@@ -234,12 +247,20 @@ based on machine speed.
 ## 7. Cancellation, errors, and cleanup
 
 Cancellation tests start a real SQL wait, observe an active pooled connection,
-cancel the HTTP-side task, and then require:
+and cancel the HTTP-side task.
 
-1. cancellation or the framework-specific bounded completion outcome;
-2. active pool usage to return to zero;
-3. an immediate `SELECT 1` through the same application connection;
-4. no lingering test request in SQL Server session metadata.
+For native FastAPI, the HTTP task must raise `asyncio.CancelledError` within
+500 ms, active pool usage must return to zero within one second, and the next
+query through the same application connection must complete immediately.
+
+For adapted Flask, the HTTP task must raise `asyncio.CancelledError` within
+500 ms, the already-started WSGI operation may continue only until the
+two-second SQL wait finishes, active pool usage must return to zero within
+3.5 seconds, and the next query through the same connection must succeed.
+
+Both paths require the cancelled or completed request to disappear from SQL
+Server request metadata. Application shutdown must leave zero sessions matching
+the app's unique SQL Server application name.
 
 Framework exception propagation is tested separately from production-style
 HTTP 500 behavior. Tests never use a broad exception handler to turn an
