@@ -102,7 +102,8 @@ PR-uri care cer hardening sau separare
     └── PR-11 TLS error classification
 
 PR-uri cu decizie de supply chain
-    └── PR-13 eliminarea advisory-urilor RustSec din ramura TLS
+    ├── PR-13 eliminarea advisory-urilor RustSec din ramura TLS
+    └── PR-14 gate RustSec obligatoriu înainte de release
 
 Funcții enterprise viitoare
     └── intake individual după implementare și audit
@@ -983,26 +984,134 @@ cargo test --locked            5/5 PASS
 clippy -D warnings             PASS
 SQL-auth TLS/connection/tx     70/70 PASS
 SSL upstream relevant          94/94 PASS
-upstream non-disruptive        962 PASS, 1 SKIP
+upstream non-disruptive        965 PASS, 1 SKIP, 0 FAIL
 sdist -> release wheel         PASS
 installed wheel live SQL query PASS
 ```
 
-Cele 3 teste upstream neincluse în linia de 962 folosesc simultan chei TLS în
-connection string și `ssl_config`; ele apar numai pe fork după contractul
-PR-12 și trebuie corectate separat, nu exceptate din audit.
+Cele 3 teste care foloseau simultan chei TLS în connection string și
+`ssl_config` au fost corectate separat în `e085336`: RED 3/3 înainte, GREEN
+3/3 după, apoi 965/965 upstream non-disruptive PASS.
 
 - [ ] **Step 6: Adaugă release gate-ul separat**
 
 CI trebuie să instaleze o versiune pin-uită `cargo-audit` și să ruleze
 `cargo audit --deny warnings`. SBOM/provenance pentru wheel și sdist rămân un
-task separat, ca să nu mărească acest PR de dependențe.
+task separat, ca să nu mărească acest PR de dependențe. Gate-ul a fost
+implementat și verificat pe fork în `3887ddd` și `1d13280`; este păstrat ca
+PR-14 independent.
 
 - [ ] **Step 7: Cere aprobarea înainte de publicare**
 
 Nu s-a creat și nu s-a publicat niciun fork Tiberius. Nu crea branch sau PR pe
 repo-ul original FastMssql până când proprietarul forkului aprobă explicit
 forma finală a dependenței și diff-ul curat față de ultimul upstream.
+
+---
+
+### Task 13: PR-14 — Gate RustSec obligatoriu înainte de release
+
+**Priority:** Ready after clean-up against latest upstream
+
+**Source test commits:**
+
+- `88ef5bd` — contract least-privilege, pin-uri și script comun;
+- `76a661d` — build-ul și publish-ul trebuie să depindă de audit;
+- `ac66048` — checkout action trebuie să fie menținut și pin-uit.
+
+**Source implementation commits:**
+
+- `3887ddd` — workflow reutilizabil și release gate;
+- `1d13280` — upgrade la
+  [actions/checkout v7.0.1](https://github.com/actions/checkout/releases/tag/v7.0.1),
+  pin-uit la SHA.
+
+**Current fork branches:**
+
+- `test/dependency-security-ci-contract`;
+- `ci/dependency-security-gate`;
+- `test/checkout-action-policy`;
+- `ci/checkout-v7`.
+
+**Proposed clean upstream branch:** `ci/upstream-rustsec-release-gate`
+
+**Proposed title:** `ci: block releases on RustSec findings`
+
+**Files:**
+
+- Add: `.github/workflows/dependency-security.yml`
+- Add: `scripts/security/audit_dependencies.sh`
+- Modify: `.github/workflows/build-wheels.yml`
+- Test: `tests/test_dependency_security_ci.py`
+
+**Interfaces:**
+
+- Consumes: `Cargo.lock` și baza oficială RustSec.
+- Produces: status check pentru push/PR și workflow reutilizabil care blochează
+  wheel, sdist și publish când auditul nu este verde.
+
+- [ ] **Step 1: Reproduce lipsa gate-ului pe ultimul upstream**
+
+Confirmă că workflow-ul de release poate construi și publica fără ca un job
+`cargo audit` să fie în graful său `needs`. Testele statice trebuie să fie RED,
+nu să accepte simpla existență a unui workflow neconectat la publish.
+
+- [ ] **Step 2: Adaugă scriptul unic fail-closed**
+
+Scriptul executabil trebuie să folosească:
+
+```bash
+set -euo pipefail
+cargo audit --deny warnings "$@"
+```
+
+Nu permite `continue-on-error`, `|| true`, ignore lists globale sau
+transformarea advisory-urilor în output informativ.
+
+- [ ] **Step 3: Adaugă workflow-ul reutilizabil și least-privilege**
+
+Contractul verificat pe fork:
+
+- `push`, `pull_request`, `workflow_dispatch` și `workflow_call`;
+- `permissions: contents: read`;
+- checkout fără credentiale persistente;
+- `actions/checkout` v7.0.1 pin-uit la
+  `3d3c42e5aac5ba805825da76410c181273ba90b1`;
+- Rust `1.94.0` și `cargo-audit 0.22.2` pin-uite;
+- timeout finit și concurrency cu anularea rulării învechite.
+
+- [ ] **Step 4: Leagă release-ul de audit**
+
+`build-wheels` și `build-sdist` au `needs: dependency-security`, iar `publish`
+depinde explicit de toate trei. Un audit roșu nu trebuie să producă sau să
+publice artefacte.
+
+- [ ] **Step 5: Rulează dovada**
+
+Rezultatul forkului:
+
+```text
+CI contract tests             4/4 PASS
+YAML syntax                   PASS
+bash -n                       PASS
+actionlint 1.7.7, new workflow PASS
+shared local audit script     219 crates, 0 findings
+hosted GitHub Actions         PASS in 3m05s
+```
+
+Dovada hosted este
+[run #30129899056](https://github.com/galeamarcel/FastMssql/actions/runs/30129899056)
+pe commitul cumulativ `0df518f`.
+
+`build-wheels.yml` are constatări `actionlint` preexistente în expresia
+`matrix.manylinux` și în scripturile sale vechi. Ele trebuie urmărite separat;
+nu sunt ascunse și nu sunt amestecate în PR-14.
+
+- [ ] **Step 6: Cere aprobarea înainte de publicare**
+
+Prezintă diff-ul clean față de ultimul upstream, rularea hosted și orice
+diferențe ale workflow-ului upstream. Nu publica PR-ul fără aprobarea explicită
+a proprietarului forkului.
 
 ---
 
