@@ -101,6 +101,9 @@ PR-uri care cer hardening sau separare
     ├── PR-10 unsupported metadata panic containment
     └── PR-11 TLS error classification
 
+PR-uri cu decizie de supply chain
+    └── PR-13 eliminarea advisory-urilor RustSec din ramura TLS
+
 Funcții enterprise viitoare
     └── intake individual după implementare și audit
 ```
@@ -888,6 +891,118 @@ Rulează suita upstream completă și caută explicit aplicații/teste care:
 Nu crea PR-ul doar pentru că fixul este verde pe fork. Prezintă mai întâi
 diff-ul izolat față de ultimul `upstream/master`, rezultatele complete și
 impactul de compatibilitate.
+
+---
+
+### Task 12: PR-13 — Eliminarea advisory-urilor RustSec din ramura TLS
+
+**Priority:** Needs dependency/maintenance decision; implementation verified
+
+**Source test commits:**
+
+- `2f202a5` — contractul inițial de securitate a dependențelor;
+- `b110277` — politica exactă pentru dependența directă `quinn-proto`.
+
+**Source fix commit:** `5ada01e`
+
+**Current fork branches:**
+
+- `test/dependency-security-policy`;
+- `fix/dependency-rustsec`.
+
+**Proposed clean upstream branch:** `fix/upstream-rustsec-dependencies`
+
+**Proposed title:** `fix: clear known RustSec findings in the TLS stack`
+
+**Files:**
+
+- Modify: `Cargo.toml`
+- Modify: `Cargo.lock`
+- Conditional add: `vendor/tiberius/**`
+- Test: `tests/test_dependency_security_policy.py`
+
+**Interfaces:**
+
+- Consumes: graful Cargo și backendul Rustls folosit de Tiberius.
+- Produces: același API Python/TDS, cu un singur runtime Rustls modern și un
+  lockfile care trece `cargo audit --deny warnings`.
+
+- [ ] **Step 1: Reproduce pe ultimul `upstream/master`**
+
+Rulează auditul cu baza oficială RustSec și salvează lista exactă. Baseline-ul
+forkului la 25 iulie 2026 a fost:
+
+```text
+12 vulnerabilities
+1 unmaintained warning
+```
+
+Distribuția era 5 advisory-uri prin `aws-lc-sys 0.36.0`, 7 prin
+`rustls-webpki` și warning-ul `rustls-pemfile 1.0.4`.
+
+- [ ] **Step 2: Reconfirmă starea Tiberius**
+
+Verifică versiunea publicată, `prisma/tiberius` `main` și
+[PR #419](https://github.com/prisma/tiberius/pull/419). Fixul forkului folosește
+exact fișierul TLS din commitul tehnic
+`d46e4c028e5b55cbd362506f24b5ef5fe645c5d5`; nu presupune că PR-ul sau branchul
+contributorului va rămâne disponibil.
+
+- [ ] **Step 3: Alege forma dependenței împreună cu maintainerul**
+
+Ordinea preferată pentru upstream:
+
+1. versiune Tiberius crates.io care include migrarea Rustls;
+2. vendor local minimal și cu proveniență, dacă release-ul FastMssql nu poate
+   aștepta;
+3. pin Git pe commit exact numai dacă politica upstream îl preferă explicit.
+
+Varianta verificată pe fork este vendorul local minimal: manifest, surse
+runtime, README, licențele MIT/Apache-2.0 și nota de proveniență. Nu include
+teste, CI, Docker fixtures sau chei de certificate din pachetul sursă.
+
+- [ ] **Step 4: Aplică schimbarea minimă**
+
+- elimină declarația directă neutilizată `quinn-proto`;
+- migrează Tiberius la `tokio-rustls 0.26` și `rustls-native-certs 0.8`;
+- elimină `rustls-pemfile`;
+- actualizează lockfile-ul fără a ignora advisory-uri;
+- păstrează licențele și condiția explicită de revenire la crates.io.
+
+Prezența opțională a numelui `quinn-proto` în lockfile nu este singură un
+defect; contractul interzice dependența directă și verifică versiunile active.
+
+- [ ] **Step 5: Rulează dovada completă**
+
+Rezultatul deja obținut pe fork:
+
+```text
+dependency policy              3/3 PASS
+cargo audit --deny warnings    219 crates, 0 vulnerabilities, 0 warnings
+cargo test --locked            5/5 PASS
+clippy -D warnings             PASS
+SQL-auth TLS/connection/tx     70/70 PASS
+SSL upstream relevant          94/94 PASS
+upstream non-disruptive        962 PASS, 1 SKIP
+sdist -> release wheel         PASS
+installed wheel live SQL query PASS
+```
+
+Cele 3 teste upstream neincluse în linia de 962 folosesc simultan chei TLS în
+connection string și `ssl_config`; ele apar numai pe fork după contractul
+PR-12 și trebuie corectate separat, nu exceptate din audit.
+
+- [ ] **Step 6: Adaugă release gate-ul separat**
+
+CI trebuie să instaleze o versiune pin-uită `cargo-audit` și să ruleze
+`cargo audit --deny warnings`. SBOM/provenance pentru wheel și sdist rămân un
+task separat, ca să nu mărească acest PR de dependențe.
+
+- [ ] **Step 7: Cere aprobarea înainte de publicare**
+
+Nu s-a creat și nu s-a publicat niciun fork Tiberius. Nu crea branch sau PR pe
+repo-ul original FastMssql până când proprietarul forkului aprobă explicit
+forma finală a dependenței și diff-ul curat față de ultimul upstream.
 
 ---
 
