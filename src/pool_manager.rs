@@ -15,6 +15,42 @@ use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 type TiberiusClient = tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>;
 
+pub struct ManagedConnection {
+    client: TiberiusClient,
+    reusable: bool,
+}
+
+impl ManagedConnection {
+    fn new(client: TiberiusClient) -> Self {
+        Self {
+            client,
+            reusable: true,
+        }
+    }
+
+    pub(crate) fn mark_unusable(&mut self) {
+        self.reusable = false;
+    }
+
+    pub(crate) fn is_reusable(&self) -> bool {
+        self.reusable
+    }
+}
+
+impl std::ops::Deref for ManagedConnection {
+    type Target = TiberiusClient;
+
+    fn deref(&self) -> &Self::Target {
+        &self.client
+    }
+}
+
+impl std::ops::DerefMut for ManagedConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.client
+    }
+}
+
 /// Error type for `AzureConnectionManager`.
 #[derive(Debug)]
 pub enum PoolConnectionError {
@@ -92,7 +128,7 @@ impl AzureConnectionManager {
 }
 
 impl bb8::ManageConnection for AzureConnectionManager {
-    type Connection = TiberiusClient;
+    type Connection = ManagedConnection;
     type Error = PoolConnectionError;
 
     async fn connect(&self) -> Result<Self::Connection, Self::Error> {
@@ -125,7 +161,7 @@ impl bb8::ManageConnection for AzureConnectionManager {
             Err(e) => return Err(e.into()),
         };
 
-        Ok(client)
+        Ok(ManagedConnection::new(client))
     }
 
     async fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
@@ -139,16 +175,55 @@ impl bb8::ManageConnection for AzureConnectionManager {
         Ok(())
     }
 
-    /// Returns `false` unconditionally.
+    /// Returns whether a cancelled pooled operation made this client unsafe to
+    /// reuse.
     ///
-    /// bb8 calls this synchronously on every connection return.  `tiberius::Client`
-    /// wraps an async TCP stream and exposes no synchronous liveness check, so
-    /// there is nothing meaningful to inspect here.  All real health-checking is
-    /// handled by [`is_valid`](AzureConnectionManager::is_valid), which runs a
-    /// real server round-trip on periodic lifetime / idle-timeout checks and,
-    /// optionally, on every checkout when `test_on_check_out = true`.
-    fn has_broken(&self, _conn: &mut Self::Connection) -> bool {
-        false
+    /// bb8 calls this synchronously whenever a checkout is returned. Normal
+    /// liveness checks remain in [`is_valid`](AzureConnectionManager::is_valid);
+    /// this flag handles the distinct case where Python cancellation dropped a
+    /// Rust future before Tiberius finished consuming the server response.
+    fn has_broken(&self, conn: &mut Self::Connection) -> bool {
+        !conn.is_reusable()
+    }
+}
+
+pub(crate) struct PooledOperationGuard<'a> {
+    connection: bb8::PooledConnection<'a, AzureConnectionManager>,
+    completed: bool,
+}
+
+impl<'a> PooledOperationGuard<'a> {
+    pub(crate) fn new(connection: bb8::PooledConnection<'a, AzureConnectionManager>) -> Self {
+        Self {
+            connection,
+            completed: false,
+        }
+    }
+
+    pub(crate) fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl std::ops::Deref for PooledOperationGuard<'_> {
+    type Target = TiberiusClient;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connection.client
+    }
+}
+
+impl std::ops::DerefMut for PooledOperationGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.connection.client
+    }
+}
+
+impl Drop for PooledOperationGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.connection.mark_unusable();
+        }
     }
 }
 

@@ -9,9 +9,11 @@ use tokio::sync::RwLock;
 use crate::azure_auth::PyAzureCredential;
 use crate::batch::{bulk_insert, execute_batch, query_batch};
 use crate::helpers::wrap_query_stream;
-use crate::parameter_conversion::{FastParameter, convert_parameters_to_fast, params_as_sql_refs};
+use crate::parameter_conversion::{convert_parameters_to_fast, params_as_sql_refs, FastParameter};
 use crate::pool_config::PyPoolConfig;
-use crate::pool_manager::{ConnectionPool, ensure_pool_initialized_with_auth};
+use crate::pool_manager::{
+    ensure_pool_initialized_with_auth, ConnectionPool, PooledOperationGuard,
+};
 use crate::ssl_config::PySslConfig;
 use crate::types::{create_connection_error, create_sql_error};
 
@@ -52,10 +54,8 @@ impl PyConnection {
         }
     }
 
-    async fn get_pool_connection(
-        pool: &ConnectionPool,
-    ) -> PyResult<bb8::PooledConnection<'_, crate::pool_manager::AzureConnectionManager>> {
-        pool.get().await.map_err(|e| match e {
+    async fn get_pool_connection(pool: &ConnectionPool) -> PyResult<PooledOperationGuard<'_>> {
+        let connection = pool.get().await.map_err(|e| match e {
             bb8::RunError::TimedOut => create_connection_error(
                 "Connection pool timeout - all connections are busy. \
                      Try reducing concurrent requests or increasing pool size.",
@@ -63,7 +63,8 @@ impl PyConnection {
             bb8::RunError::User(e) => {
                 create_connection_error(format!("Failed to get connection from pool: {}", e))
             }
-        })
+        })?;
+        Ok(PooledOperationGuard::new(connection))
     }
 
     #[inline]
@@ -75,18 +76,21 @@ impl PyConnection {
         let mut conn = Self::get_pool_connection(pool).await?;
         let tiberius_params = params_as_sql_refs(parameters);
 
-        let stream = conn
-            .query(query, &tiberius_params)
-            .await
-            .map_err(|e| create_sql_error(e, "Query execution failed"))?;
+        let operation = async {
+            let stream = conn
+                .query(query, &tiberius_params)
+                .await
+                .map_err(|e| create_sql_error(e, "Query execution failed"))?;
 
-        let result = stream
-            .into_first_result()
-            .await
-            .map_err(|e| create_sql_error(e, "Failed to get results"))?;
+            stream
+                .into_first_result()
+                .await
+                .map_err(|e| create_sql_error(e, "Failed to get results"))
+        }
+        .await;
 
-        drop(conn);
-        Ok(result)
+        conn.complete();
+        operation
     }
 
     #[inline]
@@ -96,18 +100,21 @@ impl PyConnection {
     ) -> PyResult<Vec<Row>> {
         let mut conn = Self::get_pool_connection(pool).await?;
 
-        let stream = conn
-            .simple_query(query)
-            .await
-            .map_err(|e| create_sql_error(e, "Query execution failed"))?;
+        let operation = async {
+            let stream = conn
+                .simple_query(query)
+                .await
+                .map_err(|e| create_sql_error(e, "Query execution failed"))?;
 
-        let result = stream
-            .into_first_result()
-            .await
-            .map_err(|e| create_sql_error(e, "Failed to get results"))?;
+            stream
+                .into_first_result()
+                .await
+                .map_err(|e| create_sql_error(e, "Failed to get results"))
+        }
+        .await;
 
-        drop(conn);
-        Ok(result)
+        conn.complete();
+        operation
     }
 
     #[inline]
@@ -119,14 +126,15 @@ impl PyConnection {
         let mut conn = Self::get_pool_connection(pool).await?;
         let tiberius_params = params_as_sql_refs(parameters);
 
-        let result = conn
+        let operation = conn
             .execute(query, &tiberius_params)
             .await
-            .map_err(|e| create_sql_error(e, "Command execution failed"))?;
+            .map_err(|e| create_sql_error(e, "Command execution failed"));
+        conn.complete();
+        let result = operation?;
 
         let total_affected = result.rows_affected().iter().sum::<u64>();
 
-        drop(conn);
         Ok(total_affected)
     }
 }
