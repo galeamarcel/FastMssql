@@ -840,3 +840,72 @@ async def test_checkout_validation_resets_state_before_health_probe(
             "session_id": first_session,
             "leaked_value": None,
         }
+
+
+@case("POOL-021")
+@pytest.mark.asyncio
+async def test_checkout_reset_reverts_database_impersonation(
+    sa_connection: Connection,
+    sql_auth_config: SqlAuthConfig,
+    unique_sql_name: Callable[[str], str],
+) -> None:
+    user_name = unique_sql_name("strict_pool_impersonated")
+    quoted_user = quote_identifier(user_name)
+    await sa_connection.execute(f"CREATE USER {quoted_user} WITHOUT LOGIN")
+
+    try:
+        connection = _connection(
+            sql_auth_config,
+            PoolConfig(
+                max_size=1,
+                min_idle=1,
+                max_lifetime_secs=None,
+                idle_timeout_secs=None,
+                connection_timeout_secs=2,
+                test_on_check_out=False,
+                retry_connection=False,
+            ),
+        )
+        async with connection:
+            baseline = (
+                await connection.query(
+                    """
+                    SELECT
+                        @@SPID AS session_id,
+                        USER_NAME() AS database_principal,
+                        SUSER_SNAME() AS server_principal
+                    """
+                )
+            ).fetchone()
+            assert baseline is not None
+
+            impersonated = (
+                await connection.simple_query(
+                    f"""
+                    EXECUTE AS USER = N'{user_name}';
+                    SELECT
+                        @@SPID AS session_id,
+                        USER_NAME() AS database_principal;
+                    """
+                )
+            ).fetchone()
+            assert impersonated is not None
+            assert impersonated.to_dict() == {
+                "session_id": baseline["session_id"],
+                "database_principal": user_name,
+            }
+
+            restored = (
+                await connection.query(
+                    """
+                    SELECT
+                        @@SPID AS session_id,
+                        USER_NAME() AS database_principal,
+                        SUSER_SNAME() AS server_principal
+                    """
+                )
+            ).fetchone()
+            assert restored is not None
+            assert restored.to_dict() == baseline.to_dict()
+    finally:
+        await sa_connection.execute(f"DROP USER IF EXISTS {quoted_user}")
