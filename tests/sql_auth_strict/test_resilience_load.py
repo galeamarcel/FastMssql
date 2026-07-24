@@ -344,6 +344,7 @@ async def test_restart_does_not_falsely_commit_inflight_transaction(
 
 
 @case("RES-007")
+@pytest.mark.resilience
 def test_docker_target_safety_contract() -> None:
     assert_dedicated_container(CONTAINER)
     with pytest.raises(RuntimeError, match="refusing disruptive Docker action"):

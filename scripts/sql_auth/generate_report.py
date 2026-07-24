@@ -8,6 +8,7 @@ from pathlib import Path
 import platform
 import re
 import subprocess
+import sys
 import xml.etree.ElementTree as ET
 
 
@@ -343,6 +344,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--artifact-dir", type=Path, required=True)
     parser.add_argument("--matrix-output", type=Path, required=True)
     parser.add_argument("--report-output", type=Path, required=True)
+    parser.add_argument(
+        "--require-complete",
+        action="store_true",
+        help="fail after writing reports when any matrix case lacks evidence",
+    )
     return parser.parse_args(argv)
 
 
@@ -371,6 +377,13 @@ def main(argv: list[str] | None = None) -> int:
     args.report_output.parent.mkdir(parents=True, exist_ok=True)
     args.matrix_output.write_text(matrix, encoding="utf-8")
     args.report_output.write_text(report, encoding="utf-8")
+    missing = [case_id for case_id, _ in cases if case_id not in results]
+    if args.require_complete and missing:
+        print(
+            f"missing evidence for {len(missing)} case(s): {', '.join(missing)}",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
