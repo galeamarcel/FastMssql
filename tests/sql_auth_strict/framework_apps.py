@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import logging
 import time
 
+from asgiref.wsgi import WsgiToAsgi
 from fastmssql import Connection, PoolConfig, SslConfig, Transaction
 from fastapi import FastAPI
 from flask import Flask, jsonify
@@ -325,3 +326,7 @@ def create_flask_app(state: FrameworkState) -> Flask:
         raise AssertionError("unreachable after missing-table query")
 
     return app
+
+
+def create_adapted_flask_app(state: FrameworkState) -> WsgiToAsgi:
+    return WsgiToAsgi(create_flask_app(state))

@@ -21,6 +21,7 @@ from sql_auth_strict.cases import case
 from sql_auth_strict.framework_apps import (
     FrameworkState,
     IntentionalRollback,
+    create_adapted_flask_app,
     create_fastapi_app,
     create_flask_app,
     session_count,
@@ -535,6 +536,155 @@ async def test_flask_wsgi_explicit_shutdown_removes_app_sessions(
     try:
         response = await flask_request(app, "/value/19")
         assert response.get_json() == {"value": 19}
+        assert await session_count(sa_connection, state.application_name) >= 1
+    finally:
+        await state.connection.disconnect()
+    assert await state.connection.is_connected() is False
+    await wait_for_session_count(
+        sa_connection,
+        state.application_name,
+        expected=0,
+    )
+
+
+@pytest.fixture
+def framework_adapted_flask_app(sql_auth_config, unique_sql_name):
+    state = FrameworkState.create(
+        sql_auth_config,
+        application_name=unique_sql_name("strict_flask_asgi"),
+    )
+    return create_adapted_flask_app(state), state
+
+
+@case("FRAME-020")
+@pytest.mark.asyncio
+async def test_adapted_flask_executes_real_sql_auth_query(
+    framework_adapted_flask_app,
+) -> None:
+    app, state = framework_adapted_flask_app
+    await state.connection.connect()
+    try:
+        async with asgi_client(app) as client:
+            response = await client.get("/value/20")
+        assert response.status_code == 200
+        assert response.json() == {"value": 20}
+    finally:
+        await state.connection.disconnect()
+
+
+@case("FRAME-021")
+@pytest.mark.asyncio
+async def test_adapted_flask_reuses_persistent_asgi_loop(
+    framework_adapted_flask_app,
+    record_framework_metric,
+) -> None:
+    app, state = framework_adapted_flask_app
+    await state.connection.connect()
+    try:
+        async with asgi_client(app) as client:
+            first = await client.get("/loop")
+            second = await client.get("/loop")
+        assert first.status_code == second.status_code == 200
+        assert first.json()["sql_value"] == 15
+        assert second.json()["sql_value"] == 15
+        assert len(state.loops) == 2
+        assert state.loops[0] is state.loops[1]
+        record_framework_metric(
+            "FRAME-021",
+            persistent_loop=True,
+            loop_id=first.json()["loop_id"],
+        )
+    finally:
+        await state.connection.disconnect()
+
+
+@case("FRAME-022")
+@pytest.mark.asyncio
+async def test_adapted_flask_concurrent_requests_are_correct_and_measured(
+    framework_adapted_flask_app,
+    record_framework_metric,
+) -> None:
+    app, state = framework_adapted_flask_app
+    await state.connection.connect()
+    try:
+        async with asgi_client(app) as client:
+            started = time.monotonic()
+            responses = await asyncio.gather(
+                *(client.get(f"/wait/{value}") for value in range(4))
+            )
+            elapsed = time.monotonic() - started
+        assert [response.json()["value"] for response in responses] == list(
+            range(4)
+        )
+        record_framework_metric(
+            "FRAME-022",
+            execution_model="persistent ASGI loop around Flask/WSGI",
+            requests=4,
+            elapsed_seconds=elapsed,
+        )
+    finally:
+        await state.connection.disconnect()
+
+
+@case("FRAME-023")
+@pytest.mark.asyncio
+async def test_adapted_flask_cancellation_has_bounded_recovery(
+    framework_adapted_flask_app,
+    sa_connection,
+    record_framework_metric,
+) -> None:
+    app, state = framework_adapted_flask_app
+    await state.connection.connect()
+    try:
+        async with asgi_client(app) as client:
+            request = asyncio.create_task(client.get("/wait/23"))
+            await wait_for_pool_active(state.connection, expected=1)
+            await wait_for_sql_request(
+                sa_connection,
+                state.application_name,
+                present=True,
+                timeout=1.0,
+            )
+            started = time.monotonic()
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(request, timeout=0.5)
+            cancellation_elapsed = time.monotonic() - started
+            await wait_for_pool_active(
+                state.connection,
+                expected=0,
+                timeout=3.5,
+            )
+            await wait_for_sql_request(
+                sa_connection,
+                state.application_name,
+                present=False,
+                timeout=3.5,
+            )
+            recovered = await client.get("/value/223")
+            pool_after = await state.connection.pool_stats()
+        assert recovered.json() == {"value": 223}
+        record_framework_metric(
+            "FRAME-023",
+            cancellation_seconds=cancellation_elapsed,
+            recovery_bound_seconds=3.5,
+            pool_after=pool_after,
+        )
+    finally:
+        await state.connection.disconnect()
+
+
+@case("FRAME-024")
+@pytest.mark.asyncio
+async def test_adapted_flask_shutdown_removes_app_sessions(
+    framework_adapted_flask_app,
+    sa_connection,
+) -> None:
+    app, state = framework_adapted_flask_app
+    await state.connection.connect()
+    try:
+        async with asgi_client(app) as client:
+            assert (await client.get("/value/24")).json() == {"value": 24}
         assert await session_count(sa_connection, state.application_name) >= 1
     finally:
         await state.connection.disconnect()
