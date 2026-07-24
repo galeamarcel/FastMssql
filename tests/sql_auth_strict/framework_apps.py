@@ -1,13 +1,29 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+import logging
 import time
 
 from fastmssql import Connection, PoolConfig, SslConfig, Transaction
+from fastapi import FastAPI
+from pydantic import BaseModel
+from starlette.responses import PlainTextResponse
 
 from sql_auth_strict.config import SqlAuthConfig
 from sql_auth_strict.helpers import IDENTIFIER, scalar
+
+
+LOGGER = logging.getLogger("fastmssql.framework")
+
+
+class ItemPayload(BaseModel):
+    value: str
+
+
+class IntentionalRollback(RuntimeError):
+    pass
 
 
 @dataclass
@@ -141,3 +157,85 @@ async def wait_for_sql_request(
         f"expected SQL request {token!r} present={present}, "
         f"observed count={observed}"
     )
+
+
+def create_fastapi_app(
+    state: FrameworkState,
+    table_sql: str,
+    *,
+    safe_errors: bool = False,
+) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        await state.connection.connect()
+        app.state.fastmssql = state
+        try:
+            yield
+        finally:
+            await state.connection.disconnect()
+
+    app = FastAPI(lifespan=lifespan)
+
+    @app.get("/principal")
+    async def principal():
+        return {
+            "principal": await scalar(
+                state.connection,
+                "SELECT CAST(SUSER_SNAME() AS NVARCHAR(128))",
+            )
+        }
+
+    @app.post("/items/{item_id}", status_code=201)
+    async def write_item(item_id: int, payload: ItemPayload):
+        affected = await state.connection.execute(
+            f"INSERT INTO {table_sql} (id, value) VALUES (@P1, @P2)",
+            [item_id, payload.value],
+        )
+        return {"affected": affected}
+
+    @app.get("/items/{item_id}")
+    async def read_item(item_id: int):
+        row = (
+            await state.connection.query(
+                f"SELECT id, value FROM {table_sql} WHERE id = @P1",
+                [item_id],
+            )
+        ).fetchone()
+        return {"id": row["id"], "value": row["value"]}
+
+    @app.post("/transaction/{item_id}", status_code=201)
+    async def transaction_item(item_id: int, fail: bool = False):
+        async with state.transaction() as transaction:
+            await transaction.execute(
+                f"INSERT INTO {table_sql} (id, value) VALUES (@P1, @P2)",
+                [item_id, "transaction"],
+            )
+            if fail:
+                raise IntentionalRollback("intentional rollback")
+        return {"committed": True}
+
+    @app.get("/sql-error")
+    async def sql_error():
+        await state.connection.query(
+            "SELECT * FROM dbo.strict_framework_missing_table"
+        )
+        raise AssertionError("unreachable after missing-table query")
+
+    if safe_errors:
+
+        @app.exception_handler(Exception)
+        async def safe_500(request, error):
+            del request
+            if hasattr(error, "code") and hasattr(error, "state"):
+                LOGGER.error(
+                    "FastMssql request failed: type=%s code=%s state=%s",
+                    type(error).__name__,
+                    error.code,
+                    error.state,
+                )
+            return PlainTextResponse(
+                "Internal Server Error",
+                status_code=500,
+            )
+
+    return app

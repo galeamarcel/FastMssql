@@ -8,16 +8,22 @@ import subprocess
 import sys
 import tomllib
 
+from asgi_lifespan import LifespanManager
 import pytest
+import pytest_asyncio
 
-from fastmssql import Connection
+from fastmssql import Connection, SqlError
+from httpx import ASGITransport, AsyncClient
 from sql_auth_strict.cases import case
 from sql_auth_strict.framework_apps import (
     FrameworkState,
+    IntentionalRollback,
+    create_fastapi_app,
     session_count,
     wait_for_pool_active,
+    wait_for_session_count,
 )
-from sql_auth_strict.helpers import scalar
+from sql_auth_strict.helpers import quote_identifier, scalar
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -33,6 +39,16 @@ FRAMEWORK_DISTRIBUTIONS = (
     "asgiref",
     "asgi-lifespan",
 )
+
+
+def asgi_client(app, *, raise_app_exceptions: bool = True) -> AsyncClient:
+    return AsyncClient(
+        transport=ASGITransport(
+            app=app,
+            raise_app_exceptions=raise_app_exceptions,
+        ),
+        base_url="http://framework.test",
+    )
 
 
 @case("FRAME-001")
@@ -116,3 +132,170 @@ async def test_framework_session_helpers_observe_real_pool(
         )["active_connections"] == 0
     finally:
         await state.connection.disconnect()
+
+
+@pytest_asyncio.fixture
+async def framework_table(
+    owner_connection,
+    unique_sql_name,
+    cleanup_registry,
+):
+    table = quote_identifier(unique_sql_name("strict_framework_items"))
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
+    await owner_connection.execute(
+        f"CREATE TABLE {table} (id INT PRIMARY KEY, value NVARCHAR(100) NULL)"
+    )
+    return table
+
+
+@pytest_asyncio.fixture
+async def framework_fastapi_app(
+    sql_auth_config,
+    unique_sql_name,
+    framework_table,
+):
+    state = FrameworkState.create(
+        sql_auth_config,
+        application_name=unique_sql_name("strict_fastapi_app"),
+    )
+    return create_fastapi_app(state, framework_table), state
+
+
+@case("FRAME-005")
+@pytest.mark.asyncio
+async def test_fastapi_lifespan_connects_and_disconnects_shared_pool(
+    sql_auth_config,
+    sa_connection,
+    unique_sql_name,
+) -> None:
+    state = FrameworkState.create(
+        sql_auth_config,
+        application_name=unique_sql_name("strict_fastapi_lifecycle"),
+    )
+    app = create_fastapi_app(state, "[unused_framework_table]")
+    assert await state.connection.is_connected() is False
+    async with LifespanManager(app):
+        assert await state.connection.is_connected() is True
+        assert await scalar(state.connection, "SELECT 1") == 1
+        assert await session_count(sa_connection, state.application_name) >= 1
+    assert await state.connection.is_connected() is False
+    await wait_for_session_count(
+        sa_connection,
+        state.application_name,
+        expected=0,
+    )
+
+
+@case("FRAME-006")
+@pytest.mark.asyncio
+async def test_fastapi_parameterized_read_write_routes(
+    sql_auth_config,
+    owner_connection,
+    unique_sql_name,
+    cleanup_registry,
+) -> None:
+    raw_table = unique_sql_name("strict_fastapi_items")
+    table = quote_identifier(raw_table)
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
+    await owner_connection.execute(
+        f"CREATE TABLE {table} (id INT PRIMARY KEY, value NVARCHAR(100))"
+    )
+    state = FrameworkState.create(
+        sql_auth_config,
+        application_name=unique_sql_name("strict_fastapi_data"),
+    )
+    app = create_fastapi_app(state, table)
+    async with LifespanManager(app), asgi_client(app) as client:
+        written = await client.post(
+            "/items/7",
+            json={"value": "Română 🧪"},
+        )
+        read = await client.get("/items/7")
+    assert written.status_code == 201
+    assert written.json() == {"affected": 1}
+    assert read.status_code == 200
+    assert read.json() == {"id": 7, "value": "Română 🧪"}
+    assert await scalar(
+        owner_connection,
+        f"SELECT value FROM {table} WHERE id = 7",
+    ) == "Română 🧪"
+
+
+@case("FRAME-007")
+@pytest.mark.asyncio
+async def test_fastapi_request_transaction_commits(
+    framework_fastapi_app,
+    owner_connection,
+    framework_table,
+) -> None:
+    app, _state = framework_fastapi_app
+    async with LifespanManager(app), asgi_client(app) as client:
+        response = await client.post("/transaction/17")
+    assert response.status_code == 201
+    assert await scalar(
+        owner_connection,
+        f"SELECT COUNT(*) FROM {framework_table} WHERE id = 17",
+    ) == 1
+
+
+@case("FRAME-008")
+@pytest.mark.asyncio
+async def test_fastapi_request_transaction_rolls_back(
+    framework_fastapi_app,
+    owner_connection,
+    framework_table,
+) -> None:
+    app, _state = framework_fastapi_app
+    async with LifespanManager(app), asgi_client(app) as client:
+        with pytest.raises(IntentionalRollback):
+            await client.post("/transaction/18?fail=true")
+    assert await scalar(
+        owner_connection,
+        f"SELECT COUNT(*) FROM {framework_table} WHERE id = 18",
+    ) == 0
+
+
+@case("FRAME-012")
+@pytest.mark.asyncio
+async def test_fastapi_sql_error_preserves_type_and_code(
+    framework_fastapi_app,
+) -> None:
+    app, state = framework_fastapi_app
+    async with LifespanManager(app), asgi_client(app) as client:
+        with pytest.raises(SqlError) as captured:
+            await client.get("/sql-error")
+        assert captured.value.code == 208
+        assert await scalar(state.connection, "SELECT 12") == 12
+
+
+@case("FRAME-013")
+@pytest.mark.asyncio
+async def test_fastapi_500_response_and_logs_redact_credentials(
+    sql_auth_config,
+    unique_sql_name,
+    caplog,
+) -> None:
+    state = FrameworkState.create(
+        sql_auth_config,
+        application_name=unique_sql_name("strict_fastapi_safe_error"),
+    )
+    app = create_fastapi_app(
+        state,
+        "[unused_framework_table]",
+        safe_errors=True,
+    )
+    async with LifespanManager(app), asgi_client(
+        app,
+        raise_app_exceptions=False,
+    ) as client:
+        response = await client.get("/sql-error")
+    combined = response.text + "\n" + caplog.text
+    assert response.status_code == 500
+    assert response.text == "Internal Server Error"
+    for secret in (
+        sql_auth_config.owner_password,
+        sql_auth_config.sa_password,
+        sql_auth_config.readonly_password,
+        sql_auth_config.denied_password,
+    ):
+        assert secret not in combined
