@@ -405,6 +405,7 @@ async def test_resources_return_after_task_completion(
 @case("POOL-011")
 @pytest.mark.asyncio
 async def test_resources_return_after_query_error(
+    sa_connection: Connection,
     sql_auth_config: SqlAuthConfig,
 ) -> None:
     connection = _connection(
@@ -416,11 +417,19 @@ async def test_resources_return_after_query_error(
             retry_connection=False,
         ),
     )
+    first_session = int(await scalar(connection, "SELECT @@SPID"))
+    first_connection_id = await _server_connection_id(
+        sa_connection, first_session
+    )
     with pytest.raises(SqlError):
         await connection.query("SELECT * FROM object_that_does_not_exist")
     stats = await _wait_for_active(connection, 0)
     assert stats["idle_connections"] == stats["connections"]
-    assert await scalar(connection, "SELECT 1") == 1
+    second_session = int(await scalar(connection, "SELECT @@SPID"))
+    second_connection_id = await _server_connection_id(
+        sa_connection, second_session
+    )
+    assert second_connection_id == first_connection_id
     assert await connection.disconnect() is True
 
 
