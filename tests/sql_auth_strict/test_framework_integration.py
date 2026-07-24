@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.metadata
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 import tomllib
 
 from asgi_lifespan import LifespanManager
@@ -21,9 +23,10 @@ from sql_auth_strict.framework_apps import (
     create_fastapi_app,
     session_count,
     wait_for_pool_active,
+    wait_for_sql_request,
     wait_for_session_count,
 )
-from sql_auth_strict.helpers import quote_identifier, scalar
+from sql_auth_strict.helpers import event_loop_ticks, quote_identifier, scalar
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -299,3 +302,102 @@ async def test_fastapi_500_response_and_logs_redact_credentials(
         sql_auth_config.denied_password,
     ):
         assert secret not in combined
+
+
+@case("FRAME-009")
+@pytest.mark.asyncio
+async def test_fastapi_concurrent_requests_beat_sequential_baseline(
+    framework_fastapi_app,
+    record_framework_metric,
+) -> None:
+    app, _state = framework_fastapi_app
+    async with LifespanManager(app), asgi_client(app) as client:
+        sequential_started = time.monotonic()
+        sequential = [
+            (await client.get(f"/wait/{value}?profile=short")).json()["value"]
+            for value in range(4)
+        ]
+        sequential_elapsed = time.monotonic() - sequential_started
+
+        concurrent_started = time.monotonic()
+        responses = await asyncio.gather(
+            *(client.get(f"/wait/{value}?profile=short") for value in range(4))
+        )
+        concurrent_elapsed = time.monotonic() - concurrent_started
+    assert sequential == list(range(4))
+    assert [response.json()["value"] for response in responses] == list(
+        range(4)
+    )
+    assert concurrent_elapsed < sequential_elapsed * 0.65
+    record_framework_metric(
+        "FRAME-009",
+        sequential_seconds=sequential_elapsed,
+        concurrent_seconds=concurrent_elapsed,
+        ratio=concurrent_elapsed / sequential_elapsed,
+    )
+
+
+@case("FRAME-010")
+@pytest.mark.asyncio
+async def test_fastapi_event_loop_ticks_during_sql_wait(
+    framework_fastapi_app,
+    record_framework_metric,
+) -> None:
+    app, _state = framework_fastapi_app
+    async with LifespanManager(app), asgi_client(app) as client:
+        stop = asyncio.Event()
+        ticker = asyncio.create_task(event_loop_ticks(stop, interval=0.02))
+        try:
+            response = await client.get("/wait/10?profile=short")
+            assert response.json() == {"value": 10}
+        finally:
+            stop.set()
+            ticks = await ticker
+    assert len(ticks) >= 10
+    record_framework_metric("FRAME-010", ticker_count=len(ticks))
+
+
+@case("FRAME-011")
+@pytest.mark.asyncio
+async def test_fastapi_request_cancellation_recovers_immediately(
+    framework_fastapi_app,
+    sa_connection,
+    record_framework_metric,
+) -> None:
+    app, state = framework_fastapi_app
+    async with LifespanManager(app), asgi_client(app) as client:
+        request = asyncio.create_task(client.get("/wait/11?profile=long"))
+        await wait_for_pool_active(state.connection, expected=1)
+        await wait_for_sql_request(
+            sa_connection,
+            state.application_name,
+            present=True,
+            timeout=1.0,
+        )
+        started = time.monotonic()
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(request, timeout=0.5)
+        cancellation_elapsed = time.monotonic() - started
+        await wait_for_pool_active(
+            state.connection,
+            expected=0,
+            timeout=1.0,
+        )
+        await wait_for_sql_request(
+            sa_connection,
+            state.application_name,
+            present=False,
+            timeout=1.0,
+        )
+        recovered = await asyncio.wait_for(
+            client.get("/wait/111?profile=none"),
+            timeout=2.0,
+        )
+        pool_after = await state.connection.pool_stats()
+    assert recovered.json() == {"value": 111}
+    record_framework_metric(
+        "FRAME-011",
+        cancellation_seconds=cancellation_elapsed,
+        pool_after=pool_after,
+    )

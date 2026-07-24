@@ -977,7 +977,7 @@ source .env.sql-auth.local
 set +a
 PYTHONPATH=python .venv/bin/pytest \
   tests/sql_auth_strict/test_framework_integration.py \
-  -k 'fastapi and (concurrent or ticker or cancellation)' -vv
+  -k 'fastapi and (concurrent or ticks or cancellation)' -vv
 ```
 
 Expected: requests return 404 because `/wait/{value}` does not exist.

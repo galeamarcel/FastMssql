@@ -175,6 +175,11 @@ def create_fastapi_app(
             await state.connection.disconnect()
 
     app = FastAPI(lifespan=lifespan)
+    delays = {
+        "none": "",
+        "short": "WAITFOR DELAY '00:00:01';",
+        "long": "WAITFOR DELAY '00:00:05';",
+    }
 
     @app.get("/principal")
     async def principal():
@@ -184,6 +189,18 @@ def create_fastapi_app(
                 "SELECT CAST(SUSER_SNAME() AS NVARCHAR(128))",
             )
         }
+
+    @app.get("/wait/{value}")
+    async def wait_value(value: int, profile: str = "short"):
+        prefix = delays.get(profile)
+        if prefix is None:
+            raise ValueError(f"invalid delay profile {profile!r}")
+        returned = await scalar(
+            state.connection,
+            f"/* {state.application_name} */ {prefix} SELECT @P1",
+            [value],
+        )
+        return {"value": returned}
 
     @app.post("/items/{item_id}", status_code=201)
     async def write_item(item_id: int, payload: ItemPayload):
