@@ -19,7 +19,11 @@ from sql_auth_strict.helpers import unique_sql_name as make_unique_sql_name
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RESULTS_PATH = ROOT / ".artifacts/sql-auth/strict-results.json"
+DEFAULT_FRAMEWORK_METRICS_PATH = (
+    ROOT / ".artifacts/sql-auth/framework-metrics.json"
+)
 _RESULTS: dict[str, dict[str, Any]] = {}
+_FRAMEWORK_METRICS: dict[str, dict[str, object]] = {}
 _PASSWORDS: tuple[str, ...] = ()
 _OUTCOME_PRIORITY = {"passed": 0, "skipped": 1, "failed": 2}
 
@@ -39,6 +43,7 @@ def pytest_configure(config: pytest.Config) -> None:
         f"{CASE_MARKER}(*case_ids): approved strict SQL-auth matrix IDs",
     )
     _RESULTS.clear()
+    _FRAMEWORK_METRICS.clear()
     sql_auth_config = SqlAuthConfig.from_env(require_all=False)
     _PASSWORDS = tuple(
         password
@@ -115,6 +120,26 @@ def pytest_sessionfinish(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    if _FRAMEWORK_METRICS:
+        metrics_path = Path(
+            os.getenv(
+                "FASTMSSQL_FRAMEWORK_METRICS_PATH",
+                str(DEFAULT_FRAMEWORK_METRICS_PATH),
+            )
+        )
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        metrics_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "cases": dict(sorted(_FRAMEWORK_METRICS.items())),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
 
 def pytest_collection_finish(session: pytest.Session) -> None:
@@ -161,6 +186,24 @@ def pytest_collection_finish(session: pytest.Session) -> None:
 @pytest.fixture(scope="session")
 def sql_auth_config() -> SqlAuthConfig:
     return SqlAuthConfig.from_env()
+
+
+@pytest.fixture
+def record_framework_metric():
+    def record(case_id: str, **values: object) -> None:
+        if not case_id.startswith("FRAME-"):
+            raise ValueError(f"not a framework case ID: {case_id}")
+        json.dumps(values)
+        existing = _FRAMEWORK_METRICS.setdefault(case_id, {})
+        overlap = existing.keys() & values.keys()
+        if overlap:
+            raise ValueError(
+                f"duplicate framework metric keys for {case_id}: "
+                f"{sorted(overlap)}"
+            )
+        existing.update(values)
+
+    return record
 
 
 async def _connected(
