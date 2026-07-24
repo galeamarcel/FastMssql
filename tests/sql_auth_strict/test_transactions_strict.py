@@ -481,15 +481,25 @@ async def test_read_uncommitted_and_read_committed_visibility(
         await writer.begin()
         await writer.execute(f"INSERT INTO {table} VALUES (1)")
         await observer.connect()
-        await observer.simple_query(
-            "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED"
+        dirty_read = await observer.simple_query(
+            f"""
+            SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+            SELECT COUNT_BIG(*) AS visible_rows FROM {table};
+            """
         )
-        assert await scalar(observer, f"SELECT COUNT(*) FROM {table}") == 1
+        dirty_row = dirty_read.fetchone()
+        assert dirty_row is not None
+        assert dirty_row["visible_rows"] == 1
         await writer.rollback()
-        await observer.simple_query(
-            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
+        committed_read = await observer.simple_query(
+            f"""
+            SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+            SELECT COUNT_BIG(*) AS visible_rows FROM {table};
+            """
         )
-        assert await scalar(observer, f"SELECT COUNT(*) FROM {table}") == 0
+        committed_row = committed_read.fetchone()
+        assert committed_row is not None
+        assert committed_row["visible_rows"] == 0
     finally:
         await writer.close()
         await observer.disconnect()
