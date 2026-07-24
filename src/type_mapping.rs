@@ -2,8 +2,7 @@ use std::sync::OnceLock;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::types::{
-    PyByteArray, PyBytes, PyFrozenSet, PyList, PyMemoryView, PySet, PyString,
-    PyTuple,
+    PyByteArray, PyBytes, PyFrozenSet, PyList, PyMemoryView, PySet, PyString, PyTuple,
 };
 use pyo3::{IntoPyObjectExt, Py, PyAny, prelude::*};
 use tiberius::{ColumnType, Row};
@@ -117,8 +116,7 @@ fn handle_money(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
             // monetary amount.
             if !money_is_exactly_representable(val) {
                 return Err(ConversionError::new_err(
-                    "MONEY value exceeds the exact conversion range; "
-                        .to_owned()
+                    "MONEY value exceeds the exact conversion range; ".to_owned()
                         + "CAST the expression AS DECIMAL(19,4) in SQL",
                 ));
             }
@@ -309,8 +307,14 @@ fn handle_intn(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
     }
 
     // Check for explicit SQL NULL execution across any variant match
-    if row.try_get::<i32, usize>(index).map(|v| v.is_none()).unwrap_or(false)
-        || row.try_get::<i64, usize>(index).map(|v| v.is_none()).unwrap_or(false)
+    if row
+        .try_get::<i32, usize>(index)
+        .map(|v| v.is_none())
+        .unwrap_or(false)
+        || row
+            .try_get::<i64, usize>(index)
+            .map(|v| v.is_none())
+            .unwrap_or(false)
     {
         return Ok(py.None());
     }
@@ -332,7 +336,11 @@ fn handle_floatn(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
         return Ok((val as f64).into_pyobject(py)?.into_any().unbind());
     }
 
-    if row.try_get::<f64, usize>(index).map(|v| v.is_none()).unwrap_or(false) {
+    if row
+        .try_get::<f64, usize>(index)
+        .map(|v| v.is_none())
+        .unwrap_or(false)
+    {
         return Ok(py.None());
     }
 
@@ -416,7 +424,7 @@ pub fn is_expandable_iterable(obj: &Bound<PyAny>) -> PyResult<bool> {
     }
 
     // Dynamic fallback with string lookup tracking optimization
-    Ok(obj.hasattr(pyo3::intern!(obj.py(), "__iter__"))?)
+    obj.hasattr(pyo3::intern!(obj.py(), "__iter__"))
 }
 
 #[cfg(test)]

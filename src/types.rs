@@ -43,17 +43,12 @@ pub fn create_sql_error(err: TError, base: &'static str) -> PyErr {
         TError::Io { kind: _, message } if is_tls_io_failure(&message) => {
             create_tls_error(format!("{base}: {message}"), message)
         }
-        TError::Io { kind: _, message } => {
-            Python::attach(|py| {
-                let exc =
-                    SqlConnectionError::new_err(format!("{base}: {message}"));
-                let _ = exc.value(py).setattr("message", message.as_str());
-                exc
-            })
-        }
-        TError::Tls(message) => {
-            create_tls_error(format!("{base}: {message}"), message)
-        }
+        TError::Io { kind: _, message } => Python::attach(|py| {
+            let exc = SqlConnectionError::new_err(format!("{base}: {message}"));
+            let _ = exc.value(py).setattr("message", message.as_str());
+            exc
+        }),
+        TError::Tls(message) => create_tls_error(format!("{base}: {message}"), message),
         TError::Routing { host, port } => {
             let message = format!("server redirected to {host}:{port}");
             Python::attach(|py| {
@@ -105,10 +100,7 @@ pub fn create_connection_error(message: impl Into<String>) -> PyErr {
     })
 }
 
-fn create_tls_error(
-    rendered_message: impl Into<String>,
-    detail: impl Into<String>,
-) -> PyErr {
+fn create_tls_error(rendered_message: impl Into<String>, detail: impl Into<String>) -> PyErr {
     let rendered_message = rendered_message.into();
     let detail = detail.into();
     Python::attach(|py| {

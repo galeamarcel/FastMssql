@@ -11,8 +11,7 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 use crate::azure_auth::PyAzureCredential;
 use crate::batch::{execute_batch_on_connection, parse_batch_items, query_batch_on_connection};
 use crate::helpers::{
-    catch_driver_panic, execute_unparameterized_command, requires_direct_batch,
-    wrap_query_stream,
+    catch_driver_panic, execute_unparameterized_command, requires_direct_batch, wrap_query_stream,
 };
 use crate::parameter_conversion::{convert_parameters_to_fast, params_as_sql_refs};
 use crate::ssl_config::PySslConfig;
@@ -30,7 +29,12 @@ struct TransactionHandles {
 
 impl TransactionHandles {
     async fn ensure_connected(&self) -> PyResult<()> {
-        Transaction::ensure_connected_inner(&self.conn, &self.config, self.azure_credential.as_ref()).await
+        Transaction::ensure_connected_inner(
+            &self.conn,
+            &self.config,
+            self.azure_credential.as_ref(),
+        )
+        .await
     }
 }
 
@@ -49,6 +53,7 @@ pub struct Transaction {
 impl Transaction {
     #[new]
     #[pyo3(signature = (connection_string = None, ssl_config = None, azure_credential = None, server = None, database = None, username = None, password = None, application_intent = None, port = None, instance_name = None, application_name = None))]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         connection_string: Option<String>,
         ssl_config: Option<PySslConfig>,
@@ -185,11 +190,7 @@ impl Transaction {
     /// Execute a raw (non-prepared statement) SQL query
     /// Returns rows as QueryStream
     #[pyo3(signature = (query))]
-    pub fn simple_query<'p>(
-        &self,
-        py: Python<'p>,
-        query: String,
-    ) -> PyResult<Bound<'p, PyAny>> {
+    pub fn simple_query<'p>(&self, py: Python<'p>, query: String) -> PyResult<Bound<'p, PyAny>> {
         let handles = self.clone_handles();
 
         future_into_py(py, async move {
@@ -257,15 +258,12 @@ impl Transaction {
                         )
                         .await
                     } else {
-                        let tiberius_params =
-                            params_as_sql_refs(&fast_parameters);
+                        let tiberius_params = params_as_sql_refs(&fast_parameters);
                         conn_ref
                             .execute(&command, &tiberius_params)
                             .await
                             .map(|result| result.total())
-                            .map_err(|e| {
-                                create_sql_error(e, "Command execution failed")
-                            })
+                            .map_err(|e| create_sql_error(e, "Command execution failed"))
                     }
                 })
                 .await;
@@ -306,10 +304,8 @@ impl Transaction {
                     .as_mut()
                     .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
 
-                let operation = catch_driver_panic(
-                    execute_batch_on_connection(conn_ref, batch_commands),
-                )
-                .await;
+                let operation =
+                    catch_driver_panic(execute_batch_on_connection(conn_ref, batch_commands)).await;
                 match operation {
                     Ok(result) => result?,
                     Err(driver_panic) => {
@@ -346,10 +342,8 @@ impl Transaction {
                     .as_mut()
                     .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
 
-                let operation = catch_driver_panic(
-                    query_batch_on_connection(conn_ref, batch_queries),
-                )
-                .await;
+                let operation =
+                    catch_driver_panic(query_batch_on_connection(conn_ref, batch_queries)).await;
                 match operation {
                     Ok(result) => result?,
                     Err(driver_panic) => {
@@ -401,7 +395,12 @@ impl Transaction {
         let conn = Arc::clone(&self.conn);
 
         future_into_py(py, async move {
-            Self::execute_transaction_command(&conn, "COMMIT TRANSACTION", "Failed to commit transaction").await
+            Self::execute_transaction_command(
+                &conn,
+                "COMMIT TRANSACTION",
+                "Failed to commit transaction",
+            )
+            .await
         })
     }
 
@@ -410,7 +409,12 @@ impl Transaction {
         let conn = Arc::clone(&self.conn);
 
         future_into_py(py, async move {
-            Self::execute_transaction_command(&conn, "ROLLBACK TRANSACTION", "Failed to rollback transaction").await
+            Self::execute_transaction_command(
+                &conn,
+                "ROLLBACK TRANSACTION",
+                "Failed to rollback transaction",
+            )
+            .await
         })
     }
 
@@ -423,7 +427,9 @@ impl Transaction {
             if let Some(mut c) = conn_guard.take() {
                 // Best-effort rollback: silently ignore errors (connection may already be
                 // broken or no transaction may be active — both are fine).
-                let _ = c.simple_query("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION").await;
+                let _ = c
+                    .simple_query("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION")
+                    .await;
                 // Connection is dropped here, closing the TCP stream.
             }
             Ok(())
@@ -483,9 +489,7 @@ impl Transaction {
         if conn_guard.is_none() {
             let address = config.get_addr();
             let tcp_stream = TcpStream::connect(&address).await.map_err(|e| {
-                create_connection_error(format!(
-                    "Failed to connect to server {address}: {e}"
-                ))
+                create_connection_error(format!("Failed to connect to server {address}: {e}"))
             })?;
 
             // Disable Nagle algorithm — identical to pool connections in pool_manager.rs.

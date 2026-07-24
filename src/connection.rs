@@ -9,13 +9,12 @@ use tokio::sync::RwLock;
 use crate::azure_auth::PyAzureCredential;
 use crate::batch::{bulk_insert, execute_batch, query_batch};
 use crate::helpers::{
-    catch_driver_panic, execute_unparameterized_command, requires_direct_batch,
-    wrap_query_stream,
+    catch_driver_panic, execute_unparameterized_command, requires_direct_batch, wrap_query_stream,
 };
-use crate::parameter_conversion::{convert_parameters_to_fast, params_as_sql_refs, FastParameter};
+use crate::parameter_conversion::{FastParameter, convert_parameters_to_fast, params_as_sql_refs};
 use crate::pool_config::PyPoolConfig;
 use crate::pool_manager::{
-    ensure_pool_initialized_with_auth, ConnectionPool, PooledOperationGuard,
+    ConnectionPool, PooledOperationGuard, ensure_pool_initialized_with_auth,
 };
 use crate::ssl_config::PySslConfig;
 use crate::types::{create_connection_error, create_sql_error};
@@ -139,12 +138,7 @@ impl PyConnection {
         let mut conn = Self::get_pool_connection(pool).await?;
         let operation = catch_driver_panic(async {
             if parameters.is_empty() && requires_direct_batch(query) {
-                execute_unparameterized_command(
-                    &mut conn,
-                    query,
-                    "Command execution failed",
-                )
-                .await
+                execute_unparameterized_command(&mut conn, query, "Command execution failed").await
             } else {
                 let tiberius_params = params_as_sql_refs(parameters);
                 conn.execute(query, &tiberius_params)
@@ -244,7 +238,7 @@ impl PyConnection {
         Ok(PyConnection {
             pool: Arc::new(RwLock::new(None)),
             config: Arc::new(config),
-            pool_config: pool_config.unwrap_or_else(PyPoolConfig::default),
+            pool_config: pool_config.unwrap_or_default(),
             _ssl_config: ssl_config,
             azure_credential: azure_credential.map(Arc::new),
         })

@@ -67,9 +67,11 @@ impl PySslConfig {
 
             match path.extension().map(|e| e.to_string_lossy().to_lowercase()) {
                 Some(ref ext) if matches!(ext.as_str(), "pem" | "crt" | "cer" | "der") => {}
-                _ => return Err(PyValueError::new_err(
-                    "CA certificate file must have a .pem, .crt, .cer, or .der extension",
-                )),
+                _ => {
+                    return Err(PyValueError::new_err(
+                        "CA certificate file must have a .pem, .crt, .cer, or .der extension",
+                    ));
+                }
             }
 
             let mut file = std::fs::File::open(&path).map_err(|e| {
@@ -86,7 +88,7 @@ impl PySslConfig {
 
             if !is_pem && !is_der {
                 return Err(PyValueError::new_err(
-                    "CA certificate file does not contain valid PEM or DER certificate data."
+                    "CA certificate file does not contain valid PEM or DER certificate data.",
                 ));
             }
             Some(path)
@@ -124,14 +126,16 @@ impl PySslConfig {
                         "required" => EncryptionLevel::Required,
                         "loginonly" => EncryptionLevel::LoginOnly,
                         "off" | "disabled" => EncryptionLevel::Disabled,
-                        _ => return Err(PyValueError::new_err(format!(
-                            "Invalid encryption level '{}'. Choose from 'Required', 'LoginOnly', or 'Disabled'",
-                            level_str
-                        ))),
+                        _ => {
+                            return Err(PyValueError::new_err(format!(
+                                "Invalid encryption level '{}'. Choose from 'Required', 'LoginOnly', or 'Disabled'",
+                                level_str
+                            )));
+                        }
                     }
                 } else {
                     return Err(PyValueError::new_err(
-                        "encryption_level must be a string or an EncryptionLevel enum"
+                        "encryption_level must be a string or an EncryptionLevel enum",
                     ));
                 }
             }

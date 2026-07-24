@@ -4,8 +4,8 @@ use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{
-    PyBool, PyByteArray, PyByteArrayMethods, PyBytes, PyFloat, PyInt, PyList,
-    PyMemoryView, PyString,
+    PyBool, PyByteArray, PyByteArrayMethods, PyBytes, PyFloat, PyInt, PyList, PyMemoryView,
+    PyString,
 };
 use smallvec::SmallVec;
 
@@ -22,7 +22,7 @@ pub enum FastParameter {
     String(String),
     Bytes(Vec<u8>),
     Date(NaiveDate),
-    DateTime(NaiveDateTime)
+    DateTime(NaiveDateTime),
 }
 
 impl tiberius::ToSql for FastParameter {
@@ -35,7 +35,7 @@ impl tiberius::ToSql for FastParameter {
             FastParameter::String(s) => s.to_sql(),
             FastParameter::Bytes(b) => b.to_sql(),
             FastParameter::Date(d) => d.to_sql(),
-            FastParameter::DateTime(dt) => dt.to_sql()
+            FastParameter::DateTime(dt) => dt.to_sql(),
         }
     }
 }
@@ -47,7 +47,7 @@ pub fn python_to_fast_parameter(obj: &Bound<PyAny>) -> PyResult<FastParameter> {
 
     // Typed nulls
     if let Ok(tn) = obj.extract::<TypedNull>() {
-        return Ok(FastParameter::Null(tn))
+        return Ok(FastParameter::Null(tn));
     }
 
     if let Ok(py_i) = obj.cast::<PyInt>() {
@@ -57,7 +57,8 @@ pub fn python_to_fast_parameter(obj: &Bound<PyAny>) -> PyResult<FastParameter> {
             .map_err(|_| PyValueError::new_err("Int too large"));
     }
     if let Ok(py_s) = obj.cast::<PyString>() {
-        let s = py_s.to_str()
+        let s = py_s
+            .to_str()
             .map_err(|_| PyValueError::new_err("String parameter contains invalid UTF-8"))?;
         return Ok(FastParameter::String(s.to_owned()));
     }
@@ -174,11 +175,15 @@ fn python_params_to_fast_parameters(
 }
 
 /// Expand a Python iterable into individual FastParameter objects with minimal allocations.
-/// 
+///
 /// **IMPORTANT**: The `remaining` parameter enforces a hard limit on expansion to prevent DoS attacks
 /// from generators that could otherwise yield unlimited items. This function will short-circuit
 /// and return an error if the remaining budget is exhausted before the iterator is consumed.
-fn expand_iterable_to_fast_params<T>(iterable: &Bound<PyAny>, result: &mut T, mut remaining: usize) -> PyResult<()>
+fn expand_iterable_to_fast_params<T>(
+    iterable: &Bound<PyAny>,
+    result: &mut T,
+    mut remaining: usize,
+) -> PyResult<()>
 where
     T: Extend<FastParameter>,
 {
@@ -189,7 +194,7 @@ where
         for item in list.iter() {
             if remaining == 0 {
                 return Err(PyValueError::new_err(
-                    "Parameter expansion exceeded FastMssql limit of 2,098 user parameters per query"
+                    "Parameter expansion exceeded FastMssql limit of 2,098 user parameters per query",
                 ));
             }
             let param = python_to_fast_parameter(&item)?;
@@ -203,7 +208,7 @@ where
         for item in tuple.iter() {
             if remaining == 0 {
                 return Err(PyValueError::new_err(
-                    "Parameter expansion exceeded FastMssql limit of 2,098 user parameters per query"
+                    "Parameter expansion exceeded FastMssql limit of 2,098 user parameters per query",
                 ));
             }
             let param = python_to_fast_parameter(&item)?;
@@ -225,7 +230,7 @@ where
             Ok(item) => {
                 if remaining == 0 {
                     return Err(PyValueError::new_err(
-                        "Parameter expansion exceeded FastMssql limit of 2,098 user parameters per query"
+                        "Parameter expansion exceeded FastMssql limit of 2,098 user parameters per query",
                     ));
                 }
                 batch.push(python_to_fast_parameter(&item)?);
@@ -256,8 +261,8 @@ where
 }
 
 /// Class to store a typed null value
-/// 
-/// This is required as some SQL Server features such as stored procedures etc. sometimes require type information for which is 
+///
+/// This is required as some SQL Server features such as stored procedures etc. sometimes require type information for which is
 /// not possible for nulls when just using `None`. In such cases, SQL Server will complain about being unable to cast 'tinyint'
 /// to the desired data type.
 #[pyclass(name = "TypedNull", from_py_object)]
@@ -280,7 +285,7 @@ pub enum TypedNull {
     Time,
     Date,
     DateTime2,
-    DateTimeOffset
+    DateTimeOffset,
 }
 
 impl tiberius::ToSql for TypedNull {

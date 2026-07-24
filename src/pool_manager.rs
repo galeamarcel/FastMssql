@@ -109,9 +109,7 @@ impl From<PoolConnectionError> for pyo3::PyErr {
             PoolConnectionError::Io {
                 source,
                 address: Some(address),
-            } => create_connection_error(format!(
-                "I/O error connecting to {address}: {source}"
-            )),
+            } => create_connection_error(format!("I/O error connecting to {address}: {source}")),
             PoolConnectionError::Io {
                 source,
                 address: None,

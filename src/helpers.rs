@@ -20,9 +20,7 @@ where
     F: Future<Output = T>,
 {
     AssertUnwindSafe(future).catch_unwind().await.map_err(|_| {
-        create_protocol_error(
-            "SQL Server driver could not decode SQL Server result metadata",
-        )
+        create_protocol_error("SQL Server driver could not decode SQL Server result metadata")
     })
 }
 
