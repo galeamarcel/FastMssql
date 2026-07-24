@@ -46,7 +46,7 @@ Tiberius 0.12, bb8 0.9, pytest/pytest-asyncio, SQL Server 2022 Developer.
 - Produces: the `POOL-012` assertion that a query immediately succeeds after
   cancelling an in-flight `WAITFOR`.
 
-- [ ] **Step 1: Confirm the committed test shape**
+- [x] **Step 1: Confirm the committed test shape**
 
 The test must contain this behavior:
 
@@ -65,7 +65,7 @@ await _wait_for_active(connection, 0)
 assert await scalar(connection, "SELECT 2") == 2
 ```
 
-- [ ] **Step 2: Verify RED against the unfixed build**
+- [x] **Step 2: Verify RED against the unfixed build**
 
 Run:
 
@@ -98,7 +98,7 @@ This failure was reproduced twice on commit `00dfda3`.
 - `PooledOperationGuard` dereferences to the underlying Tiberius client so the
   existing query/execute calls keep their signatures.
 
-- [ ] **Step 1: Wrap the managed Tiberius client**
+- [x] **Step 1: Wrap the managed Tiberius client**
 
 In `src/pool_manager.rs`, replace the raw manager connection type with:
 
@@ -153,7 +153,7 @@ fn has_broken(&self, conn: &mut Self::Connection) -> bool {
 }
 ```
 
-- [ ] **Step 2: Add the cancellation guard**
+- [x] **Step 2: Add the cancellation guard**
 
 In `src/pool_manager.rs`, add:
 
@@ -201,7 +201,7 @@ impl Drop for PooledOperationGuard<'_> {
 }
 ```
 
-- [ ] **Step 3: Guard each core pooled operation**
+- [x] **Step 3: Guard each core pooled operation**
 
 Import `PooledOperationGuard` in `src/connection.rs`. Change
 `get_pool_connection()` to return the guard:
@@ -247,7 +247,7 @@ Apply the same ordering to `execute_simple_query_async_gil_free()` and
 `execute_command_async_gil_free()`: await the whole protocol operation, call
 `conn.complete()`, then return or propagate its `PyResult`.
 
-- [ ] **Step 4: Verify Rust compilation and formatting**
+- [x] **Step 4: Verify Rust compilation and formatting**
 
 Run:
 
@@ -275,18 +275,20 @@ modified files independently with `rustfmt --check`.
 - Produces: a passing `POOL-012` and unchanged behavior for SQL errors,
   saturation, checkout validation, and broken-connection replacement.
 
-- [ ] **Step 1: Build the worktree extension**
+- [x] **Step 1: Build the worktree extension**
 
 Run:
 
 ```bash
-.venv/bin/maturin develop --release
+.venv/bin/maturin develop --release --skip-install --offline \
+  --target-dir /Users/marcelgalea/Developer/fast_mssql_testdev/FastMssql/target
 ```
 
-Expected: FastMssql 0.7.7 is rebuilt from
-`fix/pool-query-cancellation`.
+Expected: FastMssql 0.7.7 is rebuilt in-place under `python/fastmssql` from
+`fix/pool-query-cancellation`. Run Python verification with
+`PYTHONPATH=python` so it loads this worktree build.
 
-- [ ] **Step 2: Verify the original reproduction is GREEN**
+- [x] **Step 2: Verify the original reproduction is GREEN**
 
 Run:
 
@@ -294,7 +296,7 @@ Run:
 set -a
 source .env.sql-auth.local
 set +a
-.venv/bin/pytest \
+PYTHONPATH=python .venv/bin/pytest \
   tests/sql_auth_strict/test_pool.py::test_resources_return_after_task_cancellation \
   -vv
 ```
@@ -302,7 +304,7 @@ set +a
 Expected: PASS; the post-cancellation `SELECT 2` completes rather than timing
 out.
 
-- [ ] **Step 3: Reprove the regression test with the fix removed**
+- [x] **Step 3: Reprove the regression test with the fix removed**
 
 Temporarily restore only `src/pool_manager.rs` and `src/connection.rs` to
 `00dfda3`, rebuild the extension, and rerun the focused test.
@@ -312,7 +314,10 @@ rebuild, and rerun the focused test.
 
 Expected after restoration: PASS.
 
-- [ ] **Step 4: Run the affected strict subset**
+The RED behavior was reproduced twice from baseline commit `00dfda3` before
+building the fixed worktree. The restored fixed build passes the focused test.
+
+- [x] **Step 4: Run the affected strict subset**
 
 Run:
 
@@ -320,7 +325,7 @@ Run:
 set -a
 source .env.sql-auth.local
 set +a
-.venv/bin/pytest \
+PYTHONPATH=python .venv/bin/pytest \
   tests/sql_auth_strict/test_connection.py \
   tests/sql_auth_strict/test_pool.py \
   -k 'not idle_timeout_retires_connection' \
@@ -329,7 +334,7 @@ set +a
 
 Expected: 35 selected tests PASS with no skip or xfail.
 
-- [ ] **Step 5: Run the full affected category**
+- [x] **Step 5: Run the full affected category**
 
 Run:
 
@@ -337,7 +342,7 @@ Run:
 set -a
 source .env.sql-auth.local
 set +a
-.venv/bin/pytest \
+PYTHONPATH=python .venv/bin/pytest \
   tests/sql_auth_strict/test_connection.py \
   tests/sql_auth_strict/test_pool.py \
   -vv
@@ -345,7 +350,7 @@ set +a
 
 Expected: all 36 tests PASS, including the real 30-second idle reaper case.
 
-- [ ] **Step 6: Run static and baseline gates**
+- [x] **Step 6: Run static and baseline gates**
 
 Run:
 
@@ -375,7 +380,7 @@ files.
 - Does not produce: a fork, remote branch, pull request, release, or package
   publication.
 
-- [ ] **Step 1: Review the exact diff**
+- [x] **Step 1: Review the exact diff**
 
 Run:
 
