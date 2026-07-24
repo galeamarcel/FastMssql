@@ -43,9 +43,31 @@ def _connection(
     )
 
 
-def test_event_loop_gap_contract_accepts_fast_workload() -> None:
-    ticks = [0.010, 0.020, 0.030, 0.040]
-    assert max_event_loop_gap(0.0, 0.045, ticks) == pytest.approx(0.010)
+@pytest.mark.parametrize(
+    ("finished", "ticks", "expected_responsive"),
+    [
+        pytest.param(
+            0.045,
+            [0.010, 0.020, 0.030, 0.040],
+            True,
+            id="fast-workload",
+        ),
+        pytest.param(0.500, [], False, id="starvation-boundary"),
+        pytest.param(
+            1.000,
+            [-1.000, 0.100, 0.900, 2.000],
+            False,
+            id="out-of-window-ticks",
+        ),
+    ],
+)
+def test_event_loop_gap_contract(
+    finished: float,
+    ticks: list[float],
+    expected_responsive: bool,
+) -> None:
+    gap = max_event_loop_gap(0.0, finished, ticks)
+    assert (gap < 0.5) is expected_responsive
 
 
 async def _wait_for_active(
@@ -415,8 +437,6 @@ async def test_concurrent_result_conversion_has_bounded_loop_stalls(
     connection = _connection(sql_auth_config, max_size=4)
     stop = asyncio.Event()
     ticker = asyncio.create_task(event_loop_ticks(stop, interval=0.01))
-    await asyncio.sleep(0)
-    started = time.monotonic()
 
     async def query_and_convert(seed: int) -> tuple[int, int]:
         result = await connection.query(
@@ -439,6 +459,8 @@ async def test_concurrent_result_conversion_has_bounded_loop_stalls(
         return seed, len(rows)
 
     try:
+        await asyncio.sleep(0)
+        started = time.monotonic()
         outcomes = await asyncio.gather(
             *(query_and_convert(seed) for seed in range(4))
         )
