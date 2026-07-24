@@ -97,3 +97,4 @@ override.tf.json
 # Local SQL-auth integration environment
 .env.sql-auth.local
 .artifacts/sql-auth/
+.worktrees/
