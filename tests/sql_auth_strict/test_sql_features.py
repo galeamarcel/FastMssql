@@ -419,27 +419,58 @@ async def test_stored_procedure_return_status(
     cleanup_registry: CleanupRegistry,
 ) -> None:
     procedure = quote_identifier(unique_sql_name("strict_return_proc"))
+    table = quote_identifier(unique_sql_name("strict_proc_dml"))
     cleanup_registry.add(f"DROP PROCEDURE IF EXISTS {procedure}")
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
+    await owner_connection.execute(
+        f"""
+        CREATE TABLE {table} (
+            id INT PRIMARY KEY,
+            value NVARCHAR(100) NOT NULL
+        )
+        """
+    )
     await owner_connection.simple_query(
         f"""
         CREATE PROCEDURE {procedure}
+            @id INT,
+            @value NVARCHAR(100)
         AS
         BEGIN
+            SET NOCOUNT ON;
+            INSERT INTO {table} (id, value) VALUES (@id, @value);
             RETURN 37;
         END
         """
     )
+
+    affected = await owner_connection.execute(
+        f"EXEC {procedure} @id = @P1, @value = @P2",
+        [1, "fără set de rezultate"],
+    )
+    assert affected == 0
+    assert (
+        await scalar(
+            owner_connection,
+            f"SELECT value FROM {table} WHERE id = @P1",
+            [1],
+        )
+        == "fără set de rezultate"
+    )
+
     assert (
         await scalar(
             owner_connection,
             f"""
             DECLARE @status INT;
-            EXEC @status = {procedure};
+            EXEC @status = {procedure} @id = @P1, @value = @P2;
             SELECT @status AS return_status;
             """,
+            [2, "status capturat"],
         )
         == 37
     )
+    assert await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}") == 2
 
 
 @case("SQL-019")
