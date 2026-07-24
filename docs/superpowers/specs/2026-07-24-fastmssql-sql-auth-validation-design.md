@@ -455,6 +455,16 @@ numbers are recorded because AMD64 emulation can add host-specific variance.
 - `LOAD-005`: rapid lifecycle operations do not grow SQL sessions.
 - `LOAD-006`: mixed query/execute/transaction workload.
 - `LOAD-007`: post-load smoke query proves recovery.
+- `LOAD-008`: concurrent write transactions use independent SQL sessions,
+  overlap in time, and preserve exact commit/rollback state.
+
+The required `LOAD-008` gate runs 1,000 transactions at concurrency 50. An
+explicit, opt-in transaction stress harness additionally runs 10,000 and
+99,999 total transactions at bounded concurrency. The extended harness is not
+part of the default runner because it is an endurance diagnostic whose timing
+depends on host and container resources; it must still preserve exact database
+state, leave no application sessions, keep the event loop responsive, and emit
+machine-readable metrics.
 
 ### FRAME — framework integration
 

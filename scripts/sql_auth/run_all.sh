@@ -104,6 +104,7 @@ record resilience \
 
 record load \
   env FASTMSSQL_SQL_AUTH_RESULTS_PATH="${artifact_dir}/load-results.json" \
+  FASTMSSQL_LOAD_METRICS_PATH="${artifact_dir}/load-metrics.json" \
   uv run pytest tests/sql_auth_strict/test_resilience_load.py \
   -m load --junitxml="${artifact_dir}/load.xml" -vv
 
