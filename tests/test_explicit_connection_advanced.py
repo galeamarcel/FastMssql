@@ -151,25 +151,25 @@ async def test_execute_without_explicit_connect(test_config: Config):
     try:
         conn = Connection(test_config.connection_string)
 
-        # Create temp table without explicit connect
+        # Create an isolated test table without explicit connect
         await conn.execute("""
-            IF OBJECT_ID('tempdb..##noconnect', 'U') IS NOT NULL
-                DROP TABLE ##noconnect
+            IF OBJECT_ID('dbo.fm_noconnect', 'U') IS NOT NULL
+                DROP TABLE dbo.fm_noconnect
         """)
 
         await conn.execute("""
-            CREATE TABLE ##noconnect (id INT)
+            CREATE TABLE dbo.fm_noconnect (id INT)
         """)
 
-        result = await conn.execute("INSERT INTO ##noconnect VALUES (@P1)", [42])
+        result = await conn.execute("INSERT INTO dbo.fm_noconnect VALUES (@P1)", [42])
         assert result == 1
 
         # Verify
-        result = await conn.query("SELECT * FROM ##noconnect")
+        result = await conn.query("SELECT * FROM dbo.fm_noconnect")
         assert result.rows()[0]["id"] == 42
 
         # Cleanup
-        await conn.execute("DROP TABLE ##noconnect")
+        await conn.execute("DROP TABLE dbo.fm_noconnect")
     except Exception as e:
         pytest.fail(f"Database not available: {e}")
 
@@ -362,12 +362,12 @@ async def test_query_batch_with_explicit_connect(test_config: Config):
 
         # Create table without explicit connect (lazy init)
         await conn.execute("""
-            IF OBJECT_ID('tempdb..##batch_explicit', 'U') IS NOT NULL
-                DROP TABLE ##batch_explicit
+            IF OBJECT_ID('dbo.fm_batch_explicit', 'U') IS NOT NULL
+                DROP TABLE dbo.fm_batch_explicit
         """)
 
         await conn.execute("""
-            CREATE TABLE ##batch_explicit (id INT, value VARCHAR(50))
+            CREATE TABLE dbo.fm_batch_explicit (id INT, value VARCHAR(50))
         """)
 
         # Explicit connect
@@ -375,8 +375,8 @@ async def test_query_batch_with_explicit_connect(test_config: Config):
 
         # Execute batch
         batch_items = [
-            ("INSERT INTO ##batch_explicit VALUES (@P1, @P2)", [1, "one"]),
-            ("INSERT INTO ##batch_explicit VALUES (@P1, @P2)", [2, "two"]),
+            ("INSERT INTO dbo.fm_batch_explicit VALUES (@P1, @P2)", [1, "one"]),
+            ("INSERT INTO dbo.fm_batch_explicit VALUES (@P1, @P2)", [2, "two"]),
         ]
 
         results = await conn.execute_batch(batch_items)
@@ -384,15 +384,15 @@ async def test_query_batch_with_explicit_connect(test_config: Config):
 
         # Verify with batch query
         query_batch = [
-            ("SELECT * FROM ##batch_explicit WHERE id = @P1", [1]),
-            ("SELECT * FROM ##batch_explicit WHERE id = @P1", [2]),
+            ("SELECT * FROM dbo.fm_batch_explicit WHERE id = @P1", [1]),
+            ("SELECT * FROM dbo.fm_batch_explicit WHERE id = @P1", [2]),
         ]
 
         query_results = await conn.query_batch(query_batch)
         assert len(query_results) == 2
 
         # Cleanup before disconnect
-        await conn.execute("DROP TABLE ##batch_explicit")
+        await conn.execute("DROP TABLE dbo.fm_batch_explicit")
 
         # Disconnect
         await conn.disconnect()
@@ -432,12 +432,12 @@ async def test_bulk_insert_with_explicit_connect(test_config: Config):
 
         # Create table
         await conn.execute("""
-            IF OBJECT_ID('tempdb..##bulk_explicit', 'U') IS NOT NULL
-                DROP TABLE ##bulk_explicit
+            IF OBJECT_ID('dbo.fm_bulk_explicit', 'U') IS NOT NULL
+                DROP TABLE dbo.fm_bulk_explicit
         """)
 
         await conn.execute("""
-            CREATE TABLE ##bulk_explicit (id INT, value VARCHAR(50))
+            CREATE TABLE dbo.fm_bulk_explicit (id INT, value VARCHAR(50))
         """)
 
         # Explicit connect
@@ -446,14 +446,14 @@ async def test_bulk_insert_with_explicit_connect(test_config: Config):
         # Bulk insert
         rows = [[i, f"row_{i}"] for i in range(1, 6)]
 
-        await conn.bulk_insert("##bulk_explicit", ["id", "value"], rows)
+        await conn.bulk_insert("dbo.fm_bulk_explicit", ["id", "value"], rows)
 
         # Verify
-        result = await conn.query("SELECT COUNT(*) as cnt FROM ##bulk_explicit")
+        result = await conn.query("SELECT COUNT(*) as cnt FROM dbo.fm_bulk_explicit")
         assert result.rows()[0]["cnt"] == 5
 
         # Cleanup before disconnect
-        await conn.execute("DROP TABLE ##bulk_explicit")
+        await conn.execute("DROP TABLE dbo.fm_bulk_explicit")
 
         await conn.disconnect()
     except Exception as e:
