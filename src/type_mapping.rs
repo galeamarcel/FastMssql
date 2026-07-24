@@ -8,6 +8,8 @@ use pyo3::types::{
 use pyo3::{IntoPyObjectExt, Py, PyAny, prelude::*};
 use tiberius::{ColumnType, Row};
 
+use crate::types::ConversionError;
+
 /// Cached handle to `decimal.Decimal` — imported once, reused for every row.
 /// Stored as `Option` to allow initialization via `get_or_init()` with fallible closure.
 static DECIMAL_CLASS: OnceLock<Option<Py<PyAny>>> = OnceLock::new();
@@ -100,12 +102,27 @@ fn handle_binary(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
     }
 }
 
+#[inline]
+fn money_is_exactly_representable(value: f64) -> bool {
+    value.abs() <= 900_719_925_474.099_1_f64
+}
+
 #[inline(always)]
 fn handle_money(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
     match row.try_get::<f64, usize>(index) {
         Ok(Some(val)) => {
+            // Tiberius 0.12 decodes MONEY through f64. Above this magnitude,
+            // adjacent 0.0001 fixed-point values are no longer distinguishable,
+            // so returning Decimal would silently report a potentially different
+            // monetary amount.
+            if !money_is_exactly_representable(val) {
+                return Err(ConversionError::new_err(
+                    "MONEY value exceeds the exact conversion range; "
+                        .to_owned()
+                        + "CAST the expression AS DECIMAL(19,4) in SQL",
+                ));
+            }
             let decimal_class = get_decimal_class(py)?;
-            // Avoids floating-point math traps by formatting via string conversion directly
             let s = format!("{:.4}", val);
             Ok(decimal_class.call1((s,))?.unbind())
         }
@@ -217,7 +234,7 @@ fn handle_time(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
 
 #[inline(always)]
 fn handle_datetimeoffset(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
-    match row.try_get::<chrono::DateTime<chrono::Utc>, usize>(index) {
+    match row.try_get::<chrono::DateTime<chrono::FixedOffset>, usize>(index) {
         Ok(Some(val)) => Ok(val.into_py_any(py)?),
         Ok(None) => Ok(py.None()),
         Err(_) => Err(PyValueError::new_err(format!(
@@ -400,4 +417,17 @@ pub fn is_expandable_iterable(obj: &Bound<PyAny>) -> PyResult<bool> {
 
     // Dynamic fallback with string lookup tracking optimization
     Ok(obj.hasattr(pyo3::intern!(obj.py(), "__iter__"))?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::money_is_exactly_representable;
+
+    #[test]
+    fn money_precision_guard_matches_f64_integer_boundary() {
+        assert!(money_is_exactly_representable(900_719_925_474.099_1));
+        assert!(money_is_exactly_representable(-900_719_925_474.099_1));
+        assert!(!money_is_exactly_representable(922_337_203_685_477.6));
+        assert!(!money_is_exactly_representable(-922_337_203_685_477.6));
+    }
 }

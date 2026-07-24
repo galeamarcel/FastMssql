@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import tracemalloc
 
-from fastmssql import Connection, FastRow, QueryStream
+from fastmssql import Connection, FastRow, ProtocolError, QueryStream
 import pytest
 
 from sql_auth_strict.cases import case
@@ -249,16 +249,16 @@ async def test_stream_is_sync_not_async_iterable(
 
 @case("RESULT-015")
 @pytest.mark.asyncio
-async def test_lazy_conversion_and_python_memory_growth_are_measured(
+async def test_unsupported_metadata_and_python_memory_growth_are_measured(
     owner_connection: Connection,
 ) -> None:
-    lazy_result = await owner_connection.query(
-        "SELECT hierarchyid::Parse('/1/') AS unsupported_value"
-    )
-    assert isinstance(lazy_result, QueryStream)
-    assert lazy_result.len() == 1
-    with pytest.raises(ValueError, match="Failed to convert column"):
-        lazy_result.fetchone()
+    with pytest.raises(
+        ProtocolError,
+        match="driver could not decode SQL Server result metadata",
+    ):
+        await owner_connection.query(
+            "SELECT hierarchyid::Parse('/1/') AS unsupported_value"
+        )
 
     tracemalloc.start()
     try:

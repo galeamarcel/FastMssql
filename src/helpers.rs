@@ -1,11 +1,30 @@
+use futures_util::FutureExt;
 use pyo3::prelude::*;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use tiberius::{Client, Row};
 use tokio::net::TcpStream;
 use tokio_util::compat::Compat;
 
-use crate::types::create_sql_error;
+use crate::types::{create_protocol_error, create_sql_error};
 
 type SqlClient = Client<Compat<TcpStream>>;
+
+/// Convert panics in the SQL Server driver into a stable Python exception.
+///
+/// Tiberius 0.12 still uses `todo!()` for metadata belonging to SQL_VARIANT
+/// and UDT-backed SQL Server types. A query supplied by an application must
+/// never leak that dependency panic through the Python API.
+pub async fn catch_driver_panic<F, T>(future: F) -> Result<T, PyErr>
+where
+    F: Future<Output = T>,
+{
+    AssertUnwindSafe(future).catch_unwind().await.map_err(|_| {
+        create_protocol_error(
+            "SQL Server driver could not decode SQL Server result metadata",
+        )
+    })
+}
 
 /// Return the first SQL keyword while ignoring whitespace and leading comments.
 fn first_sql_keyword(mut sql: &str) -> Option<&str> {
