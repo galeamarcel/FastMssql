@@ -22,6 +22,16 @@ class Config:
     def asdict(self):
         return vars(self)
 
+    def individual_connection_options(self):
+        """Return endpoint and SQL-auth fields without a connection string."""
+        return {
+            "username": self.username,
+            "password": self.password,
+            "server": self.server,
+            "port": self.port,
+            "database": self.database,
+        }
+
 
 @pytest.fixture(scope="session")
 def test_config():
