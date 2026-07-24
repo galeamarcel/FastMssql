@@ -1985,15 +1985,17 @@ git add docs/SQL_AUTH_TEST_MATRIX.md docs/SQL_AUTH_TEST_REPORT.md
 git commit -m "docs: record framework SQL auth evidence"
 ```
 
-- [ ] **Step 7: Stop at the publication gate**
+- [ ] **Step 7: Publish the validated branch only to the user's fork**
 
 Report:
 
 ```text
 local branch: test/sql-auth-validation
 upstream push: DISABLED
-publication target: user's fork as origin, only after explicit approval
+publication target: https://github.com/galeamarcel/FastMssql.git
 ```
 
-Do not create a fork, push a branch, open a pull request, or publish a package
-as part of this task.
+The user has explicitly instructed that all validated branches and commits be
+published to `origin`. Push only to that remote. Do not push to `upstream`, open
+a pull request against the original repository, or publish a package as part of
+this task.
