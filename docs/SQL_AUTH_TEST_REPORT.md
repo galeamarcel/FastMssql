@@ -12,7 +12,7 @@
 - Python: `3.13.14`
 - Platform: `macOS-26.5-arm64-arm-64bit-Mach-O`
 - Machine: `arm64`
-- Git commit: `0869d85840d5df8907da8f759d05631a6c605dd1`
+- Git commit: `9e9c7843684653beeb0c3c1241a4f2e2674fbc9b`
 
 ## Matrix outcomes
 
@@ -28,7 +28,7 @@
 
 | Lane | Exit code | Tests | Failures | Errors | Skipped | Command |
 |---|---:|---:|---:|---:|---:|---|
-| async | 0 | 13 | 0 | 0 | 0 | env FASTMSSQL_SQL_AUTH_RESULTS_PATH=/Users/marcelgalea/Developer/fast_mssql_testdev/FastMssql/.artifacts/sql-auth/async-results.json uv run pytest tests/sql_auth_strict/test_async_strict.py --junitxml=/Users/marcelgalea/Developer/fast_mssql_testdev/FastMssql/.artifacts/sql-auth/async.xml -vv |
+| async | 0 | 16 | 0 | 0 | 0 | env FASTMSSQL_SQL_AUTH_RESULTS_PATH=/Users/marcelgalea/Developer/fast_mssql_testdev/FastMssql/.artifacts/sql-auth/async-results.json uv run pytest tests/sql_auth_strict/test_async_strict.py --junitxml=/Users/marcelgalea/Developer/fast_mssql_testdev/FastMssql/.artifacts/sql-auth/async.xml -vv |
 | cargo-clippy | 0 | 0 | 0 | 0 | 0 | cargo clippy --all-targets -- -D warnings |
 | cargo-fmt | 0 | 0 | 0 | 0 | 0 | cargo fmt --check |
 | cargo-test | 0 | 0 | 0 | 0 | 0 | cargo test |
@@ -68,24 +68,24 @@ None recorded.
 |---|---|
 | `FRAME-001` | {"versions": {"asgi-lifespan": "2.1.0", "asgiref": "3.12.1", "fastapi": "0.139.2", "flask": "3.1.3", "httpx": "0.28.1"}} |
 | `FRAME-003` | {"principals": {"FastAPI/native ASGI": "fastmssql_owner", "Flask/WSGI": "fastmssql_owner", "Flask/WsgiToAsgi": "fastmssql_owner"}} |
-| `FRAME-009` | {"concurrent_seconds": 1.023163750069216, "ratio": 0.25327730012066235, "sequential_seconds": 4.039697792031802} |
+| `FRAME-009` | {"concurrent_seconds": 1.0206859579775482, "ratio": 0.2525744349855128, "sequential_seconds": 4.0411293329671025} |
 | `FRAME-010` | {"ticker_count": 48} |
-| `FRAME-011` | {"cancellation_seconds": 0.00026766699738800526, "pool_after": {"active_connections": 0, "connected": true, "connections": 1, "idle_connections": 1, "max_size": 4, "min_idle": 0}} |
-| `FRAME-015` | {"distinct_request_loops": true, "loop_ids": [4474263264, 4474262352]} |
-| `FRAME-016` | {"concurrent": [0, 1, 2, 3], "concurrent_seconds": 1.023506083060056, "sequential": [0, 1, 2, 3], "sequential_seconds": 4.0343789170729} |
-| `FRAME-017` | {"elapsed_seconds": 2.0227866660570726, "execution_model": "WSGI worker-bound", "requests": 4} |
-| `FRAME-021` | {"loop_id": 4474271776, "persistent_loop": true} |
-| `FRAME-022` | {"elapsed_seconds": 8.044030874967575, "execution_model": "persistent ASGI loop around Flask/WSGI", "requests": 4} |
-| `FRAME-023` | {"cancellation_seconds": 0.0003209169954061508, "pool_after": {"active_connections": 0, "connected": true, "connections": 1, "idle_connections": 1, "max_size": 4, "min_idle": 0}, "recovery_bound_seconds": 3.5} |
+| `FRAME-011` | {"cancellation_seconds": 0.00014154193922877312, "pool_after": {"active_connections": 0, "connected": true, "connections": 1, "idle_connections": 1, "max_size": 4, "min_idle": 0}} |
+| `FRAME-015` | {"distinct_request_loops": true, "loop_ids": [4504082448, 4504081536]} |
+| `FRAME-016` | {"concurrent": [0, 1, 2, 3], "concurrent_seconds": 1.024201957974583, "sequential": [0, 1, 2, 3], "sequential_seconds": 4.028606791049242} |
+| `FRAME-017` | {"elapsed_seconds": 2.0272157079307362, "execution_model": "WSGI worker-bound", "requests": 4} |
+| `FRAME-021` | {"loop_id": 4504090960, "persistent_loop": true} |
+| `FRAME-022` | {"elapsed_seconds": 8.053353833034635, "execution_model": "persistent ASGI loop around Flask/WSGI", "requests": 4} |
+| `FRAME-023` | {"cancellation_seconds": 0.00037587492261081934, "pool_after": {"active_connections": 0, "connected": true, "connections": 1, "idle_connections": 1, "max_size": 4, "min_idle": 0}, "recovery_bound_seconds": 3.5} |
 
 ## Load metrics
 
 | Case | Metrics |
 |---|---|
-| `LOAD-001` | {"elapsed_seconds": 0.2612368749687448, "queries_per_second": 3827.943509581651} |
-| `LOAD-002` | {"python_current_bytes": 1592592, "python_peak_bytes": 4793748, "rss_after_bytes": 78954496, "rss_before_bytes": 57425920} |
+| `LOAD-001` | {"elapsed_seconds": 0.2104194170096889, "queries_per_second": 4752.413129031502} |
+| `LOAD-002` | {"python_current_bytes": 1592592, "python_peak_bytes": 4793748, "rss_after_bytes": 78364672, "rss_before_bytes": 57131008} |
 | `LOAD-003` | {"python_current_bytes": 49944, "python_peak_bytes": 63776, "samples_bytes": [49448, 49544, 49576, 49608, 49640, 49704, 49736, 49768, 49800, 49896]} |
-| `LOAD-004` | {"elapsed_by_size": {"1": 0.011421457980759442, "100": 0.009556124918162823, "1000": 0.12024766707327217, "10000": 0.36108162498567253}} |
-| `LOAD-005` | {"baseline_sessions": 0, "elapsed_seconds": 1.6611479580169544, "final_sessions": 0} |
-| `LOAD-006` | {"elapsed_seconds": 0.451696207979694, "operation_count": 500} |
-| `LOAD-008` | {"concurrency": 50, "distinct_session_count": 28, "elapsed_seconds": 1.9460541669977829, "transaction_count": 1000, "transactions_per_second": 513.860311269095} |
+| `LOAD-004` | {"elapsed_by_size": {"1": 0.01013870898168534, "100": 0.01725437503773719, "1000": 0.11684270796831697, "10000": 0.3548761249985546}} |
+| `LOAD-005` | {"baseline_sessions": 0, "elapsed_seconds": 1.5438557910965756, "final_sessions": 0} |
+| `LOAD-006` | {"elapsed_seconds": 0.30586324993055314, "operation_count": 500} |
+| `LOAD-008` | {"concurrency": 50, "distinct_session_count": 35, "elapsed_seconds": 1.5927332499995828, "transaction_count": 1000, "transactions_per_second": 627.8515250436707} |
