@@ -172,6 +172,52 @@ def test_report_generator_preserves_not_run_and_redacts(
     assert "0.25" in report
 
 
+def test_report_generator_can_require_complete_evidence(
+    tmp_path: Path,
+) -> None:
+    generator = ROOT / "scripts/sql_auth/generate_report.py"
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    strict_results = artifact_dir / "strict-results.json"
+    strict_results.write_text(
+        json.dumps({"schema_version": 1, "cases": {}}),
+        encoding="utf-8",
+    )
+    matrix_output = tmp_path / "matrix.md"
+    report_output = tmp_path / "report.md"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(generator),
+            "--spec",
+            str(
+                ROOT
+                / "docs/superpowers/specs/"
+                "2026-07-24-fastmssql-sql-auth-validation-design.md"
+            ),
+            "--strict-results",
+            str(strict_results),
+            "--artifact-dir",
+            str(artifact_dir),
+            "--matrix-output",
+            str(matrix_output),
+            "--report-output",
+            str(report_output),
+            "--require-complete",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 1
+    assert "missing evidence for 250 case(s)" in completed.stderr
+    assert matrix_output.is_file()
+    assert report_output.is_file()
+    assert "| NOT RUN | 250 |" in report_output.read_text(encoding="utf-8")
+
+
 def test_config_redacts_password(monkeypatch) -> None:
     monkeypatch.setenv(
         "FASTMSSQL_SQL_AUTH_OWNER_PASSWORD", "NeverPrintMe_2026!"
@@ -239,6 +285,39 @@ def test_every_case_id_occurs_in_exactly_one_test_source() -> None:
     assert {
         case_id: count for case_id, count in occurrences.items() if count != 1
     } == {}
+
+
+def test_resilience_and_load_cases_are_routed_to_their_runner_lanes() -> None:
+    path = ROOT / "tests/sql_auth_strict/test_resilience_load.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    incorrectly_routed: dict[str, str] = {}
+
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        decorators = {ast.unparse(decorator) for decorator in node.decorator_list}
+        case_ids = {
+            argument.value
+            for decorator in node.decorator_list
+            if isinstance(decorator, ast.Call)
+            and isinstance(decorator.func, ast.Name)
+            and decorator.func.id == "case"
+            for argument in decorator.args
+            if isinstance(argument, ast.Constant)
+            and isinstance(argument.value, str)
+        }
+        for case_id in case_ids:
+            expected_marker = (
+                "pytest.mark.resilience"
+                if case_id.startswith("RES-")
+                else "pytest.mark.load"
+                if case_id.startswith("LOAD-")
+                else ""
+            )
+            if expected_marker and expected_marker not in decorators:
+                incorrectly_routed[case_id] = node.name
+
+    assert incorrectly_routed == {}
 
 
 def test_strict_tests_do_not_swallow_failures() -> None:

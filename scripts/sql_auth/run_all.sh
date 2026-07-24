@@ -123,7 +123,8 @@ record report \
   --strict-results "${artifact_dir}/strict-results.json" \
   --artifact-dir "${artifact_dir}" \
   --matrix-output docs/SQL_AUTH_TEST_MATRIX.md \
-  --report-output docs/SQL_AUTH_TEST_REPORT.md
+  --report-output docs/SQL_AUTH_TEST_REPORT.md \
+  --require-complete
 
 if [[ "${required_failures}" -ne 0 ]]; then
   echo "[sql-auth] ${required_failures} required lane(s) failed" >&2
