@@ -246,6 +246,8 @@ evidence reference.
   replacing the physical SQL Server session.
 - `POOL-019`: a nonfatal SQL error still causes complete session-state reset
   before the physical connection is reused.
+- `POOL-020`: checkout validation resets the prior lease before its health
+  probe and preserves the healthy physical SQL Server session.
 
 ### SQL — query and command execution
 

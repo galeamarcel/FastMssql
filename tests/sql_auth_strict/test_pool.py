@@ -790,3 +790,53 @@ async def test_nonfatal_sql_error_still_resets_session_state(
             "session_id": first_session,
             "leaked_value": None,
         }
+
+
+@case("POOL-020")
+@pytest.mark.asyncio
+async def test_checkout_validation_resets_state_before_health_probe(
+    sql_auth_config: SqlAuthConfig,
+) -> None:
+    connection = _connection(
+        sql_auth_config,
+        PoolConfig(
+            max_size=1,
+            min_idle=1,
+            max_lifetime_secs=None,
+            idle_timeout_secs=None,
+            connection_timeout_secs=2,
+            test_on_check_out=True,
+            retry_connection=False,
+        ),
+    )
+
+    async with connection:
+        first_session = int(await scalar(connection, "SELECT @@SPID"))
+        await connection.simple_query(
+            """
+            EXEC sys.sp_set_session_context
+                @key = N'fastmssql_pool_checkout_validation',
+                @value = N'contaminated',
+                @read_only = 1;
+            """
+        )
+
+        observed = (
+            await connection.query(
+                """
+                SELECT
+                    @@SPID AS session_id,
+                    CONVERT(
+                        NVARCHAR(128),
+                        SESSION_CONTEXT(
+                            N'fastmssql_pool_checkout_validation'
+                        )
+                    ) AS leaked_value
+                """
+            )
+        ).fetchone()
+        assert observed is not None
+        assert observed.to_dict() == {
+            "session_id": first_session,
+            "leaked_value": None,
+        }
