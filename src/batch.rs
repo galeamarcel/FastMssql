@@ -7,7 +7,9 @@ use crate::parameter_conversion::{
     convert_parameters_to_fast, params_as_sql_refs, python_to_fast_parameter,
 };
 use crate::pool_config::PyPoolConfig;
-use crate::pool_manager::{ConnectionPool, ensure_pool_initialized_with_auth};
+use crate::pool_manager::{
+    ConnectionPool, PooledOperationGuard, ensure_pool_initialized_with_auth,
+};
 use crate::types::{create_connection_error, create_sql_error};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -19,6 +21,23 @@ use tiberius::Config;
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
+
+type SqlClient = tiberius::Client<tokio_util::compat::Compat<TcpStream>>;
+
+async fn consume_simple_command(
+    connection: &mut SqlClient,
+    command: &str,
+    error_context: &'static str,
+) -> PyResult<()> {
+    connection
+        .simple_query(command)
+        .await
+        .map_err(|error| create_sql_error(error, error_context))?
+        .into_results()
+        .await
+        .map_err(|error| create_sql_error(error, error_context))?;
+    Ok(())
+}
 
 /// Parses batch items (SQL queries with parameters) from a Python list.
 pub fn parse_batch_items<'p>(
@@ -401,10 +420,18 @@ pub fn bulk_insert<'p>(
             ensure_pool_initialized_with_auth(pool, config, &pool_config, azure_credential)
                 .await?;
 
-        let mut conn = pool_ref
+        let pooled = pool_ref
             .get()
             .await
             .map_err(|e| create_connection_error(format!("Pool error: {}", e)))?;
+        let mut conn = PooledOperationGuard::new(pooled);
+
+        consume_simple_command(
+            &mut conn,
+            "BEGIN TRANSACTION",
+            "Failed to start bulk transaction",
+        )
+        .await?;
 
         let mut total_affected = 0u64;
 
@@ -457,15 +484,36 @@ pub fn bulk_insert<'p>(
                 params.push(p as &dyn tiberius::ToSql);
             }
 
-            let result = conn
-                .execute(sql, &params)
-                .await
-                .map_err(|e| create_sql_error(e, "Batch execution failed"))?;
+            let result = match conn.execute(sql, &params).await {
+                Ok(result) => result,
+                Err(error) => {
+                    let primary =
+                        create_sql_error(error, "Batch execution failed");
+                    let rollback = consume_simple_command(
+                        &mut conn,
+                        "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION",
+                        "Failed to roll back bulk transaction",
+                    )
+                    .await;
+                    if rollback.is_ok() {
+                        conn.complete();
+                    }
+                    return Err(primary);
+                }
+            };
 
             total_affected += result.rows_affected().iter().sum::<u64>();
             // `chunk` is dropped here — its FastParameter memory is freed before
             // the next batch is sent.
         }
+
+        consume_simple_command(
+            &mut conn,
+            "COMMIT TRANSACTION",
+            "Failed to commit bulk transaction",
+        )
+        .await?;
+        conn.complete();
 
         Python::attach(|py| {
             let res = total_affected.into_pyobject(py)?;
