@@ -5,6 +5,9 @@ Fork auditat: `https://github.com/galeamarcel/FastMssql.git`
 Branch: `test/sql-auth-validation`  
 Commit: `3cc5700b5142f3e84c83767e2ff114f87a19c5dd`
 
+Ultima actualizare live: 24 iulie 2026
+Ultimul fix verificat: `fix/tls-secure-defaults` la `0b5d6ca`
+
 ## Concluzie
 
 FastMssql are o bază reală pentru acces MSSQL nativ și true-async, fără ODBC,
@@ -24,6 +27,45 @@ Aceeași observație este valabilă și pentru `aioodbc`: serializarea apare în
 special când aplicația folosește o singură conexiune fizică, nu exclusiv din
 cauza existenței ODBC. FastMssql elimină dependența de ODBC și thread offload,
 dar are în continuare nevoie de un pool corect pentru paralelism real.
+
+## Jurnal live al remedierilor
+
+### TLS secure-by-default — remediat și verificat
+
+Branchurile și commiturile sunt separate:
+
+- `test/tls-secure-policy`
+  - `b5ae7c4` — reproducerea deterministă pentru `Connection` și
+    `Transaction`;
+  - `872f5fd` — corectarea contractelor upstream care permiteau două surse TLS;
+- `fix/tls-secure-defaults`
+  - `0b5d6ca` — politica centralizată și documentația publică.
+
+Comportamentul verificat:
+
+- un connection string fără `Encrypt` folosește implicit criptare completă;
+- `ssl_config` este aplicat și când endpointul/autentificarea vin dintr-un
+  connection string;
+- opțiunile TLS provin fie din connection string, fie din `ssl_config`, fără
+  suprascrieri ambigue;
+- `TrustServerCertificate=True` împreună cu
+  `TrustServerCertificateCA` produce `ValueError` înainte de Tiberius, nu
+  `PanicException`;
+- `Encrypt=False` și `Encrypt=DANGER_PLAINTEXT` rămân opt-out-uri explicite;
+- politica este identică pentru conexiuni pooled și tranzacții directe.
+
+Dovada executată pe același source tree:
+
+- reproducere înainte de fix: 8 FAIL și 4 PASS de control;
+- regresie focalizată după fix: 12/12 PASS;
+- TLS + connection + transaction cu SQL-auth pe MSSQL Docker: 70/70 PASS;
+- suitele SSL upstream relevante: 94/94 PASS;
+- `cargo fmt --check`, `cargo test --locked` (5/5) și
+  `cargo clippy --locked --all-targets -- -D warnings`: PASS.
+
+Acest fix închide cele două constatări de comportament TLS de mai jos, dar nu
+închide încă P0-ul de securitate în ansamblu: vulnerabilitățile din ramura
+Tiberius/rustls rămân un release gate separat.
 
 ## Corecții și nuanțări față de primul audit
 
@@ -51,15 +93,15 @@ dar are în continuare nevoie de un pool corect pentru paralelism real.
 
 ## Probleme P0 — blocaje înainte de producție critică
 
-| Domeniu | Constatare | Remediere necesară |
-|---|---|---|
-| TLS | Un connection string fără `Encrypt` a produs live `encrypt_option=FALSE`. `TrustServerCertificate=True` nu activează singur criptarea completă. | Criptare obligatorie implicit, cu opt-out explicit și vizibil pentru plaintext. |
-| Configurație TLS | Când se folosește `connection_string`, `ssl_config` este ignorat. Combinația CA + trust necondiționat poate ajunge la panic Rust expus ca `PanicException`. | O singură sursă TLS, validare înainte de Tiberius, conflicte returnate ca `ValueError` și niciun panic peste FFI. |
-| Dependențe | Lockfile-ul actual are 12 potriviri RustSec și un warning de mentenanță. | Eliminarea `quinn-proto` neutilizat, actualizarea lockfile-ului și modernizarea ramurii TLS Tiberius. |
-| Izolarea sesiunilor | `SESSION_CONTEXT` a rămas vizibil următorului utilizator al aceleiași conexiuni. Un simplu `ROLLBACK` nu curăță temp tables, `SET` options, isolation level, `CONTEXT_INFO`, `USE`, impersonation etc. | Reset TDS înainte de reutilizare și teste de contaminare între lease-uri. |
-| Conexiuni defecte | Guard-ul curent poate marca operația drept completă chiar când Python primește o eroare internă de protocol/I/O. O conexiune omorâtă a putut fi reutilizată și a eșuat repetat cu EOF. | Dispoziție explicită `NeedsReset`, `Broken`, `CommitOutcomeUnknown`; conexiunile suspecte sunt eliminate. |
-| Tranzacții | `Transaction` deschide conexiuni directe, în afara pool-ului, limitelor și metricilor. Două apeluri concurente `begin()` au produs `@@TRANCOUNT=2`. | Stare de tranzacție păstrată în Rust și tranzacție pornită pe un lease din pool. |
-| COMMIT și anulare | Dacă se pierde ACK-ul după COMMIT, aplicația nu poate ști dacă tranzacția s-a aplicat. Nu este sigur să presupunem rollback sau să repetăm automat. | Excepție `CommitOutcomeUnknown`, eliminarea socketului și niciun retry automat. |
+| Domeniu | Constatare | Remediere necesară | Stare live |
+|---|---|---|---|
+| TLS | Un connection string fără `Encrypt` a produs live `encrypt_option=FALSE`. `TrustServerCertificate=True` nu activează singur criptarea completă. | Criptare obligatorie implicit, cu opt-out explicit și vizibil pentru plaintext. | **REMEDIAT și verificat** în `0b5d6ca`. |
+| Configurație TLS | Când se folosește `connection_string`, `ssl_config` este ignorat. Combinația CA + trust necondiționat poate ajunge la panic Rust expus ca `PanicException`. | O singură sursă TLS, validare înainte de Tiberius, conflicte returnate ca `ValueError` și niciun panic peste FFI. | **REMEDIAT și verificat** în `0b5d6ca`. |
+| Dependențe | Lockfile-ul actual are 12 potriviri RustSec și un warning de mentenanță. | Eliminarea `quinn-proto` neutilizat, actualizarea lockfile-ului și modernizarea ramurii TLS Tiberius. | **DESCHIS**. |
+| Izolarea sesiunilor | `SESSION_CONTEXT` a rămas vizibil următorului utilizator al aceleiași conexiuni. Un simplu `ROLLBACK` nu curăță temp tables, `SET` options, isolation level, `CONTEXT_INFO`, `USE`, impersonation etc. | Reset TDS înainte de reutilizare și teste de contaminare între lease-uri. | **DESCHIS**. |
+| Conexiuni defecte | Guard-ul curent poate marca operația drept completă chiar când Python primește o eroare internă de protocol/I/O. O conexiune omorâtă a putut fi reutilizată și a eșuat repetat cu EOF. | Dispoziție explicită `NeedsReset`, `Broken`, `CommitOutcomeUnknown`; conexiunile suspecte sunt eliminate. | **DESCHIS**. |
+| Tranzacții | `Transaction` deschide conexiuni directe, în afara pool-ului, limitelor și metricilor. Două apeluri concurente `begin()` au produs `@@TRANCOUNT=2`. | Stare de tranzacție păstrată în Rust și tranzacție pornită pe un lease din pool. | **DESCHIS**. |
+| COMMIT și anulare | Dacă se pierde ACK-ul după COMMIT, aplicația nu poate ști dacă tranzacția s-a aplicat. Nu este sigur să presupunem rollback sau să repetăm automat. | Excepție `CommitOutcomeUnknown`, eliminarea socketului și niciun retry automat. | **DESCHIS**. |
 
 ### Dependențe și RustSec
 
@@ -379,7 +421,7 @@ funcție ar necesita lucru la nivelul driverului TDS:
 ## Ordinea recomandată a branch-urilor
 
 1. `fix/dependency-rustsec`
-2. `fix/tls-secure-defaults`
+2. `fix/tls-secure-defaults` — **finalizat și verificat**
 3. `fix/connection-disposition`
 4. extensie Tiberius locală pentru rustls modern și `RESETCONNECTION`
 5. `fix/transaction-state`
@@ -402,20 +444,20 @@ upstream fără aprobarea explicită a proprietarului forkului.
 
 Înainte de a declara versiunea pregătită pentru producție:
 
-- `cargo audit` nu raportează vulnerabilități;
-- conexiunea implicită produce `encrypt_option=TRUE`;
-- configurațiile TLS conflictuale nu pot produce panic;
-- un SPID omorât este eliminat și pool-ul se recuperează;
-- nicio stare de sesiune nu trece între lease-uri;
-- două `begin()` concurente sunt respinse determinist;
-- timeout/anulare elimină conexiunea și requestul server-side se încheie;
-- ACK pierdut după COMMIT produce `CommitOutcomeUnknown`, fără retry;
-- numărul sesiunilor nu depășește `pool.max_size`;
-- streamingul menține memoria limitată și gestionează închiderea anticipată;
-- `bool` este transmis ca BIT, tipurile declarate sunt respectate și un
+- [ ] `cargo audit` nu raportează vulnerabilități;
+- [x] conexiunea implicită produce `encrypt_option=TRUE`;
+- [x] configurațiile TLS conflictuale nu pot produce panic;
+- [ ] un SPID omorât este eliminat și pool-ul se recuperează;
+- [ ] nicio stare de sesiune nu trece între lease-uri;
+- [ ] două `begin()` concurente sunt respinse determinist;
+- [ ] timeout/anulare elimină conexiunea și requestul server-side se încheie;
+- [ ] ACK pierdut după COMMIT produce `CommitOutcomeUnknown`, fără retry;
+- [ ] numărul sesiunilor nu depășește `pool.max_size`;
+- [ ] streamingul menține memoria limitată și gestionează închiderea anticipată;
+- [ ] `bool` este transmis ca BIT, tipurile declarate sunt respectate și un
   `datetime` aware este transmis ca DATETIMEOFFSET;
-- rezultatele multiple, cele goale și output parameters sunt păstrate;
-- matricea rulează prin servere reale Uvicorn/Gunicorn și din wheel-ul
+- [ ] rezultatele multiple, cele goale și output parameters sunt păstrate;
+- [ ] matricea rulează prin servere reale Uvicorn/Gunicorn și din wheel-ul
   instalat.
 
 ## Starea verificată la finalul auditului
@@ -428,6 +470,10 @@ upstream fără aprobarea explicită a proprietarului forkului.
 - Containerul `fastmssql-sql-auth-dev`: `healthy`.
 - `cargo fmt --check`: PASS.
 - `cargo test --locked`: 5/5 PASS.
+
+Această secțiune păstrează starea auditului inițial. Pentru starea curentă se
+folosește „Jurnal live al remedierilor”; branchurile validate sunt integrate
+ulterior în `test/sql-auth-validation`, fără push către `upstream`.
 - `cargo clippy --locked --all-targets -- -D warnings`: PASS.
 - `cargo audit`: FAIL așteptat, cu cele 12 advisory matches documentate.
 

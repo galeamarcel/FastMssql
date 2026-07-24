@@ -90,7 +90,8 @@ PR-uri mici deja aproape pregătite
 
 PR-uri cu decizie API
     ├── PR-04 atomic multi-chunk bulk insert
-    └── PR-05 connection endpoint error context
+    ├── PR-05 connection endpoint error context
+    └── PR-12 TLS secure-by-default și sursă unică
 
 PR-uri care cer hardening sau separare
     ├── PR-06 pooled cancellation and disposition
@@ -781,6 +782,112 @@ Acceptance:
 - TCP/network generic -> `SqlConnectionError`;
 - mesajul păstrează context util;
 - niciun secret nu apare în excepție.
+
+---
+
+### Task 11: PR-12 — TLS secure-by-default și configurație fără ambiguități
+
+**Priority:** Needs API/compatibility decision; implementation verified
+
+**Source test commits:**
+
+- `b5ae7c4` — reproducere live pentru ambele API-uri;
+- `872f5fd` — contractele upstream care interzic suprascrierea TLS.
+
+**Source fix commit:** `0b5d6ca`
+
+**Current fork branches:**
+
+- `test/tls-secure-policy`;
+- `fix/tls-secure-defaults`.
+
+**Proposed clean upstream branch:** `fix/upstream-tls-secure-defaults`
+
+**Proposed title:** `fix: require secure TLS connection defaults`
+
+**Files:**
+
+- Add: `src/connection_config.rs`
+- Modify: `src/connection.rs`
+- Modify: `src/transaction.rs`
+- Modify: `src/lib.rs`
+- Modify: `Cargo.toml`
+- Modify: `Cargo.lock`
+- Modify: `README.md`
+- Modify: `python/fastmssql/__init__.pyi`
+- Test: `tests/sql_auth_strict/test_errors_tls.py`
+- Test: `tests/test_ssl_integration.py`
+
+**Interfaces:**
+
+- Consumes: ADO.NET connection string și opțional `SslConfig`.
+- Produces: un singur `tiberius::Config`, cu criptare completă implicită și
+  validare înainte ca o combinație conflictuală să ajungă în Tiberius.
+
+- [ ] **Step 1: Reproduce pe ultimul `upstream/master`**
+
+Verifică separat `Connection` și `Transaction`:
+
+```text
+connection string fără Encrypt
+    -> înainte: encrypt_option=FALSE
+    -> cerut:   encrypt_option=TRUE
+
+connection string fără chei TLS + SslConfig.development()
+    -> înainte: ssl_config ignorat
+    -> cerut:   encrypt_option=TRUE
+
+TrustServerCertificate=True + TrustServerCertificateCA=...
+    -> înainte: PanicException
+    -> cerut:   ValueError înainte de network I/O
+```
+
+- [ ] **Step 2: Confirmă decizia de compatibilitate**
+
+Schimbarea implicitului de la login-only la full-session encryption este o
+schimbare intenționată de securitate. PR-ul trebuie să declare explicit:
+
+- utilizatorii cu certificate valide continuă fără modificări;
+- mediile self-signed trebuie să configureze o CA sau
+  `TrustServerCertificate=True`;
+- login-only/plaintext rămân disponibile numai prin `Encrypt=False`,
+  `Encrypt=DANGER_PLAINTEXT`, `SslConfig.login_only()` sau
+  `SslConfig.disabled()`;
+- un connection string cu orice cheie TLS nu poate fi combinat cu
+  `ssl_config`.
+
+- [ ] **Step 3: Reaplică numai helperul comun și cele două call-site-uri**
+
+Folosește parserul ADO.NET deja utilizat tranzitiv de Tiberius; nu detecta
+cheile prin `split(';')`, deoarece valorile pot conține delimitatori escaped.
+`Connection` și `Transaction` trebuie să apeleze aceeași funcție.
+
+- [ ] **Step 4: Rulează dovada focalizată**
+
+Rezultatul deja obținut pe fork, care trebuie reprodus pe branchul curat:
+
+```text
+RED:   8 fail + 4 pass de control
+GREEN: 12/12 policy tests
+       70/70 TLS + connection + transaction SQL-auth
+       94/94 SSL upstream relevant
+       5/5 cargo test
+       clippy -D warnings PASS
+```
+
+- [ ] **Step 5: Verifică riscul de breaking change**
+
+Rulează suita upstream completă și caută explicit aplicații/teste care:
+
+- omit `Encrypt` pe servere cu certificate neverificate;
+- folosesc simultan chei TLS în connection string și `ssl_config`;
+- presupun că `TrustServerCertificate=True` activează singur criptarea.
+
+- [ ] **Step 6: Cere aprobarea înainte de publicare**
+
+Nu crea PR-ul doar pentru că fixul este verde pe fork. Prezintă mai întâi
+diff-ul izolat față de ultimul `upstream/master`, rezultatele complete și
+impactul de compatibilitate.
 
 ---
 
