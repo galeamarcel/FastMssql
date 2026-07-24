@@ -694,3 +694,109 @@ async def test_adapted_flask_shutdown_removes_app_sessions(
         state.application_name,
         expected=0,
     )
+
+
+@pytest.fixture
+def framework_modes(sql_auth_config, unique_sql_name):
+    def fastapi_mode():
+        state = FrameworkState.create(
+            sql_auth_config,
+            application_name=unique_sql_name("strict_mode_fastapi"),
+        )
+        return (
+            "FastAPI/native ASGI",
+            create_fastapi_app(state, "[unused_framework_table]"),
+            state,
+            True,
+        )
+
+    def flask_wsgi_mode():
+        state = FrameworkState.create(
+            sql_auth_config,
+            application_name=unique_sql_name("strict_mode_flask_wsgi"),
+        )
+        return "Flask/WSGI", create_flask_app(state), state, False
+
+    def flask_asgi_mode():
+        state = FrameworkState.create(
+            sql_auth_config,
+            application_name=unique_sql_name("strict_mode_flask_asgi"),
+        )
+        return (
+            "Flask/WsgiToAsgi",
+            create_adapted_flask_app(state),
+            state,
+            True,
+        )
+
+    return fastapi_mode, flask_wsgi_mode, flask_asgi_mode
+
+
+@case("FRAME-003")
+@pytest.mark.asyncio
+async def test_every_framework_mode_uses_owner_sql_auth(
+    framework_modes,
+    sql_auth_config,
+    record_framework_metric,
+) -> None:
+    observed = {}
+    for factory in framework_modes:
+        name, app, state, is_asgi = factory()
+        try:
+            if name == "FastAPI/native ASGI":
+                async with LifespanManager(app):
+                    async with asgi_client(app) as client:
+                        response = await client.get("/principal")
+                        principal = response.json()["principal"]
+            elif is_asgi:
+                await state.connection.connect()
+                async with asgi_client(app) as client:
+                    response = await client.get("/principal")
+                    principal = response.json()["principal"]
+            else:
+                await state.connection.connect()
+                response = await flask_request(app, "/principal")
+                principal = response.get_json()["principal"]
+            assert principal == sql_auth_config.owner_user
+            observed[name] = principal
+        finally:
+            if await state.connection.is_connected():
+                await state.connection.disconnect()
+    record_framework_metric("FRAME-003", principals=observed)
+
+
+@case("FRAME-004")
+@pytest.mark.asyncio
+async def test_framework_outputs_never_disclose_credentials(
+    framework_modes,
+    sql_auth_config,
+    caplog,
+) -> None:
+    visible = []
+    for factory in framework_modes:
+        _name, app, state, is_asgi = factory()
+        await state.connection.connect()
+        try:
+            if is_asgi:
+                async with asgi_client(
+                    app,
+                    raise_app_exceptions=False,
+                ) as client:
+                    visible.append((await client.get("/sql-error")).text)
+            else:
+                app.testing = False
+                visible.append(
+                    (await flask_request(app, "/sql-error")).get_data(
+                        as_text=True
+                    )
+                )
+        finally:
+            await state.connection.disconnect()
+    combined = "\n".join(visible) + "\n" + caplog.text
+    for secret in (
+        sql_auth_config.owner_password,
+        sql_auth_config.sa_password,
+        sql_auth_config.readonly_password,
+        sql_auth_config.denied_password,
+    ):
+        assert secret not in combined
