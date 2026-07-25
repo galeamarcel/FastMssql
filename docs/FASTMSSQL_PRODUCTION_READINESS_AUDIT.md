@@ -3,13 +3,14 @@
 Data auditului: 24 iulie 2026  
 Fork auditat: `https://github.com/galeamarcel/FastMssql.git`  
 Branch: `test/sql-auth-validation`  
-Commit: `c30c02ac6d0aac10576ce9c140cb4c3161e5717e`
+Commit: `597e299bb2a86d8a68a0e209d3e54200cb4696c7`
 
 Ultima actualizare live: 25 iulie 2026
-Ultimul fix verificat: `fix/transaction-cancellation-retirement` la
-`ec7ba56`, cu implementarea Rust în `c5dcd2d`
-Ultimul harness de load verificat: `adac307`
-Ultimul branch cumulativ verificat: `test/sql-auth-validation` la `c30c02a`
+Ultimul fix verificat: `fix/connection-readiness` la `bb7f53b`, cu
+implementarea Rust în `158d801`
+Ultimul harness tranzacțional de load verificat: `adac307`
+Ultimul contract de readiness load verificat: LOAD-009 în `d891db8`
+Ultimul branch cumulativ verificat: `test/sql-auth-validation` la `597e299`
 Ultimul gate CI verificat: `ci/dependency-security-gate` la `3887ddd`, cu
 checkout menținut la `1d13280`; rularea hosted
 [#30130204804](https://github.com/galeamarcel/FastMssql/actions/runs/30130204804)
@@ -26,6 +27,13 @@ fără rollback sau retry automat. Anularea oricărei operații pe un
 `Transaction` retrage acum automat socketul direct sau lease-ul pooled,
 termină requestul/sesiunea SQL Server și recuperează capacitatea fără
 `close()` explicit.
+
+Lifecycle-ul de conectare nu mai produce un fals pozitiv: `connect()` și
+intrarea în context async execută implicit un `SELECT 1` complet drenat prin
+pool, iar `ping()` expune aceeași verificare live. Alocarea intenționat lazy
+rămâne disponibilă numai explicit prin `connect(validate=False)`;
+`is_connected()` descrie exclusiv existența handle-ului de pool și nu este
+prezentat drept health check.
 
 Toate defectele P0 de corectitudine identificate de acest audit sunt închise
 pe fork. Aceasta nu declară încă biblioteca complet enterprise
@@ -733,6 +741,124 @@ Limite păstrate explicit:
 - candidatul upstream trebuie reaplicat minim peste ultimul
   `upstream/master` și comparat cu draftul #121.
 
+### Readiness real pentru conexiune — remediat și verificat
+
+Branchurile și commiturile sunt separate:
+
+- `docs/connection-readiness-design`
+  - `f06c844` — specificația strictă și limitele de lifecycle;
+  - `4a722a1` — planul TDD și gate-urile exacte;
+- `test/connection-readiness`
+  - `d891db8` — reproducerile RED CONN-020–CONN-024,
+    FRAME-025–FRAME-026 și LOAD-009;
+- `fix/connection-readiness`
+  - `e7b1ee8` — controlul taxonomiei TLS/EOF deja stabilite;
+  - `158d801` — primitiva comună de readiness, `connect(validate=...)`,
+    `ping()` și contextul async strict;
+  - `bb7f53b` — wrapperul Python, stuburile și documentația publică;
+- branch cumulativ `test/sql-auth-validation`
+  - `597e299` — integrarea exactă a arborelui verificat, exclusiv pe fork.
+
+Defectul inițial era un fals pozitiv de lifecycle:
+
+```text
+await connection.connect()
+  -> pool bb8 construit
+  -> zero conexiuni fizice, zero login SQL Server
+  -> True returnat înainte de orice I/O
+```
+
+În consecință, o aplicație FastAPI sau Flask adaptată ASGI putea termina
+startup-ul și începe să servească, deși endpointul, autentificarea ori baza de
+date nu fuseseră validate. `is_connected()` raporta numai existența pool-ului,
+dar putea fi interpretat greșit drept disponibilitate SQL Server.
+
+Remedierea păstrează un singur contract comun:
+
+1. `connect(validate=True)`, valoarea implicită, inițializează pool-ul,
+   rezervă un lease și execută `SELECT 1`;
+2. răspunsul TDS este consumat complet înainte ca lease-ul să revină în pool;
+3. timeoutul efectiv bb8 încadrează atât checkout-ul, cât și răspunsul;
+4. timeoutul, anularea ori răspunsul incomplet lasă guard-ul nefinalizat, iar
+   conexiunea fizică este retrasă;
+5. `ping()` folosește exact aceeași cale și întoarce `True` ori o excepție
+   FastMssql tipată;
+6. `connect(validate=False)` alocă explicit lazy, fără a pretinde readiness;
+7. `__aenter__` este strict, iar `is_connected()` rămâne numai un indicator
+   local al handle-ului de pool.
+
+Reproducerea RED pe sursa nemodificată a demonstrat `connect() == True`,
+`pool_stats()["connections"] == 0` și absența unei sesiuni autentificate.
+Testele de framework au demonstrat că startup-ul putea intra în corp înaintea
+unei conexiuni reale.
+
+Dovada GREEN pe arborele integrat `597e299`:
+
+```text
+CONN-020–CONN-024                    5/5 PASS
+probe timeout checkout/răspuns       2/2 PASS
+FRAME-025–FRAME-026                  2/2 PASS
+LOAD-009                             PASS
+probe readiness                      1.000/1.000 True
+task concurrency / pool.max_size     100 / 20
+peak sesiuni readiness observate     20
+durată / throughput                  0,172589 s / 5.794,11 probe/s
+post-load query                      PASS
+suita strictă SQL-auth               354/354 PASS în 135,56 s
+ID-uri raportate din specificație    285/285 PASS
+regresie upstream aplicabilă         896/896 PASS în 64,38 s
+FastMssql Rust unit tests            13/13 PASS
+Tiberius unit / doctests executate   123/123 + 20/20 PASS
+Tiberius doctests ignorate           1, intenționat
+cargo fmt / Clippy -D warnings       PASS
+Ruff / compileall                    PASS
+cargo audit, 219 dependențe          0 findings
+sesiuni pentru loginurile de test    0
+origin                               galeamarcel/FastMssql
+upstream push                        DISABLED
+upstream PR                          necreat
+```
+
+Testul CONN-024 omoară sesiunea verificată și demonstrează că un `ping()`
+eșuat nu permite reutilizarea identității fizice. Proba cu răspuns TDS parțial
+ține proxy-ul după primii bytes, forțează timeoutul și verifică apoi un
+`connection_id` diferit. LOAD-009 trimite 1.000 de probe concurente prin
+același obiect `Connection`, observă exact plafonul de 20 de sesiuni și
+execută cu succes un query după furtună.
+
+Ownership-ul frameworkurilor este explicit:
+
+- lifespan-ul FastAPI/ASGI și adaptorul Flask/ASGI nu încep servirea dacă
+  verificarea SQL eșuează;
+- cleanup-ul de startup rămâne în `finally`, inclusiv când
+  `connect(validate=True)` ridică o excepție;
+- `async def` Flask sub WSGI rămâne doar compatibilitate funcțională, fără
+  promisiunea unui event loop persistent sau a unui pool async persistent.
+
+Limite păstrate intenționat:
+
+- un eșec de readiness retrage conexiunea nesigură, dar nu distruge automat
+  întregul pool comun; proprietarul aplicației decide retry sau `disconnect()`;
+- `is_connected()` nu face I/O și nu este un health check;
+- serializarea unui `disconnect()` concurent aparține viitoarei mașini de
+  lifecycle `Open | Closing | Closed`;
+- timeouturile generale per operație, taxonomia lor publică, telemetry și
+  retry-ul automat sunt excluse;
+- TDS `ATTENTION`, drenarea până la `DONE_ATTN` și reutilizarea aceluiași
+  socket după anulare sunt excluse;
+- EOF-ul unui transport TLS deja autentificat poate fi încă expus ca
+  `TlsError`; retragerea fizică este corectă, dar taxonomia rămâne PR-11.
+
+Gate-ul Rust a evidențiat separat o problemă preexistentă de build/CI pe
+macOS: feature-ul PyO3 `extension-module` activ permanent dezactivează
+legarea la `libpython`, astfel încât `cargo test --locked` brut nu poate lega
+executabilul de test. Cele 13 teste au trecut după legarea explicită a
+frameworkului Python 3.13. Conform
+[FAQ-ului oficial PyO3](https://github.com/PyO3/pyo3/blob/main/guide/src/faq.md),
+remedierea curată este eliminarea feature-ului permanent și folosirea
+`maturin >= 1.9.4`, care configurează extension-module numai când construiește
+extensia. Această schimbare nu este inclusă în candidatul de readiness.
+
 ## Corecții și nuanțări față de primul audit
 
 - Testul istoric cu 99.999 de operații a utilizat 100/200 de obiecte
@@ -888,9 +1014,10 @@ nedeterministe după intrarea în `Committing`; conexiunea a fost deja eliminat�
 - TDS `ATTENTION`, drenare până la `DONE_ATTN` și deadline de anulare numai
   pentru reutilizarea sigură a aceleiași sesiuni; fallback-ul trebuie să
   rămână retragerea transportului.
-- `connect()` cu `min_idle=0` este lazy: poate returna succes și
-  `is_connected=True` chiar dacă endpointul nu există. Sunt necesare
-  `ping()`/`ready()` cu acces real la SQL Server.
+- Readiness-ul inițial este **remediat în `158d801`**: `connect()` este strict
+  implicit, `ping()` face I/O real, iar `connect(validate=False)` este
+  singura cale explicit lazy. `is_connected()` rămâne intenționat numai
+  lifecycle local; politica de retry/startup aparține aplicației.
 - Graceful shutdown cu stări `Open -> Closing -> Closed`, deadline și
   așteptarea lease-urilor active.
 - Limite pentru waiters/backpressure și un buget global:
@@ -1136,12 +1263,14 @@ funcție ar necesita lucru la nivelul driverului TDS:
 9. `fix/transaction-cancellation-retirement` — **cleanup-ul RAII
    epoch-checked, retragerea autonomă și recuperarea pool-ului finalizate și
    verificate**
-10. `feat/timeouts-lifecycle-observability`
-11. `feat/typed-parameters`
-12. `feat/resultsets-streaming`
-13. `feat/batch-bulk`
-14. `fix/named-instance`
-15. `test/production-framework-matrix`
+10. `fix/connection-readiness` — **`connect(validate=True)`, `ping()` și
+    startup-ul ASGI strict finalizate și verificate**
+11. `feat/timeouts-lifecycle-observability`
+12. `feat/typed-parameters`
+13. `feat/resultsets-streaming`
+14. `feat/batch-bulk`
+15. `fix/named-instance`
+16. `test/production-framework-matrix`
 
 Orice remediere FastMssql va fi făcută numai pe forkul
 `galeamarcel/FastMssql`.
@@ -1159,6 +1288,8 @@ upstream fără aprobarea explicită a proprietarului forkului.
 - [x] conexiunea implicită produce `encrypt_option=TRUE`;
 - [x] configurațiile TLS conflictuale nu pot produce panic;
 - [x] un SPID omorât este eliminat și pool-ul se recuperează;
+- [x] `connect()` și contextul async validează SQL Server implicit, iar
+  `ping()` oferă readiness live prin pool;
 - [x] starea de sesiune acoperită de matrice nu trece între lease-urile pooled;
 - [x] două `begin()` concurente sunt respinse determinist;
 - [x] anularea unei operații tranzacționale elimină automat conexiunea, iar
@@ -1181,22 +1312,23 @@ upstream fără aprobarea explicită a proprietarului forkului.
 - Fork: `https://github.com/galeamarcel/FastMssql.git`
 - Branch cumulativ: `test/sql-auth-validation`
 - HEAD tehnic verificat:
-  `c30c02ac6d0aac10576ce9c140cb4c3161e5717e`
+  `597e299bb2a86d8a68a0e209d3e54200cb4696c7`
 - `origin` indică forkul; `upstream` permite numai fetch, cu push
   `DISABLED`.
 - Containerul SQL-auth `fastmssql-sql-auth-dev`: `healthy`.
-- Selecția TX-026/TX-032–TX-034 și proxy: 5/5 PASS.
-- Regresia tranzacțională/async/batch: 140/140 PASS.
-- Suita strictă SQL-auth: 344/344 PASS, cu exact 277/277 ID-uri din
+- CONN-020–CONN-024, FRAME-025–FRAME-026 și LOAD-009: 8/8 PASS.
+- Readiness load: 1.000/1.000 probe, concurență 100, maximum 20 sesiuni,
+  post-load query PASS.
+- Suita strictă SQL-auth: 354/354 PASS, cu exact 285/285 ID-uri din
   specificație.
-- Suita upstream aplicabilă: 896/896 PASS.
-- Rust: 13/13 unit tests PASS; Tiberius vendored: 123/123 unit tests PASS.
+- Suita upstream aplicabilă: 896/896 PASS în 64,38 s.
+- Rust: 13/13 unit tests PASS; Tiberius vendored: 123/123 unit tests și
+  20/20 doctests executate PASS, 1 doctest ignorat intenționat.
 - `cargo fmt`, Clippy cu `-D warnings`, Ruff și `compileall`: PASS.
 - `cargo audit`: 219 dependențe scanate, zero findings.
-- Storm de anulare: 20/20 `CancelledError`, toate cele 5 conexiuni active
-  retrase și înlocuite, zero lease-uri și sesiuni rămase.
-- Stress pooled: 10.000 și 99.999 tranzacții la concurență 100/200, maximum
-  100 conexiuni fizice, smoke-test final PASS și zero sesiuni rămase.
+- Loginurile SQL-auth de test au zero sesiuni rămase după teardown.
+- Ramura locală și `origin/test/sql-auth-validation` sunt în paritate `0/0`;
+  nu există push și nu există PR către upstream.
 
 Starea de mai sus este rezultatul arborelui tehnic exact înaintea acestui
 update documentar. Branchurile validate au fost integrate numai în fork; nu
