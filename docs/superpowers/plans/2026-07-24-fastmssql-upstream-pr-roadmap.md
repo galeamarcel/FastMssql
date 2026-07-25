@@ -49,7 +49,10 @@ La data redactării:
 
 - `upstream/master`: `e45f301` — versiunea `v0.7.7`;
 - branch audit: `test/sql-auth-validation`;
-- snapshotul tehnic anterior acestui update documentar este `5dc70031`;
+- snapshotul tehnic anterior acestui update documentar este
+  `776f9033975f8727fba57f51effb81c8fafd9acb`;
+- feature-ul deadline-urilor este `822ab2a`, iar evidența generată este
+  `eec7e83`; statusul auditat este `ec6161b`;
 - unicul PR upstream deschis este draftul
   [#121 — Improve transactions behavior and safety](https://github.com/Rivendael/FastMssql/pull/121);
 - PR-ul #121 modifică masiv tranzacțiile și timeouturile, deci orice PR care
@@ -92,7 +95,8 @@ PR-uri cu decizie API
     ├── PR-04 atomic multi-chunk bulk insert
     ├── PR-05 connection endpoint error context
     ├── PR-12 TLS secure-by-default și sursă unică
-    └── PR-21 PoolConfig default consistency
+    ├── PR-21 PoolConfig default consistency
+    └── PR-22 operation timeout/deadline safety
 
 PR-uri care cer hardening sau separare
     ├── PR-06 pooled cancellation and disposition
@@ -1788,7 +1792,8 @@ excepție de transport.
 
 PR-18 nu va include:
 
-- TDS `ATTENTION` sau timeouturi generale;
+- TDS `ATTENTION` sau timeouturi generale (deadline-urile au ulterior propriul
+  candidat PR-22);
 - retry transparent pentru `COMMIT` sau alte scrieri;
 - reconciliere automată ori presupunere de rollback;
 - tranzacții distribuite;
@@ -2124,7 +2129,8 @@ PR-20 nu va include:
 
 - distrugerea automată a pool-ului după un singur eșec de readiness;
 - serializarea concurentă `Open | Closing | Closed`;
-- timeouturi generale de query/tranzacție sau retry automat;
+- timeouturi generale de query/tranzacție (implementate ulterior separat în
+  candidatul PR-22) sau retry automat;
 - metrici/OpenTelemetry;
 - TDS `ATTENTION` și reutilizarea aceluiași socket după anulare;
 - corectarea taxonomiei TLS/EOF din PR-11;
@@ -2225,6 +2231,132 @@ Orice schimbare a numărului de teste se explică exact.
 Prezintă diff-ul upstream minim, rezultatul rebase-ului, compatibilitatea,
 RED/GREEN și toate URL-urile hosted. Nu face push pentru branchul viitor și nu
 executa `gh pr create` fără o aprobare nouă, explicită, a lui Marcel Galea.
+
+### Task 21: PR-22 — Deadline-uri operaționale fail-closed
+
+**Status:** `VERIFIED_FORK / requires fresh upstream rebase`. Implementat și
+verificat pe fork; nu există branch curat upstream și publicarea nu este
+aprobată.
+
+```text
+fork feature branch          feat/operation-timeouts
+fork feature SHA             822ab2acac8152a4cd373df52464edd7507d4580
+fork RED branches            test/operation-timeouts
+                             test/operation-timeout-portability
+fork RED SHAs                9d579d4, 2d8e526
+technical merge SHA          776f9033975f8727fba57f51effb81c8fafd9acb
+evidence SHA                 eec7e83c878aa158b3ba4f0840461a023cb9f14e
+audited status SHA           ec6161b6a1420f3e85d318fc073562dc674d68ed
+future clean branch          feat/upstream-operation-timeouts
+future title                 feat: add fail-closed operation deadlines
+case IDs                     TIME-001 through TIME-010
+current upstream PR state    none
+publication                  forbidden until a new explicit user approval
+```
+
+**Suprafața publică verificată:**
+
+- `TimeoutConfig(connect_timeout_secs, acquire_timeout_secs,
+  operation_timeout_secs, transaction_timeout_secs, rollback_timeout_secs)`;
+- `OperationTimeoutError(SqlConnectionError)` cu metadata structurată;
+- argumentul final `timeout_config` pentru `Connection` și `Transaction`;
+- proprietatea read-only `connection.timeout_config` /
+  `transaction.timeout_config`;
+- fazele stabile `connect`, `acquire`, `operation`, `transaction`,
+  `rollback`.
+
+**Compatibilitate și safety:**
+
+- omiterea `timeout_config` derivă connect/acquire din
+  `PoolConfig.connection_timeout_secs` sau 30 s;
+- operation și transaction rămân fără deadline implicit, păstrând
+  compatibilitatea comportamentală;
+- argumentul nou este la final și nu schimbă sensul argumentelor existente;
+- valorile sunt între 1 ns și 100 × 365 zile inclusiv, identic pe
+  Linux/macOS/Windows;
+- operațiile nu primesc retry automat nou;
+- un timeout după startul requestului retrage conexiunea;
+- un write general este marcat `outcome_unknown`;
+- timeoutul COMMIT păstrează `CommitOutcomeUnknown` ca excepție principală și
+  `OperationTimeoutError` ca `__cause__`, fără rollback, al doilea COMMIT sau
+  retry.
+
+**Dovada locală și hosted:**
+
+```text
+matrice SQL-auth                         295/295 PASS
+strict / async / framework              305/305 + 16/16 + 29/29 PASS
+resilience / load                         6/6 + 9/9 PASS
+upstream aplicabil                      915/915 PASS
+FastMssql Rust                            23/23 PASS
+wheel TimeoutConfig + PoolConfig          12/12 PASS
+stress tranzacțional                      99.999 la concurrency 100 PASS
+post-test sessions/requests               0/0
+```
+
+Primul merge tehnic `ab99c191` păstrează dovada hosted RED:
+[run #30178680707](https://github.com/galeamarcel/FastMssql/actions/runs/30178680707)
+a fost verde pe Ubuntu/macOS și a eșuat numai contractul instalat pe Windows.
+Cauza era plafonul platform-dependent al `Instant::checked_add`.
+`2d8e526` a reprodus local diferența, iar `822ab2a` a impus plafonul portabil
+de 100 de ani.
+
+[Run-ul final #30179649298](https://github.com/galeamarcel/FastMssql/actions/runs/30179649298)
+la `776f903` este verde pentru raw Cargo, Rust, wheel instalat și contractele
+Python pe
+[Ubuntu](https://github.com/galeamarcel/FastMssql/actions/runs/30179649298/job/89733979582),
+[macOS](https://github.com/galeamarcel/FastMssql/actions/runs/30179649298/job/89733979558)
+și
+[Windows](https://github.com/galeamarcel/FastMssql/actions/runs/30179649298/job/89733979531).
+[RustSec #30179649321](https://github.com/galeamarcel/FastMssql/actions/runs/30179649321)
+este verde la același SHA.
+
+**Non-goals și riscuri reziduale:**
+
+- TDS `ATTENTION`/`DONE_ATTN` și reutilizarea aceleiași sesiuni după anulare;
+- override per apel și telemetry/OpenTelemetry;
+- lifecycle `Open | Closing | Closed` și așteptarea lease-urilor;
+- agregarea excepției din corp cu excepția de cleanup din context manager;
+- retry SQL transparent, schimbare de versiune sau publicare de pachet;
+- throughputul măsurat local nu este o promisiune universală.
+
+- [ ] **Step 1: Verifică din nou ultimul upstream și PR-ul #121**
+
+Actualizează referința fetch-only, confirmă SHA-ul nou al `upstream/master` și
+compară `src/transaction.rs`, `src/connection.rs`, `src/pool_manager.rs` și
+API-ul public cu draftul #121. Nu presupune că `e45f301` sau contractul
+tranzacțional au rămas neschimbate.
+
+- [ ] **Step 2: Creează branchul curat și reproduce RED proaspăt**
+
+Creează `feat/upstream-operation-timeouts` din ultimul `upstream/master`.
+Reaplică mai întâi numai contractele portabile minime și dovedește RED pentru
+fiecare comportament încă absent. Reproducerea de pe fork nu substituie RED-ul
+pe baza upstream curentă.
+
+- [ ] **Step 3: Reaplică diff-ul minim**
+
+Include configurația tipată, deadline-urile absolute, retragerea fail-closed,
+precedența COMMIT, validarea portabilă, stuburile și documentația. Nu include
+alte remedieri cumulative, lifecycle, observabilitate, streaming, TDS
+`ATTENTION`, versiune sau release. Dacă upstream #121 oferă deja o parte din
+suprafață, adaptează testele la cauza rămasă în loc să suprascrii designul
+upstream.
+
+- [ ] **Step 4: Reexecută toate gate-urile**
+
+Rulează TIME-001–TIME-010, Rust, format, Clippy, wheel izolat, SQL-auth real,
+matricea strictă, framework, resilience/load și regresia upstream. Gate-ul
+hosted trebuie să fie verde independent pe Linux, macOS și Windows, iar
+dependency-security trebuie să treacă la exact același SHA.
+
+- [ ] **Step 5: Prezintă diff-ul și cere aprobarea separată**
+
+Prezintă branchul curat, SHA-urile RED/GREEN, comparația cu #121, toate
+rezultatele și URL-urile hosted. Nu executa `git push` pentru branchul upstream
+și nu executa `gh pr create` fără o aprobare nouă, explicită, a lui Marcel
+Galea. Starea curentă confirmată este: zero PR-uri upstream pentru
+`galeamarcel:feat/operation-timeouts`.
 
 ### PyO3 build/test separation — VERIFIED_FORK
 
@@ -2332,7 +2464,7 @@ fork, testată live și auditată.
 | Stored procedures | RPC, OUT params, return status, result sets | fără pierdere de metadata/tokeni |
 | Native bulk | TDS bulk copy | subset de coloane, streaming input, atomicity contract |
 | Named instances | SQL Browser Tokio | instanță reală fără port explicit |
-| Timeouts | connect/acquire/query/transaction | conexiune eliminată când starea protocolului este incertă |
+| Operation timeouts | PR-22, connect/acquire/operation/transaction/rollback | `VERIFIED_FORK`; rebase curat, RED proaspăt, comparație cu #121, gate pe trei sisteme și aprobare separată înainte de upstream |
 | Observability | pool metrics și OpenTelemetry | fără SQL/parametri sensibili implicit |
 | Graceful shutdown | Open/Closing/Closed | lease-uri active și deadline testate |
 | SQLAlchemy | dialect async | pool ownership și transaction semantics clare |
