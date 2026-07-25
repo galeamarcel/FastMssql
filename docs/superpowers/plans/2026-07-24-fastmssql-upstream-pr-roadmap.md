@@ -49,7 +49,7 @@ La data redactării:
 
 - `upstream/master`: `e45f301` — versiunea `v0.7.7`;
 - branch audit: `test/sql-auth-validation`;
-- snapshotul tehnic anterior acestui update documentar este `597e299`;
+- snapshotul tehnic anterior acestui update documentar este `438a86e`;
 - unicul PR upstream deschis este draftul
   [#121 — Improve transactions behavior and safety](https://github.com/Rivendael/FastMssql/pull/121);
 - PR-ul #121 modifică masiv tranzacțiile și timeouturile, deci orice PR care
@@ -109,7 +109,8 @@ PR-uri cu decizie de supply chain
     ├── PR-17 transaction leasing din pool
     ├── PR-18 rezultat necunoscut după COMMIT
     ├── PR-19 retragere automată după anularea tranzacției
-    └── PR-20 readiness strict pentru conexiunea SQL Server
+    ├── PR-20 readiness strict pentru conexiunea SQL Server
+    └── PyO3 build/test separation — VERIFIED_FORK
 
 Funcții enterprise viitoare
     └── intake individual după implementare și audit
@@ -2136,6 +2137,88 @@ Prezintă diff-ul curat, reproducerea RED, rezultatele GREEN, dovada
 `git push` pentru branchul upstream și nu executa `gh pr create` fără
 aprobarea explicită a proprietarului forkului.
 
+### PyO3 build/test separation — VERIFIED_FORK
+
+**Status:** `VERIFIED_FORK`. Implementat și verificat pe fork; publicarea
+upstream nu este aprobată.
+
+- Proposed clean branch: `fix/upstream-pyo3-build-test-separation`
+- Proposed title: `fix: separate PyO3 extension and Cargo test builds`
+- Scope: remove the permanent PyO3 extension feature, require maturin 1.9.4,
+  add deterministic contracts, a three-OS raw Cargo gate and a locked local
+  runner.
+- Upstream gate: rebase on the latest upstream, reproduce RED, re-run all
+  three hosted jobs, and obtain Marcel Galea's separate publication approval.
+- Exclusions: runtime SQL behavior, dependency upgrades, `rlib`, custom
+  linker flags, package publication and Tiberius changes.
+
+**Design și implementare verificate pe fork:**
+
+- baseline tehnic: `8191fff`;
+- design: `docs/pyo3-build-test-design`, `cf4b3b1`;
+- plan TDD: `39e6355`;
+- contract RED: `test/pyo3-build-contract`, `d42fd7b`;
+- gate hosted inițial: `3b8e449`;
+- fix manifest/runner: `fix/pyo3-build-test-separation`, `f163d7b`;
+- integrare tehnică inițială: `8d30f09`;
+- contract loader Linux: `test/pyo3-linux-libpython-runtime`, `1af58fe`;
+- fix loader Linux: `fix/pyo3-linux-libpython-runtime`, `425b553`;
+- cumulative fork commit final:
+  `438a86ef91c2d5ea819008f2c2bf52c568e3a4c9`.
+
+**Reproducere și cauză:**
+
+Pe baseline, contractul a produs 5 FAIL. `Cargo.toml` activa permanent
+`extension-module`, iar backendul PEP 517 permitea `maturin>=1.0`.
+`cargo build --locked` și `cargo test --locked` au eșuat independent cu
+simboluri Python `_Py*` nerezolvate; zero teste Rust au fost executate.
+
+Eliminarea feature-ului permanent face PyO3 să lege normal interpreterul în
+buildurile Rust. Maturin 1.9.4+ activează modul extensie numai pentru wheel și
+`maturin develop`. Versiunea de dezvoltare rămâne blocată la 1.14.1.
+
+Primul run hosted,
+[#30154717602](https://github.com/galeamarcel/FastMssql/actions/runs/30154717602),
+a fost GREEN pe macOS/Windows și RED pe Ubuntu: executabilul deja construit nu
+găsea `libpython3.13.so.1.0` la runtime. Contractul `1af58fe` a reprodus
+cerința înaintea fixului. Remedierea `425b553` derivă din interpreter
+`LIBDIR`/`LDLIBRARY`, verifică fișierul și configurează numai loaderul Linux.
+Nu adaugă flaguri de linker, path hard-codat sau bypass.
+
+**Dovada locală GREEN la `f163d7b`:**
+
+```text
+contract PyO3 inițial               5/5 PASS
+cargo build --locked                PASS
+cargo test --locked                 13/13 PASS
+maturin develop --release --locked  PASS
+wheel cp311-abi3                    build/install/import PASS
+PARAM-004 SQL-auth real             1/1 PASS
+strict / async / framework          295/295 + 16/16 + 28/28 PASS
+resilience / load / upstream        6/6 + 9/9 + 901/901 PASS
+Tiberius unit / doctests            123/123 + 20/20 PASS, 1 ignored
+cargo audit                         219 dependencies, 0 findings
+post-test SQL sessions              owner 0, readonly 0, denied 0
+```
+
+Follow-up-ul `1af58fe`/`425b553`, integrat la `438a86e`, schimbă numai
+contractul și workflow-ul. Pe acest arbore contractul extins trece 6/6.
+
+Hosted la același `438a86e`,
+[#30155107955](https://github.com/galeamarcel/FastMssql/actions/runs/30155107955),
+attempt 1, verifică exact `438a86e` cu CPython 3.13.14 și Rust/Cargo 1.94.0:
+
+```text
+Cargo on ubuntu-latest              success, build PASS, 13/13 tests
+Cargo on macos-latest               success, build PASS, 13/13 tests
+Cargo on windows-latest             success, build PASS, 13/13 tests
+```
+
+Diff-ul verificat nu modifică `src/`, `python/` sau `vendor/tiberius`.
+Comportamentul runtime/API/TDS este neschimbat. Orice branch upstream va fi
+recreat minim din ultimul `upstream/master`; branchul cumulativ nu este
+publicat direct și nu se deschide PR fără o aprobare nouă.
+
 ---
 
 ## Funcții enterprise care vor intra ulterior în roadmap
@@ -2153,7 +2236,7 @@ fork, testată live și auditată.
 | Transaction cancellation | PR-19, retragere automată după anulare | implementat/verificat pe fork; fixture DMV portabil, rebase și comparație cu #121 înainte de upstream |
 | Connection readiness | PR-20, `connect(validate=...)` și `ping()` | implementat/verificat pe fork; rebase curat și fixture portabil înainte de upstream |
 | TDS session reset | PR-15, bit `RESETCONNECTION` | implementat/verificat pe fork; traseu Tiberius și aprobare înainte de upstream |
-| PyO3 build/test separation | elimină feature-ul permanent și folosește `maturin >= 1.9.4` pentru buildul extensiei | `cargo test --locked` brut trebuie să lege portabil pe Linux/macOS/Windows |
+| PyO3 build/test separation | elimină feature-ul permanent și folosește `maturin >= 1.9.4` pentru buildul extensiei | `VERIFIED_FORK`; rebase curat, RED și toate cele trei joburi hosted înainte de aprobarea upstream |
 | True async streaming | stream Python async cu backpressure | memorie limitată, early close, lease recovery |
 | Typed parameters | tip/direction/precision/scale/length | wire metadata verificată prin SQL Server |
 | Stored procedures | RPC, OUT params, return status, result sets | fără pierdere de metadata/tokeni |

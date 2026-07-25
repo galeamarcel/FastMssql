@@ -3,16 +3,19 @@
 Data auditului: 24 iulie 2026  
 Fork auditat: `https://github.com/galeamarcel/FastMssql.git`  
 Branch: `test/sql-auth-validation`  
-Commit: `597e299bb2a86d8a68a0e209d3e54200cb4696c7`
+Commit tehnic: `438a86ef91c2d5ea819008f2c2bf52c568e3a4c9`
 
 Ultima actualizare live: 25 iulie 2026
-Ultimul fix verificat: `fix/connection-readiness` la `bb7f53b`, cu
-implementarea Rust în `158d801`
+Ultimul fix verificat: `fix/pyo3-linux-libpython-runtime` la `425b553`,
+precedat de fixul manifest/runner `f163d7b` și contractul Linux `1af58fe`
 Ultimul harness tranzacțional de load verificat: `adac307`
 Ultimul contract de readiness load verificat: LOAD-009 în `d891db8`
-Ultimul branch cumulativ verificat: `test/sql-auth-validation` la `597e299`
-Ultimul gate CI verificat: `ci/dependency-security-gate` la `3887ddd`, cu
-checkout menținut la `1d13280`; rularea hosted
+Ultimul branch cumulativ verificat: `test/sql-auth-validation` la `438a86e`
+Ultimul gate hosted verificat: `rust-unit-tests.yml`, rularea
+[#30155107955](https://github.com/galeamarcel/FastMssql/actions/runs/30155107955)
+verde pe Linux, macOS și Windows la `438a86e`
+Gate-ul dependency-security rămâne `ci/dependency-security-gate` la
+`3887ddd`, cu checkout menținut la `1d13280`; rularea hosted
 [#30130204804](https://github.com/galeamarcel/FastMssql/actions/runs/30130204804)
 a trecut pe `b1167ae`
 
@@ -34,6 +37,13 @@ pool, iar `ping()` expune aceeași verificare live. Alocarea intenționat lazy
 rămâne disponibilă numai explicit prin `connect(validate=False)`;
 `is_connected()` descrie exclusiv existența handle-ului de pool și nu este
 prezentat drept health check.
+
+Buildul extensiei Python și buildul/testarea Rust sunt acum separate:
+feature-ul PyO3 `extension-module` nu mai este activ permanent, maturin
+controlează modul de extensie, iar `cargo build --locked` și
+`cargo test --locked` sunt gate-uri hosted obligatorii pe Linux, macOS și
+Windows. Această remediere este exclusiv de build/CI și nu schimbă API-ul,
+runtime-ul SQL ori protocolul TDS.
 
 Toate defectele P0 de corectitudine identificate de acest audit sunt închise
 pe fork. Aceasta nu declară încă biblioteca complet enterprise
@@ -859,6 +869,127 @@ remedierea curată este eliminarea feature-ului permanent și folosirea
 `maturin >= 1.9.4`, care configurează extension-module numai când construiește
 extensia. Această schimbare nu este inclusă în candidatul de readiness.
 
+## Separarea build/test PyO3 — remediată și verificată
+
+Remedierea build/CI este acum închisă pe fork. Ea pornește din baseline-ul
+tehnic `8191fff`, are designul aprobat în `cf4b3b1` și planul TDD în
+`39e6355`. Istoricul păstrează separarea cerută:
+
+- `test/pyo3-build-contract`
+  - `d42fd7b` — contractul RED pentru manifest, maturin, workflow și runner;
+  - `3b8e449` — gate-ul raw Cargo Linux/macOS/Windows;
+- `fix/pyo3-build-test-separation`
+  - `f163d7b` — separarea feature-ului extensiei, minimul maturin și runnerul
+    local cu lockfile;
+- `test/pyo3-linux-libpython-runtime`
+  - `1af58fe` — contractul RED pentru biblioteca Python managed pe Linux;
+- `fix/pyo3-linux-libpython-runtime`
+  - `425b553` — configurarea strictă a loaderului Linux;
+- `test/sql-auth-validation`
+  - `8d30f09` — primul arbore tehnic integrat;
+  - `438a86e` — arborele tehnic final, după remedierea descoperită hosted.
+
+Reproducerea inițială nu a înghițit nicio excepție. Pe baseline:
+
+```text
+contract PyO3                         5 FAIL
+Cargo.toml                            extension-module activ permanent
+pyproject.toml                        maturin minim 1.0
+cargo build --locked                 exit 101, simboluri Python nerezolvate
+cargo test --locked                  exit 101, zero teste Rust executate
+```
+
+Atât `cargo build --locked`, cât și `cargo test --locked` au reprodus
+independent eșecul de linkare `_Py*`. Contractul a eșuat separat pentru
+manifestul Cargo, floor-ul PEP 517, absența workflow-ului și runnerul local
+neblocat.
+
+Fixul minim:
+
+- păstrează feature-urile directe PyO3 exact
+  `["abi3-py311", "chrono"]`, fără `extension-module`;
+- păstrează `[tool.maturin].features = ["pyo3/abi3-py311"]`;
+- ridică backendul PEP 517 la `maturin>=1.9.4,<2.0`;
+- păstrează versiunea de dezvoltare blocată la `maturin==1.14.1`;
+- rulează local `cargo test --locked`;
+- adaugă un gate hosted cu Rust 1.94.0 și CPython 3.13 pe
+  `ubuntu-latest`, `macos-latest` și `windows-latest`.
+
+Primul run hosted nu este omis din audit. La arborele `8d30f09`,
+[run-ul #30154717602](https://github.com/galeamarcel/FastMssql/actions/runs/30154717602)
+a trecut pe macOS și Windows, dar Ubuntu a eșuat după build, cu exit 127:
+loaderul nu găsea `libpython3.13.so.1.0` din instalarea managed CPython.
+Contractul `1af58fe` a fixat această condiție în test înaintea implementării.
+Workflow-ul calculează acum `LIBDIR` și `LDLIBRARY` prin `sysconfig`, verifică
+fișierul și propagă directorul prin `LD_LIBRARY_PATH` numai pe Linux.
+Aceasta este o configurare de runtime loader, nu o schimbare de link mode.
+
+Nu există `RUSTFLAGS`, `PYO3_BUILD_EXTENSION_MODULE`, `PYO3_CONFIG_FILE`,
+framework Python hard-codat, `build.rs` custom, linker script,
+`continue-on-error` sau fallback acceptat. Comenzile validate au rămas exact
+`cargo build --locked` și `cargo test --locked`.
+
+Dovada locală completă pe sursa `f163d7b`, înaintea completării
+contract/workflow exclusiv hosted:
+
+```text
+cargo build --locked                  PASS
+cargo test --locked                   13/13 PASS
+cargo fmt / Clippy -D warnings        PASS
+contract PyO3 inițial                 5/5 PASS
+suita strictă SQL-auth                295/295 PASS
+suita true-async                      16/16 PASS
+suita framework                       28/28 PASS
+suita resilience                      6/6 PASS
+suita load                            9/9 PASS
+regresie upstream                     901/901 PASS
+Tiberius unit tests                   123/123 PASS
+Tiberius doctests executate           20/20 PASS, 1 ignorat intenționat
+cargo audit, 219 dependențe           0 findings
+```
+
+Contractul extins pentru loaderul Linux a trecut separat 6/6 pe arborele
+final. Analiza structurală a celor două schimbări hosted a raportat zero
+flow-uri afectate și zero goluri de test.
+
+Packaging-ul ABI3 a fost reverificat, nu doar compilarea Rust:
+
+- `maturin develop --release --locked`: PASS cu CPython 3.13;
+- wheel:
+  `fastmssql-0.7.7-cp311-abi3-macosx_11_0_arm64.whl`;
+- instalare într-un virtualenv CPython 3.13.14 curat și import
+  `fastmssql.fastmssql`: PASS, versiune `0.7.7`;
+- `otool -L`: fără `Python.framework` și fără `libpython`;
+- PARAM-004, limite signed integer și overflow prin SQL-auth real: 1/1 PASS;
+- după teardown: owner, readonly și denied au fiecare zero sesiuni și zero
+  conexiuni rămase.
+
+Dovada cross-platform aparține exclusiv run-ului hosted terminal, nu este
+dedusă din macOS local:
+
+| Runner | CPython | Rust/Cargo | `cargo build` | `cargo test` | Concluzie |
+|---|---:|---:|---:|---:|---:|
+| `ubuntu-latest` | 3.13.14 | 1.94.0 | PASS | 13/13 PASS | success |
+| `macos-latest` | 3.13.14 | 1.94.0 | PASS | 13/13 PASS | success |
+| `windows-latest` | 3.13.14 | 1.94.0 | PASS | 13/13 PASS | success |
+
+[Run-ul #30155107955](https://github.com/galeamarcel/FastMssql/actions/runs/30155107955),
+attempt 1, a verificat exact SHA-ul
+`438a86ef91c2d5ea819008f2c2bf52c568e3a4c9` între
+2026-07-25 10:47:58Z și 10:55:57Z. Toate cele trei joburi și ambii pași raw
+Cargo au concluzia `success`.
+
+Diff-ul nu modifică `src/`, `python/` sau vendorul Tiberius. API-ul public,
+semanticile SQL, pool-ul și protocolul TDS sunt neschimbate. Repository-ul nu
+conține un `VERSION.md`; conform excepției aprobate pentru acest fix exclusiv
+de build/CI, nu a fost inventat unul și versiunea pachetului nu a fost
+modificată.
+
+Statusul este `VERIFIED_FORK`. Toate branchurile și commiturile sunt numai în
+`galeamarcel/FastMssql`; push-ul upstream rămâne `DISABLED`. Rebase-ul pe
+ultimul upstream, branchul curat și orice PR către repository-ul original cer
+aprobarea separată a lui Marcel Galea.
+
 ## Corecții și nuanțări față de primul audit
 
 - Testul istoric cu 99.999 de operații a utilizat 100/200 de obiecte
@@ -1265,12 +1396,15 @@ funcție ar necesita lucru la nivelul driverului TDS:
    verificate**
 10. `fix/connection-readiness` — **`connect(validate=True)`, `ping()` și
     startup-ul ASGI strict finalizate și verificate**
-11. `feat/timeouts-lifecycle-observability`
-12. `feat/typed-parameters`
-13. `feat/resultsets-streaming`
-14. `feat/batch-bulk`
-15. `fix/named-instance`
-16. `test/production-framework-matrix`
+11. `fix/pyo3-build-test-separation` și
+    `fix/pyo3-linux-libpython-runtime` — **buildul extensiei separat de raw
+    Cargo și gate-ul Linux/macOS/Windows finalizate și verificate hosted**
+12. `feat/timeouts-lifecycle-observability`
+13. `feat/typed-parameters`
+14. `feat/resultsets-streaming`
+15. `feat/batch-bulk`
+16. `fix/named-instance`
+17. `test/production-framework-matrix`
 
 Orice remediere FastMssql va fi făcută numai pe forkul
 `galeamarcel/FastMssql`.
@@ -1285,6 +1419,8 @@ upstream fără aprobarea explicită a proprietarului forkului.
 
 - [x] `cargo audit` nu raportează vulnerabilități;
 - [x] build-ul și publicarea depind de gate-ul RustSec hosted;
+- [x] `cargo build --locked` și `cargo test --locked` trec raw cu CPython
+  3.13 pe Linux, macOS și Windows;
 - [x] conexiunea implicită produce `encrypt_option=TRUE`;
 - [x] configurațiile TLS conflictuale nu pot produce panic;
 - [x] un SPID omorât este eliminat și pool-ul se recuperează;
@@ -1312,21 +1448,28 @@ upstream fără aprobarea explicită a proprietarului forkului.
 - Fork: `https://github.com/galeamarcel/FastMssql.git`
 - Branch cumulativ: `test/sql-auth-validation`
 - HEAD tehnic verificat:
-  `597e299bb2a86d8a68a0e209d3e54200cb4696c7`
+  `438a86ef91c2d5ea819008f2c2bf52c568e3a4c9`
 - `origin` indică forkul; `upstream` permite numai fetch, cu push
   `DISABLED`.
-- Containerul SQL-auth `fastmssql-sql-auth-dev`: `healthy`.
-- CONN-020–CONN-024, FRAME-025–FRAME-026 și LOAD-009: 8/8 PASS.
-- Readiness load: 1.000/1.000 probe, concurență 100, maximum 20 sesiuni,
-  post-load query PASS.
-- Suita strictă SQL-auth: 354/354 PASS, cu exact 285/285 ID-uri din
-  specificație.
-- Suita upstream aplicabilă: 896/896 PASS în 64,38 s.
-- Rust: 13/13 unit tests PASS; Tiberius vendored: 123/123 unit tests și
-  20/20 doctests executate PASS, 1 doctest ignorat intenționat.
-- `cargo fmt`, Clippy cu `-D warnings`, Ruff și `compileall`: PASS.
-- `cargo audit`: 219 dependențe scanate, zero findings.
-- Loginurile SQL-auth de test au zero sesiuni rămase după teardown.
+- Ultimul snapshot cu runner local/package/SQL complet este `f163d7b`:
+  containerul `fastmssql-sql-auth-dev` healthy; CONN-020–CONN-024,
+  FRAME-025–FRAME-026 și LOAD-009 8/8 PASS; readiness load 1.000/1.000 probe
+  la concurență 100 și maximum 20 sesiuni.
+- Tot la `f163d7b`: contractul PyO3 inițial 5/5; strict 295/295,
+  true-async 16/16, framework 28/28, resilience 6/6 și load 9/9 PASS;
+  upstream 901/901 PASS; exact 285/285 ID-uri din specificație.
+- Tot la `f163d7b`: Rust 13/13; Tiberius 123/123 unit și 20/20 doctests
+  executate PASS, 1 doctest ignorat intenționat; wheel ABI3 instalat și
+  importat dintr-un virtualenv CPython 3.13.14 curat.
+- Follow-up-ul exact la `438a86e`: contractul PyO3 extins 6/6 PASS și gate-ul
+  hosted
+  [#30155107955](https://github.com/galeamarcel/FastMssql/actions/runs/30155107955),
+  success separat pe Linux, macOS și Windows. Delta `f163d7b..438a86e`
+  modifică numai contractul și workflow-ul, fără runtime, manifeste sau
+  runner SQL-auth.
+- La snapshotul local complet: `cargo fmt`, Clippy cu `-D warnings`, Ruff,
+  `compileall` PASS; `cargo audit` a scanat 219 dependențe cu zero findings;
+  loginurile SQL-auth au zero sesiuni rămase după teardown.
 - Ramura locală și `origin/test/sql-auth-validation` sunt în paritate `0/0`;
   nu există push și nu există PR către upstream.
 
