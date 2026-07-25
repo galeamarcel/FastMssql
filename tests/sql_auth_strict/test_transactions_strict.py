@@ -184,12 +184,21 @@ async def test_tcp_fault_proxy_closes_server_leg_after_client_disconnect(
 
     try:
         session_id = await scalar(connection, "SELECT @@SPID")
+        connection_id = await scalar(
+            connection,
+            """
+            SELECT CONVERT(NVARCHAR(36), connection_id)
+            FROM sys.dm_exec_connections
+            WHERE session_id = @@SPID
+            """,
+        )
         assert proxy.accepted_connections == 1
         await connection.disconnect()
 
-        await _wait_for_session_absent(
+        await _wait_for_session_identity_absent(
             sa_connection,
             session_id,
+            connection_id,
             timeout=2.0,
         )
     finally:
@@ -275,9 +284,10 @@ async def _wait_for_request_identity(
     )
 
 
-async def _wait_for_session_absent(
+async def _wait_for_session_identity_absent(
     sa_connection: Connection,
     session_id: int,
+    connection_id: str,
     *,
     timeout: float = 2.0,
 ) -> None:
@@ -287,16 +297,18 @@ async def _wait_for_session_absent(
             sa_connection,
             """
             SELECT COUNT(*)
-            FROM sys.dm_exec_sessions
+            FROM sys.dm_exec_connections
             WHERE session_id = @P1
+              AND CONVERT(NVARCHAR(36), connection_id) = @P2
             """,
-            [session_id],
+            [session_id, connection_id],
         )
         if count == 0:
             return
         await asyncio.sleep(0.02)
     raise AssertionError(
-        f"SQL Server session {session_id} did not disappear"
+        "SQL Server session identity "
+        f"({session_id}, {connection_id}) did not disappear"
     )
 
 
@@ -891,9 +903,10 @@ async def test_cancelled_pooled_transaction_retires_without_explicit_close(
             present=False,
             timeout=2.0,
         )
-        await _wait_for_session_absent(
+        await _wait_for_session_identity_absent(
             sa_connection,
             original_session_id,
+            original_connection_id,
             timeout=2.0,
         )
         await asyncio.wait_for(waiting_begin, timeout=2.0)
@@ -996,9 +1009,10 @@ async def test_cancelled_direct_transaction_closes_and_rolls_back_without_close(
             present=False,
             timeout=2.0,
         )
-        await _wait_for_session_absent(
+        await _wait_for_session_identity_absent(
             sa_connection,
             original_session_id,
+            original_connection_id,
             timeout=2.0,
         )
         assert transaction.is_connected() is False
@@ -1076,9 +1090,10 @@ async def test_cancelled_commit_retires_lease_without_claiming_rollback(
         # Releasing the transparent proxy gate lets it observe the cancelled
         # client's EOF. No committing.close() occurs before the assertions.
         proxy.resume_downstream()
-        await _wait_for_session_absent(
+        await _wait_for_session_identity_absent(
             sa_connection,
             original_session_id,
+            original_connection_id,
             timeout=2.0,
         )
         await asyncio.wait_for(waiting_begin, timeout=2.0)
