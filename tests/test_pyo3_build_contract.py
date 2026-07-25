@@ -82,6 +82,21 @@ def test_hosted_gate_has_no_linker_or_failure_bypass() -> None:
         assert token not in workflow
 
 
+def test_linux_runner_exposes_managed_python_library_to_runtime_loader() -> None:
+    """PyO3 Rust tests embed Python, so Linux must resolve its shared library."""
+    workflow = _read_required(WORKFLOW)
+
+    assert "if: runner.os == 'Linux'" in workflow
+    assert 'sysconfig.get_config_var("LIBDIR")' in workflow
+    assert 'sysconfig.get_config_var("LDLIBRARY")' in workflow
+    assert "LD_LIBRARY_PATH=" in workflow
+    assert "${GITHUB_ENV}" in workflow
+    assert "/home/runner" not in workflow
+    assert workflow.index("LD_LIBRARY_PATH=") < workflow.index(
+        "cargo test --locked"
+    )
+
+
 def test_sql_auth_runner_uses_locked_cargo_tests() -> None:
     runner = _read_required(SQL_AUTH_RUNNER)
 
