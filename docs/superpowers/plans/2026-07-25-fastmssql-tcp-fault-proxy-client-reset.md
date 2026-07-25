@@ -696,7 +696,8 @@ set -euo pipefail
 set -a
 source .env.sql-auth.local
 set +a
-test "${FASTMSSQL_SQL_AUTH_CONTAINER}" = "fastmssql-sql-auth-dev"
+test "${FASTMSSQL_SQL_AUTH_CONTAINER:-fastmssql-sql-auth-dev}" = \
+  "fastmssql-sql-auth-dev"
 docker compose --env-file .env.sql-auth.local \
   -f docker-compose.sql-auth.yml up -d sqlserver
 scripts/sql_auth/provision.sh
@@ -1414,7 +1415,8 @@ Load `.env.sql-auth.local`, start/provision the approved container and run:
 set -a
 source .env.sql-auth.local
 set +a
-test "${FASTMSSQL_SQL_AUTH_CONTAINER}" = "fastmssql-sql-auth-dev"
+test "${FASTMSSQL_SQL_AUTH_CONTAINER:-fastmssql-sql-auth-dev}" = \
+  "fastmssql-sql-auth-dev"
 docker compose --env-file .env.sql-auth.local \
   -f docker-compose.sql-auth.yml up -d sqlserver
 scripts/sql_auth/provision.sh
