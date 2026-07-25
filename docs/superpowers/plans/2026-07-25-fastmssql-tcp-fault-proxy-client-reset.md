@@ -1103,9 +1103,11 @@ set -euo pipefail
 set -a
 source .env.sql-auth.local
 set +a
-verification_artifacts="../verify-tcp-fault-proxy-client-reset/.artifacts/sql-auth"
-uv run python scripts/sql_auth/generate_report.py \
-  --spec docs/superpowers/specs/2026-07-24-fastmssql-sql-auth-validation-design.md \
+verification_worktree="../verify-tcp-fault-proxy-client-reset"
+verification_artifacts="${verification_worktree}/.artifacts/sql-auth"
+"${verification_worktree}/.venv/bin/python" \
+  "${verification_worktree}/scripts/sql_auth/generate_report.py" \
+  --spec "${verification_worktree}/docs/superpowers/specs/2026-07-24-fastmssql-sql-auth-validation-design.md" \
   --strict-results "${verification_artifacts}/strict-results.json" \
   --artifact-dir "${verification_artifacts}" \
   --matrix-output docs/SQL_AUTH_TEST_MATRIX.md \
@@ -1114,7 +1116,9 @@ uv run python scripts/sql_auth/generate_report.py \
 ```
 
 Expected: matrix `285/285` PASS and report lanes
-`296/16/28/6/9/902`, all exit zero.
+`296/16/28/6/9/902`, all exit zero. Running the generator resolved from the
+detached verification worktree also makes the report's `Git commit` field
+equal `technical_sha`, rather than the later documentation-only status SHA.
 
 - [ ] **Step 3: Commit the generated evidence first**
 
@@ -1693,9 +1697,11 @@ set -euo pipefail
 set -a
 source .env.sql-auth.local
 set +a
-verification_artifacts="../verify-pool-config-default-consistency/.artifacts/sql-auth"
-uv run python scripts/sql_auth/generate_report.py \
-  --spec docs/superpowers/specs/2026-07-24-fastmssql-sql-auth-validation-design.md \
+verification_worktree="../verify-pool-config-default-consistency"
+verification_artifacts="${verification_worktree}/.artifacts/sql-auth"
+"${verification_worktree}/.venv/bin/python" \
+  "${verification_worktree}/scripts/sql_auth/generate_report.py" \
+  --spec "${verification_worktree}/docs/superpowers/specs/2026-07-24-fastmssql-sql-auth-validation-design.md" \
   --strict-results "${verification_artifacts}/strict-results.json" \
   --artifact-dir "${verification_artifacts}" \
   --matrix-output docs/SQL_AUTH_TEST_MATRIX.md \
@@ -1704,7 +1710,8 @@ uv run python scripts/sql_auth/generate_report.py \
 ```
 
 Expected: `285/285` cases and lanes
-`296/16/28/6/9/906`, all green.
+`296/16/28/6/9/906`, all green. The report's `Git commit` field must equal
+the detached `pool_technical_sha`, not the documentation-only status SHA.
 
 - [ ] **Step 3: Correct only post-harness PoolConfig plan counts**
 
