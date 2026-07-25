@@ -3,21 +3,20 @@
 Data auditului: 24 iulie 2026  
 Fork auditat: `https://github.com/galeamarcel/FastMssql.git`  
 Branch: `test/sql-auth-validation`  
-Commit tehnic: `438a86ef91c2d5ea819008f2c2bf52c568e3a4c9`
+Commit tehnic: `776f9033975f8727fba57f51effb81c8fafd9acb`
 
 Ultima actualizare live: 25 iulie 2026
-Ultimul fix verificat: `fix/pyo3-linux-libpython-runtime` la `425b553`,
-precedat de fixul manifest/runner `f163d7b` și contractul Linux `1af58fe`
-Ultimul harness tranzacțional de load verificat: `adac307`
+Ultimul fix verificat: `feat/operation-timeouts` la `822ab2a`, inclusiv
+contractul RED cross-platform `2d8e526`
+Ultimul harness tranzacțional de load verificat: `822ab2a`
 Ultimul contract de readiness load verificat: LOAD-009 în `d891db8`
-Ultimul branch cumulativ verificat: `test/sql-auth-validation` la `438a86e`
+Ultimul merge tehnic verificat: `test/sql-auth-validation` la `776f903`
 Ultimul gate hosted verificat: `rust-unit-tests.yml`, rularea
-[#30155107955](https://github.com/galeamarcel/FastMssql/actions/runs/30155107955)
-verde pe Linux, macOS și Windows la `438a86e`
-Gate-ul dependency-security rămâne `ci/dependency-security-gate` la
-`3887ddd`, cu checkout menținut la `1d13280`; rularea hosted
-[#30130204804](https://github.com/galeamarcel/FastMssql/actions/runs/30130204804)
-a trecut pe `b1167ae`
+[#30179649298](https://github.com/galeamarcel/FastMssql/actions/runs/30179649298)
+verde pe Linux, macOS și Windows la `776f903`
+Ultimul gate dependency-security verificat: rularea
+[#30179649321](https://github.com/galeamarcel/FastMssql/actions/runs/30179649321)
+verde la același `776f903`
 
 ## Concluzie
 
@@ -45,11 +44,19 @@ controlează modul de extensie, iar `cargo build --locked` și
 Windows. Această remediere este exclusiv de build/CI și nu schimbă API-ul,
 runtime-ul SQL ori protocolul TDS.
 
+Deadline-urile publice sunt acum implementate separat pentru conectare
+fizică, achiziție din pool, operație, durata absolută a tranzacției și
+rollback. Un timeout după pornirea unui request este fail-closed: socketul sau
+lease-ul este retras, SQL-ul nu este retrimis, iar pierderea confirmării
+`COMMIT` păstrează `CommitOutcomeUnknown` ca eroare principală. Contractul
+este identic pe Linux, macOS și Windows printr-un plafon portabil explicit de
+100 de ani.
+
 Toate defectele P0 de corectitudine identificate de acest audit sunt închise
 pe fork. Aceasta nu declară încă biblioteca complet enterprise
-production-ready: timeouturile publice și lifecycle-ul, streamingul cu memorie
-limitată, tipurile lipsă, multiple result sets/RPC și gate-urile de packaging
-prin servere reale rămân cerințe P1/P2.
+production-ready: lifecycle-ul `Open | Closing | Closed`, observabilitatea,
+streamingul cu memorie limitată, tipurile lipsă, multiple result sets/RPC și
+gate-urile de packaging prin servere reale rămân cerințe P1/P2.
 
 Auditul corectează explicit o concluzie anterioară: TDS `ATTENTION` nu este o
 condiție necesară pentru a termina sigur un request dacă driverul închide
@@ -741,9 +748,12 @@ parțială a `ATTENTION` ar risca returnarea în pool a unui stream
 desincronizat. Închiderea transportului este contractul P0 sigur și verificat;
 `ATTENTION` cu reutilizarea aceleiași sesiuni rămâne o optimizare P1 separată.
 
-Limite păstrate explicit:
+Limite păstrate explicit de candidatul de anulare, la momentul verificării
+lui:
 
-- nu există încă timeout public separat pentru query/tranzacție/rollback;
+- timeouturile publice separate pentru query/tranzacție/rollback nu făceau
+  parte din acel diff; ele au fost adăugate ulterior de candidatul
+  `feat/operation-timeouts`, descris în secțiunea dedicată;
 - anularea unui `COMMIT` rămâne rezultat de business care trebuie reconciliat
   prin cheie idempotentă, chiar dacă excepția Python este `CancelledError`;
 - nu există retry automat, al doilea settlement sau presupunere de rollback;
@@ -928,15 +938,16 @@ Ownership-ul frameworkurilor este explicit:
 - `async def` Flask sub WSGI rămâne doar compatibilitate funcțională, fără
   promisiunea unui event loop persistent sau a unui pool async persistent.
 
-Limite păstrate intenționat:
+Limite păstrate intenționat de candidatul readiness:
 
 - un eșec de readiness retrage conexiunea nesigură, dar nu distruge automat
   întregul pool comun; proprietarul aplicației decide retry sau `disconnect()`;
 - `is_connected()` nu face I/O și nu este un health check;
 - serializarea unui `disconnect()` concurent aparține viitoarei mașini de
   lifecycle `Open | Closing | Closed`;
-- timeouturile generale per operație, taxonomia lor publică, telemetry și
-  retry-ul automat sunt excluse;
+- timeouturile generale per operație și taxonomia lor publică erau excluse
+  din acel diff și au fost implementate ulterior în
+  `feat/operation-timeouts`; telemetry și retry-ul automat rămân excluse;
 - TDS `ATTENTION`, drenarea până la `DONE_ATTN` și reutilizarea aceluiași
   socket după anulare sunt excluse;
 - EOF-ul unui transport TLS deja autentificat poate fi încă expus ca
@@ -1106,8 +1117,9 @@ Limitele de compatibilitate sunt deliberate:
   `adaptive()` nu se schimbă;
 - profilul direct istoric `20/2/None/None/30/None/None` rămâne disponibil
   prin argumente explicite;
-- semantica `connection_timeout_secs=None` și viitoarele deadline-uri separate
-  pentru acquire/query/tranzacție rămân un candidat independent.
+- semantica `connection_timeout_secs=None` a rămas compatibilă; deadline-urile
+  separate pentru acquire/operație/tranzacție au fost implementate ulterior
+  în candidatul independent `feat/operation-timeouts`.
 
 Istoricul TDD separat, publicat numai pe fork, este:
 
@@ -1188,6 +1200,169 @@ Nu a fost creat niciun branch upstream, nu s-a făcut push și nu s-a deschis
 niciun PR către `Rivendael/FastMssql`. PR-21 din roadmap este numai un
 candidat `VERIFIED_FORK`; rebase-ul curat și publicarea cer o aprobare nouă,
 separată.
+
+## Deadline-uri operaționale — implementate și verificate
+
+Statusul candidatului este `VERIFIED_FORK`. API-ul public expune
+`TimeoutConfig` cu cinci bugete distincte:
+
+```text
+connect_timeout_secs       30.0
+acquire_timeout_secs       30.0
+operation_timeout_secs     None
+transaction_timeout_secs   None
+rollback_timeout_secs      30.0
+```
+
+`connect`, `operation`, `transaction` și `rollback` pot fi dezactivate
+explicit cu `None`. Achiziția din pool rămâne obligatoriu limitată.
+Compatibilitatea fără `timeout_config` derivă bugetele connect/acquire din
+`PoolConfig.connection_timeout_secs` sau din defaultul de 30 de secunde;
+valorile explicite din `TimeoutConfig` au prioritate și aliniază timeoutul
+intern bb8.
+
+Toate valorile numerice sunt validate identic la construcție și mutare:
+
+- booleenii, valorile nefinite, zero și valorile negative sunt respinse;
+- minimul este o nanosecundă;
+- maximul inclusiv este `3_153_600_000` secunde, adică 100 × 365 zile;
+- plafonul explicit evită semantica diferită a
+  `Instant::checked_add` între Linux/macOS și Windows;
+- verificarea clock-ului monoton local rămâne un al doilea guard fail-closed.
+
+`OperationTimeoutError` este un `SqlConnectionError` tipat și păstrează
+`operation`, `phase`, `timeout_seconds`, `retryable`,
+`connection_discarded` și `outcome_unknown`. Fazele publice stabile sunt
+`connect`, `acquire`, `operation`, `transaction` și `rollback`.
+
+Limitele executate sunt precise:
+
+1. connect acoperă credential acquisition, TCP, TLS/login și routed reconnect;
+2. acquire acoperă coada, checkout-ul și validation/reset;
+3. operation acoperă cererea și consumarea completă a răspunsului;
+4. batch/bulk consumă un singur deadline absolut, fără reset per chunk;
+5. durata tranzacției începe numai după confirmarea `BEGIN` și nu se resetează
+   între operații;
+6. rollback folosește propriul buget, independent de durata tranzacției.
+
+Orice timeout după ce requestul poate fi pe wire retrage socketul sau lease-ul
+în loc să returneze o sesiune posibil desincronizată. Nu există retry automat
+nou. Pentru un write general, `outcome_unknown=True`; aplicația trebuie să
+reconcilieze printr-o cheie idempotentă/business. Pentru `COMMIT`, eroarea
+principală rămâne `CommitOutcomeUnknown`, iar `OperationTimeoutError` este
+cauza tipată; FastMssql nu trimite rollback, un al doilea COMMIT sau retry.
+
+Istoricul separat de design, RED, GREEN și integrare este:
+
+- `docs/operation-timeouts-design`
+  - `462cdb0` — designul public și limitele de siguranță;
+  - `7c14d26` — planul TDD și gate-urile locale/hosted;
+- `test/operation-timeouts`
+  - `9d579d4` — reproducerea RED pentru TIME-001–TIME-010;
+- `feat/operation-timeouts`
+  - `30a22cd` — `TimeoutConfig` și taxonomia tipată;
+  - `5d52735` — deadline-uri pentru connect/acquire;
+  - `0fb81d4` — operații fail-closed;
+  - `c0d20c0` — lifetime tranzacțional și rollback independent;
+  - `872b9bd` — contractul public documentat;
+  - `86d025d` — respingerea duratelor nereprezentabile;
+  - `8e57797` — retragerea conexiunilor directe după erori fatale;
+- `test/operation-timeout-portability`
+  - `2d8e526` — RED determinist: 100 ani acceptat, 100 ani + 1 s respins;
+- `feat/operation-timeouts`
+  - `822ab2a` — plafonul portabil și corecția de reproducibilitate a planului;
+- `test/sql-auth-validation`
+  - `ab99c191` — primul merge tehnic, păstrat cu gate-ul Windows RED;
+  - `776f9033975f8727fba57f51effb81c8fafd9acb` — merge-ul tehnic final;
+- `docs/operation-timeouts-status`
+  - `eec7e83c878aa158b3ba4f0840461a023cb9f14e` — matricea și raportul
+    regenerate din artefactele feature-ului final.
+
+Self-review-ul local a găsit două defecte suplimentare înainte de închidere:
+
+- duratele foarte mici puteau deveni `Duration::ZERO`, iar duratele enorme
+  puteau depăși clock-ul monoton; ambele sunt acum respinse înainte de I/O;
+- `Transaction` direct considera reutilizabile unele erori I/O/TLS/protocol.
+  Prima suită completă la `86d025d` a păstrat RED-ul RES-006: `close()` încerca
+  rollback pe socketul TLS mort. `8e57797` folosește clasificarea comună,
+  retrage socketul și expune `is_connected() == False`.
+
+Dovada locală finală la feature SHA `822ab2a` este:
+
+```text
+matrice SQL-auth                               295/295 PASS
+suita strictă SQL-auth                        305/305 PASS
+async / framework                              16/16, 29/29 PASS
+resilience / load                                6/6, 9/9 PASS
+regresie upstream aplicabilă                  915/915 PASS
+FastMssql Rust                                  23/23 PASS
+TimeoutConfig + PoolConfig wheel izolat         12/12 PASS
+cargo fmt / Clippy -D warnings / Ruff          PASS
+cargo audit hosted la merge-ul final           0 findings
+```
+
+Vendorul Tiberius nu s-a schimbat în corecția de portabilitate. La arborele
+tehnic anterior `8e57797`, aceleași surse Tiberius au trecut `123/123` teste
+unitare și `20/20` doctests cu feature-urile de producție
+`chrono,tds73,rustls` (`1` doctest ignorat).
+
+Profilul final de stress, executat tot la `822ab2a`, a măsurat:
+
+```text
+tranzacții totale / concurență                99.999 / 100
+strategie                                      100 obiecte Transaction persistente
+COMMIT / ROLLBACK                              50.000 / 49.999
+sesiuni fizice/eșantionate                     100 / 100
+durată / throughput local                      26,76 s / 3.736,19 tx/s
+tick-uri event loop                            2.647
+creștere RSS                                   51.265.536 bytes
+smoke după load                                PASS
+sesiuni rămase                                 0
+```
+
+Throughputul și RSS sunt specifice mediului macOS ARM64 + container MSSQL
+amd64 emulat; nu sunt promisiuni universale de performanță. Interogarea finală
+`sys.dm_exec_sessions`/`sys.dm_exec_requests` a raportat zero sesiuni
+`fastmssql_%`, zero sesiuni TIME și zero requesturi TIME.
+
+Primul gate hosted nu este ascuns:
+[run-ul #30178680707](https://github.com/galeamarcel/FastMssql/actions/runs/30178680707)
+la `ab99c191` a trecut complet pe Ubuntu și macOS, iar Windows a trecut Cargo,
+Rust și build/install wheel, dar a eșuat un singur contract deoarece valoarea
+`1e19` era acceptată de clock-ul Windows. RustSec-ul aceleiași versiuni,
+[#30178680735](https://github.com/galeamarcel/FastMssql/actions/runs/30178680735),
+a fost verde.
+
+RED-ul portabil `2d8e526` a reprodus local divergența. După `822ab2a`,
+[run-ul final #30179649298](https://github.com/galeamarcel/FastMssql/actions/runs/30179649298)
+a verificat exact `776f903`:
+
+- [Ubuntu](https://github.com/galeamarcel/FastMssql/actions/runs/30179649298/job/89733979582)
+  — raw Cargo, `23/23` Rust, wheel instalat și contract Python: `success`;
+- [macOS](https://github.com/galeamarcel/FastMssql/actions/runs/30179649298/job/89733979558)
+  — aceleași gate-uri: `success`;
+- [Windows](https://github.com/galeamarcel/FastMssql/actions/runs/30179649298/job/89733979531)
+  — inclusiv frontiera portabilă care eșuase anterior: `success`;
+- [RustSec](https://github.com/galeamarcel/FastMssql/actions/runs/30179649321/job/89733979621)
+  — vulnerabilități și warnings respinse: `success`.
+
+Limitele rămase sunt intenționat vizibile:
+
+- `None` elimină numai deadline-ul FastMssql; timeouturile OS, rețea,
+  infrastructură și SQL Server continuă să se aplice;
+- timeoutul anulează future-ul și retrage transportul; nu trimite încă TDS
+  `ATTENTION` și nu reutilizează aceeași sesiune după anulare;
+- nu există override per apel, retry SQL nou sau telemetry implicită;
+- lifecycle-ul `Open | Closing | Closed`, așteptarea lease-urilor și
+  observabilitatea rămân candidați separați;
+- agregarea unei excepții din corp cu o excepție de cleanup în context manager
+  rămâne un candidat separat.
+
+`origin` este exclusiv `galeamarcel/FastMssql`, iar push URL-ul `upstream`
+este `DISABLED`. Lista PR-urilor upstream pentru
+`galeamarcel:feat/operation-timeouts` este goală. Orice branch curat, push sau
+PR către repository-ul original cere rebase/reproducere proaspătă și aprobarea
+separată, explicită, a lui Marcel Galea.
 
 ## Corecții și nuanțări față de primul audit
 
@@ -1306,8 +1481,9 @@ Această abstracție rezolvă simultan:
 `8027b67` implementează această arhitectură pentru tranzacțiile create prin
 `Connection.transaction()`: pool-ul comun produce un lease owned, iar
 dispozițiile `NeedsReset` și `Broken` sunt aplicate înainte de returnarea sau
-retragerea conexiunii. Generalizarea aceleiași abstracții pentru streaming,
-bulk, timeouturi și graceful shutdown rămâne lucru P1.
+retragerea conexiunii. Deadline-urile fail-closed au fost generalizate
+ulterior în `feat/operation-timeouts`; streamingul, bulk și graceful shutdown
+rămân lucru P1.
 
 Implementarea actuală relevantă este împărțită între
 [pool_manager.rs](../src/pool_manager.rs#L201),
@@ -1337,22 +1513,31 @@ nedeterministe după intrarea în `Committing`; conexiunea a fost deja eliminat�
 
 ## Probleme P1
 
-### Lifecycle, timeouturi și observabilitate
+### Deadline-uri și timeouturi — `VERIFIED_FORK`
 
-- Timeout separat pentru connect, pool acquisition, query, transaction și
-  rollback la închidere.
+- `TimeoutConfig` separă connect, pool acquisition, operation, transaction și
+  rollback; TIME-001–TIME-010 și gate-urile cross-platform sunt verzi la
+  `776f903`.
 - TDS `ATTENTION`, drenare până la `DONE_ATTN` și deadline de anulare numai
   pentru reutilizarea sigură a aceleiași sesiuni; fallback-ul trebuie să
   rămână retragerea transportului.
+- Override-urile per apel și orice retry explicit rămân decizii API viitoare;
+  nu sunt necesare pentru contractul fail-closed verificat.
+
+### Lifecycle și graceful shutdown — deschis
+
 - Readiness-ul inițial este **remediat în `158d801`**: `connect()` este strict
   implicit, `ping()` face I/O real, iar `connect(validate=False)` este
   singura cale explicit lazy. `is_connected()` rămâne intenționat numai
   lifecycle local; politica de retry/startup aparține aplicației.
-- Graceful shutdown cu stări `Open -> Closing -> Closed`, deadline și
+- Graceful shutdown cu stări `Open | Closing | Closed`, deadline și
   așteptarea lease-urilor active.
 - Limite pentru waiters/backpressure și un buget global:
   `workers * pool.max_size`, nu un pool calculat independent în fiecare
   proces.
+
+### Observabilitate — deschis
+
 - Metricile bb8 complete: timp de așteptare, checkout direct/așteptat,
   timeouturi, conexiuni create/eliminate și motivul eliminării.
 - Metrici de durată și tracing/OpenTelemetry, fără logarea implicită a SQL-ului
@@ -1601,12 +1786,15 @@ funcție ar necesita lucru la nivelul driverului TDS:
 12. `fix/pool-config-default-consistency` — **defaulturile explicite și
     implicite canonice, introspecția, stubul și limitele reale de pool
     finalizate și verificate hosted**
-13. `feat/timeouts-lifecycle-observability`
-14. `feat/typed-parameters`
-15. `feat/resultsets-streaming`
-16. `feat/batch-bulk`
-17. `fix/named-instance`
-18. `test/production-framework-matrix`
+13. `feat/operation-timeouts` — **deadline-uri separate, taxonomie tipată,
+    retragere fail-closed și gate Linux/macOS/Windows finalizate și verificate**
+14. `feat/lifecycle-state`
+15. `feat/observability`
+16. `feat/typed-parameters`
+17. `feat/resultsets-streaming`
+18. `feat/batch-bulk`
+19. `fix/named-instance`
+20. `test/production-framework-matrix`
 
 Orice remediere FastMssql va fi făcută numai pe forkul
 `galeamarcel/FastMssql`.
@@ -1634,8 +1822,9 @@ upstream fără aprobarea explicită a proprietarului forkului.
 - [x] două `begin()` concurente sunt respinse determinist;
 - [x] anularea unei operații tranzacționale elimină automat conexiunea, iar
   requestul și sesiunea server-side se încheie fără `close()` explicit;
-- [ ] timeouturile publice separate pentru connect/acquire/query/tranzacție
-  aplică deadline-uri și elimină conexiunea când protocolul rămâne incert;
+- [x] timeouturile publice separate pentru connect/acquire/operație/tranzacție/
+  rollback aplică deadline-uri absolute și elimină conexiunea când protocolul
+  rămâne incert;
 - [x] răspunsul pierdut după COMMIT produce `CommitOutcomeUnknown`, fără
   rollback sau retry automat;
 - [x] numărul sesiunilor tranzacționale nu depășește `pool.max_size`, inclusiv
@@ -1652,31 +1841,37 @@ upstream fără aprobarea explicită a proprietarului forkului.
 - Fork: `https://github.com/galeamarcel/FastMssql.git`
 - Branch cumulativ: `test/sql-auth-validation`
 - HEAD tehnic verificat:
-  `5dc70031fc1961faf76a5ec1fdb6f28b1141c10b`
+  `776f9033975f8727fba57f51effb81c8fafd9acb`
 - `origin` indică forkul; `upstream` permite numai fetch, cu push
   `DISABLED`.
-- La același SHA: PoolConfig pur `92/92`, integrare `16/16`, `POOL-001`
-  `1/1`, contract PyO3 `7/7` și FastMssql Rust `14/14` PASS. Profilurile
-  explicit și implicit sunt `15/3/1800/300/30`, iar proba live a rămas
-  limitată la `15/15/15` taskuri active/conexiuni/sesiuni și zero sesiuni
-  după teardown.
-- Tot la `5dc70031`: strict `296/296`, true-async `16/16`, framework
-  `28/28`, resilience `6/6`, load `9/9`, upstream `906/906` și exact
-  `285/285` ID-uri din specificație, toate PASS.
+- Feature-ul final este `822ab2a`; raportul generat din artefactele sale este
+  `eec7e83`, cu commitul tehnic al merge-ului `776f903` în antet.
+- La acest source tree: FastMssql Rust `23/23`, contractele instalate
+  TimeoutConfig + PoolConfig `12/12`, strict `305/305`, true-async `16/16`,
+  framework `29/29`, resilience `6/6`, load `9/9`, upstream `915/915` și
+  exact `295/295` ID-uri din specificație, toate PASS.
+- Stress-ul final: `99.999` tranzacții la concurență 100, exact
+  `50.000/49.999` COMMIT/ROLLBACK, smoke PASS și zero sesiuni după teardown.
+- Hosted la `776f903`: Linux/macOS/Windows
+  [#30179649298](https://github.com/galeamarcel/FastMssql/actions/runs/30179649298)
+  și RustSec
+  [#30179649321](https://github.com/galeamarcel/FastMssql/actions/runs/30179649321)
+  sunt verzi.
+- Run-ul Windows RED
+  [#30178680707](https://github.com/galeamarcel/FastMssql/actions/runs/30178680707)
+  rămâne vizibil și este legat de reproducerea `2d8e526` și fixul `822ab2a`.
+- Nu există PR upstream pentru acest candidat.
 - Wheel-ul `cp311-abi3` a fost construit, instalat și importat dintr-un
   virtualenv curat. `cargo fmt`, Clippy cu `-D warnings`, Ruff și `compileall`
   au trecut; `cargo audit` a scanat 219 dependențe cu zero findings.
-- Gate-ul hosted
+- Gate-ul hosted precedent, pentru candidatul PoolConfig,
   [#30172198247](https://github.com/galeamarcel/FastMssql/actions/runs/30172198247)
   a trecut separat pe Ubuntu, macOS și Windows: raw Cargo, `14/14` teste Rust,
   wheel instalat și contract Python izolat. Gate-ul
   [RustSec #30172198251](https://github.com/galeamarcel/FastMssql/actions/runs/30172198251)
   a trecut cu zero vulnerabilități și zero warnings.
-- Evidența generată la SHA-ul tehnic este commitul documentar
-  `8cba60f0b40a6e78a7270216c0fedf604db6c030`; commiturile narative ulterioare
-  nu schimbă arborele tehnic verificat.
 - Ramura tehnică locală și `origin/test/sql-auth-validation` sunt în paritate
-  `0/0`; nu există push și nu există PR către upstream.
+  `0/0`; nu există niciun push și niciun PR către upstream.
 
 Starea de mai sus este rezultatul arborelui tehnic exact înaintea acestui
 update documentar. Branchurile validate au fost integrate numai în fork; nu
