@@ -52,7 +52,7 @@ record uv-sync uv sync --locked --all-extras --dev
 record maturin-develop uv run maturin develop --release
 record cargo-fmt cargo fmt --check
 record cargo-clippy cargo clippy --all-targets -- -D warnings
-record cargo-test cargo test
+record cargo-test cargo test --locked
 
 record compose-up \
   docker compose --env-file "${env_file}" \
