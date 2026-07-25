@@ -1,3 +1,4 @@
+use crate::deadline::{DeadlineElapsed, OperationName};
 use crate::type_mapping;
 use ahash::AHashMap as HashMap;
 use pyo3::exceptions::{PyException, PyRuntimeError};
@@ -9,6 +10,7 @@ use tiberius::{ColumnType, Row, error::Error as TError};
 
 create_exception!(crate::fastmssql, SqlError, PyException);
 create_exception!(crate::fastmssql, SqlConnectionError, PyException);
+create_exception!(crate::fastmssql, OperationTimeoutError, SqlConnectionError);
 create_exception!(crate::fastmssql, CommitOutcomeUnknown, PyException);
 create_exception!(crate::fastmssql, TlsError, PyException);
 create_exception!(crate::fastmssql, ProtocolError, PyException);
@@ -16,6 +18,39 @@ create_exception!(crate::fastmssql, ConversionError, PyException);
 
 const UNKNOWN_COMMIT_MESSAGE: &str =
     "COMMIT completion was not confirmed; the transaction outcome is unknown";
+
+pub(crate) struct TimeoutErrorMetadata {
+    pub(crate) operation: OperationName,
+    pub(crate) retryable: bool,
+    pub(crate) connection_discarded: bool,
+    pub(crate) outcome_unknown: bool,
+}
+
+pub(crate) fn create_operation_timeout_error(
+    elapsed: DeadlineElapsed,
+    metadata: TimeoutErrorMetadata,
+) -> PyResult<PyErr> {
+    let phase = elapsed.phase.as_str();
+    let seconds = elapsed.timeout.as_secs_f64();
+    let message = format!(
+        "{} timed out in {} phase after {:.6} seconds",
+        metadata.operation.as_str(),
+        phase,
+        seconds
+    );
+    Python::attach(|py| {
+        let error = OperationTimeoutError::new_err(message.clone());
+        let value = error.value(py);
+        value.setattr("message", message)?;
+        value.setattr("operation", metadata.operation.as_str())?;
+        value.setattr("phase", phase)?;
+        value.setattr("timeout_seconds", seconds)?;
+        value.setattr("retryable", metadata.retryable)?;
+        value.setattr("connection_discarded", metadata.connection_discarded)?;
+        value.setattr("outcome_unknown", metadata.outcome_unknown)?;
+        Ok(error)
+    })
+}
 
 pub(crate) fn create_commit_outcome_unknown(cause: PyErr) -> PyResult<PyErr> {
     Python::attach(|py| {

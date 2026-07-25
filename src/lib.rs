@@ -9,12 +9,14 @@ mod azure_auth;
 mod batch;
 mod connection;
 mod connection_config;
+mod deadline;
 mod helpers;
 mod parameter_conversion;
 mod pool_config;
 mod pool_manager;
 mod py_parameters;
 mod ssl_config;
+mod timeout_config;
 mod transaction;
 mod type_mapping;
 mod types;
@@ -24,10 +26,11 @@ pub use connection::PyConnection;
 pub use pool_config::PyPoolConfig;
 pub use py_parameters::{Parameter, Parameters};
 pub use ssl_config::{EncryptionLevel, PySslConfig};
+pub use timeout_config::PyTimeoutConfig;
 pub use transaction::Transaction;
 pub use types::{
-    CommitOutcomeUnknown, ConversionError, ProtocolError, PyFastRow, PyQueryStream,
-    SqlConnectionError, SqlError, TlsError,
+    CommitOutcomeUnknown, ConversionError, OperationTimeoutError, ProtocolError, PyFastRow,
+    PyQueryStream, SqlConnectionError, SqlError, TlsError,
 };
 
 use crate::parameter_conversion::TypedNull;
@@ -72,6 +75,7 @@ fn fastmssql(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Parameter>()?;
     m.add_class::<Parameters>()?;
     m.add_class::<PyPoolConfig>()?;
+    m.add_class::<PyTimeoutConfig>()?;
     m.add_class::<PySslConfig>()?;
     m.add_class::<EncryptionLevel>()?;
     m.add_class::<PyAzureCredential>()?;
@@ -82,6 +86,10 @@ fn fastmssql(m: &Bound<'_, PyModule>) -> PyResult<()> {
         let py = m.py();
         m.add("SqlError", py.get_type::<SqlError>())?;
         m.add("SqlConnectionError", py.get_type::<SqlConnectionError>())?;
+        m.add(
+            "OperationTimeoutError",
+            py.get_type::<OperationTimeoutError>(),
+        )?;
         m.add(
             "CommitOutcomeUnknown",
             py.get_type::<CommitOutcomeUnknown>(),
