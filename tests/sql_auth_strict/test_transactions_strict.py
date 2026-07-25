@@ -525,6 +525,7 @@ async def test_cancelled_transaction_lease_is_retired_and_waiter_recovers(
 
     try:
         await cancelled.begin()
+        cancelled_session_id = await scalar(cancelled, "SELECT @@SPID")
         cancelled_connection_id = await scalar(
             cancelled,
             """
@@ -540,6 +541,11 @@ async def test_cancelled_transaction_lease_is_retired_and_waiter_recovers(
             )
         )
         await _wait_for_request(sa_connection, token, present=True)
+
+        waiting_begin = asyncio.create_task(waiting.begin())
+        await asyncio.sleep(0.1)
+        assert waiting_begin.done() is False
+
         query_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await query_task
@@ -550,11 +556,13 @@ async def test_cancelled_transaction_lease_is_retired_and_waiter_recovers(
         ):
             await cancelled.commit()
 
-        waiting_begin = asyncio.create_task(waiting.begin())
-        await asyncio.sleep(0.1)
-        assert waiting_begin.done() is False
-
-        await cancelled.close()
+        # Cancellation itself must retire the connection and release the
+        # waiter; explicit close remains a later compatibility operation.
+        await _wait_for_request(sa_connection, token, present=False)
+        await _wait_for_session_absent(
+            sa_connection,
+            cancelled_session_id,
+        )
         await asyncio.wait_for(waiting_begin, timeout=2.0)
         recovered_connection_id = await scalar(
             waiting,
@@ -565,13 +573,16 @@ async def test_cancelled_transaction_lease_is_retired_and_waiter_recovers(
             """,
         )
         assert recovered_connection_id != cancelled_connection_id
-        await _wait_for_request(sa_connection, token, present=False)
+        assert cancelled.is_connected() is False
 
         stats = await connection.pool_stats()
         assert stats["connections"] == 1
         assert stats["active_connections"] == 1
         await waiting.rollback()
         await _wait_for_pool_active(connection, 0)
+
+        await cancelled.close()
+        await cancelled.close()
     finally:
         if query_task is not None and not query_task.done():
             query_task.cancel()
@@ -1015,7 +1026,6 @@ async def test_cancelled_commit_retires_lease_without_claiming_rollback(
 
     try:
         await committing.begin()
-        original_session_id = await scalar(committing, "SELECT @@SPID")
         original_connection_id = await scalar(
             committing,
             """
@@ -1041,11 +1051,6 @@ async def test_cancelled_commit_retires_lease_without_claiming_rollback(
         # Releasing the transparent proxy gate lets it observe the cancelled
         # client's EOF. No committing.close() occurs before the assertions.
         proxy.resume_downstream()
-        await _wait_for_session_absent(
-            sa_connection,
-            original_session_id,
-            timeout=2.0,
-        )
         await asyncio.wait_for(waiting_begin, timeout=2.0)
         replacement_connection_id = await scalar(
             waiting,
