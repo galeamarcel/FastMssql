@@ -313,3 +313,30 @@ impl Default for PyPoolConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_pool_profile_is_canonical() {
+        let config = PyPoolConfig::default();
+
+        assert_eq!(config.max_size, 15);
+        assert_eq!(config.min_idle, Some(3));
+        assert_eq!(
+            config.max_lifetime,
+            Some(std::time::Duration::from_secs(1800))
+        );
+        assert_eq!(
+            config.idle_timeout,
+            Some(std::time::Duration::from_secs(300))
+        );
+        assert_eq!(
+            config.connection_timeout,
+            Some(std::time::Duration::from_secs(30))
+        );
+        assert_eq!(config.test_on_check_out, None);
+        assert_eq!(config.retry_connection, None);
+    }
+}
