@@ -1,6 +1,7 @@
 use std::fmt::Write;
 
 use crate::azure_auth::PyAzureCredential;
+use crate::deadline::OperationName;
 use crate::helpers::{
     catch_driver_panic, execute_unparameterized_command, requires_connection_retirement,
     requires_direct_batch,
@@ -11,9 +12,11 @@ use crate::parameter_conversion::{
 };
 use crate::pool_config::PyPoolConfig;
 use crate::pool_manager::{
-    ConnectionPool, PooledOperationGuard, ensure_pool_initialized_with_auth,
+    ConnectionPool, PooledOperationGuard, connect_client_with_timeout,
+    ensure_pool_initialized_with_auth, map_pool_checkout_error,
 };
-use crate::types::{create_connection_error, create_sql_error};
+use crate::timeout_config::PyTimeoutConfig;
+use crate::types::create_sql_error;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
@@ -23,7 +26,6 @@ use std::sync::Arc;
 use tiberius::Config;
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
-use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 type SqlClient = tiberius::Client<tokio_util::compat::Compat<TcpStream>>;
 
@@ -151,6 +153,7 @@ pub async fn query_batch_on_connection(
 
 pub fn execute_batch<'p>(
     config: Arc<Config>,
+    timeout_config: PyTimeoutConfig,
     azure_credential: Option<Arc<PyAzureCredential>>,
     py: Python<'p>,
     commands: &Bound<'p, PyList>,
@@ -175,28 +178,13 @@ pub fn execute_batch<'p>(
         // because batch operations are inherently heavy and latency-tolerant.
         // ───────────────────────────────────────────────────────────────────────────
 
-        let address = config.get_addr();
-        let tcp = TcpStream::connect(&address).await.map_err(|e| {
-            create_connection_error(format!("Failed to connect to server {address}: {e}"))
-        })?;
-
-        // Disable Nagle — same rationale as pool_manager.rs and transaction.rs.
-        tcp.set_nodelay(true)
-            .map_err(|e| create_connection_error(format!("Failed to set TCP_NODELAY: {}", e)))?;
-
-        // Apply Azure token (or leave config auth as-is for SQL / Windows auth).
-        let mut auth_config = (*config).clone();
-        if let Some(ref cred) = azure_credential {
-            let auth_method = cred
-                .to_auth_method()
-                .await
-                .map_err(|e| create_connection_error(format!("Authentication failed: {}", e)))?;
-            auth_config.authentication(auth_method);
-        }
-
-        let mut conn = tiberius::Client::connect(auth_config, tcp.compat_write())
-            .await
-            .map_err(|e| create_sql_error(e, "Failed to connect for batch execution"))?;
+        let mut conn = connect_client_with_timeout(
+            &config,
+            azure_credential.as_ref(),
+            timeout_config.connect_timeout,
+            OperationName::ExecuteBatch,
+        )
+        .await?;
 
         conn.simple_query("BEGIN TRANSACTION")
             .await
@@ -229,6 +217,7 @@ pub fn query_batch<'p>(
     pool: Arc<RwLock<Option<ConnectionPool>>>,
     config: Arc<Config>,
     pool_config: PyPoolConfig,
+    timeout_config: PyTimeoutConfig,
     azure_credential: Option<Arc<PyAzureCredential>>,
     py: Python<'p>,
     queries: &Bound<'p, PyList>,
@@ -243,11 +232,22 @@ pub fn query_batch<'p>(
     let pool_config = pool_config.clone();
 
     future_into_py(py, async move {
-        let pool_ref =
-            ensure_pool_initialized_with_auth(pool, config, &pool_config, azure_credential).await?;
+        let pool_ref = ensure_pool_initialized_with_auth(
+            pool,
+            config,
+            &pool_config,
+            &timeout_config,
+            azure_credential,
+            OperationName::QueryBatch,
+        )
+        .await?;
 
-        let pooled = pool_ref.get().await.map_err(|e| {
-            create_connection_error(format!("Failed to get connection from pool: {}", e))
+        let pooled = pool_ref.get().await.map_err(|error| {
+            map_pool_checkout_error(
+                error,
+                OperationName::QueryBatch,
+                timeout_config.acquire_timeout,
+            )
         })?;
         let mut conn = PooledOperationGuard::new(pooled);
 
@@ -371,6 +371,7 @@ pub fn bulk_insert<'p>(
     pool: Arc<RwLock<Option<ConnectionPool>>>,
     config: Arc<Config>,
     pool_config: PyPoolConfig,
+    timeout_config: PyTimeoutConfig,
     azure_credential: Option<Arc<PyAzureCredential>>,
     py: Python<'p>,
     table_name: String,
@@ -432,13 +433,23 @@ pub fn bulk_insert<'p>(
     }
 
     future_into_py(py, async move {
-        let pool_ref =
-            ensure_pool_initialized_with_auth(pool, config, &pool_config, azure_credential).await?;
+        let pool_ref = ensure_pool_initialized_with_auth(
+            pool,
+            config,
+            &pool_config,
+            &timeout_config,
+            azure_credential,
+            OperationName::BulkInsert,
+        )
+        .await?;
 
-        let pooled = pool_ref
-            .get()
-            .await
-            .map_err(|e| create_connection_error(format!("Pool error: {}", e)))?;
+        let pooled = pool_ref.get().await.map_err(|error| {
+            map_pool_checkout_error(
+                error,
+                OperationName::BulkInsert,
+                timeout_config.acquire_timeout,
+            )
+        })?;
         let mut conn = PooledOperationGuard::new(pooled);
 
         consume_simple_command(

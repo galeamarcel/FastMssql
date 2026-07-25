@@ -7,24 +7,23 @@ use std::sync::Arc;
 use tiberius::{AuthMethod, Client, Config};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
-use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use crate::azure_auth::PyAzureCredential;
 use crate::batch::{execute_batch_on_connection, parse_batch_items, query_batch_on_connection};
 use crate::connection_config::config_from_ado_string;
+use crate::deadline::OperationName;
 use crate::helpers::{
     catch_driver_panic, execute_unparameterized_command, requires_direct_batch, wrap_query_stream,
 };
 use crate::parameter_conversion::{convert_parameters_to_fast, params_as_sql_refs};
 use crate::pool_config::PyPoolConfig;
 use crate::pool_manager::{
-    ConnectionPool, OwnedPooledConnection, acquire_owned_connection,
+    ConnectionPool, OwnedPooledConnection, acquire_owned_connection, connect_client_with_timeout,
     ensure_pool_initialized_with_auth,
 };
 use crate::ssl_config::PySslConfig;
-use crate::types::{
-    SqlError, create_commit_outcome_unknown, create_connection_error, create_sql_error,
-};
+use crate::timeout_config::PyTimeoutConfig;
+use crate::types::{SqlError, create_commit_outcome_unknown, create_sql_error};
 
 type SingleConnectionType = Client<tokio_util::compat::Compat<TcpStream>>;
 
@@ -231,6 +230,7 @@ impl Drop for TransactionCancellationGuard {
 struct SharedPoolSource {
     pool: Arc<RwLock<Option<ConnectionPool>>>,
     pool_config: PyPoolConfig,
+    timeout_config: PyTimeoutConfig,
 }
 
 #[derive(Clone, Copy)]
@@ -329,15 +329,18 @@ struct TransactionHandles {
     config: Arc<Config>,
     azure_credential: Option<Arc<PyAzureCredential>>,
     pool_source: Option<SharedPoolSource>,
+    timeout_config: PyTimeoutConfig,
 }
 
 impl TransactionHandles {
-    async fn ensure_connected(&self) -> PyResult<()> {
+    async fn ensure_connected(&self, operation: OperationName) -> PyResult<()> {
         Transaction::ensure_connected_inner(
             &self.session,
             &self.config,
             self.azure_credential.as_ref(),
             self.pool_source.as_ref(),
+            &self.timeout_config,
+            operation,
         )
         .await
     }
@@ -355,12 +358,13 @@ pub struct Transaction {
     _ssl_config: Option<PySslConfig>,
     azure_credential: Option<Arc<PyAzureCredential>>,
     pool_source: Option<SharedPoolSource>,
+    timeout_config: PyTimeoutConfig,
 }
 
 #[pymethods]
 impl Transaction {
     #[new]
-    #[pyo3(signature = (connection_string = None, ssl_config = None, azure_credential = None, server = None, database = None, username = None, password = None, application_intent = None, port = None, instance_name = None, application_name = None))]
+    #[pyo3(signature = (connection_string = None, ssl_config = None, azure_credential = None, server = None, database = None, username = None, password = None, application_intent = None, port = None, instance_name = None, application_name = None, timeout_config = None))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         connection_string: Option<String>,
@@ -374,6 +378,7 @@ impl Transaction {
         port: Option<u16>,
         instance_name: Option<String>,
         application_name: Option<String>,
+        timeout_config: Option<PyTimeoutConfig>,
     ) -> PyResult<Self> {
         let server_param = server.clone();
 
@@ -439,7 +444,13 @@ impl Transaction {
             _ssl_config: ssl_config,
             azure_credential: azure_credential.map(Arc::new),
             pool_source: None,
+            timeout_config: timeout_config.unwrap_or_else(PyTimeoutConfig::explicit_default),
         })
+    }
+
+    #[getter]
+    pub fn timeout_config(&self) -> PyTimeoutConfig {
+        self.timeout_config.clone()
     }
 
     /// Execute a SQL query that returns rows.
@@ -456,7 +467,7 @@ impl Transaction {
         future_into_py(py, async move {
             let mut cancellation_guard =
                 TransactionCancellationGuard::new(Arc::clone(&handles.session));
-            handles.ensure_connected().await?;
+            handles.ensure_connected(OperationName::Query).await?;
 
             let execution_result = {
                 let mut session = handles.session.lock().await;
@@ -496,7 +507,7 @@ impl Transaction {
         future_into_py(py, async move {
             let mut cancellation_guard =
                 TransactionCancellationGuard::new(Arc::clone(&handles.session));
-            handles.ensure_connected().await?;
+            handles.ensure_connected(OperationName::SimpleQuery).await?;
 
             let execution_result = {
                 let mut session = handles.session.lock().await;
@@ -541,7 +552,7 @@ impl Transaction {
         future_into_py(py, async move {
             let mut cancellation_guard =
                 TransactionCancellationGuard::new(Arc::clone(&handles.session));
-            handles.ensure_connected().await?;
+            handles.ensure_connected(OperationName::Execute).await?;
 
             let affected = {
                 let mut session = handles.session.lock().await;
@@ -593,7 +604,9 @@ impl Transaction {
         future_into_py(py, async move {
             let mut cancellation_guard =
                 TransactionCancellationGuard::new(Arc::clone(&handles.session));
-            handles.ensure_connected().await?;
+            handles
+                .ensure_connected(OperationName::ExecuteBatch)
+                .await?;
 
             let all_results = {
                 let mut session = handles.session.lock().await;
@@ -633,7 +646,7 @@ impl Transaction {
         future_into_py(py, async move {
             let mut cancellation_guard =
                 TransactionCancellationGuard::new(Arc::clone(&handles.session));
-            handles.ensure_connected().await?;
+            handles.ensure_connected(OperationName::QueryBatch).await?;
 
             let all_results = {
                 let mut session = handles.session.lock().await;
@@ -668,7 +681,7 @@ impl Transaction {
         let handles = self.clone_handles();
 
         future_into_py(py, async move {
-            handles.ensure_connected().await?;
+            handles.ensure_connected(OperationName::Begin).await?;
             Self::execute_transaction_command(&handles.session, TransactionCommand::Begin).await
         })
     }
@@ -755,6 +768,7 @@ impl Transaction {
         pool: Arc<RwLock<Option<ConnectionPool>>>,
         config: Arc<Config>,
         pool_config: PyPoolConfig,
+        timeout_config: PyTimeoutConfig,
         azure_credential: Option<Arc<PyAzureCredential>>,
     ) -> Self {
         Self {
@@ -762,7 +776,12 @@ impl Transaction {
             config,
             _ssl_config: None,
             azure_credential,
-            pool_source: Some(SharedPoolSource { pool, pool_config }),
+            pool_source: Some(SharedPoolSource {
+                pool,
+                pool_config,
+                timeout_config: timeout_config.clone(),
+            }),
+            timeout_config,
         }
     }
 
@@ -772,6 +791,7 @@ impl Transaction {
             config: Arc::clone(&self.config),
             azure_credential: self.azure_credential.clone(),
             pool_source: self.pool_source.clone(),
+            timeout_config: self.timeout_config.clone(),
         }
     }
 
@@ -901,6 +921,8 @@ impl Transaction {
         config: &Arc<Config>,
         azure_credential: Option<&Arc<PyAzureCredential>>,
         pool_source: Option<&SharedPoolSource>,
+        timeout_config: &PyTimeoutConfig,
+        operation: OperationName,
     ) -> PyResult<()> {
         let mut session = session.lock().await;
         session.state.ensure_connection_usable()?;
@@ -914,29 +936,23 @@ impl Transaction {
                 Arc::clone(&source.pool),
                 Arc::clone(config),
                 &source.pool_config,
+                &source.timeout_config,
                 azure_credential.cloned(),
+                operation,
             )
             .await?;
-            let lease = acquire_owned_connection(&pool).await?;
+            let lease =
+                acquire_owned_connection(&pool, operation, source.timeout_config.acquire_timeout)
+                    .await?;
             TransactionConnection::Pooled(lease)
         } else {
-            let address = config.get_addr();
-            let tcp_stream = TcpStream::connect(&address).await.map_err(|error| {
-                create_connection_error(format!("Failed to connect to server {address}: {error}"))
-            })?;
-            tcp_stream.set_nodelay(true).map_err(|error| {
-                create_connection_error(format!("Failed to set TCP_NODELAY: {error}"))
-            })?;
-
-            let mut auth_config = (**config).clone();
-            if let Some(azure_credential) = azure_credential {
-                let auth_method = azure_credential.to_auth_method().await?;
-                auth_config.authentication(auth_method);
-            }
-
-            let direct = Client::connect(auth_config, tcp_stream.compat())
-                .await
-                .map_err(|error| create_sql_error(error, "Failed to connect to database"))?;
+            let direct = connect_client_with_timeout(
+                config,
+                azure_credential,
+                timeout_config.connect_timeout,
+                operation,
+            )
+            .await?;
             TransactionConnection::Direct(direct)
         };
 

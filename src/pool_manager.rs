@@ -1,10 +1,16 @@
 use crate::azure_auth::PyAzureCredential;
+use crate::deadline::{DeadlineElapsed, OperationName, TimeoutPhase, deadline_from, run_until};
 use crate::pool_config::PyPoolConfig;
-use crate::types::{SqlError, create_connection_error, create_sql_error};
+use crate::timeout_config::PyTimeoutConfig;
+use crate::types::{
+    SqlError, TimeoutErrorMetadata, create_connection_error, create_operation_timeout_error,
+    create_sql_error,
+};
 use bb8::Pool;
 use pyo3::prelude::*;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 use tiberius::Config;
 use tokio::sync::RwLock;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
@@ -137,6 +143,9 @@ pub enum PoolConnectionError {
     },
     Tiberius(tiberius::error::Error),
     Auth(String),
+    Timeout {
+        timeout: Duration,
+    },
 }
 
 impl fmt::Display for PoolConnectionError {
@@ -154,6 +163,11 @@ impl fmt::Display for PoolConnectionError {
             } => write!(f, "I/O error: {source}"),
             PoolConnectionError::Tiberius(e) => write!(f, "SQL error: {e}"),
             PoolConnectionError::Auth(e) => write!(f, "Auth error: {e}"),
+            PoolConnectionError::Timeout { timeout } => write!(
+                f,
+                "physical connection timed out after {} seconds",
+                timeout.as_secs_f64()
+            ),
         }
     }
 }
@@ -194,8 +208,122 @@ impl From<PoolConnectionError> for pyo3::PyErr {
             PoolConnectionError::Auth(msg) => {
                 create_connection_error(format!("Authentication error: {msg}"))
             }
+            PoolConnectionError::Timeout { timeout } => timeout_error_or_metadata_failure(
+                DeadlineElapsed {
+                    timeout,
+                    phase: TimeoutPhase::Connect,
+                },
+                TimeoutErrorMetadata {
+                    operation: OperationName::Connect,
+                    retryable: true,
+                    connection_discarded: false,
+                    outcome_unknown: false,
+                },
+            ),
         }
     }
+}
+
+pub(crate) fn timeout_error_or_metadata_failure(
+    elapsed: DeadlineElapsed,
+    metadata: TimeoutErrorMetadata,
+) -> PyErr {
+    match create_operation_timeout_error(elapsed, metadata) {
+        Ok(timeout) => timeout,
+        Err(metadata_failure) => metadata_failure,
+    }
+}
+
+fn map_physical_connection_error(error: PoolConnectionError, operation: OperationName) -> PyErr {
+    match error {
+        PoolConnectionError::Timeout { timeout } => timeout_error_or_metadata_failure(
+            DeadlineElapsed {
+                timeout,
+                phase: TimeoutPhase::Connect,
+            },
+            TimeoutErrorMetadata {
+                operation,
+                retryable: true,
+                connection_discarded: false,
+                outcome_unknown: false,
+            },
+        ),
+        other => other.into(),
+    }
+}
+
+async fn connect_client_inner(
+    base_config: &Config,
+    azure_credential: Option<&Arc<PyAzureCredential>>,
+) -> Result<TiberiusClient, PoolConnectionError> {
+    let mut config = base_config.clone();
+
+    if let Some(credential) = azure_credential {
+        let auth_method = credential
+            .to_auth_method()
+            .await
+            .map_err(|error| PoolConnectionError::Auth(error.to_string()))?;
+        config.authentication(auth_method);
+    }
+
+    let address = config.get_addr();
+    let tcp = tokio::net::TcpStream::connect(&address)
+        .await
+        .map_err(|source| PoolConnectionError::Io {
+            source,
+            address: Some(address),
+        })?;
+    tcp.set_nodelay(true)?;
+
+    match tiberius::Client::connect(config.clone(), tcp.compat_write()).await {
+        Ok(client) => Ok(client),
+        Err(tiberius::error::Error::Routing { host, port }) => {
+            config.host(&host);
+            config.port(port);
+            let address = config.get_addr();
+            let tcp = tokio::net::TcpStream::connect(&address)
+                .await
+                .map_err(|source| PoolConnectionError::Io {
+                    source,
+                    address: Some(address),
+                })?;
+            tcp.set_nodelay(true)?;
+            tiberius::Client::connect(config, tcp.compat_write())
+                .await
+                .map_err(Into::into)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn connect_client_bounded(
+    base_config: &Config,
+    azure_credential: Option<&Arc<PyAzureCredential>>,
+    timeout: Option<Duration>,
+) -> Result<TiberiusClient, PoolConnectionError> {
+    let deadline = deadline_from(TimeoutPhase::Connect, timeout);
+    match run_until(
+        deadline,
+        connect_client_inner(base_config, azure_credential),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(elapsed) => Err(PoolConnectionError::Timeout {
+            timeout: elapsed.timeout,
+        }),
+    }
+}
+
+pub(crate) async fn connect_client_with_timeout(
+    config: &Config,
+    azure_credential: Option<&Arc<PyAzureCredential>>,
+    connect_timeout: Option<Duration>,
+    operation: OperationName,
+) -> PyResult<TiberiusClient> {
+    connect_client_bounded(config, azure_credential, connect_timeout)
+        .await
+        .map_err(|error| map_physical_connection_error(error, operation))
 }
 
 /// A `bb8::ManageConnection` implementation that calls `to_auth_method()` on every
@@ -215,13 +343,20 @@ pub struct AzureConnectionManager {
     base_config: Config,
     /// Azure credential, or `None` for non-Azure auth.
     azure_credential: Option<Arc<PyAzureCredential>>,
+    /// One budget covering credential refresh, TCP, TLS, login, and routing.
+    connect_timeout: Option<Duration>,
 }
 
 impl AzureConnectionManager {
-    pub fn new(base_config: Config, azure_credential: Option<Arc<PyAzureCredential>>) -> Self {
+    pub fn new(
+        base_config: Config,
+        azure_credential: Option<Arc<PyAzureCredential>>,
+        connect_timeout: Option<Duration>,
+    ) -> Self {
         Self {
             base_config,
             azure_credential,
+            connect_timeout,
         }
     }
 }
@@ -231,47 +366,12 @@ impl bb8::ManageConnection for AzureConnectionManager {
     type Error = PoolConnectionError;
 
     async fn connect(&self) -> Result<Self::Connection, Self::Error> {
-        let mut config = self.base_config.clone();
-
-        // Refresh (or serve from cache) the Azure access token for every new connection.
-        // `to_auth_method()` is cheap when a valid cached token exists; it only hits the
-        // network when the token has expired.
-        if let Some(cred) = &self.azure_credential {
-            let auth_method = cred
-                .to_auth_method()
-                .await
-                .map_err(|e| PoolConnectionError::Auth(e.to_string()))?;
-            config.authentication(auth_method);
-        }
-
-        let address = config.get_addr();
-        let tcp = tokio::net::TcpStream::connect(&address)
-            .await
-            .map_err(|source| PoolConnectionError::Io {
-                source,
-                address: Some(address),
-            })?;
-        tcp.set_nodelay(true)?;
-
-        let client = match tiberius::Client::connect(config.clone(), tcp.compat_write()).await {
-            Ok(c) => c,
-            // Server redirect: reconnect to the forwarded address.
-            Err(tiberius::error::Error::Routing { host, port }) => {
-                config.host(&host);
-                config.port(port);
-                let address = config.get_addr();
-                let tcp = tokio::net::TcpStream::connect(&address)
-                    .await
-                    .map_err(|source| PoolConnectionError::Io {
-                        source,
-                        address: Some(address),
-                    })?;
-                tcp.set_nodelay(true)?;
-                tiberius::Client::connect(config, tcp.compat_write()).await?
-            }
-            Err(e) => return Err(e.into()),
-        };
-
+        let client = connect_client_bounded(
+            &self.base_config,
+            self.azure_credential.as_ref(),
+            self.connect_timeout,
+        )
+        .await?;
         Ok(ManagedConnection::new(client))
     }
 
@@ -372,22 +472,36 @@ impl Drop for PooledOperationGuard<'_> {
 pub type ConnectionPool = Pool<AzureConnectionManager>;
 pub(crate) type OwnedPooledConnection = bb8::PooledConnection<'static, AzureConnectionManager>;
 
-pub(crate) fn map_pool_checkout_error(error: bb8::RunError<PoolConnectionError>) -> PyErr {
+pub(crate) fn map_pool_checkout_error(
+    error: bb8::RunError<PoolConnectionError>,
+    operation: OperationName,
+    acquire_timeout: Duration,
+) -> PyErr {
     match error {
-        bb8::RunError::TimedOut => create_connection_error(
-            "Connection pool timeout - all connections are busy. \
-             Try reducing concurrent requests or increasing pool size.",
+        bb8::RunError::TimedOut => timeout_error_or_metadata_failure(
+            DeadlineElapsed {
+                timeout: acquire_timeout,
+                phase: TimeoutPhase::Acquire,
+            },
+            TimeoutErrorMetadata {
+                operation,
+                retryable: true,
+                connection_discarded: false,
+                outcome_unknown: false,
+            },
         ),
-        bb8::RunError::User(error) => {
-            create_connection_error(format!("Failed to get connection from pool: {error}"))
-        }
+        bb8::RunError::User(error) => map_physical_connection_error(error, operation),
     }
 }
 
 pub(crate) async fn acquire_owned_connection(
     pool: &ConnectionPool,
+    operation: OperationName,
+    acquire_timeout: Duration,
 ) -> PyResult<OwnedPooledConnection> {
-    pool.get_owned().await.map_err(map_pool_checkout_error)
+    pool.get_owned()
+        .await
+        .map_err(|error| map_pool_checkout_error(error, operation, acquire_timeout))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -398,9 +512,17 @@ pub async fn establish_pool(
     base_config: &Config,
     azure_credential: Option<Arc<PyAzureCredential>>,
     pool_config: &PyPoolConfig,
+    timeout_config: &PyTimeoutConfig,
+    operation: OperationName,
 ) -> PyResult<ConnectionPool> {
-    let manager = AzureConnectionManager::new(base_config.clone(), azure_credential);
-    let mut builder = Pool::builder().max_size(pool_config.max_size);
+    let manager = AzureConnectionManager::new(
+        base_config.clone(),
+        azure_credential,
+        timeout_config.connect_timeout,
+    );
+    let mut builder = Pool::builder()
+        .max_size(pool_config.max_size)
+        .connection_timeout(timeout_config.acquire_timeout);
 
     if let Some(min) = pool_config.min_idle {
         builder = builder.min_idle(Some(min));
@@ -411,9 +533,6 @@ pub async fn establish_pool(
     if let Some(to) = pool_config.idle_timeout {
         builder = builder.idle_timeout(Some(to));
     }
-    if let Some(ct) = pool_config.connection_timeout {
-        builder = builder.connection_timeout(ct);
-    }
     if let Some(test) = pool_config.test_on_check_out {
         builder = builder.test_on_check_out(test);
     }
@@ -421,15 +540,14 @@ pub async fn establish_pool(
         builder = builder.retry_connection(retry);
     }
 
-    let pool = builder.build(manager).await.map_err(pyo3::PyErr::from)?;
+    let pool = builder
+        .build(manager)
+        .await
+        .map_err(|error| map_physical_connection_error(error, operation))?;
 
     // Warmup pool if min_idle is configured to eliminate cold-start latency.
     if let Some(min_idle) = pool_config.min_idle {
-        // Derive per-connection budget from pool_config; fall back to 30 s.
-        let conn_timeout = pool_config
-            .connection_timeout
-            .unwrap_or(std::time::Duration::from_secs(30));
-        warmup_pool(&pool, min_idle, conn_timeout).await?;
+        warmup_pool(&pool, min_idle, timeout_config, operation).await?;
     }
 
     Ok(pool)
@@ -439,7 +557,9 @@ pub async fn ensure_pool_initialized_with_auth(
     pool: Arc<RwLock<Option<ConnectionPool>>>,
     config: Arc<Config>,
     pool_config: &PyPoolConfig,
+    timeout_config: &PyTimeoutConfig,
     azure_credential: Option<Arc<PyAzureCredential>>,
+    operation: OperationName,
 ) -> PyResult<ConnectionPool> {
     {
         let read_guard = pool.read().await;
@@ -457,7 +577,14 @@ pub async fn ensure_pool_initialized_with_auth(
     // Pass the base config and credential to establish_pool.
     // AzureConnectionManager will call to_auth_method() on every new connection,
     // so tokens are always fresh regardless of when bb8 decides to open them.
-    let new_pool = establish_pool(&config, azure_credential, pool_config).await?;
+    let new_pool = establish_pool(
+        &config,
+        azure_credential,
+        pool_config,
+        timeout_config,
+        operation,
+    )
+    .await?;
     *write_guard = Some(new_pool.clone());
     Ok(new_pool)
 }
@@ -468,12 +595,13 @@ pub async fn ensure_pool_initialized_with_auth(
 /// All tasks run concurrently via a [`tokio::task::JoinSet`].  The total budget is
 /// `connection_timeout × target_connections` (capped at 120 s).  If the deadline
 /// expires, all outstanding tasks are cancelled via [`JoinSet::shutdown`] and an
-/// error is returned.  All individual errors are collected and surfaced together
-/// rather than bailing on the first failure.
+/// error is returned. The first connection failure retains its typed timeout/TLS/
+/// protocol classification; task-join failures are aggregated separately.
 pub async fn warmup_pool(
     pool: &ConnectionPool,
     target_connections: u32,
-    connection_timeout: std::time::Duration,
+    timeout_config: &PyTimeoutConfig,
+    operation: OperationName,
 ) -> PyResult<()> {
     use tokio::task::JoinSet;
 
@@ -482,8 +610,8 @@ pub async fn warmup_pool(
     // pool.get(); this outer deadline is a safety net to guarantee that
     // warmup_pool() always returns even if bb8's own timeout is misconfigured or
     // bypassed.
-    let warmup_budget =
-        (connection_timeout * target_connections.max(1)).min(std::time::Duration::from_secs(120));
+    let warmup_budget = (timeout_config.acquire_timeout * target_connections.max(1))
+        .min(std::time::Duration::from_secs(120));
 
     let mut set: JoinSet<Result<(), bb8::RunError<PoolConnectionError>>> = JoinSet::new();
 
@@ -495,16 +623,17 @@ pub async fn warmup_pool(
     }
 
     let deadline = tokio::time::Instant::now() + warmup_budget;
-    let mut errors: Vec<String> = Vec::new();
+    let mut errors: Vec<bb8::RunError<PoolConnectionError>> = Vec::new();
+    let mut join_errors: Vec<String> = Vec::new();
 
     loop {
         match tokio::time::timeout_at(deadline, set.join_next()).await {
             // Task completed successfully.
             Ok(Some(Ok(Ok(())))) => {}
             // Task returned a bb8/connection error – collect it and continue.
-            Ok(Some(Ok(Err(e)))) => errors.push(e.to_string()),
+            Ok(Some(Ok(Err(error)))) => errors.push(error),
             // Task panicked or was cancelled – record the join error and continue.
-            Ok(Some(Err(join_err))) => errors.push(format!("task panicked: {join_err}")),
+            Ok(Some(Err(join_err))) => join_errors.push(format!("task panicked: {join_err}")),
             // All tasks finished.
             Ok(None) => break,
             // Overall deadline exceeded – abort every outstanding task.
@@ -519,11 +648,19 @@ pub async fn warmup_pool(
         }
     }
 
-    if !errors.is_empty() {
+    if let Some(error) = errors.into_iter().next() {
+        return Err(map_pool_checkout_error(
+            error,
+            operation,
+            timeout_config.acquire_timeout,
+        ));
+    }
+
+    if !join_errors.is_empty() {
         return Err(create_connection_error(format!(
             "Connection pool warmup encountered {} error(s): {}",
-            errors.len(),
-            errors.join("; "),
+            join_errors.len(),
+            join_errors.join("; "),
         )));
     }
 
