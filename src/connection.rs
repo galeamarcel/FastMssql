@@ -9,6 +9,7 @@ use tokio::sync::RwLock;
 use crate::azure_auth::PyAzureCredential;
 use crate::batch::{bulk_insert, execute_batch, query_batch};
 use crate::connection_config::config_from_ado_string;
+use crate::deadline::{DeadlineElapsed, OperationName, TimeoutPhase, deadline_from, run_until};
 use crate::helpers::{
     catch_driver_panic, execute_unparameterized_command, requires_connection_retirement,
     requires_direct_batch, wrap_query_stream,
@@ -17,11 +18,12 @@ use crate::parameter_conversion::{FastParameter, convert_parameters_to_fast, par
 use crate::pool_config::PyPoolConfig;
 use crate::pool_manager::{
     ConnectionPool, PooledOperationGuard, ensure_pool_initialized_with_auth,
-    map_pool_checkout_error,
+    map_pool_checkout_error, timeout_error_or_metadata_failure,
 };
 use crate::ssl_config::PySslConfig;
+use crate::timeout_config::PyTimeoutConfig;
 use crate::transaction::Transaction;
-use crate::types::{create_connection_error, create_sql_error};
+use crate::types::{TimeoutErrorMetadata, create_sql_error};
 
 const READINESS_QUERY: &str = "SELECT 1";
 
@@ -29,16 +31,22 @@ struct ConnectionHandles {
     pool: Arc<RwLock<Option<ConnectionPool>>>,
     config: Arc<Config>,
     pool_config: PyPoolConfig,
+    timeout_config: PyTimeoutConfig,
     azure_credential: Option<Arc<PyAzureCredential>>,
 }
 
 impl ConnectionHandles {
-    fn ensure_connected(&self) -> impl std::future::Future<Output = PyResult<ConnectionPool>> + '_ {
+    fn ensure_connected(
+        &self,
+        operation: OperationName,
+    ) -> impl std::future::Future<Output = PyResult<ConnectionPool>> + '_ {
         ensure_pool_initialized_with_auth(
             self.pool.clone(),
             self.config.clone(),
             &self.pool_config,
+            &self.timeout_config,
             self.azure_credential.clone(),
+            operation,
         )
     }
 }
@@ -48,30 +56,60 @@ pub struct PyConnection {
     pool: Arc<RwLock<Option<ConnectionPool>>>,
     config: Arc<Config>,
     pool_config: PyPoolConfig,
+    timeout_config: PyTimeoutConfig,
     _ssl_config: Option<PySslConfig>,
     azure_credential: Option<Arc<PyAzureCredential>>,
 }
 
 impl PyConnection {
+    fn operation_timeout_error(
+        elapsed: DeadlineElapsed,
+        operation: OperationName,
+        outcome_unknown: bool,
+    ) -> PyErr {
+        timeout_error_or_metadata_failure(
+            elapsed,
+            TimeoutErrorMetadata {
+                operation,
+                retryable: false,
+                connection_discarded: true,
+                outcome_unknown,
+            },
+        )
+    }
+
     fn clone_handles(&self) -> ConnectionHandles {
         ConnectionHandles {
             pool: Arc::clone(&self.pool),
             config: Arc::clone(&self.config),
             pool_config: self.pool_config.clone(),
+            timeout_config: self.timeout_config.clone(),
             azure_credential: self.azure_credential.clone(),
         }
     }
 
-    async fn get_pool_connection(pool: &ConnectionPool) -> PyResult<PooledOperationGuard<'_>> {
-        let connection = pool.get().await.map_err(map_pool_checkout_error)?;
+    async fn get_pool_connection<'a>(
+        pool: &'a ConnectionPool,
+        timeouts: &PyTimeoutConfig,
+        operation: OperationName,
+    ) -> PyResult<PooledOperationGuard<'a>> {
+        let connection = pool
+            .get()
+            .await
+            .map_err(|error| map_pool_checkout_error(error, operation, timeouts.acquire_timeout))?;
         Ok(PooledOperationGuard::new(connection))
     }
 
-    async fn validate_pool_readiness(pool: &ConnectionPool) -> PyResult<()> {
-        let readiness_timeout = pool.config().connection_timeout;
-        let readiness = async {
-            let mut connection = Self::get_pool_connection(pool).await?;
-            let operation = catch_driver_panic(async {
+    async fn validate_pool_readiness(
+        pool: &ConnectionPool,
+        timeouts: &PyTimeoutConfig,
+        operation_name: OperationName,
+    ) -> PyResult<()> {
+        let mut connection = Self::get_pool_connection(pool, timeouts, operation_name).await?;
+        let deadline = deadline_from(TimeoutPhase::Operation, timeouts.operation_timeout);
+        let operation = run_until(
+            deadline,
+            catch_driver_panic(async {
                 connection
                     .simple_query(READINESS_QUERY)
                     .await
@@ -82,116 +120,135 @@ impl PyConnection {
                         create_sql_error(error, "Failed to consume connection readiness response")
                     })?;
                 Ok::<(), PyErr>(())
-            })
-            .await;
+            }),
+        )
+        .await;
 
-            match operation {
-                Ok(result) => {
-                    connection.complete_with_result_and_retirement(&result, false);
-                    result
-                }
-                Err(driver_panic) => Err(driver_panic),
+        match operation {
+            Err(elapsed) => Err(Self::operation_timeout_error(
+                elapsed,
+                operation_name,
+                false,
+            )),
+            Ok(Ok(result)) => {
+                connection.complete_with_result_and_retirement(&result, false);
+                result
             }
-        };
-
-        match tokio::time::timeout(readiness_timeout, readiness).await {
-            Ok(result) => result,
-            Err(_) => Err(create_connection_error(format!(
-                "Connection readiness timed out after {:.3} seconds",
-                readiness_timeout.as_secs_f64(),
-            ))),
+            Ok(Err(driver_panic)) => Err(driver_panic),
         }
     }
 
     #[inline]
     async fn execute_query_async_gil_free(
         pool: &ConnectionPool,
+        timeouts: &PyTimeoutConfig,
+        operation_name: OperationName,
         query: &str,
         parameters: &[FastParameter],
     ) -> PyResult<Vec<Row>> {
         let retire_after_operation = requires_connection_retirement(query);
-        let mut conn = Self::get_pool_connection(pool).await?;
+        let mut conn = Self::get_pool_connection(pool, timeouts, operation_name).await?;
         let tiberius_params = params_as_sql_refs(parameters);
+        let deadline = deadline_from(TimeoutPhase::Operation, timeouts.operation_timeout);
 
-        let operation = catch_driver_panic(async {
-            let stream = conn
-                .query(query, &tiberius_params)
-                .await
-                .map_err(|e| create_sql_error(e, "Query execution failed"))?;
+        let operation = run_until(
+            deadline,
+            catch_driver_panic(async {
+                let stream = conn
+                    .query(query, &tiberius_params)
+                    .await
+                    .map_err(|e| create_sql_error(e, "Query execution failed"))?;
 
-            stream
-                .into_first_result()
-                .await
-                .map_err(|e| create_sql_error(e, "Failed to get results"))
-        })
+                stream
+                    .into_first_result()
+                    .await
+                    .map_err(|e| create_sql_error(e, "Failed to get results"))
+            }),
+        )
         .await;
 
         match operation {
-            Ok(result) => {
+            Err(elapsed) => Err(Self::operation_timeout_error(elapsed, operation_name, true)),
+            Ok(Ok(result)) => {
                 conn.complete_with_result_and_retirement(&result, retire_after_operation);
                 result
             }
-            Err(driver_panic) => Err(driver_panic),
+            Ok(Err(driver_panic)) => Err(driver_panic),
         }
     }
 
     #[inline]
     async fn execute_simple_query_async_gil_free(
         pool: &ConnectionPool,
+        timeouts: &PyTimeoutConfig,
+        operation_name: OperationName,
         query: &str,
     ) -> PyResult<Vec<Row>> {
         let retire_after_operation = requires_connection_retirement(query);
-        let mut conn = Self::get_pool_connection(pool).await?;
+        let mut conn = Self::get_pool_connection(pool, timeouts, operation_name).await?;
+        let deadline = deadline_from(TimeoutPhase::Operation, timeouts.operation_timeout);
 
-        let operation = catch_driver_panic(async {
-            let stream = conn
-                .simple_query(query)
-                .await
-                .map_err(|e| create_sql_error(e, "Query execution failed"))?;
+        let operation = run_until(
+            deadline,
+            catch_driver_panic(async {
+                let stream = conn
+                    .simple_query(query)
+                    .await
+                    .map_err(|e| create_sql_error(e, "Query execution failed"))?;
 
-            stream
-                .into_first_result()
-                .await
-                .map_err(|e| create_sql_error(e, "Failed to get results"))
-        })
+                stream
+                    .into_first_result()
+                    .await
+                    .map_err(|e| create_sql_error(e, "Failed to get results"))
+            }),
+        )
         .await;
 
         match operation {
-            Ok(result) => {
+            Err(elapsed) => Err(Self::operation_timeout_error(elapsed, operation_name, true)),
+            Ok(Ok(result)) => {
                 conn.complete_with_result_and_retirement(&result, retire_after_operation);
                 result
             }
-            Err(driver_panic) => Err(driver_panic),
+            Ok(Err(driver_panic)) => Err(driver_panic),
         }
     }
 
     #[inline]
     async fn execute_command_async_gil_free(
         pool: &ConnectionPool,
+        timeouts: &PyTimeoutConfig,
+        operation_name: OperationName,
         query: &str,
         parameters: &[FastParameter],
     ) -> PyResult<u64> {
         let retire_after_operation = requires_connection_retirement(query);
-        let mut conn = Self::get_pool_connection(pool).await?;
-        let operation = catch_driver_panic(async {
-            if parameters.is_empty() && requires_direct_batch(query) {
-                execute_unparameterized_command(&mut conn, query, "Command execution failed").await
-            } else {
-                let tiberius_params = params_as_sql_refs(parameters);
-                conn.execute(query, &tiberius_params)
-                    .await
-                    .map(|result| result.rows_affected().iter().sum())
-                    .map_err(|e| create_sql_error(e, "Command execution failed"))
-            }
-        })
+        let mut conn = Self::get_pool_connection(pool, timeouts, operation_name).await?;
+        let deadline = deadline_from(TimeoutPhase::Operation, timeouts.operation_timeout);
+        let operation = run_until(
+            deadline,
+            catch_driver_panic(async {
+                if parameters.is_empty() && requires_direct_batch(query) {
+                    execute_unparameterized_command(&mut conn, query, "Command execution failed")
+                        .await
+                } else {
+                    let tiberius_params = params_as_sql_refs(parameters);
+                    conn.execute(query, &tiberius_params)
+                        .await
+                        .map(|result| result.rows_affected().iter().sum())
+                        .map_err(|e| create_sql_error(e, "Command execution failed"))
+                }
+            }),
+        )
         .await;
 
         match operation {
-            Ok(result) => {
+            Err(elapsed) => Err(Self::operation_timeout_error(elapsed, operation_name, true)),
+            Ok(Ok(result)) => {
                 conn.complete_with_result_and_retirement(&result, retire_after_operation);
                 result
             }
-            Err(driver_panic) => Err(driver_panic),
+            Ok(Err(driver_panic)) => Err(driver_panic),
         }
     }
 }
@@ -199,7 +256,7 @@ impl PyConnection {
 #[pymethods]
 impl PyConnection {
     #[new]
-    #[pyo3(signature = (connection_string = None, pool_config = None, ssl_config = None, azure_credential = None, server = None, database = None, username = None, password = None, application_intent = None, port = None, instance_name = None, application_name = None))]
+    #[pyo3(signature = (connection_string = None, pool_config = None, ssl_config = None, azure_credential = None, server = None, database = None, username = None, password = None, application_intent = None, port = None, instance_name = None, application_name = None, timeout_config = None))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         connection_string: Option<String>,
@@ -214,6 +271,7 @@ impl PyConnection {
         port: Option<u16>,
         instance_name: Option<String>,
         application_name: Option<String>,
+        timeout_config: Option<PyTimeoutConfig>,
     ) -> PyResult<Self> {
         let config = if let Some(conn_str) = connection_string {
             config_from_ado_string(&conn_str, ssl_config.as_ref())?
@@ -271,10 +329,18 @@ impl PyConnection {
             ));
         }
 
+        let original_pool_config = pool_config.unwrap_or_default();
+        let effective_timeout = match timeout_config {
+            Some(timeout_config) => timeout_config,
+            None => PyTimeoutConfig::from_pool_compatibility(&original_pool_config)?,
+        };
+        let effective_pool_config = effective_timeout.align_pool_config(&original_pool_config);
+
         Ok(PyConnection {
             pool: Arc::new(RwLock::new(None)),
             config: Arc::new(config),
-            pool_config: pool_config.unwrap_or_default(),
+            pool_config: effective_pool_config,
+            timeout_config: effective_timeout,
             _ssl_config: ssl_config,
             azure_credential: azure_credential.map(Arc::new),
         })
@@ -291,9 +357,15 @@ impl PyConnection {
         let handles = self.clone_handles();
 
         future_into_py(py, async move {
-            let pool_ref = handles.ensure_connected().await?;
-            let execution_result =
-                Self::execute_query_async_gil_free(&pool_ref, &query, &fast_parameters).await?;
+            let pool_ref = handles.ensure_connected(OperationName::Query).await?;
+            let execution_result = Self::execute_query_async_gil_free(
+                &pool_ref,
+                &handles.timeout_config,
+                OperationName::Query,
+                &query,
+                &fast_parameters,
+            )
+            .await?;
             wrap_query_stream(execution_result)
         })
     }
@@ -303,9 +375,14 @@ impl PyConnection {
         let handles = self.clone_handles();
 
         future_into_py(py, async move {
-            let pool_ref = handles.ensure_connected().await?;
-            let execution_result =
-                Self::execute_simple_query_async_gil_free(&pool_ref, &query).await?;
+            let pool_ref = handles.ensure_connected(OperationName::SimpleQuery).await?;
+            let execution_result = Self::execute_simple_query_async_gil_free(
+                &pool_ref,
+                &handles.timeout_config,
+                OperationName::SimpleQuery,
+                &query,
+            )
+            .await?;
             wrap_query_stream(execution_result)
         })
     }
@@ -321,9 +398,15 @@ impl PyConnection {
         let handles = self.clone_handles();
 
         future_into_py(py, async move {
-            let pool_ref = handles.ensure_connected().await?;
-            let affected_count =
-                Self::execute_command_async_gil_free(&pool_ref, &query, &fast_parameters).await?;
+            let pool_ref = handles.ensure_connected(OperationName::Execute).await?;
+            let affected_count = Self::execute_command_async_gil_free(
+                &pool_ref,
+                &handles.timeout_config,
+                OperationName::Execute,
+                &query,
+                &fast_parameters,
+            )
+            .await?;
             Ok(affected_count)
         })
     }
@@ -382,8 +465,14 @@ impl PyConnection {
             Arc::clone(&self.pool),
             Arc::clone(&self.config),
             self.pool_config.clone(),
+            self.timeout_config.clone(),
             self.azure_credential.clone(),
         )
+    }
+
+    #[getter]
+    pub fn timeout_config(&self) -> PyTimeoutConfig {
+        self.timeout_config.clone()
     }
 
     pub fn __aenter__<'p>(slf: Bound<'p, Self>, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
@@ -391,8 +480,9 @@ impl PyConnection {
         let slf_clone = slf.clone().unbind();
 
         future_into_py(py, async move {
-            let pool = handles.ensure_connected().await?;
-            Self::validate_pool_readiness(&pool).await?;
+            let pool = handles.ensure_connected(OperationName::Connect).await?;
+            Self::validate_pool_readiness(&pool, &handles.timeout_config, OperationName::Connect)
+                .await?;
             Python::try_attach(|py| Ok(slf_clone.clone_ref(py))).ok_or_else(|| {
                 pyo3::exceptions::PyRuntimeError::new_err("Failed to attach Python runtime thread")
             })?
@@ -421,9 +511,14 @@ impl PyConnection {
     pub fn connect<'p>(&self, py: Python<'p>, validate: bool) -> PyResult<Bound<'p, PyAny>> {
         let handles = self.clone_handles();
         future_into_py(py, async move {
-            let pool = handles.ensure_connected().await?;
+            let pool = handles.ensure_connected(OperationName::Connect).await?;
             if validate {
-                Self::validate_pool_readiness(&pool).await?;
+                Self::validate_pool_readiness(
+                    &pool,
+                    &handles.timeout_config,
+                    OperationName::Connect,
+                )
+                .await?;
             }
             Ok(true)
         })
@@ -437,8 +532,9 @@ impl PyConnection {
     pub fn ping<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let handles = self.clone_handles();
         future_into_py(py, async move {
-            let pool = handles.ensure_connected().await?;
-            Self::validate_pool_readiness(&pool).await?;
+            let pool = handles.ensure_connected(OperationName::Ping).await?;
+            Self::validate_pool_readiness(&pool, &handles.timeout_config, OperationName::Ping)
+                .await?;
             Ok(true)
         })
     }
@@ -464,6 +560,7 @@ impl PyConnection {
             handles.pool,
             handles.config,
             handles.pool_config,
+            handles.timeout_config,
             handles.azure_credential,
             py,
             queries,
@@ -482,6 +579,7 @@ impl PyConnection {
             handles.pool,
             handles.config,
             handles.pool_config,
+            handles.timeout_config,
             handles.azure_credential,
             py,
             table_name,
@@ -496,6 +594,12 @@ impl PyConnection {
         commands: &Bound<'p, PyList>,
     ) -> PyResult<Bound<'p, PyAny>> {
         let handles = self.clone_handles();
-        execute_batch(handles.config, handles.azure_credential, py, commands)
+        execute_batch(
+            handles.config,
+            handles.timeout_config,
+            handles.azure_credential,
+            py,
+            commands,
+        )
     }
 }

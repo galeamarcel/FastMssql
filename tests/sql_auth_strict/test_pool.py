@@ -6,6 +6,7 @@ import time
 
 from fastmssql import (
     Connection,
+    OperationTimeoutError,
     PoolConfig,
     ProtocolError,
     SqlConnectionError,
@@ -488,9 +489,16 @@ async def test_pool_saturation_times_out(
     )
     await _wait_for_active(connection, 1)
     started = time.monotonic()
-    with pytest.raises(SqlConnectionError, match="pool timeout"):
+    with pytest.raises(SqlConnectionError) as captured:
         await scalar(connection, "SELECT 2")
     elapsed = time.monotonic() - started
+    assert isinstance(captured.value, OperationTimeoutError)
+    assert captured.value.operation == "query"
+    assert captured.value.phase == "acquire"
+    assert captured.value.timeout_seconds == pytest.approx(1.0)
+    assert captured.value.retryable is True
+    assert captured.value.connection_discarded is False
+    assert captured.value.outcome_unknown is False
     assert 0.8 <= elapsed < 1.8
     assert await holder == 1
     assert await connection.disconnect() is True

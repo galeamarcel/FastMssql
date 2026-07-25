@@ -90,6 +90,24 @@ class PoolConfig:
         """
         ...
 
+class TimeoutConfig:
+    """Timeout policy shared by connection and transaction operations."""
+
+    connect_timeout_secs: Optional[float]
+    acquire_timeout_secs: float
+    operation_timeout_secs: Optional[float]
+    transaction_timeout_secs: Optional[float]
+    rollback_timeout_secs: Optional[float]
+
+    def __init__(
+        self,
+        connect_timeout_secs: Optional[float] = 30.0,
+        acquire_timeout_secs: float = 30.0,
+        operation_timeout_secs: Optional[float] = None,
+        transaction_timeout_secs: Optional[float] = None,
+        rollback_timeout_secs: Optional[float] = 30.0,
+    ) -> None: ...
+
 class EncryptionLevel(StrEnum):
     """SQL Server encryption level constants."""
 
@@ -143,6 +161,18 @@ class SqlConnectionError(Exception):
     message: Optional[str]
     host: Optional[str]
     port: Optional[int]
+    ...
+
+class OperationTimeoutError(SqlConnectionError):
+    """Raised when a configured FastMssql deadline expires."""
+
+    message: str
+    operation: str
+    phase: str
+    timeout_seconds: float
+    retryable: bool
+    connection_discarded: bool
+    outcome_unknown: bool
     ...
 
 class CommitOutcomeUnknown(Exception):
@@ -604,6 +634,7 @@ class Connection:
         port: Optional[int] = None,
         instance_name: Optional[str] = None,
         application_name: Optional[str] = None,
+        timeout_config: Optional[TimeoutConfig] = None,
     ) -> None:
         """
         Initialize a new SQL Server connection.
@@ -627,6 +658,11 @@ class Connection:
             - When using individual parameters, either username/password OR azure_credential must be provided
             - azure_credential and username/password are mutually exclusive
         """
+        ...
+
+    @property
+    def timeout_config(self) -> TimeoutConfig:
+        """Return an isolated copy of the effective timeout policy."""
         ...
 
     def connect(
@@ -813,8 +849,14 @@ class Transaction:
         port: Optional[int] = None,
         instance_name: Optional[str] = None,
         application_name: Optional[str] = None,
+        timeout_config: Optional[TimeoutConfig] = None,
     ) -> None:
         """Initialize a dedicated non-pooled connection for transactions."""
+        ...
+
+    @property
+    def timeout_config(self) -> TimeoutConfig:
+        """Return an isolated copy of the effective timeout policy."""
         ...
 
     def query(

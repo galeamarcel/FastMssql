@@ -19,11 +19,13 @@ from .fastmssql import (
     Parameter,
     Parameters,
     PoolConfig,
+    OperationTimeoutError,
     ProtocolError,
     QueryStream,
     SqlError,
     SslConfig,
     TlsError,
+    TimeoutConfig,
     TypedNull,
     version,
 )
@@ -94,6 +96,11 @@ class Connection:
         """Create a transaction backed by this connection's shared pool."""
         return Transaction._from_rust(self._conn.transaction())
 
+    @property
+    def timeout_config(self):
+        """Return an isolated copy of the effective timeout policy."""
+        return self._conn.timeout_config
+
 
 class Transaction:
     """SQL Server transaction on a shared pool lease or direct connection.
@@ -159,6 +166,11 @@ class Transaction:
     def is_connected(self):
         """Return True if the underlying connection is currently established."""
         return self._rust_conn.is_connected()
+
+    @property
+    def timeout_config(self):
+        """Return an isolated copy of the effective timeout policy."""
+        return self._rust_conn.timeout_config
 
     async def begin(self):
         """Begin a transaction."""
@@ -243,11 +255,13 @@ __all__ = [
     "Parameter",
     "Parameters",
     "PoolConfig",
+    "OperationTimeoutError",
     "ProtocolError",
     "QueryStream",
     "SqlError",
     "SslConfig",
     "TlsError",
+    "TimeoutConfig",
     "Transaction",
     "ApplicationIntent",
     "TypedNull",

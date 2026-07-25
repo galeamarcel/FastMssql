@@ -7,11 +7,12 @@ import logging
 import time
 
 from asgiref.wsgi import WsgiToAsgi
+import fastmssql
 from fastmssql import Connection, PoolConfig, SslConfig, Transaction
 from fastapi import FastAPI
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from pydantic import BaseModel
-from starlette.responses import PlainTextResponse
+from starlette.responses import JSONResponse, PlainTextResponse
 
 from sql_auth_strict.config import SqlAuthConfig
 from sql_auth_strict.helpers import IDENTIFIER, scalar
@@ -43,11 +44,16 @@ class FrameworkState:
         application_name: str,
         max_size: int = 4,
         min_idle: int = 0,
+        pool_config: PoolConfig | None = None,
+        timeout_config=None,
     ) -> FrameworkState:
         if not IDENTIFIER.fullmatch(application_name):
             raise ValueError(
                 f"unsafe framework application name {application_name!r}"
             )
+        connection_kwargs = {}
+        if timeout_config is not None:
+            connection_kwargs["timeout_config"] = timeout_config
         connection = Connection(
             server=config.host,
             port=config.port,
@@ -56,14 +62,19 @@ class FrameworkState:
             password=config.owner_password,
             application_name=application_name,
             ssl_config=SslConfig.development(),
-            pool_config=PoolConfig(
-                max_size=max_size,
-                min_idle=min_idle,
-                max_lifetime_secs=None,
-                idle_timeout_secs=None,
-                connection_timeout_secs=3,
-                retry_connection=False,
+            pool_config=(
+                pool_config
+                if pool_config is not None
+                else PoolConfig(
+                    max_size=max_size,
+                    min_idle=min_idle,
+                    max_lifetime_secs=None,
+                    idle_timeout_secs=None,
+                    connection_timeout_secs=3,
+                    retry_connection=False,
+                )
             ),
+            **connection_kwargs,
         )
         return cls(config, application_name, connection)
 
@@ -161,6 +172,47 @@ async def wait_for_sql_request(
     )
 
 
+def _timeout_payload(error: BaseException) -> dict[str, object]:
+    timeout_type = getattr(fastmssql, "OperationTimeoutError", None)
+    if timeout_type is None or not isinstance(error, timeout_type):
+        raise error
+    return {
+        "type": type(error).__name__,
+        "phase": error.phase,
+        "operation": error.operation,
+        "retryable": error.retryable,
+        "connection_discarded": error.connection_discarded,
+        "outcome_unknown": error.outcome_unknown,
+    }
+
+
+async def _timeout_route_value(
+    state: FrameworkState,
+    value: int,
+    *,
+    wait: bool,
+) -> dict[str, object]:
+    delay = "WAITFOR DELAY '00:00:00.250';" if wait else ""
+    result = await state.connection.query(
+        f"""
+        /* {state.application_name}_timeout_route */
+        {delay}
+        SELECT
+            @P1 AS value,
+            CONVERT(NVARCHAR(36), connection_id) AS connection_id
+        FROM sys.dm_exec_connections
+        WHERE session_id = @@SPID
+        """,
+        [value],
+    )
+    row = result.fetchone()
+    assert row is not None
+    return {
+        "value": int(row["value"]),
+        "connection_id": str(row["connection_id"]),
+    }
+
+
 def create_fastapi_app(
     state: FrameworkState,
     table_sql: str,
@@ -203,6 +255,22 @@ def create_fastapi_app(
             [value],
         )
         return {"value": returned}
+
+    @app.get("/timeout/{value}")
+    async def timeout_value(value: int, profile: str = "immediate"):
+        if profile not in {"immediate", "wait"}:
+            raise ValueError(f"invalid timeout profile {profile!r}")
+        try:
+            return await _timeout_route_value(
+                state,
+                value,
+                wait=profile == "wait",
+            )
+        except fastmssql.SqlConnectionError as error:
+            return JSONResponse(
+                _timeout_payload(error),
+                status_code=504,
+            )
 
     @app.post("/items/{item_id}", status_code=201)
     async def write_item(item_id: int, payload: ItemPayload):
@@ -317,6 +385,22 @@ def create_flask_app(state: FrameworkState) -> Flask:
     @app.get("/wait/<int:value>")
     async def wait(value: int):
         return jsonify(value=await delayed(value, "long"))
+
+    @app.get("/timeout/<int:value>")
+    async def timeout_value(value: int):
+        profile = request.args.get("profile", "immediate")
+        if profile not in {"immediate", "wait"}:
+            raise ValueError(f"invalid timeout profile {profile!r}")
+        try:
+            return jsonify(
+                await _timeout_route_value(
+                    state,
+                    value,
+                    wait=profile == "wait",
+                )
+            )
+        except fastmssql.SqlConnectionError as error:
+            return jsonify(_timeout_payload(error)), 504
 
     @app.get("/sql-error")
     async def sql_error():

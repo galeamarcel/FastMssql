@@ -332,6 +332,7 @@ async def test_restart_does_not_falsely_commit_inflight_transaction(
             outcomes[0],
             (SqlConnectionError, ProtocolError, TlsError),
         )
+        assert transaction.is_connected() is False
     finally:
         await transaction.close()
         await observer.disconnect()

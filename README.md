@@ -462,6 +462,127 @@ legacy_direct_profile = PoolConfig(
 )
 ```
 
+### Operation deadlines and timeout safety
+
+Use `TimeoutConfig` to give each part of database work an independent budget:
+
+```python
+from fastmssql import (
+    Connection,
+    OperationTimeoutError,
+    PoolConfig,
+    TimeoutConfig,
+)
+
+timeouts = TimeoutConfig(
+    connect_timeout_secs=10.0,
+    acquire_timeout_secs=2.0,
+    operation_timeout_secs=15.0,
+    transaction_timeout_secs=30.0,
+    rollback_timeout_secs=5.0,
+)
+
+async with Connection(
+    conn_str,
+    pool_config=PoolConfig(max_size=20, min_idle=5),
+    timeout_config=timeouts,
+) as database:
+    try:
+        await database.execute(
+            "UPDATE jobs SET status = @P1 WHERE id = @P2",
+            ["running", 42],
+        )
+    except OperationTimeoutError as error:
+        # Use structured fields; do not parse the human-readable message.
+        print(
+            error.operation,
+            error.phase,
+            error.timeout_seconds,
+            error.retryable,
+            error.connection_discarded,
+            error.outcome_unknown,
+        )
+        raise
+```
+
+The five settings have distinct boundaries:
+
+| Setting | Phase | What it bounds |
+| --- | --- | --- |
+| `connect_timeout_secs` | `connect` | credential acquisition, TCP, TLS/login and a routed reconnect |
+| `acquire_timeout_secs` | `acquire` | pool queueing, checkout and checkout validation/reset |
+| `operation_timeout_secs` | `operation` | one complete query, command, ping, batch or bulk call |
+| `transaction_timeout_secs` | `transaction` | absolute lifetime after SQL Server confirms `BEGIN` |
+| `rollback_timeout_secs` | `rollback` | explicit rollback and rollback performed by `close()` |
+
+Every configured number must be finite, at least one nanosecond, and small
+enough to form a deadline on the platform's monotonic clock; booleans are
+rejected. Subsecond values are supported. `None` means that FastMssql does not
+install a deadline for that phase and is accepted for connect, operation,
+transaction and rollback. Acquisition must always be bounded, so
+`acquire_timeout_secs` cannot be `None`. Operating-system, network,
+infrastructure or SQL Server timeouts may still apply when a FastMssql
+deadline is disabled.
+
+For backward compatibility, omitting `timeout_config` derives the effective
+policy from the legacy pool setting:
+
+```text
+connect_timeout_secs       PoolConfig.connection_timeout_secs or 30.0
+acquire_timeout_secs       PoolConfig.connection_timeout_secs or 30.0
+operation_timeout_secs     None
+transaction_timeout_secs   None
+rollback_timeout_secs      30.0
+```
+
+If both configurations are supplied, `TimeoutConfig.acquire_timeout_secs`
+wins and the effective pool checkout timeout is aligned to it. Read
+`connection.timeout_config` or `transaction.timeout_config` to inspect a
+clone of the effective policy.
+
+A timeout after a TDS request may have started is fail-closed: FastMssql
+retires that physical connection instead of returning a possibly desynchronized
+session to the pool. It does not retry SQL operations. A general write timeout
+has `outcome_unknown=True`; reconcile the write using an idempotency or
+business key before deciding what to do next. `retryable=True` is used only
+when connect or acquisition expired before application SQL began, and is
+guidance for the caller rather than an automatic retry.
+
+An unconfirmed `COMMIT` has a stricter exception contract:
+
+```python
+from fastmssql import CommitOutcomeUnknown, OperationTimeoutError
+
+request_id = "order-2026-000042"  # unique business/idempotency key
+transaction = database.transaction()
+
+try:
+    await transaction.begin()
+    await transaction.execute(
+        "INSERT INTO orders (request_id, total) VALUES (@P1, @P2)",
+        [request_id, 99.99],
+    )
+    await transaction.commit()
+except CommitOutcomeUnknown as error:
+    # The connection was retired. Never issue a blind second COMMIT or
+    # ROLLBACK: SQL Server may already have committed the first request.
+    cause = error.__cause__
+    if isinstance(cause, OperationTimeoutError):
+        print(cause.phase, cause.timeout_seconds, cause.outcome_unknown)
+
+    result = await database.query(
+        "SELECT id, status FROM orders WHERE request_id = @P1",
+        [request_id],
+    )
+    reconciled_rows = result.rows()
+    # Continue from the reconciled database state. Retry only if the
+    # application can prove that the original write was not committed.
+```
+
+For a timeout while awaiting `COMMIT`, the top-level exception is always
+`CommitOutcomeUnknown`; its `__cause__` is the structured
+`OperationTimeoutError` whose phase is `operation` or `transaction`.
+
 
 ### Transactions
 

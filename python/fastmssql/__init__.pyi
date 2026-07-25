@@ -10,6 +10,7 @@ from .fastmssql import (
     FastRow,
     Parameter,
     Parameters,
+    OperationTimeoutError,
     PoolConfig,
     ProtocolError,
     QueryStream,
@@ -17,6 +18,7 @@ from .fastmssql import (
     SqlError,
     SslConfig,
     TlsError,
+    TimeoutConfig,
     TypedNull,
 )
 
@@ -65,6 +67,7 @@ class Connection:
         port: Optional[int] = None,
         instance_name: Optional[str] = None,
         application_name: Optional[str] = None,
+        timeout_config: Optional[TimeoutConfig] = None,
     ) -> None:
         """
         Initialize a new SQL Server connection.
@@ -92,6 +95,11 @@ class Connection:
             - azure_credential and username/password are mutually exclusive
             - Weaker TLS modes require an explicit ssl_config or Encrypt opt-out
         """
+        ...
+
+    @property
+    def timeout_config(self) -> TimeoutConfig:
+        """Return an isolated copy of the effective timeout policy."""
         ...
 
     def connect(
@@ -275,6 +283,7 @@ class Transaction:
         port: Optional[int] = None,
         instance_name: Optional[str] = None,
         application_name: Optional[str] = None,
+        timeout_config: Optional[TimeoutConfig] = None,
     ) -> None:
         """Initialize a dedicated non-pooled connection for transactions.
 
@@ -282,6 +291,11 @@ class Transaction:
         TLS options must come from either the connection string or ssl_config,
         never both.
         """
+        ...
+
+    @property
+    def timeout_config(self) -> TimeoutConfig:
+        """Return an isolated copy of the effective timeout policy."""
         ...
 
     def query(
@@ -364,6 +378,7 @@ __all__ = [
     "FastRow",
     "Parameter",
     "Parameters",
+    "OperationTimeoutError",
     "PoolConfig",
     "ProtocolError",
     "QueryStream",
@@ -371,6 +386,7 @@ __all__ = [
     "SqlError",
     "SslConfig",
     "TlsError",
+    "TimeoutConfig",
     "Transaction",
     "TypedNull",
     "version",
