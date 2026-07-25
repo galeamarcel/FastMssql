@@ -4,7 +4,8 @@ import asyncio
 from collections.abc import Callable
 import time
 
-from fastmssql import Connection, PoolConfig, SqlError, SslConfig
+from fastmssql import Connection, PoolConfig, SqlError, SslConfig, Transaction
+from fastmssql.fastmssql import Transaction as RustTransaction
 import pytest
 
 from sql_auth_strict.cases import case
@@ -31,6 +32,21 @@ def _observer_connection(config: SqlAuthConfig) -> Connection:
             connection_timeout_secs=2,
             retry_connection=False,
         ),
+    )
+
+
+def _state_contract_transaction(
+    config: SqlAuthConfig,
+    implementation: str,
+):
+    transaction_type = (
+        Transaction if implementation == "public" else RustTransaction
+    )
+    return transaction_type(
+        config.connection_string(
+            config.owner_user,
+            config.owner_password,
+        )
     )
 
 
@@ -666,5 +682,151 @@ async def test_concurrent_calls_serialize_on_dedicated_client(
         assert values == [1, 2, 3]
         assert 0.5 <= elapsed < 2.0
         await transaction.rollback()
+    finally:
+        await transaction.close()
+
+
+@case("TX-020")
+@pytest.mark.parametrize(
+    "implementation",
+    ("public", "rust-core"),
+    ids=("public-wrapper", "rust-core"),
+)
+@pytest.mark.asyncio
+async def test_concurrent_begin_has_exactly_one_atomic_winner(
+    sql_auth_config: SqlAuthConfig,
+    implementation: str,
+) -> None:
+    transaction = _state_contract_transaction(
+        sql_auth_config,
+        implementation,
+    )
+    start = asyncio.Event()
+
+    async def begin_once() -> None:
+        await start.wait()
+        await transaction.begin()
+
+    tasks = [asyncio.create_task(begin_once()) for _ in range(16)]
+    await asyncio.sleep(0)
+    start.set()
+
+    try:
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=10.0,
+        )
+        transaction_count = await scalar(transaction, "SELECT @@TRANCOUNT")
+
+        successes = [
+            outcome
+            for outcome in outcomes
+            if not isinstance(outcome, BaseException)
+        ]
+        failures = [
+            outcome
+            for outcome in outcomes
+            if isinstance(outcome, BaseException)
+        ]
+
+        assert successes == [None]
+        assert len(failures) == 15
+        assert all(isinstance(error, RuntimeError) for error in failures)
+        assert {
+            str(error)
+            for error in failures
+        } == {"Transaction has already begun"}
+        assert transaction_count == 1
+    finally:
+        await transaction.close()
+
+
+@case("TX-021")
+@pytest.mark.parametrize(
+    "implementation",
+    ("public", "rust-core"),
+    ids=("public-wrapper", "rust-core"),
+)
+@pytest.mark.parametrize(
+    ("first_action", "second_action"),
+    (
+        ("commit", "commit"),
+        ("rollback", "rollback"),
+        ("commit", "rollback"),
+        ("rollback", "commit"),
+    ),
+    ids=(
+        "commit-vs-commit",
+        "rollback-vs-rollback",
+        "commit-vs-rollback",
+        "rollback-vs-commit",
+    ),
+)
+@pytest.mark.asyncio
+async def test_concurrent_settlement_has_exactly_one_atomic_winner(
+    owner_connection: Connection,
+    sql_auth_config: SqlAuthConfig,
+    unique_sql_name: Callable[[str], str],
+    cleanup_registry: CleanupRegistry,
+    implementation: str,
+    first_action: str,
+    second_action: str,
+) -> None:
+    table = quote_identifier(unique_sql_name("strict_tx_state_race"))
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
+    await owner_connection.execute(f"CREATE TABLE {table} (id INT PRIMARY KEY)")
+
+    transaction = _state_contract_transaction(
+        sql_auth_config,
+        implementation,
+    )
+    await transaction.begin()
+    await transaction.execute(f"INSERT INTO {table} VALUES (1)")
+    start = asyncio.Event()
+
+    async def settle(action: str) -> None:
+        await start.wait()
+        await getattr(transaction, action)()
+
+    actions = (first_action, second_action)
+    tasks = [
+        asyncio.create_task(settle(action))
+        for action in actions
+    ]
+    await asyncio.sleep(0)
+    start.set()
+
+    try:
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=10.0,
+        )
+        winners = [
+            action
+            for action, outcome in zip(actions, outcomes, strict=True)
+            if not isinstance(outcome, BaseException)
+        ]
+        failures = [
+            outcome
+            for outcome in outcomes
+            if isinstance(outcome, BaseException)
+        ]
+        persisted_rows = await scalar(
+            owner_connection,
+            f"SELECT COUNT(*) FROM {table}",
+        )
+
+        assert len(winners) == 1
+        assert len(failures) == 1
+        assert isinstance(failures[0], RuntimeError)
+
+        winner = winners[0]
+        terminal_state = (
+            "committed" if winner == "commit" else "rolled back"
+        )
+        assert str(failures[0]) == (
+            f"Transaction has already been {terminal_state}"
+        )
+        assert persisted_rows == (1 if winner == "commit" else 0)
     finally:
         await transaction.close()

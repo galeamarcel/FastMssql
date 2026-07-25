@@ -398,6 +398,10 @@ evidence reference.
 - `TX-017`: deterministic deadlock victim error.
 - `TX-018`: cancellation leaves transaction state explicit and recoverable.
 - `TX-019`: concurrent method calls serialize safely on the dedicated client.
+- `TX-020`: concurrent `begin()` calls have exactly one atomic winner in both
+  the public wrapper and the Rust transaction core.
+- `TX-021`: concurrent `commit()`/`rollback()` settlement has exactly one
+  atomic winner and the persisted result matches that winner.
 
 ### ASYNC — true asynchronous behavior
 
