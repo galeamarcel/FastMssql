@@ -22,7 +22,8 @@ use crate::parameter_conversion::{convert_parameters_to_fast, params_as_sql_refs
 use crate::pool_config::PyPoolConfig;
 use crate::pool_manager::{
     ConnectionPool, OwnedPooledConnection, acquire_owned_connection, connect_client_with_timeout,
-    ensure_pool_initialized_with_auth, timeout_error_or_metadata_failure,
+    ensure_pool_initialized_with_auth, python_error_allows_connection_reuse,
+    timeout_error_or_metadata_failure,
 };
 use crate::ssl_config::PySslConfig;
 use crate::timeout_config::PyTimeoutConfig;
@@ -81,6 +82,14 @@ impl TransactionConnection {
             Self::Direct(_) => true,
             Self::Pooled(connection) => connection.is_reusable(),
         }
+    }
+
+    fn result_requires_direct_retirement<T>(&self, result: &PyResult<T>) -> bool {
+        matches!(self, Self::Direct(_))
+            && result
+                .as_ref()
+                .err()
+                .is_some_and(|error| !python_error_allows_connection_reuse(error))
     }
 }
 
@@ -1025,12 +1034,13 @@ impl Transaction {
 
         let connection_broken = match session.conn.as_mut() {
             Some(connection) => {
+                let direct_retirement = connection.result_requires_direct_retirement(&result);
                 if driver_panicked {
                     connection.mark_unusable();
                 } else {
                     connection.finish_operation(&result);
                 }
-                driver_panicked || !connection.is_reusable()
+                driver_panicked || direct_retirement || !connection.is_reusable()
             }
             None => true,
         };

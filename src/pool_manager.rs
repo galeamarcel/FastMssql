@@ -63,6 +63,10 @@ impl ConnectionDisposition {
     }
 }
 
+pub(crate) fn python_error_allows_connection_reuse(error: &PyErr) -> bool {
+    ConnectionDisposition::after_python_error(error) != ConnectionDisposition::Broken
+}
+
 pub struct ManagedConnection {
     client: TiberiusClient,
     disposition: ConnectionDisposition,
@@ -112,7 +116,11 @@ impl ManagedConnection {
     }
 
     pub(crate) fn apply_operation_error(&mut self, error: &PyErr) {
-        self.disposition = ConnectionDisposition::after_python_error(error);
+        self.disposition = if python_error_allows_connection_reuse(error) {
+            ConnectionDisposition::NeedsReset
+        } else {
+            ConnectionDisposition::Broken
+        };
     }
 
     pub(crate) fn is_reusable(&self) -> bool {
