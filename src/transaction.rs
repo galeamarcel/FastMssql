@@ -120,6 +120,13 @@ enum TransactionState {
 }
 
 impl TransactionState {
+    fn is_in_flight(self) -> bool {
+        matches!(
+            self,
+            Self::Beginning | Self::Executing | Self::Committing | Self::RollingBack
+        )
+    }
+
     fn ensure_connection_usable(self) -> PyResult<()> {
         match self {
             Self::Idle | Self::Active | Self::Committed | Self::RolledBack => Ok(()),
@@ -141,6 +148,7 @@ impl TransactionState {
 struct TransactionSession {
     conn: Option<TransactionConnection>,
     state: TransactionState,
+    operation_epoch: u64,
 }
 
 impl Default for TransactionSession {
@@ -148,7 +156,74 @@ impl Default for TransactionSession {
         Self {
             conn: None,
             state: TransactionState::Idle,
+            operation_epoch: 0,
         }
+    }
+}
+
+impl TransactionSession {
+    fn enter_in_flight(&mut self, state: TransactionState) -> u64 {
+        debug_assert!(state.is_in_flight());
+        self.operation_epoch = self.operation_epoch.wrapping_add(1);
+        self.state = state;
+        self.operation_epoch
+    }
+
+    fn retire_cancelled_operation(&mut self, epoch: u64) {
+        if self.operation_epoch != epoch || !self.state.is_in_flight() {
+            return;
+        }
+
+        if let Some(connection) = self.conn.as_mut() {
+            connection.mark_unusable();
+        }
+        self.conn.take();
+        self.state = TransactionState::Failed;
+    }
+}
+
+/// Retires a transaction connection if Python drops an in-flight Rust future.
+///
+/// Cleanup is epoch-checked so a delayed task cannot close a later operation
+/// after the transaction object has been explicitly closed and reused.
+struct TransactionCancellationGuard {
+    session: Arc<AsyncMutex<TransactionSession>>,
+    armed_epoch: Option<u64>,
+}
+
+impl TransactionCancellationGuard {
+    fn new(session: Arc<AsyncMutex<TransactionSession>>) -> Self {
+        Self {
+            session,
+            armed_epoch: None,
+        }
+    }
+
+    fn arm(&mut self, epoch: u64) {
+        self.armed_epoch = Some(epoch);
+    }
+
+    fn disarm(&mut self) {
+        self.armed_epoch = None;
+    }
+}
+
+impl Drop for TransactionCancellationGuard {
+    fn drop(&mut self) {
+        let Some(epoch) = self.armed_epoch.take() else {
+            return;
+        };
+
+        if let Ok(mut session) = self.session.try_lock() {
+            session.retire_cancelled_operation(epoch);
+            return;
+        }
+
+        let session = Arc::clone(&self.session);
+        let _cleanup_task = pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+            let mut session = session.lock().await;
+            session.retire_cancelled_operation(epoch);
+        });
     }
 }
 
@@ -379,32 +454,37 @@ impl Transaction {
         let handles = self.clone_handles();
 
         future_into_py(py, async move {
+            let mut cancellation_guard =
+                TransactionCancellationGuard::new(Arc::clone(&handles.session));
             handles.ensure_connected().await?;
 
             let execution_result = {
                 let mut session = handles.session.lock().await;
-                let previous_state = Self::begin_data_operation(&mut session)?;
-                let operation = {
-                    let conn_ref = session
-                        .conn
-                        .as_mut()
-                        .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
-                    let tiberius_params = params_as_sql_refs(&fast_parameters);
-                    catch_driver_panic(async {
-                        conn_ref
-                            .query(&query, &tiberius_params)
-                            .await
-                            .map_err(|e| create_sql_error(e, "Query execution failed"))?
-                            .into_first_result()
-                            .await
-                            .map_err(|e| create_sql_error(e, "Failed to get results"))
-                    })
-                    .await
+                let (previous_state, epoch) = Self::begin_data_operation(&mut session)?;
+                cancellation_guard.arm(epoch);
+                let operation = match session.conn.as_mut() {
+                    Some(conn_ref) => {
+                        let tiberius_params = params_as_sql_refs(&fast_parameters);
+                        catch_driver_panic(async {
+                            conn_ref
+                                .query(&query, &tiberius_params)
+                                .await
+                                .map_err(|e| create_sql_error(e, "Query execution failed"))?
+                                .into_first_result()
+                                .await
+                                .map_err(|e| create_sql_error(e, "Failed to get results"))
+                        })
+                        .await
+                    }
+                    None => Ok(Err(PyRuntimeError::new_err(
+                        "Connection is not established",
+                    ))),
                 };
-                Self::finish_data_operation(&mut session, previous_state, operation)?
+                Self::finish_data_operation(&mut session, previous_state, operation)
             };
+            cancellation_guard.disarm();
 
-            wrap_query_stream(execution_result)
+            wrap_query_stream(execution_result?)
         })
     }
 
@@ -414,31 +494,36 @@ impl Transaction {
         let handles = self.clone_handles();
 
         future_into_py(py, async move {
+            let mut cancellation_guard =
+                TransactionCancellationGuard::new(Arc::clone(&handles.session));
             handles.ensure_connected().await?;
 
             let execution_result = {
                 let mut session = handles.session.lock().await;
-                let previous_state = Self::begin_data_operation(&mut session)?;
-                let operation = {
-                    let conn_ref = session
-                        .conn
-                        .as_mut()
-                        .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
-                    catch_driver_panic(async {
-                        conn_ref
-                            .simple_query(&query)
-                            .await
-                            .map_err(|e| create_sql_error(e, "Query execution failed"))?
-                            .into_first_result()
-                            .await
-                            .map_err(|e| create_sql_error(e, "Failed to get results"))
-                    })
-                    .await
+                let (previous_state, epoch) = Self::begin_data_operation(&mut session)?;
+                cancellation_guard.arm(epoch);
+                let operation = match session.conn.as_mut() {
+                    Some(conn_ref) => {
+                        catch_driver_panic(async {
+                            conn_ref
+                                .simple_query(&query)
+                                .await
+                                .map_err(|e| create_sql_error(e, "Query execution failed"))?
+                                .into_first_result()
+                                .await
+                                .map_err(|e| create_sql_error(e, "Failed to get results"))
+                        })
+                        .await
+                    }
+                    None => Ok(Err(PyRuntimeError::new_err(
+                        "Connection is not established",
+                    ))),
                 };
-                Self::finish_data_operation(&mut session, previous_state, operation)?
+                Self::finish_data_operation(&mut session, previous_state, operation)
             };
+            cancellation_guard.disarm();
 
-            wrap_query_stream(execution_result)
+            wrap_query_stream(execution_result?)
         })
     }
 
@@ -454,39 +539,44 @@ impl Transaction {
         let handles = self.clone_handles();
 
         future_into_py(py, async move {
+            let mut cancellation_guard =
+                TransactionCancellationGuard::new(Arc::clone(&handles.session));
             handles.ensure_connected().await?;
 
             let affected = {
                 let mut session = handles.session.lock().await;
-                let previous_state = Self::begin_data_operation(&mut session)?;
-                let operation = {
-                    let conn_ref = session
-                        .conn
-                        .as_mut()
-                        .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
-                    catch_driver_panic(async {
-                        if fast_parameters.is_empty() && requires_direct_batch(&command) {
-                            execute_unparameterized_command(
-                                conn_ref,
-                                &command,
-                                "Command execution failed",
-                            )
-                            .await
-                        } else {
-                            let tiberius_params = params_as_sql_refs(&fast_parameters);
-                            conn_ref
-                                .execute(&command, &tiberius_params)
+                let (previous_state, epoch) = Self::begin_data_operation(&mut session)?;
+                cancellation_guard.arm(epoch);
+                let operation = match session.conn.as_mut() {
+                    Some(conn_ref) => {
+                        catch_driver_panic(async {
+                            if fast_parameters.is_empty() && requires_direct_batch(&command) {
+                                execute_unparameterized_command(
+                                    conn_ref,
+                                    &command,
+                                    "Command execution failed",
+                                )
                                 .await
-                                .map(|result| result.total())
-                                .map_err(|e| create_sql_error(e, "Command execution failed"))
-                        }
-                    })
-                    .await
+                            } else {
+                                let tiberius_params = params_as_sql_refs(&fast_parameters);
+                                conn_ref
+                                    .execute(&command, &tiberius_params)
+                                    .await
+                                    .map(|result| result.total())
+                                    .map_err(|e| create_sql_error(e, "Command execution failed"))
+                            }
+                        })
+                        .await
+                    }
+                    None => Ok(Err(PyRuntimeError::new_err(
+                        "Connection is not established",
+                    ))),
                 };
-                Self::finish_data_operation(&mut session, previous_state, operation)?
+                Self::finish_data_operation(&mut session, previous_state, operation)
             };
+            cancellation_guard.disarm();
 
-            Ok(affected)
+            affected
         })
     }
 
@@ -501,20 +591,27 @@ impl Transaction {
         let handles = self.clone_handles();
 
         future_into_py(py, async move {
+            let mut cancellation_guard =
+                TransactionCancellationGuard::new(Arc::clone(&handles.session));
             handles.ensure_connected().await?;
 
             let all_results = {
                 let mut session = handles.session.lock().await;
-                let previous_state = Self::begin_data_operation(&mut session)?;
-                let operation = {
-                    let conn_ref = session
-                        .conn
-                        .as_mut()
-                        .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
-                    catch_driver_panic(execute_batch_on_connection(conn_ref, batch_commands)).await
+                let (previous_state, epoch) = Self::begin_data_operation(&mut session)?;
+                cancellation_guard.arm(epoch);
+                let operation = match session.conn.as_mut() {
+                    Some(conn_ref) => {
+                        catch_driver_panic(execute_batch_on_connection(conn_ref, batch_commands))
+                            .await
+                    }
+                    None => Ok(Err(PyRuntimeError::new_err(
+                        "Connection is not established",
+                    ))),
                 };
-                Self::finish_data_operation(&mut session, previous_state, operation)?
+                Self::finish_data_operation(&mut session, previous_state, operation)
             };
+            cancellation_guard.disarm();
+            let all_results = all_results?;
 
             Python::attach(|py| {
                 let py_list = PyList::new(py, all_results)?;
@@ -534,20 +631,26 @@ impl Transaction {
         let handles = self.clone_handles();
 
         future_into_py(py, async move {
+            let mut cancellation_guard =
+                TransactionCancellationGuard::new(Arc::clone(&handles.session));
             handles.ensure_connected().await?;
 
             let all_results = {
                 let mut session = handles.session.lock().await;
-                let previous_state = Self::begin_data_operation(&mut session)?;
-                let operation = {
-                    let conn_ref = session
-                        .conn
-                        .as_mut()
-                        .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
-                    catch_driver_panic(query_batch_on_connection(conn_ref, batch_queries)).await
+                let (previous_state, epoch) = Self::begin_data_operation(&mut session)?;
+                cancellation_guard.arm(epoch);
+                let operation = match session.conn.as_mut() {
+                    Some(conn_ref) => {
+                        catch_driver_panic(query_batch_on_connection(conn_ref, batch_queries)).await
+                    }
+                    None => Ok(Err(PyRuntimeError::new_err(
+                        "Connection is not established",
+                    ))),
                 };
-                Self::finish_data_operation(&mut session, previous_state, operation)?
+                Self::finish_data_operation(&mut session, previous_state, operation)
             };
+            cancellation_guard.disarm();
+            let all_results = all_results?;
 
             Python::attach(|py| -> PyResult<Py<PyAny>> {
                 let mut py_results = Vec::with_capacity(all_results.len());
@@ -672,7 +775,7 @@ impl Transaction {
         }
     }
 
-    fn begin_data_operation(session: &mut TransactionSession) -> PyResult<TransactionState> {
+    fn begin_data_operation(session: &mut TransactionSession) -> PyResult<(TransactionState, u64)> {
         session.state.ensure_connection_usable()?;
         let previous_state = session.state;
         let connection = session
@@ -680,8 +783,8 @@ impl Transaction {
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
         connection.begin_operation();
-        session.state = TransactionState::Executing;
-        Ok(previous_state)
+        let epoch = session.enter_in_flight(TransactionState::Executing);
+        Ok((previous_state, epoch))
     }
 
     fn finish_data_operation<T>(
@@ -720,16 +823,20 @@ impl Transaction {
         session: &Arc<AsyncMutex<TransactionSession>>,
         command: TransactionCommand,
     ) -> PyResult<()> {
+        let mut cancellation_guard = TransactionCancellationGuard::new(Arc::clone(session));
         let mut session = session.lock().await;
         command.validate(session.state)?;
         if session.conn.is_none() {
             return Err(PyRuntimeError::new_err("Connection is not established"));
         }
-        session.state = command.in_flight_state();
+        if let Some(connection) = session.conn.as_mut() {
+            connection.begin_operation();
+        }
+        let epoch = session.enter_in_flight(command.in_flight_state());
+        cancellation_guard.arm(epoch);
 
         let operation = match session.conn.as_mut() {
             Some(conn_ref) => {
-                conn_ref.begin_operation();
                 catch_driver_panic(async {
                     conn_ref
                         .simple_query(command.sql())
@@ -760,7 +867,7 @@ impl Transaction {
             }
         }
 
-        match result {
+        let command_result = match result {
             Ok(()) => {
                 session.state = command.completed_state();
                 let release_pool_lease = command.releases_pool_lease()
@@ -776,16 +883,17 @@ impl Transaction {
             Err(error) => {
                 session.conn.take();
                 session.state = TransactionState::Failed;
-                let public_error = if matches!(command, TransactionCommand::Commit)
+                if matches!(command, TransactionCommand::Commit)
                     && !is_deterministic_commit_rejection(&error)
                 {
-                    create_commit_outcome_unknown(error)?
+                    create_commit_outcome_unknown(error).and_then(Err)
                 } else {
-                    error
-                };
-                Err(public_error)
+                    Err(error)
+                }
             }
-        }
+        };
+        cancellation_guard.disarm();
+        command_result
     }
 
     async fn ensure_connected_inner(
@@ -835,5 +943,56 @@ impl Transaction {
         connection.prepare_for_checkout();
         session.conn = Some(connection);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cancellation_retirement_tests {
+    use super::{TransactionSession, TransactionState};
+
+    #[test]
+    fn matching_in_flight_epoch_becomes_failed() {
+        let mut session = TransactionSession::default();
+        let epoch = session.enter_in_flight(TransactionState::Executing);
+
+        session.retire_cancelled_operation(epoch);
+
+        assert_eq!(session.state, TransactionState::Failed);
+        assert!(session.conn.is_none());
+    }
+
+    #[test]
+    fn stale_epoch_cannot_retire_a_newer_operation() {
+        let mut session = TransactionSession::default();
+        let stale_epoch = session.enter_in_flight(TransactionState::Executing);
+        let current_epoch = session.enter_in_flight(TransactionState::Committing);
+
+        session.retire_cancelled_operation(stale_epoch);
+
+        assert_eq!(session.operation_epoch, current_epoch);
+        assert_eq!(session.state, TransactionState::Committing);
+    }
+
+    #[test]
+    fn matching_epoch_does_not_change_a_terminal_state() {
+        let mut session = TransactionSession::default();
+        let epoch = session.enter_in_flight(TransactionState::Committing);
+        session.state = TransactionState::Committed;
+
+        session.retire_cancelled_operation(epoch);
+
+        assert_eq!(session.state, TransactionState::Committed);
+    }
+
+    #[test]
+    fn repeated_retirement_is_idempotent() {
+        let mut session = TransactionSession::default();
+        let epoch = session.enter_in_flight(TransactionState::RollingBack);
+
+        session.retire_cancelled_operation(epoch);
+        session.retire_cancelled_operation(epoch);
+
+        assert_eq!(session.state, TransactionState::Failed);
+        assert!(session.conn.is_none());
     }
 }
