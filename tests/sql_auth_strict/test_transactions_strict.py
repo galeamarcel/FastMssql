@@ -208,6 +208,63 @@ async def _wait_for_request(
     )
 
 
+async def _wait_for_request_identity(
+    sa_connection: Connection,
+    token: str,
+    *,
+    timeout: float = 3.0,
+) -> tuple[int, str]:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        result = await sa_connection.query(
+            """
+            SELECT TOP (1)
+                request.session_id,
+                CONVERT(NVARCHAR(36), connection.connection_id)
+            FROM sys.dm_exec_requests AS request
+            JOIN sys.dm_exec_connections AS connection
+              ON connection.session_id = request.session_id
+            CROSS APPLY sys.dm_exec_sql_text(request.sql_handle) AS sql_text
+            WHERE request.session_id <> @@SPID
+              AND sql_text.text LIKE @P1
+            ORDER BY request.session_id
+            """,
+            [f"%{token}%"],
+        )
+        row = result.fetchone()
+        if row is not None:
+            return int(row[0]), str(row[1])
+        await asyncio.sleep(0.02)
+    raise AssertionError(
+        f"request token {token!r} did not become active"
+    )
+
+
+async def _wait_for_session_absent(
+    sa_connection: Connection,
+    session_id: int,
+    *,
+    timeout: float = 2.0,
+) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        count = await scalar(
+            sa_connection,
+            """
+            SELECT COUNT(*)
+            FROM sys.dm_exec_sessions
+            WHERE session_id = @P1
+            """,
+            [session_id],
+        )
+        if count == 0:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError(
+        f"SQL Server session {session_id} did not disappear"
+    )
+
+
 async def _wait_for_row_count(
     connection: Connection,
     table: str,
@@ -737,6 +794,296 @@ async def test_server_commit_rejection_remains_sql_error(
     finally:
         await transaction.close()
         await connection.disconnect()
+
+
+@case("TX-032")
+@pytest.mark.asyncio
+async def test_cancelled_pooled_transaction_retires_without_explicit_close(
+    sa_connection: Connection,
+    sql_auth_config: SqlAuthConfig,
+    unique_sql_name: Callable[[str], str],
+) -> None:
+    token = unique_sql_name("strict_tx_auto_retire_pool")
+    connection = _pooled_transaction_connection(
+        sql_auth_config,
+        max_size=1,
+        application_name=unique_sql_name("strict_tx_auto_retire_pool_app"),
+    )
+    cancelled = connection.transaction()
+    waiting = connection.transaction()
+    query_task: asyncio.Task | None = None
+    waiting_begin: asyncio.Task | None = None
+
+    try:
+        await cancelled.begin()
+        original_session_id = await scalar(cancelled, "SELECT @@SPID")
+        original_connection_id = await scalar(
+            cancelled,
+            """
+            SELECT CONVERT(NVARCHAR(36), connection_id)
+            FROM sys.dm_exec_connections
+            WHERE session_id = @@SPID
+            """,
+        )
+        query_task = asyncio.create_task(
+            cancelled.simple_query(
+                "WAITFOR DELAY '00:00:10'; "
+                f"SELECT 1 AS value /* {token} */"
+            )
+        )
+        request_identity = await _wait_for_request_identity(
+            sa_connection,
+            token,
+        )
+        assert request_identity == (
+            original_session_id,
+            original_connection_id,
+        )
+
+        waiting_begin = asyncio.create_task(waiting.begin())
+        await asyncio.sleep(0.1)
+        assert waiting_begin.done() is False
+
+        query_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await query_task
+
+        # No cancelled.close() is permitted before all autonomous cleanup
+        # assertions below.
+        await _wait_for_request(
+            sa_connection,
+            token,
+            present=False,
+            timeout=2.0,
+        )
+        await _wait_for_session_absent(
+            sa_connection,
+            original_session_id,
+            timeout=2.0,
+        )
+        await asyncio.wait_for(waiting_begin, timeout=2.0)
+        replacement_connection_id = await scalar(
+            waiting,
+            """
+            SELECT CONVERT(NVARCHAR(36), connection_id)
+            FROM sys.dm_exec_connections
+            WHERE session_id = @@SPID
+            """,
+        )
+        assert replacement_connection_id != original_connection_id
+
+        with pytest.raises(
+            RuntimeError,
+            match="state is indeterminate; call close",
+        ):
+            await cancelled.commit()
+        assert cancelled.is_connected() is False
+
+        stats = await connection.pool_stats()
+        assert stats["connections"] == 1
+        assert stats["active_connections"] == 1
+        await waiting.rollback()
+        await _wait_for_pool_active(connection, 0)
+
+        await cancelled.close()
+        await cancelled.close()
+    finally:
+        if query_task is not None and not query_task.done():
+            query_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await query_task
+        if waiting_begin is not None:
+            if not waiting_begin.done():
+                waiting_begin.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await waiting_begin
+            elif not waiting_begin.cancelled():
+                waiting_begin.exception()
+        await cancelled.close()
+        await waiting.close()
+        await connection.disconnect()
+
+
+@case("TX-033")
+@pytest.mark.asyncio
+async def test_cancelled_direct_transaction_closes_and_rolls_back_without_close(
+    owner_connection: Connection,
+    sa_connection: Connection,
+    transaction_factory: Callable,
+    unique_sql_name: Callable[[str], str],
+    cleanup_registry: CleanupRegistry,
+) -> None:
+    table = quote_identifier(unique_sql_name("strict_tx_auto_retire_direct"))
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
+    await owner_connection.execute(
+        f"CREATE TABLE {table} (id INT NOT NULL PRIMARY KEY)"
+    )
+    token = unique_sql_name("strict_tx_auto_retire_direct_wait")
+    transaction = transaction_factory()
+    query_task: asyncio.Task | None = None
+
+    try:
+        await transaction.begin()
+        await transaction.execute(f"INSERT INTO {table} (id) VALUES (1)")
+        original_session_id = await scalar(transaction, "SELECT @@SPID")
+        original_connection_id = await scalar(
+            transaction,
+            """
+            SELECT CONVERT(NVARCHAR(36), connection_id)
+            FROM sys.dm_exec_connections
+            WHERE session_id = @@SPID
+            """,
+        )
+        query_task = asyncio.create_task(
+            transaction.query(
+                "WAITFOR DELAY '00:00:10'; "
+                f"SELECT CAST(1 AS INT) AS value /* {token} */"
+            )
+        )
+        request_identity = await _wait_for_request_identity(
+            sa_connection,
+            token,
+        )
+        assert request_identity == (
+            original_session_id,
+            original_connection_id,
+        )
+
+        query_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await query_task
+
+        # No transaction.close() is permitted before SQL Server cleanup and
+        # rollback are proven.
+        await _wait_for_request(
+            sa_connection,
+            token,
+            present=False,
+            timeout=2.0,
+        )
+        await _wait_for_session_absent(
+            sa_connection,
+            original_session_id,
+            timeout=2.0,
+        )
+        assert transaction.is_connected() is False
+        assert await scalar(
+            owner_connection,
+            f"SELECT COUNT(*) FROM {table} WHERE id = 1",
+        ) == 0
+
+        await transaction.close()
+        await transaction.close()
+    finally:
+        if query_task is not None and not query_task.done():
+            query_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await query_task
+        await transaction.close()
+
+
+@case("TX-034")
+@pytest.mark.asyncio
+async def test_cancelled_commit_retires_lease_without_claiming_rollback(
+    sa_connection: Connection,
+    sql_auth_config: SqlAuthConfig,
+    unique_sql_name: Callable[[str], str],
+    cleanup_registry: CleanupRegistry,
+) -> None:
+    table = quote_identifier(unique_sql_name("strict_cancelled_commit"))
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
+    await sa_connection.execute(
+        f"CREATE TABLE {table} (id INT NOT NULL PRIMARY KEY)"
+    )
+
+    proxy = DownstreamGateProxy(
+        sql_auth_config.host,
+        sql_auth_config.port,
+    )
+    await proxy.start()
+    connection = _pooled_transaction_connection(
+        sql_auth_config,
+        max_size=1,
+        application_name=unique_sql_name("strict_cancelled_commit_app"),
+        server=proxy.host,
+        port=proxy.port,
+    )
+    committing = connection.transaction()
+    waiting = connection.transaction()
+    commit_task: asyncio.Task | None = None
+    waiting_begin: asyncio.Task | None = None
+
+    try:
+        await committing.begin()
+        original_session_id = await scalar(committing, "SELECT @@SPID")
+        original_connection_id = await scalar(
+            committing,
+            """
+            SELECT CONVERT(NVARCHAR(36), connection_id)
+            FROM sys.dm_exec_connections
+            WHERE session_id = @@SPID
+            """,
+        )
+        await committing.execute(f"INSERT INTO {table} (id) VALUES (1)")
+
+        waiting_begin = asyncio.create_task(waiting.begin())
+        await asyncio.sleep(0.1)
+        assert waiting_begin.done() is False
+
+        proxy.pause_downstream()
+        commit_task = asyncio.create_task(committing.commit())
+        await _wait_for_row_count(sa_connection, table, 1)
+        await proxy.wait_until_downstream_held()
+        commit_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await commit_task
+
+        # Releasing the transparent proxy gate lets it observe the cancelled
+        # client's EOF. No committing.close() occurs before the assertions.
+        proxy.resume_downstream()
+        await _wait_for_session_absent(
+            sa_connection,
+            original_session_id,
+            timeout=2.0,
+        )
+        await asyncio.wait_for(waiting_begin, timeout=2.0)
+        replacement_connection_id = await scalar(
+            waiting,
+            """
+            SELECT CONVERT(NVARCHAR(36), connection_id)
+            FROM sys.dm_exec_connections
+            WHERE session_id = @@SPID
+            """,
+        )
+        assert replacement_connection_id != original_connection_id
+        assert await scalar(
+            sa_connection,
+            f"SELECT COUNT(*) FROM {table} WHERE id = 1",
+        ) == 1
+        assert committing.is_connected() is False
+        with pytest.raises(
+            RuntimeError,
+            match="state is indeterminate; call close",
+        ):
+            await committing.commit()
+
+        await waiting.rollback()
+        await _wait_for_pool_active(connection, 0)
+    finally:
+        proxy.resume_downstream()
+        for task in (commit_task, waiting_begin):
+            if task is None:
+                continue
+            if not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            elif not task.cancelled():
+                task.exception()
+        await committing.close()
+        await waiting.close()
+        await connection.disconnect()
+        await proxy.close()
 
 
 @case("TX-002", "TX-003")

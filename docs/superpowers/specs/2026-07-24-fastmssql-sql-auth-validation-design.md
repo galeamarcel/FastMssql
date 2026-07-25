@@ -423,6 +423,14 @@ evidence reference.
 - `TX-030`: automatic context-manager COMMIT propagates
   `CommitOutcomeUnknown` without calling rollback or retrying.
 - `TX-031`: SQL Server error 3902 at severity 16 remains `SqlError`.
+- `TX-032`: cancelling a pooled transaction operation retires its unsafe
+  physical connection, terminates the request and releases a pool waiter
+  without requiring explicit `close()`.
+- `TX-033`: cancelling a direct transaction operation closes its SQL session
+  and rolls back its uncommitted work without requiring explicit `close()`.
+- `TX-034`: cancelling a COMMIT after SQL Server has made it durable retires
+  the pooled lease and releases a waiter without claiming rollback or retrying
+  the settlement operation.
 
 ### ASYNC — true asynchronous behavior
 
