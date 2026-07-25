@@ -6,8 +6,8 @@ Branch: `test/sql-auth-validation`
 Commit: `3cc5700b5142f3e84c83767e2ff114f87a19c5dd`
 
 Ultima actualizare live: 25 iulie 2026
-Ultimul fix verificat: `fix/connection-disposition` la `85e295f`
-Ultimul branch cumulativ verificat: `test/sql-auth-validation` la `4788fdf`
+Ultimul fix verificat: `fix/session-reset-isolation` la `16f076a`
+Ultimul branch cumulativ verificat: `test/sql-auth-validation` la `e61b771`
 Ultimul gate CI verificat: `ci/dependency-security-gate` la `3887ddd`, cu
 checkout menținut la `1d13280`; rularea hosted
 [#30130204804](https://github.com/galeamarcel/FastMssql/actions/runs/30130204804)
@@ -15,14 +15,15 @@ a trecut pe `b1167ae`
 
 ## Concluzie
 
-FastMssql are o bază reală pentru acces MSSQL nativ și true-async, fără ODBC,
-dar nu este încă pregătită pentru producție mare sau multi-tenant până când nu
-sunt rezolvate patru categorii P0:
+FastMssql are o bază reală pentru acces MSSQL nativ și true-async, fără ODBC.
+TLS, dependențele RustSec, eliminarea conexiunilor pooled defecte și izolarea
+sesiunilor reutilizate au acum remedieri verificate pe fork. Biblioteca nu este
+încă declarată pregătită pentru producție critică sau multi-tenant până când nu
+sunt închise cele două categorii P0 rămase:
 
-1. TLS și dependențele de securitate;
-2. izolarea sesiunilor reutilizate din pool;
-3. starea și leasingul tranzacțiilor;
-4. gestionarea conexiunilor defecte, anulate sau cu rezultat de commit incert.
+1. starea și leasingul tranzacțiilor;
+2. anularea tranzacțiilor și rezultatul necunoscut după pierderea confirmării
+   pentru COMMIT.
 
 True-async nu înseamnă executarea simultană a mai multor comenzi pe aceeași
 conexiune fizică. O sesiune TDS execută în mod normal secvențial. Paralelismul
@@ -193,13 +194,108 @@ Dovada executată pe MSSQL Docker cu SQL authentication:
 
 Limitele rămase sunt intenționat vizibile:
 
-- `NeedsReset` este acum urmărit, dar resetarea TDS nu este încă executată;
-  izolarea stării între lease-uri rămâne P0 deschis;
+- consumarea `NeedsReset` prin reset TDS este închisă de remedierea
+  `16f076a`, descrisă în secțiunea următoare;
 - `Transaction` folosește încă o conexiune directă și nu are încă
   `CommitOutcomeUnknown`;
 - un EOF după o conexiune TLS deja stabilită poate fi expus momentan ca
   `TlsError` din cauza euristicii de substring. Conexiunea este eliminată
   corect, dar taxonomia trebuie corectată separat în PR-11.
+
+### Izolarea sesiunilor pooled — reset TDS remediat și verificat
+
+Branchurile și commiturile sunt separate:
+
+- `test/session-reset-isolation`
+  - `6cc1d55`–`0038d08` — reproduceri pentru temp tables, stare de sesiune,
+    tranzacții abandonate, checkout validation și impersonare;
+  - `99c878f` — contractele matricei și isolation lease;
+  - `7645e70` — fixture-uri upstream deterministe, fără tabele globale
+    temporare păstrate accidental între checkout-uri;
+  - `122f713` — impersonare urmată de eroare și control pentru SQL dinamic
+    scope-bound;
+- `fix/session-reset-isolation`
+  - `dcada81` — aceeași acoperire de regresie pe branchul fixului;
+  - `16f076a` — resetarea protocolară și retragerea contextelor de securitate;
+- branch cumulativ `test/sql-auth-validation`
+  - `e61b771` — integrarea completă pe fork.
+
+Cauza confirmată era reutilizarea unei sesiuni TDS sincronizate, dar
+contaminate:
+
+```text
+operație reușită sau eroare SQL non-fatală
+  -> lease returnat în bb8 ca NeedsReset
+  -> următorul checkout primea același SPID
+  -> SESSION_CONTEXT / SET / USE / temp state / tranzacție puteau supraviețui
+```
+
+Remedierea:
+
+- armează bitul MS-TDS `RESETCONNECTION` pe primul pachet al următoarei cereri
+  Batch, RPC sau TransactionManager;
+- combină corect `RESETCONNECTION | EOM` ca `0x09` pentru o cerere cu un singur
+  pachet și nu repetă bitul pe pachetele următoare;
+- curăță client-side descriptorul tranzacției și metadata cache;
+- face piggyback pe următoarea cerere, fără query T-SQL și fără round-trip
+  suplimentar;
+- prefixează acea cerere cu `SET TRANSACTION ISOLATION LEVEL READ COMMITTED`,
+  deoarece
+  [MS-TDS 2.2.3.1.2](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-tds/ce398f9a-7d47-4ede-8f36-9dd6fc21ca43)
+  exclude isolation level din reset;
+- în calea `test_on_check_out`, resetează înainte de health probe, consumă
+  complet răspunsul și păstrează conexiunea numai după succes;
+- o anulare în timpul resetului sau al răspunsului marchează conexiunea
+  `Broken`, deci nu poate reveni în pool;
+- detectează `EXECUTE AS`, `EXEC AS` și `SETUSER` în SQL direct și retrage
+  conexiunea fizică inclusiv când o instrucțiune ulterioară din batch produce
+  o eroare non-fatală;
+- nu retrage inutil conexiunea pentru text citat/comentat sau pentru
+  impersonarea normală dintr-un batch dinamic scope-bound.
+
+Resetarea verificată acoperă:
+
+- database context;
+- `@@OPTIONS`, language, dateformat și `DATEFIRST`;
+- lock timeout, deadlock priority, `XACT_ABORT`, `NOCOUNT` și opțiunile ANSI;
+- isolation level;
+- `CONTEXT_INFO`;
+- `SESSION_CONTEXT`, inclusiv valori read-only;
+- local temp tables;
+- tranzacții locale abandonate;
+- stare modificată înaintea unei erori SQL non-fatale;
+- context de utilizator cu `EXECUTE AS ... WITH NO REVERT`.
+
+Dovada executată pe MSSQL Docker cu SQL authentication:
+
+- reproducerile de contaminare și impersonare au fost RED pe codul anterior;
+- contractele focalizate de impersonare: 3/3 PASS după fix;
+- suita strictă non-disruptivă: 305 PASS, 14 deselectate, zero FAIL;
+- regresia upstream SQL-auth aplicabilă: 896/896 PASS;
+- lane-ul de load: 8/8 PASS;
+- 1.000 query-uri, concurență 20: aproximativ 5.503 query-uri/s;
+- 1.000 tranzacții write, concurență 50: aproximativ 698 tranzacții/s;
+- 10.000 tranzacții, concurență 100: 3.591,59 tranzacții/s;
+- 99.999 tranzacții, concurență 200: 3.536,24 tranzacții/s, exact 50.000
+  commituri și 49.999 rollback-uri, 200 sesiuni distincte eșantionate și zero
+  sesiuni rămase;
+- `cargo test --locked`: 9/9 PASS;
+- testele unitare Tiberius vendored: 123/123 PASS;
+- `cargo fmt --check` și
+  `cargo clippy --locked --all-targets -- -D warnings`: PASS.
+
+Limite rămase:
+
+- testul de 99.999 folosește 200 de obiecte `Transaction` persistente, nu un
+  transaction-leasing pool; validează driverul și concurența, nu arhitectura
+  enterprise finală;
+- tranzacțiile distribuite nu sunt un contract FastMssql suportat sau testat;
+  MS-TDS le enumeră separat de resetarea standard;
+- `Transaction` directă nu folosește încă lease din pool și nu poate raporta
+  `CommitOutcomeUnknown`;
+- pentru un PR FastMssql upstream, patchul protocolar trebuie acceptat în
+  Tiberius sau consumat printr-o strategie de dependență aprobată. Nu a fost
+  creat sau publicat niciun fork Tiberius.
 
 ## Corecții și nuanțări față de primul audit
 
@@ -215,8 +311,9 @@ Limitele rămase sunt intenționat vizibile:
 - PyO3 0.29 nu necesită explicit `gil_used = false` pentru free-threaded
   Python; această suspiciune din primul audit nu este o problemă.
 - `sp_reset_connection` nu poate fi apelată normal ca procedură T-SQL.
-  Resetarea completă trebuie transmisă prin bitul TDS `RESETCONNECTION`; pentru
-  aceasta va fi probabil necesară o extensie Tiberius.
+  Resetarea completă trebuie transmisă prin bitul TDS `RESETCONNECTION`;
+  extensia Tiberius locală din `16f076a` implementează și verifică această
+  cale, fără round-trip separat.
 - Tiberius nu expune momentan public trimiterea unui pachet TDS `ATTENTION`.
   Până la implementarea protocolului complet de anulare, o conexiune anulată
   trebuie eliminată din pool.
@@ -232,8 +329,8 @@ Limitele rămase sunt intenționat vizibile:
 | TLS | Un connection string fără `Encrypt` a produs live `encrypt_option=FALSE`. `TrustServerCertificate=True` nu activează singur criptarea completă. | Criptare obligatorie implicit, cu opt-out explicit și vizibil pentru plaintext. | **REMEDIAT și verificat** în `0b5d6ca`. |
 | Configurație TLS | Când se folosește `connection_string`, `ssl_config` este ignorat. Combinația CA + trust necondiționat poate ajunge la panic Rust expus ca `PanicException`. | O singură sursă TLS, validare înainte de Tiberius, conflicte returnate ca `ValueError` și niciun panic peste FFI. | **REMEDIAT și verificat** în `0b5d6ca`. |
 | Dependențe | Lockfile-ul inițial avea 12 vulnerabilități RustSec și un warning de mentenanță. | Eliminarea dependenței directe `quinn-proto`, actualizarea lockfile-ului și modernizarea ramurii TLS Tiberius. | **REMEDIAT și verificat** în `5ada01e`; gate CI hosted verde prin `3887ddd`/`1d13280`; SBOM rămâne separat. |
-| Izolarea sesiunilor | `SESSION_CONTEXT` a rămas vizibil următorului utilizator al aceleiași conexiuni. Un simplu `ROLLBACK` nu curăță temp tables, `SET` options, isolation level, `CONTEXT_INFO`, `USE`, impersonation etc. | Reset TDS înainte de reutilizare și teste de contaminare între lease-uri. | **DESCHIS**. |
-| Conexiuni defecte | Guard-ul putea marca operația drept completă chiar când Python primea o eroare fatală de server/protocol/I/O. O conexiune omorâtă era reutilizată și eșua repetat cu EOF. | Dispoziție explicită `NeedsReset`, `Broken`, `CommitOutcomeUnknown`; conexiunile suspecte sunt eliminate. | **PARȚIAL REMEDIAT și verificat** în `85e295f`: `Broken` este eliminat, iar erorile SQL non-fatale evită churn. Resetarea `NeedsReset` și `CommitOutcomeUnknown` rămân deschise. |
+| Izolarea sesiunilor | `SESSION_CONTEXT` a rămas vizibil următorului utilizator al aceleiași conexiuni. Un simplu `ROLLBACK` nu curăță temp tables, `SET` options, isolation level, `CONTEXT_INFO`, `USE`, impersonation etc. | Reset TDS înainte de reutilizare și teste de contaminare între lease-uri. | **REMEDIAT și verificat** în `16f076a`: `RESETCONNECTION` este piggyback pe următoarea cerere, isolation level este restaurat explicit, iar contexte de securitate persistente retrag conexiunea. |
+| Conexiuni defecte | Guard-ul putea marca operația drept completă chiar când Python primea o eroare fatală de server/protocol/I/O. O conexiune omorâtă era reutilizată și eșua repetat cu EOF. | Dispoziție explicită `NeedsReset`, `Broken`, `CommitOutcomeUnknown`; conexiunile suspecte sunt eliminate. | **REMEDIAT pentru căile pooled obișnuite** prin `85e295f` + `16f076a`: `Broken` este eliminat și `NeedsReset` este resetat. `CommitOutcomeUnknown` rămâne P0 separat pe calea tranzacțiilor. |
 | Tranzacții | `Transaction` deschide conexiuni directe, în afara pool-ului, limitelor și metricilor. Două apeluri concurente `begin()` au produs `@@TRANCOUNT=2`. | Stare de tranzacție păstrată în Rust și tranzacție pornită pe un lease din pool. | **DESCHIS**. |
 | COMMIT și anulare | Dacă se pierde ACK-ul după COMMIT, aplicația nu poate ști dacă tranzacția s-a aplicat. Nu este sigur să presupunem rollback sau să repetăm automat. | Excepție `CommitOutcomeUnknown`, eliminarea socketului și niciun retry automat. | **DESCHIS**. |
 
@@ -325,16 +422,16 @@ SQL-ul executat poate modifica stare persistentă. Stările recomandate sunt:
 - `Broken`: socketul sau fluxul TDS nu mai este sigur pentru reutilizare;
 - `CommitOutcomeUnknown`: nu se cunoaște dacă serverul a aplicat COMMIT-ul.
 
-Ideal, o extensie Tiberius va marca primul pachet al următoarei operații cu
-`RESETCONNECTION`. Astfel, resetarea și următoarea comandă pot fi combinate
+În `16f076a`, extensia Tiberius locală marchează primul pachet al următoarei
+operații cu `RESETCONNECTION`. Resetarea și următoarea comandă sunt combinate
 fără un round-trip T-SQL separat.
 
-În `85e295f`, `Clean`, `NeedsReset` și `Broken` sunt stări Rust reale.
-`Broken` este consumat de `bb8::ManageConnection::has_broken` și socketul este
-eliminat. `NeedsReset` este încă reutilizabil temporar, fără reset complet;
-aceasta este următoarea remediere P0. `CommitOutcomeUnknown` va fi introdus pe
-calea de tranzacție, unde poate fi distins de un eșec înainte de trimiterea
-`COMMIT`.
+`Clean`, `NeedsReset` și `Broken` sunt stări Rust reale. `Broken` este consumat
+de `bb8::ManageConnection::has_broken` și socketul este eliminat. `NeedsReset`
+armează resetul protocolar, iar conexiunea poate redeveni curată numai după ce
+răspunsul cererii a fost consumat complet. `CommitOutcomeUnknown` va fi
+introdus pe calea de tranzacție, unde poate fi distins de un eșec înainte de
+trimiterea `COMMIT`.
 
 ## Probleme P1
 
@@ -576,9 +673,9 @@ funcție ar necesita lucru la nivelul driverului TDS:
 1. `fix/dependency-rustsec` — **finalizat și verificat**
 2. `fix/tls-secure-defaults` — **finalizat și verificat**
 3. `ci/dependency-security-gate` — **finalizat și verificat hosted**
-4. `fix/connection-disposition` — **`Broken` finalizat și verificat;
-   `NeedsReset`/`CommitOutcomeUnknown` continuă în branchurile următoare**
-5. extensie Tiberius locală pentru `RESETCONNECTION`
+4. `fix/connection-disposition` — **`Broken` finalizat și verificat**
+5. `fix/session-reset-isolation` — **`NeedsReset` și extensia Tiberius locală
+   pentru `RESETCONNECTION` finalizate și verificate**
 6. `fix/transaction-state`
 7. `feat/session-lease`
 8. `feat/timeouts-lifecycle-observability`
@@ -604,7 +701,7 @@ upstream fără aprobarea explicită a proprietarului forkului.
 - [x] conexiunea implicită produce `encrypt_option=TRUE`;
 - [x] configurațiile TLS conflictuale nu pot produce panic;
 - [x] un SPID omorât este eliminat și pool-ul se recuperează;
-- [ ] nicio stare de sesiune nu trece între lease-uri;
+- [x] starea de sesiune acoperită de matrice nu trece între lease-urile pooled;
 - [ ] două `begin()` concurente sunt respinse determinist;
 - [ ] timeout/anulare elimină conexiunea și requestul server-side se încheie;
 - [ ] ACK pierdut după COMMIT produce `CommitOutcomeUnknown`, fără retry;

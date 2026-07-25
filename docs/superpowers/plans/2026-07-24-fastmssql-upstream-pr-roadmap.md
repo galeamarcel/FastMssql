@@ -49,7 +49,8 @@ La data redactării:
 
 - `upstream/master`: `e45f301` — versiunea `v0.7.7`;
 - branch audit: `test/sql-auth-validation`;
-- branchul audit este cu 54 de commituri înaintea `upstream/master`;
+- snapshotul tehnic anterior acestui update documentar este `e61b771`, cu 87
+  de commituri înaintea `upstream/master`;
 - unicul PR upstream deschis este draftul
   [#121 — Improve transactions behavior and safety](https://github.com/Rivendael/FastMssql/pull/121);
 - PR-ul #121 modifică masiv tranzacțiile și timeouturile, deci orice PR care
@@ -103,7 +104,8 @@ PR-uri care cer hardening sau separare
 
 PR-uri cu decizie de supply chain
     ├── PR-13 eliminarea advisory-urilor RustSec din ramura TLS
-    └── PR-14 gate RustSec obligatoriu înainte de release
+    ├── PR-14 gate RustSec obligatoriu înainte de release
+    └── PR-15 RESETCONNECTION TDS și izolarea sesiunilor pooled
 
 Funcții enterprise viitoare
     └── intake individual după implementare și audit
@@ -584,8 +586,9 @@ git commit -m "fix: preserve connection endpoint in errors"
 
 ### Task 7: PR-06 — Anulare sigură și connection disposition
 
-**Priority:** P0, `Broken` verificat; upstream rămâne blocat până la
-`NeedsReset`, fault matrix completă și reconcilierea tranzacțiilor
+**Priority:** P0, `Broken` verificat; acest PR rămâne limitat la conexiunile
+nesigure și anulare. Resetarea `NeedsReset` este candidatul separat PR-15, iar
+`CommitOutcomeUnknown` aparține branchului de tranzacții.
 
 **Source commits:**
 
@@ -610,9 +613,8 @@ git commit -m "fix: preserve connection endpoint in errors"
 **Interfaces:**
 
 - Consumes: finalizarea, eroarea, anularea sau panicul unei operații TDS.
-- Produces:
-  `NeedsReset | Broken | CommitOutcomeUnknown`, cu returnare în pool numai
-  pentru stările sigure.
+- Produces: `Clean | NeedsReset | Broken`, cu eliminarea conexiunii pentru
+  orice stare protocolară nesigură.
 
 **Stare verificată pe fork:**
 
@@ -621,8 +623,9 @@ git commit -m "fix: preserve connection endpoint in errors"
   fail-closed;
 - 4/4 reproduceri au fost RED înainte de fix și GREEN după fix;
 - o eroare SQL de severitate non-fatală păstrează același `connection_id`;
-- `CommitOutcomeUnknown` și resetarea efectivă pentru `NeedsReset` nu sunt încă
-  implementate.
+- resetarea efectivă pentru `NeedsReset` este implementată și verificată
+  separat în `16f076a`, candidatul PR-15;
+- `CommitOutcomeUnknown` nu este implementat și nu trebuie amestecat în PR-06.
 
 - [x] **Step 1: Nu cherry-pick-ui commitul în forma actuală**
 
@@ -635,22 +638,23 @@ future Rust terminat
   -> conexiunea suspectă poate reveni în pool
 ```
 
-- [ ] **Step 2: Introdu disposition explicit**
+- [x] **Step 2: Introdu disposition explicit**
 
 Contract minim:
 
 ```rust
 enum ConnectionDisposition {
+    Clean,
     NeedsReset,
     Broken,
-    CommitOutcomeUnknown,
 }
 ```
 
-`85e295f` finalizează `Broken` și urmărește `NeedsReset`.
-`CommitOutcomeUnknown` rămâne obligatoriu pe branch-ul tranzacțiilor, iar
-`NeedsReset` nu poate fi bifat până când bitul TDS `RESETCONNECTION` este
-trimis efectiv.
+`85e295f` finalizează `Broken` și urmărește `NeedsReset`. PR-06 poate fi
+revizuit independent pentru eliminarea socketurilor nesigure, dar branchul
+upstream trebuie construit astfel încât să nu pretindă că `NeedsReset` este
+consumat dacă PR-15 nu este încă prezent. `CommitOutcomeUnknown` rămâne
+obligatoriu pe branchul tranzacțiilor.
 
 - [ ] **Step 3: Adaugă fault injection**
 
@@ -716,8 +720,8 @@ Rezultate pe `85e295f`:
 - upstream SQL-auth aplicabil: 896/896 PASS;
 - Rust: 7/7, format și Clippy PASS.
 
-PR-ul nu este încă propus: Step 2, restul Step 3 și reconcilierea Step 5 sunt
-deschise.
+PR-ul nu este încă propus: restul Step 3 și reconcilierea Step 5 sunt
+deschise. PR-15 nu este inclus în acest diff.
 
 ---
 
@@ -1164,6 +1168,164 @@ a proprietarului forkului.
 
 ---
 
+### Task 14: PR-15 — Reset TDS și izolarea sesiunilor pooled
+
+**Priority:** P0 implementat și verificat pe fork; publicarea upstream este
+blocată numai de alegerea traseului pentru modificarea Tiberius, rebase pe
+ultimul upstream și aprobarea explicită.
+
+**Source test branch:** `test/session-reset-isolation`
+
+**Source test commits:**
+
+- `6cc1d55`–`0038d08` — reproducerile inițiale pentru stare, tranzacție,
+  checkout validation și impersonare;
+- `99c878f` — contractele matricei și ale isolation lease;
+- `7645e70` — eliminarea presupunerilor nedeterministe despre tabele globale
+  `##temp` între checkout-uri pooled;
+- `122f713` — impersonare cu eroare și controlul pentru impersonarea dinamică
+  scope-bound.
+
+**Source fix branch:** `fix/session-reset-isolation`
+
+**Source implementation commit:** `16f076a`
+
+**Cumulative fork commit:** `e61b771`
+
+**Proposed clean upstream branch:** `fix/upstream-tds-session-reset`
+
+**Proposed title:** `fix: reset pooled SQL Server sessions before reuse`
+
+**Files on the verified fork:**
+
+- Modify: `src/pool_manager.rs`
+- Modify: `src/connection.rs`
+- Modify: `src/batch.rs`
+- Modify: `src/helpers.rs`
+- Modify: `vendor/tiberius/src/client.rs`
+- Modify: `vendor/tiberius/src/client/connection.rs`
+- Modify: `vendor/tiberius/src/tds/codec/header.rs`
+- Modify: `vendor/tiberius/src/tds/context.rs`
+- Test: `tests/sql_auth_strict/test_pool.py`
+- Test: `tests/sql_auth_strict/test_sql_features.py`
+- Test: `tests/sql_auth_strict/test_transactions_strict.py`
+- Test compatibility: cele cinci module upstream care foloseau tabele globale
+  temporare peste operații pooled independente.
+
+**Interfaces:**
+
+- Consumes: o conexiune `NeedsReset` la următorul checkout.
+- Produces: primul pachet Batch/RPC/TransactionManager cu bitul MS-TDS
+  `RESETCONNECTION`, fără round-trip separat.
+- Restabilește explicit `READ COMMITTED`, deoarece MS-TDS exclude isolation
+  level din reset.
+- Elimină sesiunea în loc să o reutilizeze când SQL-ul poate lăsa un context
+  de securitate nereversibil (`EXECUTE AS`, `EXEC AS`, `SETUSER`).
+
+**Stare verificată pe fork:**
+
+- pachetul unic folosește statusul combinat `RESETCONNECTION | EOM = 0x09`;
+- numai primul pachet al cererii poartă bitul de reset;
+- descriptorul tranzacției și metadata cache sunt curățate client-side;
+- resetarea este piggyback pe următoarea comandă, fără query T-SQL sau RTT
+  suplimentar;
+- `test_on_check_out` resetează înainte de health probe și consumă complet
+  răspunsul;
+- anularea în timpul resetului elimină conexiunea fail-closed;
+- temp tables, `USE`, `SET` options, language/dateformat, lock timeout,
+  deadlock priority, `CONTEXT_INFO`, `SESSION_CONTEXT`, tranzacții locale și
+  isolation level nu trec în lease-ul următor;
+- un `EXECUTE AS ... WITH NO REVERT` retrage conexiunea chiar dacă o instrucțiune
+  ulterioară produce eroare SQL non-fatală;
+- impersonarea normală în SQL dinamic rămâne scope-bound și nu produce
+  connection churn inutil.
+
+- [x] **Step 1: Reproduce contaminarea pe codul anterior**
+
+Reproducerile stricte trebuie să fie RED fără fix pentru:
+
+```text
+local temp table
+database context și SET options
+SESSION_CONTEXT read-only
+tranzacție locală abandonată
+stare după eroare SQL non-fatală
+checkout validation înainte de health probe
+EXECUTE AS direct, inclusiv batch terminat cu THROW
+```
+
+- [x] **Step 2: Implementează RESETCONNECTION la nivel TDS**
+
+Implementarea verificată respectă
+[MS-TDS 2.2.3.1.2](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-tds/ce398f9a-7d47-4ede-8f36-9dd6fc21ca43):
+
+```text
+first packet, multi-packet request -> 0x08
+first and last packet             -> 0x09
+later packets                     -> 0x00 / EOM
+```
+
+Nu se folosește `sp_reset_connection` ca procedură T-SQL și nu se adaugă un
+round-trip dedicat.
+
+- [x] **Step 3: Leagă resetarea de disposition**
+
+`NeedsReset` armează următoarea cerere. O operație incompletă, o anulare, un
+panic sau un context de securitate potențial persistent marchează conexiunea
+`Broken`; numai răspunsul consumat complet poate reveni în pool.
+
+- [x] **Step 4: Rulează dovada completă**
+
+Rezultate pe `16f076a`:
+
+```text
+strict SQL-auth non-disruptive    305 PASS, 14 deselectate
+load lane                         8/8 PASS
+upstream SQL-auth aplicabil       896/896 PASS
+FastMssql Rust unit tests         9/9 PASS
+vendored Tiberius unit tests      123/123 PASS
+cargo fmt / Clippy -D warnings    PASS
+10.000 tx, concurrency 100        PASS, 3.591,59 tx/s
+99.999 tx, concurrency 200        PASS, 3.536,24 tx/s
+remaining application sessions   0
+```
+
+- [ ] **Step 5: Alege traseul Tiberius înainte de PR**
+
+Ordinea preferată pentru upstream este:
+
+1. PR minimal către Tiberius pentru API-ul și bitul `RESETCONNECTION`;
+2. release sau commit Tiberius acceptat și pin-uit;
+3. PR FastMssql care consumă API-ul public.
+
+O dependență Git temporară sau includerea sursei vendored sunt variante de
+rezervă și necesită aprobare explicită. Nu se creează și nu se publică un fork
+Tiberius fără această aprobare.
+
+- [ ] **Step 6: Construiește diff-ul curat față de ultimul upstream**
+
+PR-ul nu va cherry-pick-ui orb `16f076a`, deoarece repository-ul original nu
+conține încă patchul Tiberius local și poate evolua față de `v0.7.7`.
+Reaplică separat:
+
+1. testele RED;
+2. commitul de compatibilitate pentru fixture-urile `##temp`;
+3. integrarea FastMssql;
+4. dependency bump-ul sau API-ul Tiberius aprobat.
+
+Riscurile trebuie declarate: resetarea invalidează intenționat obiectele
+temporare legate de sesiunea precedentă; isolation level este restaurat
+explicit; tranzacțiile distribuite nu sunt încă un contract FastMssql
+suportat/testat.
+
+- [ ] **Step 7: Cere aprobarea pentru publicare**
+
+Prezintă diff-ul final, traseul Tiberius, rezultatele de mai sus și orice
+diferență față de PR-ul upstream #121. Nu executa `gh pr create` fără aprobarea
+explicită a proprietarului forkului.
+
+---
+
 ## Funcții enterprise care vor intra ulterior în roadmap
 
 Fiecare funcție primește propriul candidat numai după ce este implementată pe
@@ -1174,7 +1336,7 @@ fork, testată live și auditată.
 | Domeniu | Posibil PR viitor | Condiție înainte de upstream |
 |---|---|---|
 | Session leasing | tranzacții pe conexiuni rezervate din pool | reset complet, cancellation safety, max pool respectat |
-| TDS session reset | bit `RESETCONNECTION` | extensie Tiberius verificată și session leakage zero |
+| TDS session reset | PR-15, bit `RESETCONNECTION` | implementat/verificat pe fork; traseu Tiberius și aprobare înainte de upstream |
 | True async streaming | stream Python async cu backpressure | memorie limitată, early close, lease recovery |
 | Typed parameters | tip/direction/precision/scale/length | wire metadata verificată prin SQL Server |
 | Stored procedures | RPC, OUT params, return status, result sets | fără pierdere de metadata/tokeni |
