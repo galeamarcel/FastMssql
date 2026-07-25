@@ -102,3 +102,18 @@ def test_sql_auth_runner_uses_locked_cargo_tests() -> None:
 
     assert "record cargo-test cargo test --locked" in runner
     assert "record cargo-test cargo test\n" not in runner
+
+
+def test_hosted_gate_builds_extension_and_checks_pool_defaults() -> None:
+    workflow = _read_required(WORKFLOW)
+
+    assert "uvx --from maturin==1.14.1 maturin build" in workflow
+    assert "uv pip install" in workflow
+    assert '--python "${contract_python}"' in workflow
+    assert "-m pytest tests/test_pool_config_default_contract.py -q" in workflow
+    assert workflow.index("cargo test --locked") < workflow.index(
+        "uvx --from maturin==1.14.1 maturin build"
+    )
+    assert workflow.index("uv pip install") < workflow.index(
+        "tests/test_pool_config_default_contract.py"
+    )

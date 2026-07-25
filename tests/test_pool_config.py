@@ -11,13 +11,28 @@ class TestPoolConfigConstructor:
     """Test PoolConfig constructor and basic validation."""
 
     def test_default_constructor(self):
-        """Test creating PoolConfig with default values."""
+        """PoolConfig() uses the canonical managed profile."""
         config = PoolConfig()
-        assert config.max_size == 20
-        assert config.min_idle == 2
-        assert config.max_lifetime_secs is None
-        assert config.idle_timeout_secs is None
-        assert config.connection_timeout_secs == 30
+        assert (
+            config.max_size,
+            config.min_idle,
+            config.max_lifetime_secs,
+            config.idle_timeout_secs,
+            config.connection_timeout_secs,
+            config.test_on_check_out,
+            config.retry_connection,
+        ) == (15, 3, 1800, 300, 30, None, None)
+        rendered = repr(config)
+        for field in (
+            "max_size=15",
+            "min_idle=Some(3)",
+            "max_lifetime_secs=Some(1800)",
+            "idle_timeout_secs=Some(300)",
+            "connection_timeout_secs=Some(30)",
+            "test_on_check_out=None",
+            "retry_connection=None",
+        ):
+            assert field in rendered
 
     def test_custom_values(self):
         """Test creating PoolConfig with custom values."""
@@ -35,19 +50,21 @@ class TestPoolConfigConstructor:
         assert config.connection_timeout_secs == 45
 
     def test_none_values(self):
-        """Test creating PoolConfig with None values."""
+        """The historical direct profile remains available explicitly."""
         config = PoolConfig(
-            max_size=15,
-            min_idle=None,
+            max_size=20,
+            min_idle=2,
             max_lifetime_secs=None,
             idle_timeout_secs=None,
-            connection_timeout_secs=None,
+            connection_timeout_secs=30,
         )
-        assert config.max_size == 15
-        assert config.min_idle is None
-        assert config.max_lifetime_secs is None
-        assert config.idle_timeout_secs is None
-        assert config.connection_timeout_secs is None
+        assert (
+            config.max_size,
+            config.min_idle,
+            config.max_lifetime_secs,
+            config.idle_timeout_secs,
+            config.connection_timeout_secs,
+        ) == (20, 2, None, None, 30)
 
     def test_max_size_zero_invalid(self):
         """Test that max_size of 0 raises an error."""

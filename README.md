@@ -22,7 +22,7 @@ Great for data ingestion, bulk inserts, and large-scale query workloads.
 - Rust core: memory‑safe and reliable, tuned Tokio runtime
 - No ODBC: native SQL Server client, no external drivers needed
 - Azure authentication: Service Principal, Managed Identity, and access token support (**BETA**)
-- Connection pooling: bb8‑based, smart defaults (default max_size=20, min_idle=2)
+- Connection pooling: bb8‑based, smart defaults (default max_size=15, min_idle=3)
 - Async first: clean async/await API with `async with` context managers
 - Strong typing: fast conversions for common SQL Server types
 - Thread‑safe: safe to use in concurrent apps
@@ -444,7 +444,23 @@ async with Connection(conn_str, pool_config=PoolConfig.high_throughput()) as con
     rows = (await conn.query("SELECT 1 AS ok")).rows()
 ```
 
-Default pool (if omitted): `max_size=15`, `min_idle=3`.
+Default pool (if omitted or constructed with `PoolConfig()`):
+`max_size=15`, `min_idle=3`, `max_lifetime_secs=1800`,
+`idle_timeout_secs=300`, `connection_timeout_secs=30`.
+
+Explicit values always win. `None` leaves the corresponding FastMssql bb8
+override unset; it does not by itself guarantee an unlimited timeout. To
+retain the historical direct-constructor field profile explicitly:
+
+```python
+legacy_direct_profile = PoolConfig(
+    max_size=20,
+    min_idle=2,
+    max_lifetime_secs=None,
+    idle_timeout_secs=None,
+    connection_timeout_secs=30,
+)
+```
 
 
 ### Transactions

@@ -38,13 +38,17 @@ def test_pool_config_with_all_parameters():
 
 
 def test_pool_config_default_values():
-    """Test PoolConfig default values."""
+    """PoolConfig exposes the same canonical defaults as Connection."""
     config = PoolConfig()
-
-    # Check defaults (from code: max_size=10, min_idle=Some(1), connection_timeout_secs=Some(30))
-    assert config.max_size == 20
-    assert config.min_idle == 2
-    assert config.connection_timeout_secs == 30
+    assert (
+        config.max_size,
+        config.min_idle,
+        config.max_lifetime_secs,
+        config.idle_timeout_secs,
+        config.connection_timeout_secs,
+        config.test_on_check_out,
+        config.retry_connection,
+    ) == (15, 3, 1800, 300, 30, None, None)
 
 
 def test_pool_config_max_size_zero_invalid():
