@@ -49,8 +49,7 @@ La data redactării:
 
 - `upstream/master`: `e45f301` — versiunea `v0.7.7`;
 - branch audit: `test/sql-auth-validation`;
-- snapshotul tehnic anterior acestui update documentar este `e61b771`, cu 87
-  de commituri înaintea `upstream/master`;
+- snapshotul tehnic anterior acestui update documentar este `9d51d07`;
 - unicul PR upstream deschis este draftul
   [#121 — Improve transactions behavior and safety](https://github.com/Rivendael/FastMssql/pull/121);
 - PR-ul #121 modifică masiv tranzacțiile și timeouturile, deci orice PR care
@@ -105,7 +104,8 @@ PR-uri care cer hardening sau separare
 PR-uri cu decizie de supply chain
     ├── PR-13 eliminarea advisory-urilor RustSec din ramura TLS
     ├── PR-14 gate RustSec obligatoriu înainte de release
-    └── PR-15 RESETCONNECTION TDS și izolarea sesiunilor pooled
+    ├── PR-15 RESETCONNECTION TDS și izolarea sesiunilor pooled
+    └── PR-16 mașină atomică de stare pentru tranzacții
 
 Funcții enterprise viitoare
     └── intake individual după implementare și audit
@@ -1326,6 +1326,134 @@ explicită a proprietarului forkului.
 
 ---
 
+### Task 15: PR-16 — Mașină atomică de stare pentru tranzacții
+
+**Priority:** P0 implementat și verificat pe fork. Transaction leasing și
+`CommitOutcomeUnknown` rămân PR-uri P0 separate.
+
+**Source test branch:** `test/transaction-state-machine`
+
+**Source test commit:** `ff844b7`
+
+**Source fix branch:** `fix/transaction-state-machine`
+
+**Source implementation commit:** `b86b0ac`
+
+**Independent harness correction:** `9c2a88f` pe
+`test/restart-tls-error-contract`
+
+**Cumulative fork commit:** `9d51d07`
+
+**Proposed clean upstream branch:** `fix/upstream-transaction-state-machine`
+
+**Proposed title:** `fix: make transaction state transitions atomic`
+
+**Files on the verified fork:**
+
+- Modify: `src/transaction.rs`
+- Test: `tests/sql_auth_strict/test_transactions_strict.py`
+- Test contract: `tests/sql_auth_strict/test_matrix_contract.py`
+- Spec:
+  `docs/superpowers/specs/2026-07-24-fastmssql-sql-auth-validation-design.md`
+
+**Interfaces:**
+
+- Consumes: apeluri publice concurente `begin`, `commit`, `rollback`, `query`,
+  `execute`, `query_batch` și `close` pe același obiect `Transaction`.
+- Produces: o singură autoritate Rust pentru conexiune și stare, exact un
+  câștigător pentru fiecare tranziție și comportament fail-closed când
+  operația in-flight este anulată sau panichează.
+- Nu schimbă încă modelul de ownership: conexiunea rămâne directă și
+  persistentă pe obiect, nu lease din pool.
+
+**Root cause:**
+
+Wrapperul Python și nucleul Rust validau starea separat de operația TDS.
+Conexiunea era protejată de mutex, dar starea nu forma aceeași secțiune atomică.
+Mai multe taskuri puteau trece aceeași verificare înainte ca primul apel să
+actualizeze flagurile și puteau trimite două comenzi tranzacționale valide
+individual, dar incompatibile împreună.
+
+- [x] **Step 1: Reproduce cursele pe codul anterior**
+
+Matricea TX-020/TX-021 rulează atât prin wrapperul public, cât și direct prin
+clasa Rust expusă:
+
+```text
+16 x begin                     exact un câștigător
+commit versus commit          exact un câștigător
+rollback versus rollback      exact un câștigător
+commit versus rollback        efect persistent conform câștigătorului
+rollback versus commit        efect persistent conform câștigătorului
+```
+
+Pe baseline, toate cele 10 variante au eșuat. Burstul de `begin` a acceptat
+toate cele 16 apeluri, iar settlementul mixt a putut trimite un al doilea
+`ROLLBACK` fără `BEGIN` corespunzător.
+
+- [x] **Step 2: Mută autoritatea stării în Rust**
+
+`TransactionSession` păstrează conexiunea și starea sub același
+`Arc<AsyncMutex<_>>`. Stările intermediare `Beginning`, `Committing`,
+`RollingBack` și `Closing` sunt setate înainte de primul `await` relevant.
+Comanda TDS și consumarea completă a răspunsului se încheie înaintea tranziției
+terminale.
+
+- [x] **Step 3: Fă anularea și panicurile fail-closed**
+
+O operație anulată în starea in-flight nu revine optimist la `Active`.
+Conexiunea este retrasă la eroare/panic, iar obiectul poate reveni la `Idle`
+numai prin `close()`. `close()` încearcă rollback best-effort când mai există o
+tranzacție activă și apoi elimină socketul.
+
+- [x] **Step 4: Rulează dovada completă**
+
+Rezultate pe source tree-ul cumulativ `9d51d07`:
+
+```text
+TX-020/TX-021 focalizat           10/10 PASS
+strict transaction + compat      46/46 PASS
+strict SQL-auth complet           329/329 PASS
+upstream aplicabil                896/896 PASS
+FastMssql Rust unit tests         9/9 PASS
+cargo fmt / Clippy -D warnings    PASS
+cargo audit, 219 dependențe       0 findings
+10.000 tx, concurrency 100        PASS, 3.580,03 tx/s
+99.999 tx, concurrency 100        PASS, 3.841,77 tx/s
+99.999 tx, concurrency 200        PASS, 3.609,59 tx/s
+remaining application sessions   0
+```
+
+Corecția `9c2a88f` nu este parte din fixul de producție PR-16. Ea aliniază
+harness-ul de resilience cu închiderea TLS observată la restartul brutal al
+containerului și a fost demonstrată ca eșec preexistent pe baseline.
+
+- [ ] **Step 5: Rebase curat și compară draftul upstream #121**
+
+Nu se propune direct istoricul cumulativ. Se pornește un branch nou din ultimul
+`upstream/master`, se confirmă RED pe acea bază și se reaplică testul plus
+implementarea minimă. Diff-ul `src/transaction.rs` trebuie comparat explicit cu
+[#121](https://github.com/Rivendael/FastMssql/pull/121), deoarece draftul
+modifică aceeași zonă și poate schimba API-ul sau regulile de timeout.
+
+- [ ] **Step 6: Păstrează următoarele P0 în PR-uri separate**
+
+PR-16 nu va include:
+
+- transaction leasing din pool;
+- `CommitOutcomeUnknown`;
+- API TDS `ATTENTION`;
+- retry automat pentru operații de scriere;
+- schimbări de API pentru savepoints sau isolation ergonomics.
+
+- [ ] **Step 7: Cere aprobarea pentru publicare**
+
+Prezintă diff-ul curat, comparația cu #121 și dovada rerulată pe ultimul
+upstream. Nu executa `gh pr create` fără aprobarea explicită a proprietarului
+forkului.
+
+---
+
 ## Funcții enterprise care vor intra ulterior în roadmap
 
 Fiecare funcție primește propriul candidat numai după ce este implementată pe
@@ -1335,7 +1463,8 @@ fork, testată live și auditată.
 
 | Domeniu | Posibil PR viitor | Condiție înainte de upstream |
 |---|---|---|
-| Session leasing | tranzacții pe conexiuni rezervate din pool | reset complet, cancellation safety, max pool respectat |
+| Transaction state | PR-16, tranziții atomice în Rust | implementat/verificat pe fork; rebase și comparație cu #121 înainte de upstream |
+| Session leasing | tranzacții pe conexiuni rezervate din pool | următorul P0; reset complet, cancellation safety, max pool respectat |
 | TDS session reset | PR-15, bit `RESETCONNECTION` | implementat/verificat pe fork; traseu Tiberius și aprobare înainte de upstream |
 | True async streaming | stream Python async cu backpressure | memorie limitată, early close, lease recovery |
 | Typed parameters | tip/direction/precision/scale/length | wire metadata verificată prin SQL Server |
