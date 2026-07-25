@@ -62,12 +62,16 @@ class Connection:
         """
         return await self._conn.pool_stats()
 
+    def transaction(self):
+        """Create a transaction backed by this connection's shared pool."""
+        return Transaction._from_rust(self._conn.transaction())
+
 
 class Transaction:
-    """Single dedicated connection for SQL Server transactions.
+    """SQL Server transaction on a shared pool lease or direct connection.
 
-    Provides a non-pooled connection where all operations happen on the same
-    underlying connection, ensuring transaction safety for BEGIN/COMMIT/ROLLBACK.
+    Prefer ``Connection.transaction()`` for bounded enterprise concurrency.
+    The direct constructor remains available for backward compatibility.
 
     Example:
         async with Transaction(server="localhost", database="mydb") as conn:
@@ -76,7 +80,16 @@ class Transaction:
 
     def __init__(self, *args, **kwargs):
         """Initialize a dedicated non-pooled connection for transactions."""
-        self._rust_conn = _RustTransaction(*args, **kwargs)
+        self._initialize(_RustTransaction(*args, **kwargs))
+
+    @classmethod
+    def _from_rust(cls, rust_transaction):
+        transaction = cls.__new__(cls)
+        transaction._initialize(rust_transaction)
+        return transaction
+
+    def _initialize(self, rust_transaction):
+        self._rust_conn = rust_transaction
         self._TRANSACTION_BEGUN = False
         self._TRANSACTION_COMMITTED = False
         self._TRANSACTION_ROLLEDBACK = False

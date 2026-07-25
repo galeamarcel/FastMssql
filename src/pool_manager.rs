@@ -74,30 +74,39 @@ impl ManagedConnection {
         self.disposition = ConnectionDisposition::Broken;
     }
 
-    fn mark_clean(&mut self) {
+    pub(crate) fn mark_clean(&mut self) {
         self.disposition = ConnectionDisposition::Clean;
     }
 
-    fn mark_needs_reset(&mut self) {
+    pub(crate) fn mark_needs_reset(&mut self) {
         if self.disposition != ConnectionDisposition::Broken {
             self.disposition = ConnectionDisposition::NeedsReset;
         }
     }
 
-    fn prepare_for_checkout(&mut self) {
+    pub(crate) fn prepare_for_checkout(&mut self) {
         if self.disposition == ConnectionDisposition::NeedsReset {
             self.client.reset_connection_on_next_request();
             self.mark_clean();
         }
     }
 
-    fn apply_operation_error(&mut self, error: &PyErr) {
-        match ConnectionDisposition::after_python_error(error) {
-            ConnectionDisposition::Broken => self.mark_unusable(),
-            ConnectionDisposition::Clean | ConnectionDisposition::NeedsReset => {
-                self.mark_needs_reset();
-            }
-        }
+    /// Marks a request as unsafe before its first await.
+    ///
+    /// If the owning Rust future is cancelled, no completion callback runs and
+    /// bb8 will retire this connection rather than returning a partial TDS
+    /// response to another borrower.
+    pub(crate) fn begin_operation(&mut self) {
+        self.disposition = ConnectionDisposition::Broken;
+    }
+
+    /// Records a fully consumed successful response.
+    pub(crate) fn finish_operation_success(&mut self) {
+        self.disposition = ConnectionDisposition::NeedsReset;
+    }
+
+    pub(crate) fn apply_operation_error(&mut self, error: &PyErr) {
+        self.disposition = ConnectionDisposition::after_python_error(error);
     }
 
     pub(crate) fn is_reusable(&self) -> bool {
@@ -361,6 +370,25 @@ impl Drop for PooledOperationGuard<'_> {
 }
 
 pub type ConnectionPool = Pool<AzureConnectionManager>;
+pub(crate) type OwnedPooledConnection = bb8::PooledConnection<'static, AzureConnectionManager>;
+
+pub(crate) fn map_pool_checkout_error(error: bb8::RunError<PoolConnectionError>) -> PyErr {
+    match error {
+        bb8::RunError::TimedOut => create_connection_error(
+            "Connection pool timeout - all connections are busy. \
+             Try reducing concurrent requests or increasing pool size.",
+        ),
+        bb8::RunError::User(error) => {
+            create_connection_error(format!("Failed to get connection from pool: {error}"))
+        }
+    }
+}
+
+pub(crate) async fn acquire_owned_connection(
+    pool: &ConnectionPool,
+) -> PyResult<OwnedPooledConnection> {
+    pool.get_owned().await.map_err(map_pool_checkout_error)
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Pool helpers

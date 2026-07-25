@@ -411,7 +411,8 @@ evidence reference.
 - `TX-025`: a transaction lease is reset before cross-lease reuse, including
   local temporary objects, `SESSION_CONTEXT`, and isolation level.
 - `TX-026`: cancellation makes an active transaction lease fail-closed; close
-  retires the uncertain socket and a waiter recovers on a new SQL session.
+  retires the uncertain socket and a waiter recovers on a new physical
+  `connection_id`, even if SQL Server reuses the numeric SPID.
 
 ### ASYNC — true asynchronous behavior
 
