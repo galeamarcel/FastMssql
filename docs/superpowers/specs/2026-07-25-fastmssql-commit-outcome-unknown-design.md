@@ -1,7 +1,9 @@
 # FastMssql `CommitOutcomeUnknown` Design
 
-**Date:** 2026-07-25  
-**Status:** approved by the standing enterprise-hardening mandate  
+**Date:** 2026-07-25
+
+**Status:** approved by the standing enterprise-hardening mandate
+
 **Scope:** transaction COMMIT outcome classification, fail-closed connection
 handling, public Python exception contract, and deterministic fault injection
 
