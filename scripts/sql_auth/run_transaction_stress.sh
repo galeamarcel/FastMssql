@@ -5,6 +5,8 @@ readonly root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly env_file="${root_dir}/.env.sql-auth.local"
 readonly artifact_dir="${root_dir}/.artifacts/sql-auth"
 readonly profiles="${FASTMSSQL_TRANSACTION_STRESS_PROFILES:-10_000:100,99_999:100,99_999:200}"
+readonly strategy="${FASTMSSQL_TRANSACTION_STRESS_STRATEGY:-persistent}"
+readonly pool_size="${FASTMSSQL_TRANSACTION_STRESS_POOL_SIZE:-100}"
 readonly metrics_path="${artifact_dir}/transaction-stress-metrics.json"
 
 cd "${root_dir}"
@@ -22,5 +24,6 @@ set +a
 mkdir -p "${artifact_dir}"
 uv run python scripts/sql_auth/transaction_stress.py \
   --profiles "${profiles}" \
-  --connection-strategy persistent \
+  --connection-strategy "${strategy}" \
+  --pool-size "${pool_size}" \
   --metrics-output "${metrics_path}"
