@@ -49,7 +49,7 @@ La data redactării:
 
 - `upstream/master`: `e45f301` — versiunea `v0.7.7`;
 - branch audit: `test/sql-auth-validation`;
-- snapshotul tehnic anterior acestui update documentar este `438a86e`;
+- snapshotul tehnic anterior acestui update documentar este `5dc70031`;
 - unicul PR upstream deschis este draftul
   [#121 — Improve transactions behavior and safety](https://github.com/Rivendael/FastMssql/pull/121);
 - PR-ul #121 modifică masiv tranzacțiile și timeouturile, deci orice PR care
@@ -91,7 +91,8 @@ PR-uri mici deja aproape pregătite
 PR-uri cu decizie API
     ├── PR-04 atomic multi-chunk bulk insert
     ├── PR-05 connection endpoint error context
-    └── PR-12 TLS secure-by-default și sursă unică
+    ├── PR-12 TLS secure-by-default și sursă unică
+    └── PR-21 PoolConfig default consistency
 
 PR-uri care cer hardening sau separare
     ├── PR-06 pooled cancellation and disposition
@@ -2137,6 +2138,94 @@ Prezintă diff-ul curat, reproducerea RED, rezultatele GREEN, dovada
 `git push` pentru branchul upstream și nu executa `gh pr create` fără
 aprobarea explicită a proprietarului forkului.
 
+### Task 20: PR-21 — Consistența defaulturilor PoolConfig
+
+**Status:** `VERIFIED_FORK / requires fresh upstream rebase`. Implementat și
+verificat pe fork; branchul upstream curat nu a fost creat și publicarea nu
+este aprobată.
+
+```text
+fork implementation branch   fix/pool-config-default-consistency
+future clean branch           fix/upstream-pool-config-default-consistency
+future title                  fix: align PoolConfig default construction
+public API change             omitted PoolConfig arguments become canonical
+compatibility note            historical direct profile remains explicit
+required evidence             RED, 906 upstream, 296 strict, 285 IDs,
+                              14 Rust, 7 PyO3, three hosted OS jobs
+publication                   forbidden until a new explicit user approval
+```
+
+**Problema verificată pe fork:**
+
+```text
+PoolConfig() cu argumente omise       20/2/None/None/30/None/None
+PyPoolConfig::default()               15/3/1800/300/30/None/None
+Connection(pool_config=None)          15/3/1800/300/30/None/None
+```
+
+Constructorul PyO3 repeta literali care divergeau de
+`PyPoolConfig::default()`. Proveniența configurației de pool este commitul
+upstream `2c5620a`. Fixul de pe fork definește profilul canonic tipat
+`15/3/1800/300/30/None/None` și îl folosește atât pentru defaultul intern,
+cât și pentru argumentele omise. Valorile explicite, `None` explicit,
+preset-urile și `adaptive()` rămân neschimbate.
+
+**Istoric și dovadă pe fork:**
+
+- design `9e59249`, plan `57f2d17`;
+- RED pur/static `659a187` și runtime/SQL-auth `06e3129`;
+- GREEN runtime/API/stub/README `b5239c7`;
+- RED hosted pentru izolarea wheel-ului `a4877c4`;
+- GREEN hosted `fb1f901`;
+- integrare tehnică finală
+  `5dc70031fc1961faf76a5ec1fdb6f28b1141c10b`;
+- evidență generată `8cba60f`.
+
+Rezultatul final este `92/92` PoolConfig pur, `16/16` integrare,
+`POOL-001 1/1` pe MSSQL SQL-auth real, `14/14` Rust, `7/7` PyO3,
+`296/296` strict, `285/285` ID-uri, `16/16` async, `28/28` framework,
+`6/6` resilience, `9/9` load și `906/906` upstream. `POOL-001` a măsurat
+maximum `15/15/15` taskuri active/conexiuni/sesiuni pentru ambele căi și zero
+sesiuni după teardown.
+
+[Run-ul final #30172198247](https://github.com/galeamarcel/FastMssql/actions/runs/30172198247)
+a trecut raw Cargo, Rust, wheel și contractul Python izolat pe Ubuntu, macOS
+și Windows. [RustSec #30172198251](https://github.com/galeamarcel/FastMssql/actions/runs/30172198251)
+a trecut cu zero vulnerabilități și warnings. Primul gate hosted
+[#30171657690](https://github.com/galeamarcel/FastMssql/actions/runs/30171657690)
+este păstrat ca dovadă RED: mediul minimal încărca `tests/conftest.py` și
+depindea accidental de `python-dotenv`; remedierea folosește
+`pytest --noconftest`, fără a instala dependențe de dezvoltare sau a slăbi
+contractul.
+
+- [ ] **Step 1: Rebase curat și reproducere RED pe ultimul upstream**
+
+Actualizează numai referința fetch-only `upstream`, creează viitorul branch
+`fix/upstream-pool-config-default-consistency` din ultimul
+`upstream/master` și reproduce cele două profiluri diferite înainte de fix.
+Compară sursa upstream cu `2c5620a` și nu presupune că implementarea a rămas
+neschimbată.
+
+- [ ] **Step 2: Reaplică numai diff-ul minim**
+
+Include sursa unică de default Rust, semnătura PyO3 concretă, stubul,
+documentația și testele portabile. Nu include harnessul SQL-auth complet,
+alte remedieri cumulative, schimbări Tiberius, timeouturi de operație,
+telemetry sau versiune/release.
+
+- [ ] **Step 3: Reexecută toate gate-urile**
+
+Reproducerea trebuie să treacă după fix. Rulează testele PoolConfig pure și de
+integrare, Rust, PyO3, wheel-ul izolat, regresia upstream și SQL-auth real.
+Gate-ul hosted trebuie să fie verde independent pe Linux, macOS și Windows.
+Orice schimbare a numărului de teste se explică exact.
+
+- [ ] **Step 4: Cere aprobarea separată pentru publicare**
+
+Prezintă diff-ul upstream minim, rezultatul rebase-ului, compatibilitatea,
+RED/GREEN și toate URL-urile hosted. Nu face push pentru branchul viitor și nu
+executa `gh pr create` fără o aprobare nouă, explicită, a lui Marcel Galea.
+
 ### PyO3 build/test separation — VERIFIED_FORK
 
 **Status:** `VERIFIED_FORK`. Implementat și verificat pe fork; publicarea
@@ -2235,6 +2324,7 @@ fork, testată live și auditată.
 | Commit outcome | PR-18, `CommitOutcomeUnknown` fără rollback/retry | implementat/verificat pe fork; fault fixture portabil, rebase și comparație cu #121 înainte de upstream |
 | Transaction cancellation | PR-19, retragere automată după anulare | implementat/verificat pe fork; fixture DMV portabil, rebase și comparație cu #121 înainte de upstream |
 | Connection readiness | PR-20, `connect(validate=...)` și `ping()` | implementat/verificat pe fork; rebase curat și fixture portabil înainte de upstream |
+| PoolConfig defaults | PR-21, un singur profil pentru argumentele omise și calea implicită | `VERIFIED_FORK`; rebase curat, RED și gate wheel pe toate cele trei sisteme înainte de aprobarea upstream |
 | TDS session reset | PR-15, bit `RESETCONNECTION` | implementat/verificat pe fork; traseu Tiberius și aprobare înainte de upstream |
 | PyO3 build/test separation | elimină feature-ul permanent și folosește `maturin >= 1.9.4` pentru buildul extensiei | `VERIFIED_FORK`; rebase curat, RED și toate cele trei joburi hosted înainte de aprobarea upstream |
 | True async streaming | stream Python async cu backpressure | memorie limitată, early close, lease recovery |
