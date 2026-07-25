@@ -86,7 +86,10 @@ Snapshotul tehnic verificat la ultima actualizare:
 
 - data: `2026-07-25`;
 - fork cumulativ: `test/sql-auth-validation`;
-- HEAD cumulativ: `9d51d0765a4718fd1748711ac3a669c5f165efcf`;
+- HEAD tehnic verificat pentru transaction leasing:
+  `7d4955dbecd496701d15f083415cdfa4b275ef4a`;
+- HEAD cumulativ publicat după actualizarea auditului:
+  `d7526e1`;
 - bază upstream în referințele locale:
   `e45f301f46128e7114c27097b608a4b2d7f429cf`;
 - versiune de bază: `v0.7.7`;
@@ -136,6 +139,7 @@ Nicio stare sub `APPROVED_TO_PUBLISH` nu autorizează `gh pr create`.
 | PR-14 | gate RustSec obligatoriu pentru build și release | teste `88ef5bd`, `76a661d`, `ac66048`; fixuri `3887ddd`, `1d13280` | `READY_TO_PORT` | adaptare minimă la workflow-urile ultimului upstream |
 | PR-15 | `RESETCONNECTION` TDS și izolarea sesiunilor pooled | teste `6cc1d55`, `dcada81`, `122f713`; fix `16f076a` | `BLOCKED_DEPENDENCY` | traseu Tiberius, rebase upstream și declararea invalidării obiectelor de sesiune |
 | PR-16 | state machine atomic pentru tranzacții concurente | test `ff844b7`; fix `b86b0ac`; cumulativ `9d51d07` | `VERIFIED_FORK` | rebase curat, RED/GREEN pe ultimul upstream și comparație obligatorie cu draftul #121 |
+| PR-17 | tranzacții pe lease rezervat din pool-ul comun | teste `3aee0da`, `a7e35d9`; fix `8027b67`; stress `4662c70`, `adac307`; cumulativ `7d4955d` | `VERIFIED_FORK` | rebase curat, fixture-uri portabile și comparație obligatorie cu draftul #121 |
 
 Hash-urile scurte identifică sursa de lucru, nu sunt instrucțiuni de
 cherry-pick orb. Pentru fiecare PR se extrage numai diff-ul subiectului său.
@@ -173,16 +177,68 @@ restart pentru EOF TLS fără `close_notify`. Eșecul a fost reprodus și fără
 PR-16, deci nu intră în diff-ul candidatului upstream.
 
 PR-16 nu include transaction leasing, `CommitOutcomeUnknown`, TDS `ATTENTION`
-sau retry pentru operații de scriere. Acestea rămân PR-17/PR-18 ori candidați
-separați.
+sau retry pentru operații de scriere. Transaction leasing este implementat și
+verificat separat ca PR-17; rezultatul necunoscut al COMMIT-ului rămâne PR-18.
 
-## Candidați rezervați după PR-16
+### Dovada de promovare pentru PR-17
+
+Reproducerea TX-022–TX-026 din `3aee0da` a fost RED în toate cele cinci
+contracte deoarece API-ul `Connection.transaction()` nu exista. Contractele
+cer același SPID pe durata tranzacției, același buget pentru query și
+tranzacție, backpressure la `pool.max_size`, resetarea stării între lease-uri
+și retragerea fail-closed după anulare.
+
+Corecția de test `a7e35d9` identifică socketul prin
+`sys.dm_exec_connections.connection_id`: SQL Server poate reutiliza imediat un
+număr SPID, deci SPID diferit nu este o condiție corectă pentru retragerea unei
+conexiuni fizice.
+
+Remedierea `8027b67` adaugă calea recomandată
+`Connection.transaction()`. Tranzacția obține un `OwnedPooledConnection` din
+același pool bb8 folosit de query-urile normale, fixează acea sesiune până la
+settlement și eliberează lease-ul la `commit`, `rollback` sau `close`.
+Constructorul direct `Transaction(...)` rămâne disponibil pentru
+compatibilitate, dar nu este prezentat drept cale pooled.
+
+Dovada GREEN pe source tree-ul integrat în `7d4955d`:
+
+```text
+TX-022–TX-026 focalizat               5/5 PASS
+strict transaction + compat          94/94 PASS
+strict SQL-auth complet               334/334 PASS
+cazuri raportate din specificație     269/269
+upstream aplicabil                    896/896 PASS
+FastMssql Rust unit tests             9/9 PASS
+cargo fmt / Clippy -D warnings        PASS
+cargo audit, 219 dependențe           0 findings
+```
+
+Commiturile `4662c70` și `adac307` adaugă strategia de stress pooled. Un singur
+`Connection` cu `pool.max_size=100` a produs:
+
+```text
+10.000 tx, concurrency 100     PASS, 3.118,50 tx/s
+99.999 tx, concurrency 100     PASS, 3.296,48 tx/s
+99.999 tx, concurrency 200     PASS, 3.575,91 tx/s
+maximum physical/SQL sessions  100
+remaining application sessions 0
+```
+
+Ambele profile de 99.999 au exact 50.000 commituri și 49.999 rollback-uri.
+Concurența 200 cu maximum 100 sesiuni demonstrează bounded concurrency și
+backpressure, nu doar throughput.
+
+PR-17 nu include `CommitOutcomeUnknown`, retry automat, TDS `ATTENTION`,
+tranzacții distribuite, savepoints sau graceful shutdown general. Diff-ul
+upstream va fi reconstruit din ultimul `upstream/master` și comparat cu draftul
+#121 înainte de orice cerere de publicare.
+
+## Candidați rezervați după PR-17
 
 Acești candidați nu sunt considerați implementați:
 
 | ID rezervat | Capabilitate | Dependențe de intrare | Criteriu minim de promovare în registrul principal |
 |---|---|---|---|
-| PR-17 | tranzacții pe lease rezervat din pool | PR-06, PR-15 și PR-16 | numărul de sesiuni respectă `pool.max_size`, lease-ul este recuperat la close/anulare |
 | PR-18 | `CommitOutcomeUnknown` | PR-16 și fault injection după trimiterea COMMIT | excepție tipată, socket eliminat, zero retry automat |
 | E-01 | timeouturi separate pentru connect/acquire/query/transaction | connection disposition stabil | fiecare timeout are clasă și efect asupra conexiunii testate |
 | E-02 | streaming async cu backpressure | session leasing și cancellation safety | memorie limitată, early close, recuperarea lease-ului |
@@ -211,11 +267,12 @@ Lot B — gate-uri și hardening cu risc controlat
   PR-12 -> PR-13
 
 Lot C — pool și protocol
-  PR-06 -> PR-15 -> PR-17
+  PR-06 -> PR-15 --\
+                     -> PR-17
+  PR-16 ------------/
 
 Lot D — tranzacții
   PR-16 -> PR-18
-            \-> PR-17, dacă leasingul cere state machine final
 
 Lot E — API sau split suplimentar
   PR-04, PR-05, PR-07, PR-08, PR-09, PR-10, PR-11
@@ -511,11 +568,18 @@ FASTMSSQL_TRANSACTION_STRESS_PROFILES="10_000:100" \
 
 Promovarea la `99999` tranzacții se face după trecerea nivelului de `10000`.
 Strategia persistentă actuală măsoară driverul cu un obiect `Transaction` și o
-conexiune fizică per worker, nu transaction leasing și nici capacitatea maximă
-a SQL Server. După implementarea PR-17, un contract separat trebuie să
-demonstreze că sesiunile nu depășesc `pool.max_size`. Profilul extins folosește
-exact
-`FASTMSSQL_TRANSACTION_STRESS_PROFILES="99_999:100,99_999:200"`.
+conexiune fizică per worker, nu capacitatea maximă a SQL Server. Pentru PR-17,
+strategia pooled verificată trebuie rulată explicit:
+
+```bash
+FASTMSSQL_TRANSACTION_STRESS_STRATEGY=pooled \
+FASTMSSQL_TRANSACTION_STRESS_POOL_SIZE=100 \
+FASTMSSQL_TRANSACTION_STRESS_PROFILES="99_999:100,99_999:200" \
+./scripts/sql_auth/run_transaction_stress.sh
+```
+
+Contractul cere maximum 100 conexiuni bb8 și sesiuni SQL de aplicație, zero
+lease-uri active după workers și zero sesiuni rămase după `disconnect()`.
 
 - [ ] **Step 4: Verifică diff-ul și istoricul**
 
