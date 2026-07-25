@@ -751,6 +751,89 @@ Limite păstrate explicit:
 - candidatul upstream trebuie reaplicat minim peste ultimul
   `upstream/master` și comparat cu draftul #121.
 
+### Stabilizarea resetului client în TX-034 — remediată și verificată
+
+Gate-ul complet al candidatului PoolConfig
+`b5239c715934ab40e0aefc0b2a8a8fac10c7f869` a expus o singură eroare:
+suita strictă a ajuns la `294/295`, iar cleanup-ul TX-034 a ridicat
+`ConnectionResetError: [Errno 54] Connection reset by peer` după ce toate
+aserțiunile funcționale ale tranzacției trecuseră. Campaniile izolate au
+reprodus aceeași intermitență în `1/10`, apoi în `1/7` procese pytest
+proaspete. Instrumentarea temporară a fixat granița exactă:
+`downstream=False` și `_aborting=False`; `_downstream_held` fusese confirmat,
+iar la excepție gate-ul era deja redeschis (`gate_set=True`). Excepția venea
+din `reader.read()` pe segmentul client-spre-server.
+
+Cauza era o asimetrie a harnessului, nu o eroare de business FastMssql.
+Retragerea intenționată a socketului de către cleanup-ul fail-closed poate fi
+observată de peer ca EOF sau ca RST, în funcție de timingul kernelului macOS.
+Proxy-ul trata EOF ca terminare normală, dar propaga întotdeauna RST-ul
+echivalent. Același scenariu valid producea astfel două rezultate de cleanup.
+
+Remedierea este explicită, one-shot și limitată la granița demonstrată:
+
+1. `expect_client_disconnect()` adaugă exact o permisiune pending;
+2. numai un EOF ori `ConnectionResetError` citit pe relay-ul
+   client-spre-server o poate consuma;
+3. un reset nedeclarat și al doilea reset rămân erori vizibile;
+4. reseturile downstream, erorile de conectare, `write()`/`drain()` și orice
+   excepție non-reset nu sunt interceptate și nu consumă permisiunea;
+5. TX-034 declară permisiunea imediat înainte de `commit_task.cancel()`.
+
+Un test async determinist cu reader/writer scriptate dovedește toate aceste
+frontiere fără rețea și fără un ID nou de specificație. Numărul testelor
+stricte crește la 296, iar matricea funcțională rămâne exact 285 de cazuri.
+Nu a fost adăugat retry, nu este înghițită nicio eroare neașteptată și nu s-a
+modificat codul de producție, API-ul public ori comportamentul FastMssql.
+
+Istoricul separat și publicat numai pe fork este:
+
+- `docs/tcp-fault-proxy-client-reset-design`
+  - `fbe2c23` — designul și contractul strict;
+  - `2b683b4` — planul TDD;
+  - `476ead4`, `a63f63e` și `9f07bdf` — corecțiile self-review pentru
+    verificări, RustSec și proveniența SHA-ului din raport;
+- `test/tcp-fault-proxy-client-reset`
+  - `3a0de91` — reproducerea RED deterministă;
+- `fix/tcp-fault-proxy-client-reset`
+  - `e546a00` — politica one-shot și declarația exactă TX-034;
+- branch cumulativ `test/sql-auth-validation`
+  - `2a8560ad9900ed2bd8f803bd7956da6be7d51847` — integrarea tehnică;
+- `docs/tcp-fault-proxy-client-reset-status`
+  - `84bf55a0364f1d6c9a2814e90f16a03f6aae7fb8` — matricea și raportul
+    regenerate din artefactele SHA-ului tehnic.
+
+Dovada repetabilității și gate-ul complet la `2a8560ad` sunt:
+
+```text
+TX-034, procese pytest proaspete      50/50 PASS
+suita strictă SQL-auth               296/296 PASS
+cazuri raportate din specificație    285/285 PASS
+async / framework                    16/16, 28/28 PASS
+resilience / load                    6/6, 9/9 PASS
+regresie upstream aplicabilă         902/902 PASS
+FastMssql Rust unit tests            13/13 PASS
+cargo fmt / Clippy -D warnings       PASS
+cargo audit, 219 dependențe          0 findings
+```
+
+Gate-urile hosted au trecut la același SHA tehnic:
+
+- [RustSec / dependency security](https://github.com/galeamarcel/FastMssql/actions/runs/30170569020)
+  — succes, zero vulnerabilități și zero warnings;
+- [Cargo pe Ubuntu](https://github.com/galeamarcel/FastMssql/actions/runs/30170569017/job/89710873892),
+  [macOS](https://github.com/galeamarcel/FastMssql/actions/runs/30170569017/job/89710873877)
+  și
+  [Windows](https://github.com/galeamarcel/FastMssql/actions/runs/30170569017/job/89710873909)
+  — build raw Cargo și `13/13` teste pe fiecare sistem.
+
+Branch-urile RED și GREEN au paritate `0/0` cu
+`galeamarcel/FastMssql`; verificările filtrate au întors `[]` pentru orice PR
+al lor către `Rivendael/FastMssql`. PoolConfig va fi realiniat prin
+forward-merge, fără rescrierea commitului său `b5239c71`. Baza tehnică exactă
+pe care o consumă este `2a8560ad`; commiturile documentare ulterioare nu
+schimbă acel arbore tehnic.
+
 ### Readiness real pentru conexiune — remediat și verificat
 
 Branchurile și commiturile sunt separate:
