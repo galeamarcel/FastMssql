@@ -683,7 +683,7 @@ async def test_batch_and_bulk_share_one_absolute_operation_budget(
             await batch_connection.execute_batch(
                 [
                     (
-                        "WAITFOR DELAY '00:00:00.120'; "
+                        "WAITFOR DELAY '00:00:00.140'; "
                         f"INSERT INTO {batch_table} (id) VALUES (@P1); "
                         f"-- {token}",
                         [index],
