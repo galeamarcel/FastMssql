@@ -11,6 +11,7 @@ from .fastmssql import (
 from .fastmssql import (
     AzureCredential,
     AzureCredentialType,
+    CommitOutcomeUnknown,
     ConversionError,
     SqlConnectionError,
     EncryptionLevel,
@@ -204,6 +205,7 @@ class Transaction:
 __all__ = [
     "AzureCredential",
     "AzureCredentialType",
+    "CommitOutcomeUnknown",
     "Connection",
     "ConversionError",
     "SqlConnectionError",

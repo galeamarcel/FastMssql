@@ -26,8 +26,8 @@ pub use py_parameters::{Parameter, Parameters};
 pub use ssl_config::{EncryptionLevel, PySslConfig};
 pub use transaction::Transaction;
 pub use types::{
-    ConversionError, ProtocolError, PyFastRow, PyQueryStream, SqlConnectionError, SqlError,
-    TlsError,
+    CommitOutcomeUnknown, ConversionError, ProtocolError, PyFastRow, PyQueryStream,
+    SqlConnectionError, SqlError, TlsError,
 };
 
 use crate::parameter_conversion::TypedNull;
@@ -82,6 +82,10 @@ fn fastmssql(m: &Bound<'_, PyModule>) -> PyResult<()> {
         let py = m.py();
         m.add("SqlError", py.get_type::<SqlError>())?;
         m.add("SqlConnectionError", py.get_type::<SqlConnectionError>())?;
+        m.add(
+            "CommitOutcomeUnknown",
+            py.get_type::<CommitOutcomeUnknown>(),
+        )?;
         m.add("TlsError", py.get_type::<TlsError>())?;
         m.add("ProtocolError", py.get_type::<ProtocolError>())?;
         m.add("ConversionError", py.get_type::<ConversionError>())?;
