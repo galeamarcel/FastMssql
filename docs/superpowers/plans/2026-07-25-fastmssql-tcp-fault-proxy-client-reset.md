@@ -1659,6 +1659,27 @@ PoolConfig Python contract on every OS   3/3
 
 Do not accept a successful run for an earlier SHA.
 
+Execution exposed and closed one hosted-only isolation defect before Task 8:
+
+- cumulative SHA `f1db97ba3547a0f5268f631bfd6b445d613a2dde`
+  passed RustSec and every raw Cargo, Rust, wheel-build and wheel-install
+  step, but run
+  `https://github.com/galeamarcel/FastMssql/actions/runs/30171657690`
+  failed the Python contract on Ubuntu, macOS and Windows with exit code 4;
+- a matching minimal local wheel environment reproduced
+  `ModuleNotFoundError: No module named 'dotenv'` because pytest loaded the
+  repository `tests/conftest.py`; the production wheel itself imported
+  correctly;
+- RED commit `a4877c4` requires the dependency-free contract lane to use
+  `--noconftest`;
+- GREEN commit `fb1f901` adds only that pytest isolation flag, after which the
+  same minimal environment passes `3/3`;
+- the complete local enterprise gate and RustSec were rerun at `fb1f901`,
+  preserving exact totals `14/296/16/28/6/9/285/906`;
+- the corrected cumulative technical SHA is
+  `5dc70031fc1961faf76a5ec1fdb6f28b1141c10b`. This SHA, not `f1db97ba`,
+  is `pool_technical_sha` for Task 8 and must pass both hosted workflows.
+
 ---
 
 ### Task 8: Finalize PoolConfig status and return to the enterprise roadmap
