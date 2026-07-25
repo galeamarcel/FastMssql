@@ -385,9 +385,9 @@ async def test_saturated_pool_acquire_timeout_starts_no_application_sql(
         ),
         application_name=unique_sql_name("strict_timeout_acquire"),
     )
-    holder: asyncio.Task | None = None
+    holder: asyncio.Future | None = None
     try:
-        holder = asyncio.create_task(
+        holder = asyncio.ensure_future(
             connection.query(
                 "WAITFOR DELAY '00:00:00.600'; SELECT 1 AS value"
             )
@@ -579,7 +579,7 @@ async def test_timed_out_parameterized_write_is_not_retried_and_reconciles(
         assert await scalar(connection, "SELECT 5") == 5
         proxy.pause_downstream()
         proxy.expect_client_disconnect()
-        write_task = asyncio.create_task(
+        write_task = asyncio.ensure_future(
             connection.execute(
                 f"EXEC {procedure} @business_key = @P1, @value = @P2",
                 [business_key, 505],
