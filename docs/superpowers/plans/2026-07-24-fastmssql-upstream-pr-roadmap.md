@@ -49,7 +49,7 @@ La data redactării:
 
 - `upstream/master`: `e45f301` — versiunea `v0.7.7`;
 - branch audit: `test/sql-auth-validation`;
-- snapshotul tehnic anterior acestui update documentar este `c30c02a`;
+- snapshotul tehnic anterior acestui update documentar este `597e299`;
 - unicul PR upstream deschis este draftul
   [#121 — Improve transactions behavior and safety](https://github.com/Rivendael/FastMssql/pull/121);
 - PR-ul #121 modifică masiv tranzacțiile și timeouturile, deci orice PR care
@@ -108,7 +108,8 @@ PR-uri cu decizie de supply chain
     ├── PR-16 mașină atomică de stare pentru tranzacții
     ├── PR-17 transaction leasing din pool
     ├── PR-18 rezultat necunoscut după COMMIT
-    └── PR-19 retragere automată după anularea tranzacției
+    ├── PR-19 retragere automată după anularea tranzacției
+    └── PR-20 readiness strict pentru conexiunea SQL Server
 
 Funcții enterprise viitoare
     └── intake individual după implementare și audit
@@ -1962,6 +1963,181 @@ executa `gh pr create` fără aprobarea explicită a proprietarului forkului.
 
 ---
 
+### Task 19: PR-20 — Readiness strict pentru conexiunea SQL Server
+
+**Status:** `VERIFIED_FORK`
+
+**Priority:** P1 de lifecycle implementat și verificat pe fork. Publicarea
+upstream nu este aprobată.
+
+**Source design branch:** `docs/connection-readiness-design`
+
+**Source design commits:**
+
+- `f06c844` — specificația strictă, semantica API și limitele explicite;
+- `4a722a1` — planul TDD și gate-urile de acceptare.
+
+**Source test branch:** `test/connection-readiness`
+
+**Source test commit:** `d891db8`
+
+**Source implementation branch:** `fix/connection-readiness`
+
+**Source implementation commits:**
+
+- `e7b1ee8` — păstrează explicit taxonomia TLS/EOF deja stabilită;
+- `158d801` — primitiva Rust comună de readiness, timeout și retirement;
+- `bb7f53b` — wrapperul Python, stuburile și documentația publică.
+
+**Cumulative fork commit:** `597e299`
+
+**Proposed clean upstream branch:** `fix/upstream-connection-readiness`
+
+**Proposed title:** `fix: validate SQL Server readiness on connect`
+
+**Files on the verified fork:**
+
+- Modify: `src/connection.rs`
+- Modify: `python/fastmssql/__init__.py`
+- Modify: `python/fastmssql/__init__.pyi`
+- Modify: `python/fastmssql/fastmssql.pyi`
+- Modify: `README.md`
+- Test: `tests/sql_auth_strict/test_connection.py`
+- Test: `tests/sql_auth_strict/test_framework_integration.py`
+- Test: `tests/sql_auth_strict/test_resilience_load.py`
+- Test support: `tests/sql_auth_strict/framework_apps.py`
+- Test contract: `tests/sql_auth_strict/test_matrix_contract.py`
+
+**Scope:** o singură primitivă `SELECT 1` prin pool-ul comun;
+`connect(validate=True)` strict implicit; `connect(validate=False)` pentru
+alocare explicit lazy; `ping()` public; intrare strictă în contextul async;
+semantică precisă de lifecycle pentru `is_connected()`.
+
+**Excluded:** mașina generală de lifecycle, taxonomia timeouturilor per
+operație, metrici/telemetry, retry automat, TDS `ATTENTION`, publicarea unui
+fork Tiberius și orice operație upstream.
+
+**Root cause:**
+
+`connect()` inițializa numai obiectul bb8 și întorcea `True`. Cu
+`min_idle=0`, nicio conexiune fizică nu era creată și nu avea loc niciun login
+SQL Server. `__aenter__` folosea aceeași cale, iar `is_connected()` putea fi
+interpretat greșit drept health check deși verifica numai existența handle-ului
+de pool.
+
+- [x] **Step 1: Reproduce falsul pozitiv și contractele de framework**
+
+Baseline-ul nemodificat a returnat `True`, cu
+`pool_stats()["connections"] == 0` și fără sesiune autentificată. FastAPI și
+Flask adaptat ASGI puteau intra în corpul lifespan-ului înainte de validarea
+endpointului SQL.
+
+CONN-020–CONN-024 acoperă endpoint închis, alocare lazy explicită, login real
+cu `min_idle=0`, intrarea în context și retragerea după omorârea sesiunii.
+FRAME-025–FRAME-026 impun eșecul startup-ului înainte de servire și cleanup în
+`finally`.
+
+- [x] **Step 2: Folosește o singură primitivă de readiness**
+
+`connect(validate=True)`, `ping()` și `__aenter__` execută același `SELECT 1`
+prin pool și consumă complet răspunsul. Timeoutul efectiv bb8 încadrează
+checkout-ul și răspunsul, iar guard-ul pooled retrage conexiunea dacă future-ul
+este anulat, expiră sau rămâne cu un răspuns TDS incomplet.
+
+Un eșec nu distruge automat întregul pool comun. Conexiunea fizică nesigură
+este retrasă, excepția tipată ajunge la apelant, iar proprietarul aplicației
+decide retry sau `disconnect()`.
+
+- [x] **Step 3: Expune contractul Python fără ambiguitate**
+
+Wrapperul și ambele stuburi expun explicit:
+
+```python
+await connection.connect(validate=True)
+await connection.connect(validate=False)
+await connection.ping()
+await connection.is_connected()
+```
+
+README diferențiază readiness-ul live de lifecycle, FastAPI/ASGI de
+Flask/WSGI și ownership-ul unui event loop persistent.
+
+- [x] **Step 4: Demonstrează retragerea fizică și load-ul bounded**
+
+CONN-024 omoară sesiunea observată și verifică înlocuirea ei. Proba cu proxy
+ține un răspuns TDS parțial până la timeout; query-ul ulterior folosește un
+`connection_id` fizic diferit.
+
+LOAD-009 a executat 1.000 de `ping()` concurente prin același obiect:
+
+```text
+rezultate True                      1.000/1.000
+task concurrency                   100
+pool.max_size                      20
+peak sesiuni observate             20
+durată                             0,172589 s
+throughput                         5.794,11 probe/s
+post-load application query        PASS
+```
+
+- [x] **Step 5: Verifică suita completă pe arborele integrat**
+
+Rezultatele pentru snapshotul tehnic `597e299`:
+
+```text
+CONN-020–CONN-024                  5/5 PASS
+probe timeout suport              2/2 PASS
+FRAME-025–FRAME-026                2/2 PASS
+LOAD-009                           PASS
+suita strictă SQL-auth             354/354 PASS în 135,56 s
+cazuri raportate din specificație  285/285 PASS
+upstream aplicabil                 896/896 PASS în 64,38 s
+FastMssql Rust unit tests          13/13 PASS
+Tiberius unit tests                123/123 PASS
+Tiberius doctests executate        20/20 PASS, 1 ignorat
+cargo fmt / Clippy / Ruff          PASS
+compileall                         PASS
+cargo audit, 219 dependențe        0 findings
+loginuri SQL-auth după teardown    0 sesiuni
+```
+
+Pe macOS, cele 13 teste Rust au necesitat legarea explicită la frameworkul
+Python 3.13. Configurația preexistentă activează permanent feature-ul PyO3
+`extension-module`, care dezactivează legarea `libpython` pentru
+`cargo test`. Separarea buildului extensiei de buildul testelor este candidat
+independent de build/CI și nu este ascunsă în PR-20. Remedierea candidată va
+elimina feature-ul permanent și va ridica minimul de build la
+`maturin >= 1.9.4`, conform recomandării PyO3.
+
+- [ ] **Step 6: Reaplică minim peste ultimul upstream**
+
+Branchul upstream trebuie creat din ultimul `upstream/master`. Se reproduce
+falsul pozitiv înainte de fix și se reaplică numai primitiva comună, API-ul,
+stuburile, documentația și testele portabile necesare. Branchul cumulativ și
+întregul harness strict nu se folosesc direct ca diff de PR.
+
+- [ ] **Step 7: Păstrează limitele API**
+
+PR-20 nu va include:
+
+- distrugerea automată a pool-ului după un singur eșec de readiness;
+- serializarea concurentă `Open | Closing | Closed`;
+- timeouturi generale de query/tranzacție sau retry automat;
+- metrici/OpenTelemetry;
+- TDS `ATTENTION` și reutilizarea aceluiași socket după anulare;
+- corectarea taxonomiei TLS/EOF din PR-11;
+- refactorul PyO3 `extension-module`;
+- publicarea ori schimbarea provenienței Tiberius.
+
+- [ ] **Step 8: Cere aprobarea pentru publicare**
+
+Prezintă diff-ul curat, reproducerea RED, rezultatele GREEN, dovada
+`connection_id`, load-ul bounded și rezultatul rebase-ului. Nu executa
+`git push` pentru branchul upstream și nu executa `gh pr create` fără
+aprobarea explicită a proprietarului forkului.
+
+---
+
 ## Funcții enterprise care vor intra ulterior în roadmap
 
 Fiecare funcție primește propriul candidat numai după ce este implementată pe
@@ -1975,7 +2151,9 @@ fork, testată live și auditată.
 | Session leasing | PR-17, tranzacții pe conexiuni rezervate din pool | implementat/verificat pe fork; rebase și comparație cu #121 înainte de upstream |
 | Commit outcome | PR-18, `CommitOutcomeUnknown` fără rollback/retry | implementat/verificat pe fork; fault fixture portabil, rebase și comparație cu #121 înainte de upstream |
 | Transaction cancellation | PR-19, retragere automată după anulare | implementat/verificat pe fork; fixture DMV portabil, rebase și comparație cu #121 înainte de upstream |
+| Connection readiness | PR-20, `connect(validate=...)` și `ping()` | implementat/verificat pe fork; rebase curat și fixture portabil înainte de upstream |
 | TDS session reset | PR-15, bit `RESETCONNECTION` | implementat/verificat pe fork; traseu Tiberius și aprobare înainte de upstream |
+| PyO3 build/test separation | elimină feature-ul permanent și folosește `maturin >= 1.9.4` pentru buildul extensiei | `cargo test --locked` brut trebuie să lege portabil pe Linux/macOS/Windows |
 | True async streaming | stream Python async cu backpressure | memorie limitată, early close, lease recovery |
 | Typed parameters | tip/direction/precision/scale/length | wire metadata verificată prin SQL Server |
 | Stored procedures | RPC, OUT params, return status, result sets | fără pierdere de metadata/tokeni |
@@ -2003,7 +2181,8 @@ Tiberius fără aprobarea explicită a proprietarului forkului FastMssql.
 - [ ] Reproducerea eșuează pe `upstream/master`.
 - [ ] Testul trece cu fixul aplicat.
 - [ ] `cargo fmt --check` trece.
-- [ ] `cargo test --locked` trece.
+- [ ] `cargo test --locked` trece fără workaround local de linker; până la
+  separarea feature-ului PyO3, rezultatul macOS trebuie raportat explicit.
 - [ ] `cargo clippy --locked --all-targets -- -D warnings` trece.
 - [ ] Testele Python focalizate trec.
 - [ ] Suita upstream trece.
