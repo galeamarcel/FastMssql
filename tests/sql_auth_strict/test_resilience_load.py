@@ -13,6 +13,7 @@ from fastmssql import (
     ProtocolError,
     SqlConnectionError,
     SslConfig,
+    TlsError,
 )
 import psutil
 import pytest
@@ -329,7 +330,7 @@ async def test_restart_does_not_falsely_commit_inflight_transaction(
         assert len(outcomes) == 1
         assert isinstance(
             outcomes[0],
-            (SqlConnectionError, ProtocolError),
+            (SqlConnectionError, ProtocolError, TlsError),
         )
     finally:
         await transaction.close()
