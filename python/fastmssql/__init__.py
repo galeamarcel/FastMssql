@@ -184,6 +184,8 @@ class Transaction:
                 if not self._TRANSACTION_COMMITTED and not self._TRANSACTION_ROLLEDBACK:
                     try:
                         await self.commit()
+                    except CommitOutcomeUnknown:
+                        raise
                     except Exception as commit_err:
                         # Commit failed - attempt rollback then re-raise so the
                         # caller knows the transaction was never committed.
