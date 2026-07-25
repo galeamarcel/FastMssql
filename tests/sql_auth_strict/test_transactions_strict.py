@@ -606,9 +606,10 @@ async def test_cancelled_transaction_lease_is_retired_and_waiter_recovers(
         # Cancellation itself must retire the connection and release the
         # waiter; explicit close remains a later compatibility operation.
         await _wait_for_request(sa_connection, token, present=False)
-        await _wait_for_session_absent(
+        await _wait_for_session_identity_absent(
             sa_connection,
             cancelled_session_id,
+            cancelled_connection_id,
         )
         await asyncio.wait_for(waiting_begin, timeout=2.0)
         recovered_connection_id = await scalar(
