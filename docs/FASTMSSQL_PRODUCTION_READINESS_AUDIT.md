@@ -6,8 +6,8 @@ Branch: `test/sql-auth-validation`
 Commit: `3cc5700b5142f3e84c83767e2ff114f87a19c5dd`
 
 Ultima actualizare live: 25 iulie 2026
-Ultimul fix verificat: `fix/session-reset-isolation` la `16f076a`
-Ultimul branch cumulativ verificat: `test/sql-auth-validation` la `e61b771`
+Ultimul fix verificat: `fix/transaction-state-machine` la `b86b0ac`
+Ultimul branch cumulativ verificat: `test/sql-auth-validation` la `9d51d07`
 Ultimul gate CI verificat: `ci/dependency-security-gate` la `3887ddd`, cu
 checkout menținut la `1d13280`; rularea hosted
 [#30130204804](https://github.com/galeamarcel/FastMssql/actions/runs/30130204804)
@@ -21,9 +21,14 @@ sesiunilor reutilizate au acum remedieri verificate pe fork. Biblioteca nu este
 încă declarată pregătită pentru producție critică sau multi-tenant până când nu
 sunt închise cele două categorii P0 rămase:
 
-1. starea și leasingul tranzacțiilor;
+1. leasingul tranzacțiilor din pool și respectarea limitelor pool-ului;
 2. anularea tranzacțiilor și rezultatul necunoscut după pierderea confirmării
    pentru COMMIT.
+
+Mașina atomică de stare a tranzacțiilor directe este acum remediată și
+verificată. Aceasta elimină cursele locale `begin`/`commit`/`rollback`, dar nu
+înlocuiește încă obiectele `Transaction` directe cu lease-uri rezervate din
+pool.
 
 True-async nu înseamnă executarea simultană a mai multor comenzi pe aceeași
 conexiune fizică. O sesiune TDS execută în mod normal secvențial. Paralelismul
@@ -297,6 +302,87 @@ Limite rămase:
   Tiberius sau consumat printr-o strategie de dependență aprobată. Nu a fost
   creat sau publicat niciun fork Tiberius.
 
+### Mașina atomică de stare a tranzacțiilor — remediată și verificată
+
+Branchurile și commiturile sunt separate:
+
+- `test/transaction-state-machine`
+  - `ff844b7` — reproducerile concurente deterministe pentru `begin` și
+    settlement, executate atât prin wrapperul Python public, cât și direct prin
+    clasa Rust expusă;
+- `fix/transaction-state-machine`
+  - `b86b0ac` — mașina de stare autoritativă și tranzițiile atomice din Rust;
+- `test/restart-tls-error-contract`
+  - `9c2a88f` — corectarea independentă a harness-ului de restart, care acceptă
+    EOF-ul TLS legitim când containerul SQL Server este oprit fără
+    `close_notify`;
+- branch cumulativ `test/sql-auth-validation`
+  - `9d51d07` — integrarea completă pe fork.
+
+Reproducerea înainte de fix a demonstrat două curse:
+
+- 16 apeluri concurente `begin()` puteau reuși pe același obiect și produceau
+  o tranzacție SQL imbricată, în loc de un singur câștigător;
+- două settlement-uri concurente puteau trimite ambele comenzi pe fir. În
+  varianta `commit` versus `rollback`, al doilea apel ajungea la SQL Server și
+  primea eroarea „ROLLBACK TRANSACTION request has no corresponding BEGIN
+  TRANSACTION”.
+
+Remedierea mută adevărul tranzacției într-un singur
+`Arc<AsyncMutex<TransactionSession>>`, cu stările:
+
+```text
+Idle -> Beginning -> Active -> Committing -> Committed
+                           \-> RollingBack -> RolledBack
+orice eroare/anulare incertă -> Failed -> close() -> Idle
+```
+
+Validarea stării, schimbarea în starea „in-flight”, comanda TDS, consumarea
+completă a răspunsului și tranziția finală sunt serializate sub aceeași
+autoritate Rust. O anulare nu poate restaura optimist starea anterioară:
+obiectul rămâne fail-closed până la `close()`. O eroare fatală sau un panic
+retrage conexiunea, iar `close()` încearcă rollback pentru o tranzacție încă
+activă înainte de a elimina socketul.
+
+Contractele noi verifică pentru fiecare implementare publică:
+
+- exact un câștigător dintr-un burst de 16 apeluri `begin()`;
+- exact un câștigător pentru `commit/commit`, `rollback/rollback`,
+  `commit/rollback` și `rollback/commit`;
+- efectul persistent corespunde singurului settlement câștigător;
+- apelul pierzător este respins local, fără o a doua comandă tranzacțională
+  trimisă serverului.
+
+Dovada executată pe source tree-ul cumulativ `9d51d07`, cu MSSQL Docker și SQL
+authentication:
+
+- reproducerea RED: toate cele 10 variante concurente au eșuat pe codul
+  anterior;
+- contractele focalizate după fix: 10/10 PASS;
+- toate testele stricte de tranzacție, inclusiv compatibilitatea upstream:
+  46/46 PASS;
+- suita strictă SQL-auth completă: 329/329 PASS în 129,51 s;
+- regresia upstream aplicabilă: 896/896 PASS în 63,89 s;
+- `cargo test --locked`: 9/9 PASS;
+- `cargo fmt --check` și
+  `cargo clippy --locked --all-targets -- -D warnings`: PASS;
+- `cargo audit --deny warnings`: 219 dependențe scanate, zero findings;
+- 10.000 tranzacții la concurență 100: 3.580,03 tranzacții/s;
+- 99.999 tranzacții la concurență 100: 3.841,77 tranzacții/s;
+- 99.999 tranzacții la concurență 200: 3.609,59 tranzacții/s;
+- fiecare profil a avut smoke-test final `PASS`, numărul așteptat de conexiuni
+  fizice și `0` sesiuni de aplicație rămase.
+
+Limite intenționat rămase deschise:
+
+- `Transaction` continuă să dețină o conexiune directă persistentă; nu obține
+  încă un lease din pool și nu respectă `pool.max_size`;
+- pierderea ACK-ului după trimiterea `COMMIT` nu produce încă
+  `CommitOutcomeUnknown`;
+- nu există încă API public de anulare TDS `ATTENTION`;
+- înaintea unui PR upstream, schimbarea trebuie reaplicată curat peste ultimul
+  `upstream/master` și comparată cu draftul upstream #121.
+
 ## Corecții și nuanțări față de primul audit
 
 - Testul cu 99.999 de operații a utilizat 100/200 de obiecte `Transaction`
@@ -331,7 +417,7 @@ Limite rămase:
 | Dependențe | Lockfile-ul inițial avea 12 vulnerabilități RustSec și un warning de mentenanță. | Eliminarea dependenței directe `quinn-proto`, actualizarea lockfile-ului și modernizarea ramurii TLS Tiberius. | **REMEDIAT și verificat** în `5ada01e`; gate CI hosted verde prin `3887ddd`/`1d13280`; SBOM rămâne separat. |
 | Izolarea sesiunilor | `SESSION_CONTEXT` a rămas vizibil următorului utilizator al aceleiași conexiuni. Un simplu `ROLLBACK` nu curăță temp tables, `SET` options, isolation level, `CONTEXT_INFO`, `USE`, impersonation etc. | Reset TDS înainte de reutilizare și teste de contaminare între lease-uri. | **REMEDIAT și verificat** în `16f076a`: `RESETCONNECTION` este piggyback pe următoarea cerere, isolation level este restaurat explicit, iar contexte de securitate persistente retrag conexiunea. |
 | Conexiuni defecte | Guard-ul putea marca operația drept completă chiar când Python primea o eroare fatală de server/protocol/I/O. O conexiune omorâtă era reutilizată și eșua repetat cu EOF. | Dispoziție explicită `NeedsReset`, `Broken`, `CommitOutcomeUnknown`; conexiunile suspecte sunt eliminate. | **REMEDIAT pentru căile pooled obișnuite** prin `85e295f` + `16f076a`: `Broken` este eliminat și `NeedsReset` este resetat. `CommitOutcomeUnknown` rămâne P0 separat pe calea tranzacțiilor. |
-| Tranzacții | `Transaction` deschide conexiuni directe, în afara pool-ului, limitelor și metricilor. Două apeluri concurente `begin()` au produs `@@TRANCOUNT=2`. | Stare de tranzacție păstrată în Rust și tranzacție pornită pe un lease din pool. | **DESCHIS**. |
+| Tranzacții | `Transaction` deschide conexiuni directe, în afara pool-ului, limitelor și metricilor. Două apeluri concurente `begin()` au produs `@@TRANCOUNT=2`. | Stare de tranzacție păstrată în Rust și tranzacție pornită pe un lease din pool. | **PARȚIAL REMEDIAT**: mașina atomică de stare este verificată în `b86b0ac`; transaction leasing rămâne P0 deschis. |
 | COMMIT și anulare | Dacă se pierde ACK-ul după COMMIT, aplicația nu poate ști dacă tranzacția s-a aplicat. Nu este sigur să presupunem rollback sau să repetăm automat. | Excepție `CommitOutcomeUnknown`, eliminarea socketului și niciun retry automat. | **DESCHIS**. |
 
 ### Dependențe și RustSec
@@ -676,7 +762,7 @@ funcție ar necesita lucru la nivelul driverului TDS:
 4. `fix/connection-disposition` — **`Broken` finalizat și verificat**
 5. `fix/session-reset-isolation` — **`NeedsReset` și extensia Tiberius locală
    pentru `RESETCONNECTION` finalizate și verificate**
-6. `fix/transaction-state`
+6. `fix/transaction-state-machine` — **starea atomică finalizată și verificată**
 7. `feat/session-lease`
 8. `feat/timeouts-lifecycle-observability`
 9. `feat/typed-parameters`
@@ -702,7 +788,7 @@ upstream fără aprobarea explicită a proprietarului forkului.
 - [x] configurațiile TLS conflictuale nu pot produce panic;
 - [x] un SPID omorât este eliminat și pool-ul se recuperează;
 - [x] starea de sesiune acoperită de matrice nu trece între lease-urile pooled;
-- [ ] două `begin()` concurente sunt respinse determinist;
+- [x] două `begin()` concurente sunt respinse determinist;
 - [ ] timeout/anulare elimină conexiunea și requestul server-side se încheie;
 - [ ] ACK pierdut după COMMIT produce `CommitOutcomeUnknown`, fără retry;
 - [ ] numărul sesiunilor nu depășește `pool.max_size`;
