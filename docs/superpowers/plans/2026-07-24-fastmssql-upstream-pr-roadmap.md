@@ -49,7 +49,7 @@ La data redactării:
 
 - `upstream/master`: `e45f301` — versiunea `v0.7.7`;
 - branch audit: `test/sql-auth-validation`;
-- snapshotul tehnic anterior acestui update documentar este `9d51d07`;
+- snapshotul tehnic anterior acestui update documentar este `7d4955d`;
 - unicul PR upstream deschis este draftul
   [#121 — Improve transactions behavior and safety](https://github.com/Rivendael/FastMssql/pull/121);
 - PR-ul #121 modifică masiv tranzacțiile și timeouturile, deci orice PR care
@@ -105,7 +105,8 @@ PR-uri cu decizie de supply chain
     ├── PR-13 eliminarea advisory-urilor RustSec din ramura TLS
     ├── PR-14 gate RustSec obligatoriu înainte de release
     ├── PR-15 RESETCONNECTION TDS și izolarea sesiunilor pooled
-    └── PR-16 mașină atomică de stare pentru tranzacții
+    ├── PR-16 mașină atomică de stare pentru tranzacții
+    └── PR-17 transaction leasing din pool
 
 Funcții enterprise viitoare
     └── intake individual după implementare și audit
@@ -1328,8 +1329,9 @@ explicită a proprietarului forkului.
 
 ### Task 15: PR-16 — Mașină atomică de stare pentru tranzacții
 
-**Priority:** P0 implementat și verificat pe fork. Transaction leasing și
-`CommitOutcomeUnknown` rămân PR-uri P0 separate.
+**Priority:** P0 implementat și verificat pe fork. Transaction leasing este
+implementat separat și documentat ca PR-17; `CommitOutcomeUnknown` rămâne un
+PR P0 separat.
 
 **Source test branch:** `test/transaction-state-machine`
 
@@ -1454,6 +1456,171 @@ forkului.
 
 ---
 
+### Task 16: PR-17 — Transaction leasing din pool-ul comun
+
+**Status:** `VERIFIED_FORK`
+
+**Priority:** P0 implementat și verificat pe fork.
+`CommitOutcomeUnknown` și TDS `ATTENTION` rămân schimbări P0 separate.
+
+**Source test branch:** `test/transaction-leasing`
+
+**Source test commits:**
+
+- `3aee0da` — contractele TX-022–TX-026;
+- `a7e35d9` — identificarea retragerii socketului prin `connection_id`.
+
+**Source implementation branch:** `feat/transaction-leasing`
+
+**Source implementation commit:** `8027b67`
+
+**Source stress commits:**
+
+- `4662c70` — contractul static pentru strategia pooled;
+- `adac307` — harness-ul și profilele bounded.
+
+**Cumulative fork commit:** `7d4955d`
+
+**Proposed clean upstream branch:** `feat/upstream-transaction-leasing`
+
+**Proposed title:** `feat: lease transactions from the shared connection pool`
+
+**Files on the verified fork:**
+
+- Modify: `src/connection.rs`
+- Modify: `src/pool_manager.rs`
+- Modify: `src/transaction.rs`
+- Modify: `python/fastmssql/__init__.py`
+- Modify: `python/fastmssql/__init__.pyi`
+- Modify: `python/fastmssql/fastmssql.pyi`
+- Test: `tests/sql_auth_strict/test_transactions_strict.py`
+- Test contract: `tests/sql_auth_strict/test_matrix_contract.py`
+- Stress: `scripts/sql_auth/transaction_stress.py`
+- Stress runner: `scripts/sql_auth/run_transaction_stress.sh`
+
+**Interfaces:**
+
+- Consumes: `Connection(..., pool_config=...)` și apelul
+  `Connection.transaction()`.
+- Produces: un obiect `Transaction` compatibil cu async context manager, care
+  rezervă un lease din același pool bb8 folosit de operațiile normale.
+- Păstrează aceeași sesiune SQL Server între `BEGIN` și settlement.
+- Include tranzacțiile și query-urile obișnuite în același `pool.max_size`.
+- Păstrează constructorul direct `Transaction(...)` pentru compatibilitate,
+  fără a îl prezenta drept cale pooled.
+
+**Root cause:**
+
+API-ul istoric construia un client Tiberius direct pentru fiecare obiect
+`Transaction`. Conexiunile tranzacționale nu erau contorizate de pool-ul unui
+`Connection`, nu beneficiau de backpressure-ul lui și puteau depăși bugetul de
+sesiuni chiar dacă aplicația configurase `max_size`.
+
+- [x] **Step 1: Reproduce lipsa leasingului pe codul anterior**
+
+TX-022–TX-026 cer:
+
+```text
+un transaction lease                 aceeași sesiune până la settlement
+3 tranzacții, pool max_size=2        al treilea task așteaptă
+query + tranzacție, max_size=1       același buget și backpressure
+reutilizare cross-lease              reset temp/context/isolation
+anulare TDS in-flight                socket retras, waiter recuperat
+```
+
+Pe baseline, toate cele cinci contracte au eșuat deoarece
+`Connection.transaction()` nu exista.
+
+- [x] **Step 2: Leagă tranzacția de pool-ul comun**
+
+`Connection.transaction()` transmite către nucleul tranzacțional același
+`Arc<RwLock<Option<ConnectionPool>>>`, configurația și credentialul Azure.
+`Pool::get_owned()` furnizează un lease owned care poate trăi pe întreaga
+durată a obiectului async fără un lifetime Python nesigur.
+
+`TransactionConnection` separă explicit cele două căi:
+
+```text
+Direct  -> compatibilitate Transaction(...)
+Pooled  -> Connection.transaction(), contorizat de bb8
+```
+
+`commit()` și `rollback()` eliberează lease-ul imediat după răspunsul complet.
+
+- [x] **Step 3: Păstrează resetarea și anularea fail-closed**
+
+Operațiile tranzacționale pooled marchează lease-ul `NeedsReset` după succes.
+Următorul checkout consumă resetul TDS existent. Dacă un task este anulat în
+timpul unei operații TDS, starea rămâne incertă, lease-ul este marcat `Broken`
+și conexiunea fizică este retrasă.
+
+Retragerea este verificată prin
+`sys.dm_exec_connections.connection_id`. Numărul SPID nu este un identificator
+suficient deoarece SQL Server îl poate reutiliza imediat pentru socketul nou.
+
+- [x] **Step 4: Verifică limitele și regresia**
+
+Rezultate pe source tree-ul integrat în `7d4955d`:
+
+```text
+TX-022–TX-026 focalizat               5/5 PASS
+strict transaction + compat          94/94 PASS
+strict SQL-auth complet               334/334 PASS
+cazuri raportate din specificație     269/269
+upstream aplicabil                    896/896 PASS
+FastMssql Rust unit tests             9/9 PASS
+cargo fmt / Clippy -D warnings        PASS
+cargo audit, 219 dependențe           0 findings
+```
+
+- [x] **Step 5: Rulează stress bounded pe un singur pool**
+
+Profilele folosesc `pool.max_size=100`:
+
+```text
+10.000 tx, concurrency 100     PASS, 3.118,50 tx/s
+99.999 tx, concurrency 100     PASS, 3.296,48 tx/s
+99.999 tx, concurrency 200     PASS, 3.575,91 tx/s
+maximum physical/SQL sessions  100
+remaining application sessions 0
+```
+
+Ambele profile de 99.999 produc exact 50.000 commituri și 49.999 rollback-uri.
+Profilul cu concurență 200 demonstrează că taskurile așteaptă fără depășirea
+pool-ului.
+
+- [ ] **Step 6: Reaplică minim peste ultimul upstream și compară #121**
+
+Nu se trimite branchul cumulativ. Se pornește din ultimul `upstream/master`,
+se confirmă RED și se reaplică numai API-ul, ownership-ul și testele necesare.
+Diff-ul trebuie comparat explicit cu
+[#121](https://github.com/Rivendael/FastMssql/pull/121), care modifică aceeași
+zonă tranzacțională.
+
+Înainte de upstream trebuie decis dacă testele Docker SQL-auth pot intra direct
+în suita originală sau necesită fixture-uri portabile. Constructorul direct
+trebuie să rămână compatibil dacă maintainerul nu aprobă o schimbare majoră de
+API.
+
+- [ ] **Step 7: Păstrează rezultatul necunoscut al COMMIT-ului separat**
+
+PR-17 nu va include:
+
+- `CommitOutcomeUnknown`;
+- retry automat pentru COMMIT sau alte scrieri;
+- TDS `ATTENTION`;
+- tranzacții distribuite;
+- savepoints sau isolation ergonomics;
+- lifecycle/graceful shutdown general.
+
+- [ ] **Step 8: Cere aprobarea pentru publicare**
+
+Prezintă diff-ul curat, comparația cu #121, dovada RED/GREEN și toate
+rezultatele bounded. Nu executa `gh pr create` fără aprobarea explicită a
+proprietarului forkului.
+
+---
+
 ## Funcții enterprise care vor intra ulterior în roadmap
 
 Fiecare funcție primește propriul candidat numai după ce este implementată pe
@@ -1464,7 +1631,7 @@ fork, testată live și auditată.
 | Domeniu | Posibil PR viitor | Condiție înainte de upstream |
 |---|---|---|
 | Transaction state | PR-16, tranziții atomice în Rust | implementat/verificat pe fork; rebase și comparație cu #121 înainte de upstream |
-| Session leasing | tranzacții pe conexiuni rezervate din pool | următorul P0; reset complet, cancellation safety, max pool respectat |
+| Session leasing | PR-17, tranzacții pe conexiuni rezervate din pool | implementat/verificat pe fork; rebase și comparație cu #121 înainte de upstream |
 | TDS session reset | PR-15, bit `RESETCONNECTION` | implementat/verificat pe fork; traseu Tiberius și aprobare înainte de upstream |
 | True async streaming | stream Python async cu backpressure | memorie limitată, early close, lease recovery |
 | Typed parameters | tip/direction/precision/scale/length | wire metadata verificată prin SQL Server |

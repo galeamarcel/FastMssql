@@ -6,8 +6,9 @@ Branch: `test/sql-auth-validation`
 Commit: `3cc5700b5142f3e84c83767e2ff114f87a19c5dd`
 
 Ultima actualizare live: 25 iulie 2026
-Ultimul fix verificat: `fix/transaction-state-machine` la `b86b0ac`
-Ultimul branch cumulativ verificat: `test/sql-auth-validation` la `9d51d07`
+Ultimul fix verificat: `feat/transaction-leasing` la `8027b67`
+Ultimul harness de load verificat: `adac307`
+Ultimul branch cumulativ verificat: `test/sql-auth-validation` la `7d4955d`
 Ultimul gate CI verificat: `ci/dependency-security-gate` la `3887ddd`, cu
 checkout menținut la `1d13280`; rularea hosted
 [#30130204804](https://github.com/galeamarcel/FastMssql/actions/runs/30130204804)
@@ -17,18 +18,20 @@ a trecut pe `b1167ae`
 
 FastMssql are o bază reală pentru acces MSSQL nativ și true-async, fără ODBC.
 TLS, dependențele RustSec, eliminarea conexiunilor pooled defecte și izolarea
-sesiunilor reutilizate au acum remedieri verificate pe fork. Biblioteca nu este
-încă declarată pregătită pentru producție critică sau multi-tenant până când nu
-sunt închise cele două categorii P0 rămase:
+sesiunilor reutilizate au acum remedieri verificate pe fork. Mașina atomică de
+stare și leasingul tranzacțiilor din pool sunt de asemenea implementate și
+verificate. Biblioteca nu este încă declarată pregătită pentru producție
+critică sau multi-tenant până când nu este închisă categoria P0 rămasă:
 
-1. leasingul tranzacțiilor din pool și respectarea limitelor pool-ului;
-2. anularea tranzacțiilor și rezultatul necunoscut după pierderea confirmării
+1. anularea tranzacțiilor și rezultatul necunoscut după pierderea confirmării
    pentru COMMIT.
 
-Mașina atomică de stare a tranzacțiilor directe este acum remediată și
-verificată. Aceasta elimină cursele locale `begin`/`commit`/`rollback`, dar nu
-înlocuiește încă obiectele `Transaction` directe cu lease-uri rezervate din
-pool.
+API-ul enterprise recomandat este acum `Connection.transaction()`: rezervă un
+lease din același pool bb8 folosit de query-urile obișnuite, păstrează aceeași
+sesiune fizică până la settlement și respectă `pool.max_size`. Constructorul
+direct `Transaction(...)` rămâne disponibil pentru compatibilitate upstream,
+dar nu aparține bugetului unui obiect `Connection`; aplicațiile noi nu trebuie
+să îl folosească drept mecanism de pooling.
 
 True-async nu înseamnă executarea simultană a mai multor comenzi pe aceeași
 conexiune fizică. O sesiune TDS execută în mod normal secvențial. Paralelismul
@@ -201,8 +204,9 @@ Limitele rămase sunt intenționat vizibile:
 
 - consumarea `NeedsReset` prin reset TDS este închisă de remedierea
   `16f076a`, descrisă în secțiunea următoare;
-- `Transaction` folosește încă o conexiune directă și nu are încă
-  `CommitOutcomeUnknown`;
+- la acest checkpoint, `Transaction` folosea încă o conexiune directă;
+  leasingul este închis ulterior prin `8027b67`, iar
+  `CommitOutcomeUnknown` rămâne deschis;
 - un EOF după o conexiune TLS deja stabilită poate fi expus momentan ca
   `TlsError` din cauza euristicii de substring. Conexiunea este eliminată
   corect, dar taxonomia trebuie corectată separat în PR-11.
@@ -289,15 +293,15 @@ Dovada executată pe MSSQL Docker cu SQL authentication:
 - `cargo fmt --check` și
   `cargo clippy --locked --all-targets -- -D warnings`: PASS.
 
-Limite rămase:
+Limite rămase la acest checkpoint:
 
-- testul de 99.999 folosește 200 de obiecte `Transaction` persistente, nu un
-  transaction-leasing pool; validează driverul și concurența, nu arhitectura
-  enterprise finală;
+- testul istoric de 99.999 folosește 200 de obiecte `Transaction` persistente,
+  nu un transaction-leasing pool; harness-ul pooled separat este adăugat și
+  verificat ulterior prin `adac307`;
 - tranzacțiile distribuite nu sunt un contract FastMssql suportat sau testat;
   MS-TDS le enumeră separat de resetarea standard;
-- `Transaction` directă nu folosește încă lease din pool și nu poate raporta
-  `CommitOutcomeUnknown`;
+- API-ul recomandat primește ulterior lease din pool prin `8027b67`;
+  `CommitOutcomeUnknown` rămâne deschis;
 - pentru un PR FastMssql upstream, patchul protocolar trebuie acceptat în
   Tiberius sau consumat printr-o strategie de dependență aprobată. Nu a fost
   creat sau publicat niciun fork Tiberius.
@@ -375,19 +379,111 @@ authentication:
 
 Limite intenționat rămase deschise:
 
-- `Transaction` continuă să dețină o conexiune directă persistentă; nu obține
-  încă un lease din pool și nu respectă `pool.max_size`;
+- la checkpointul PR-16, `Transaction` deținea încă o conexiune directă;
+  această limită este închisă pentru API-ul recomandat de secțiunea următoare;
 - pierderea ACK-ului după trimiterea `COMMIT` nu produce încă
   `CommitOutcomeUnknown`;
 - nu există încă API public de anulare TDS `ATTENTION`;
 - înaintea unui PR upstream, schimbarea trebuie reaplicată curat peste ultimul
   `upstream/master` și comparată cu draftul upstream #121.
 
+### Transaction leasing din pool — implementat și verificat
+
+Branchurile și commiturile sunt separate:
+
+- `test/transaction-leasing`
+  - `3aee0da` — contractele RED TX-022–TX-026 pentru ownership, limite,
+    backpressure, reset și anulare;
+  - `a7e35d9` — identificarea retragerii socketului prin
+    `sys.dm_exec_connections.connection_id`, nu prin SPID, deoarece SQL Server
+    poate reutiliza imediat numărul numeric al sesiunii;
+- `feat/transaction-leasing`
+  - `8027b67` — API-ul public și leasingul tranzacțiilor din pool;
+  - `4662c70` — contractul static pentru strategia de stress pooled;
+  - `adac307` — harness-ul și profilele de stress cu buget limitat;
+- branch cumulativ `test/sql-auth-validation`
+  - `7d4955d` — integrarea completă pe fork.
+
+API-ul recomandat este:
+
+```python
+database = Connection(connection_string, pool_config=pool_config)
+
+async with database.transaction() as transaction:
+    await transaction.execute(sql, params)
+```
+
+`Connection.transaction()` nu creează un pool paralel. Obiectul rezultat
+obține un `OwnedPooledConnection` din același `Arc<Pool<...>>` folosit de
+`query` și `execute`, iar lease-ul rămâne fixat pe aceeași sesiune SQL Server
+de la `BEGIN` până la `COMMIT`, `ROLLBACK` sau `close`.
+
+Contractele verificate demonstrează:
+
+- un obiect `Connection` cu `max_size=1` folosește aceeași sesiune în interiorul
+  tranzacției și raportează un singur lease activ;
+- trei tranzacții pe un pool cu `max_size=2` nu pot crea o a treia conexiune;
+  al treilea task așteaptă până când un settlement eliberează un lease;
+- query-urile obișnuite și tranzacțiile consumă același buget de pool;
+- înaintea reutilizării între tranzacții sunt curățate temp tables,
+  `SESSION_CONTEXT` și isolation level prin resetul TDS existent;
+- anularea unei operații TDS in-flight lasă tranzacția fail-closed, marchează
+  conexiunea `Broken`, o retrage și permite waiterului să continue pe alt
+  `connection_id`;
+- `commit()` și `rollback()` eliberează lease-ul imediat după consumarea
+  completă a răspunsului, fără a aștepta colectarea obiectului Python.
+
+Constructorul direct `Transaction(...)` rămâne compatibil cu suita upstream.
+El reprezintă în continuare o conexiune directă per obiect și nu consumă
+bugetul unui `Connection` separat. Această cale este păstrată pentru
+compatibilitate, nu recomandată ca arhitectură enterprise.
+
+Dovada executată pe MSSQL Docker cu SQL authentication:
+
+- baseline înainte de feature: 5/5 contracte noi FAIL, deoarece
+  `Connection.transaction()` nu exista;
+- TX-022–TX-026 după implementare: 5/5 PASS;
+- toate testele stricte de tranzacție și compatibilitate: 94/94 PASS;
+- suita strictă SQL-auth completă: 334/334 PASS în 125,96 s, cu toate cele 269
+  de cazuri din specificație raportate;
+- regresia upstream aplicabilă: 896/896 PASS în 63,16 s;
+- `cargo test --locked`: 9/9 PASS;
+- `cargo fmt --check` și
+  `cargo clippy --locked --all-targets -- -D warnings`: PASS;
+- `cargo audit --deny warnings`: 219 dependențe scanate, zero findings.
+
+Harness-ul pooled a folosit un singur `Connection`, `pool.max_size=100` și un
+număr de taskuri mai mare sau egal cu numărul de conexiuni:
+
+```text
+10.000 tx, concurrency 100     3.118,50 tx/s, maximum 100 sesiuni
+99.999 tx, concurrency 100     3.296,48 tx/s, maximum 100 sesiuni
+99.999 tx, concurrency 200     3.575,91 tx/s, maximum 100 sesiuni
+```
+
+În ambele profile de 99.999 au rezultat exact 50.000 commituri și 49.999
+rollback-uri. Fiecare profil a avut smoke-test final `PASS`, zero lease-uri
+active și zero sesiuni de aplicație rămase după `disconnect()`. Profilul cu
+concurență 200 demonstrează backpressure real: numărul taskurilor poate depăși
+pool-ul fără ca numărul conexiunilor fizice să depășească 100.
+
+Limite rămase:
+
+- pierderea confirmării după trimiterea `COMMIT` trebuie expusă distinct ca
+  `CommitOutcomeUnknown`; nu este sigur nici rollback-ul presupus, nici retry-ul
+  automat;
+- anularea fail-closed retrage socketul, dar nu există încă pachet TDS
+  `ATTENTION` public;
+- tranzacțiile distribuite nu sunt suportate sau testate;
+- înaintea unui PR upstream, diff-ul trebuie reaplicat peste ultimul
+  `upstream/master` și comparat cu draftul #121.
+
 ## Corecții și nuanțări față de primul audit
 
-- Testul cu 99.999 de operații a utilizat 100/200 de obiecte `Transaction`
-  persistente, fiecare cu propria conexiune directă. Nu a testat încă un
-  transaction-leasing pool.
+- Testul istoric cu 99.999 de operații a utilizat 100/200 de obiecte
+  `Transaction` persistente, fiecare cu propria conexiune directă. Harness-ul
+  nou din `adac307` testează separat transaction leasing printr-un singur pool
+  limitat.
 - Eșecul testului bazat pe crearea repetată a mii de conexiuni este o dovadă
   împotriva connection churn, dar nu dovedește că limita aparține SQL Server.
   Poate implica și Tiberius, sistemul de operare, porturile efemere sau mediul
@@ -417,7 +513,7 @@ Limite intenționat rămase deschise:
 | Dependențe | Lockfile-ul inițial avea 12 vulnerabilități RustSec și un warning de mentenanță. | Eliminarea dependenței directe `quinn-proto`, actualizarea lockfile-ului și modernizarea ramurii TLS Tiberius. | **REMEDIAT și verificat** în `5ada01e`; gate CI hosted verde prin `3887ddd`/`1d13280`; SBOM rămâne separat. |
 | Izolarea sesiunilor | `SESSION_CONTEXT` a rămas vizibil următorului utilizator al aceleiași conexiuni. Un simplu `ROLLBACK` nu curăță temp tables, `SET` options, isolation level, `CONTEXT_INFO`, `USE`, impersonation etc. | Reset TDS înainte de reutilizare și teste de contaminare între lease-uri. | **REMEDIAT și verificat** în `16f076a`: `RESETCONNECTION` este piggyback pe următoarea cerere, isolation level este restaurat explicit, iar contexte de securitate persistente retrag conexiunea. |
 | Conexiuni defecte | Guard-ul putea marca operația drept completă chiar când Python primea o eroare fatală de server/protocol/I/O. O conexiune omorâtă era reutilizată și eșua repetat cu EOF. | Dispoziție explicită `NeedsReset`, `Broken`, `CommitOutcomeUnknown`; conexiunile suspecte sunt eliminate. | **REMEDIAT pentru căile pooled obișnuite** prin `85e295f` + `16f076a`: `Broken` este eliminat și `NeedsReset` este resetat. `CommitOutcomeUnknown` rămâne P0 separat pe calea tranzacțiilor. |
-| Tranzacții | `Transaction` deschide conexiuni directe, în afara pool-ului, limitelor și metricilor. Două apeluri concurente `begin()` au produs `@@TRANCOUNT=2`. | Stare de tranzacție păstrată în Rust și tranzacție pornită pe un lease din pool. | **PARȚIAL REMEDIAT**: mașina atomică de stare este verificată în `b86b0ac`; transaction leasing rămâne P0 deschis. |
+| Tranzacții | `Transaction` deschidea conexiuni directe, în afara pool-ului, limitelor și metricilor. Două apeluri concurente `begin()` produceau `@@TRANCOUNT=2`. | Stare de tranzacție păstrată în Rust și tranzacție pornită pe un lease din pool. | **REMEDIAT și verificat pentru API-ul recomandat**: mașina atomică de stare este în `b86b0ac`, iar `Connection.transaction()` folosește pool-ul comun prin `8027b67`; constructorul direct rămâne numai pentru compatibilitate. |
 | COMMIT și anulare | Dacă se pierde ACK-ul după COMMIT, aplicația nu poate ști dacă tranzacția s-a aplicat. Nu este sigur să presupunem rollback sau să repetăm automat. | Excepție `CommitOutcomeUnknown`, eliminarea socketului și niciun retry automat. | **DESCHIS**. |
 
 ### Dependențe și RustSec
@@ -493,6 +589,12 @@ Această abstracție rezolvă simultan:
 - conexiunile moarte;
 - căile batch care deschid acum conexiuni directe;
 - graceful shutdown.
+
+`8027b67` implementează această arhitectură pentru tranzacțiile create prin
+`Connection.transaction()`: pool-ul comun produce un lease owned, iar
+dispozițiile `NeedsReset` și `Broken` sunt aplicate înainte de returnarea sau
+retragerea conexiunii. Generalizarea aceleiași abstracții pentru streaming,
+bulk, timeouturi și graceful shutdown rămâne lucru P1.
 
 Implementarea actuală relevantă este împărțită între
 [pool_manager.rs](../src/pool_manager.rs#L201),
@@ -645,7 +747,8 @@ Condiția testului anterior a rezultat din trei proprietăți:
 1. O tranzacție SQL Server aparține unei sesiuni/SPID.
 2. Clientul Tiberius păstrează stare protocolară mutabilă și nu poate muta
    tranzacția între socketuri.
-3. Implementarea actuală `Transaction` creează și păstrează un client direct.
+3. Implementarea istorică și constructorul direct compatibil
+   `Transaction(...)` creează și păstrează un client direct.
 
 Recomandarea de pool persistent vine din:
 
@@ -656,7 +759,8 @@ Recomandarea de pool persistent vine din:
 - necesitatea unei limite globale și a backpressure-ului.
 
 Recomandarea nu este păstrarea permanentă a unei conexiuni pentru fiecare
-tranzacție viitoare. Modelul corect este:
+tranzacție viitoare. Modelul corect, implementat acum de
+`Connection.transaction()`, este:
 
 1. se obține un lease din pool;
 2. lease-ul rămâne fixat la aceeași sesiune până la COMMIT/ROLLBACK;
@@ -763,7 +867,8 @@ funcție ar necesita lucru la nivelul driverului TDS:
 5. `fix/session-reset-isolation` — **`NeedsReset` și extensia Tiberius locală
    pentru `RESETCONNECTION` finalizate și verificate**
 6. `fix/transaction-state-machine` — **starea atomică finalizată și verificată**
-7. `feat/session-lease`
+7. `feat/transaction-leasing` — **lease-ul tranzacțional din pool, limitele și
+   stress-ul bounded finalizate și verificate**
 8. `feat/timeouts-lifecycle-observability`
 9. `feat/typed-parameters`
 10. `feat/resultsets-streaming`
@@ -791,7 +896,8 @@ upstream fără aprobarea explicită a proprietarului forkului.
 - [x] două `begin()` concurente sunt respinse determinist;
 - [ ] timeout/anulare elimină conexiunea și requestul server-side se încheie;
 - [ ] ACK pierdut după COMMIT produce `CommitOutcomeUnknown`, fără retry;
-- [ ] numărul sesiunilor nu depășește `pool.max_size`;
+- [x] numărul sesiunilor tranzacționale nu depășește `pool.max_size`, inclusiv
+  la 99.999 operații și concurență mai mare decât pool-ul;
 - [ ] streamingul menține memoria limitată și gestionează închiderea anticipată;
 - [ ] `bool` este transmis ca BIT, tipurile declarate sunt respectate și un
   `datetime` aware este transmis ca DATETIMEOFFSET;
