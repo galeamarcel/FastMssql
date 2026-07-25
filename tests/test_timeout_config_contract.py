@@ -42,6 +42,7 @@ UNREPRESENTABLE_TIMEOUT_VALUES = (
     0.5e-9,
     1e19,
 )
+PORTABLE_TIMEOUT_CEILING_SECS = 100 * 365 * 24 * 60 * 60
 
 
 def _public_type(name: str):
@@ -133,6 +134,22 @@ def test_timeout_config_rejects_values_that_cannot_form_runtime_deadlines() -> N
             with pytest.raises(ValueError):
                 setattr(config, field, invalid)
             assert getattr(config, field) == original
+
+
+def test_timeout_config_enforces_portable_hundred_year_ceiling() -> None:
+    timeout_type = _public_type("TimeoutConfig")
+    for field in DEFAULTS:
+        boundary = timeout_type(**{field: PORTABLE_TIMEOUT_CEILING_SECS})
+        assert getattr(boundary, field) == PORTABLE_TIMEOUT_CEILING_SECS
+
+        with pytest.raises(ValueError, match="100 years"):
+            timeout_type(**{field: PORTABLE_TIMEOUT_CEILING_SECS + 1})
+
+        config = timeout_type()
+        original = getattr(config, field)
+        with pytest.raises(ValueError, match="100 years"):
+            setattr(config, field, PORTABLE_TIMEOUT_CEILING_SECS + 1)
+        assert getattr(config, field) == original
 
 
 def test_legacy_pool_timeout_cannot_bypass_deadline_representability() -> None:
