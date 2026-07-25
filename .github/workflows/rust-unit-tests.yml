@@ -102,8 +102,10 @@ jobs:
             .artifacts/pool-contract-wheel/*.whl
           echo "POOL_CONTRACT_PYTHON=${contract_python}" >> "${GITHUB_ENV}"
 
-      - name: Verify PoolConfig Python contract
+      - name: Verify installed Python configuration contracts
         shell: bash
         run: |
           "${POOL_CONTRACT_PYTHON}" \
-            -m pytest --noconftest tests/test_pool_config_default_contract.py -q
+            -m pytest --noconftest \
+            tests/test_pool_config_default_contract.py \
+            tests/test_timeout_config_contract.py -q

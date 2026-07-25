@@ -593,6 +593,29 @@ machine-readable metrics.
 Performance results are diagnostic unless a correctness/resource invariant is
 violated. No marketing claim is declared proven from a single emulated host.
 
+### TIME — operation timeout and deadline safety
+
+- `TIME-001`: typed configuration, compatibility fallback, precedence,
+  exports, and clone isolation.
+- `TIME-002`: an unanswered TDS pre-login handshake expires in the physical-
+  connect phase.
+- `TIME-003`: saturated pool checkout expires in the acquire phase without
+  starting application SQL.
+- `TIME-004`: a timed-out query retires its physical session and the bounded
+  pool recovers.
+- `TIME-005`: a timed-out parameterized write is submitted once and reconciled
+  by business key.
+- `TIME-006`: batch and bulk work consume one absolute operation budget rather
+  than one budget per item.
+- `TIME-007`: idle transaction-lifetime expiry retires the lease and rolls back
+  the uncommitted write.
+- `TIME-008`: the earlier operation or transaction deadline wins for in-flight
+  transaction work.
+- `TIME-009`: COMMIT timeout preserves unknown-outcome precedence and rollback
+  timeout remains visible.
+- `TIME-010`: FastAPI and Flask-through-ASGI preserve typed errors and recover
+  after 1,000 bounded operations.
+
 ## 7. Error handling and defect workflow
 
 When a strict test fails:

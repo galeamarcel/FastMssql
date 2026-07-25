@@ -12,11 +12,12 @@ import time
 import tomllib
 
 from asgi_lifespan import LifespanManager
+import fastmssql
 from flask import Flask
 import pytest
 import pytest_asyncio
 
-from fastmssql import Connection, SqlConnectionError, SqlError
+from fastmssql import Connection, PoolConfig, SqlConnectionError, SqlError
 from httpx import ASGITransport, AsyncClient
 from sql_auth_strict.cases import case
 from sql_auth_strict.framework_apps import (
@@ -65,6 +66,259 @@ async def flask_request(app: Flask, path: str):
             return client.get(path)
 
     return await asyncio.to_thread(request_once)
+
+
+def _timeout_load_kind(index: int) -> str:
+    remainder = index % 5
+    if remainder < 3:
+        return "success"
+    if remainder == 3:
+        return "operation"
+    return "acquire"
+
+
+async def _sample_framework_pool(
+    connection: Connection,
+    stop: asyncio.Event,
+) -> int:
+    maximum = 0
+    while not stop.is_set():
+        stats = await connection.pool_stats()
+        maximum = max(maximum, int(stats["connections"]))
+        await asyncio.sleep(0.01)
+    stats = await connection.pool_stats()
+    return max(maximum, int(stats["connections"]))
+
+
+async def _sample_framework_request_connection_ids(
+    observer: Connection,
+    application_name: str,
+    stop: asyncio.Event,
+) -> set[str]:
+    observed: set[str] = set()
+    while not stop.is_set():
+        result = await observer.query(
+            """
+            SELECT CONVERT(NVARCHAR(36), connection.connection_id)
+            FROM sys.dm_exec_requests AS request
+            JOIN sys.dm_exec_sessions AS session
+              ON session.session_id = request.session_id
+            JOIN sys.dm_exec_connections AS connection
+              ON connection.session_id = request.session_id
+            CROSS APPLY sys.dm_exec_sql_text(request.sql_handle) AS sql_text
+            WHERE request.session_id <> @@SPID
+              AND session.program_name = @P1
+              AND sql_text.text LIKE @P2
+            """,
+            [
+                application_name,
+                f"%{application_name}_timeout_route%",
+            ],
+        )
+        observed.update(str(row[0]) for row in result.rows())
+        await asyncio.sleep(0.005)
+    return observed
+
+
+async def _close_holders(holders: list) -> None:
+    if not holders:
+        return
+    await asyncio.gather(*(holder.close() for holder in holders))
+
+
+async def _run_timeout_wave(
+    *,
+    client: AsyncClient,
+    state: FrameworkState,
+    observer: Connection,
+    indices: range,
+    serialized_wsgi: bool,
+) -> dict[str, object]:
+    starts = {
+        "success": asyncio.Event(),
+        "operation": asyncio.Event(),
+        "acquire": asyncio.Event(),
+    }
+
+    async def request_one(index: int) -> tuple[str, int, dict[str, object]]:
+        kind = _timeout_load_kind(index)
+        await starts[kind].wait()
+        profile = "wait" if kind == "operation" else "immediate"
+        response = await client.get(
+            f"/timeout/{index}?profile={profile}"
+        )
+        return kind, response.status_code, response.json()
+
+    tasks = {
+        index: asyncio.create_task(request_one(index))
+        for index in indices
+    }
+    tasks_by_kind = {
+        kind: [
+            task
+            for index, task in tasks.items()
+            if _timeout_load_kind(index) == kind
+        ]
+        for kind in starts
+    }
+    assert {kind: len(items) for kind, items in tasks_by_kind.items()} == {
+        "success": 60,
+        "operation": 20,
+        "acquire": 20,
+    }
+
+    pool_stop = asyncio.Event()
+    pool_sampler = asyncio.create_task(
+        _sample_framework_pool(state.connection, pool_stop)
+    )
+    holders = [state.connection.transaction() for _ in range(20)]
+    results: list[tuple[str, int, dict[str, object]]] = []
+    request_ids: set[str] = set()
+    id_stop: asyncio.Event | None = None
+    id_sampler: asyncio.Task | None = None
+    try:
+        await asyncio.gather(*(holder.begin() for holder in holders))
+        await wait_for_pool_active(state.connection, expected=20)
+
+        starts["acquire"].set()
+        acquire_results = await asyncio.gather(*tasks_by_kind["acquire"])
+        results.extend(acquire_results)
+        assert all(
+            status == 504
+            and payload["phase"] == "acquire"
+            and payload["operation"] == "query"
+            for _, status, payload in acquire_results
+        )
+
+        await asyncio.gather(*(holder.rollback() for holder in holders))
+        await wait_for_pool_active(state.connection, expected=0)
+
+        id_stop = asyncio.Event()
+        id_sampler = asyncio.create_task(
+            _sample_framework_request_connection_ids(
+                observer,
+                state.application_name,
+                id_stop,
+            )
+        )
+        starts["operation"].set()
+        if not serialized_wsgi:
+            await wait_for_pool_active(state.connection, expected=20)
+        operation_results = await asyncio.gather(
+            *tasks_by_kind["operation"]
+        )
+        id_stop.set()
+        request_ids = await id_sampler
+        id_sampler = None
+        results.extend(operation_results)
+        assert all(
+            status == 504
+            and payload["phase"] == "operation"
+            and payload["operation"] == "query"
+            for _, status, payload in operation_results
+        )
+        assert request_ids
+
+        starts["success"].set()
+        success_results = await asyncio.gather(*tasks_by_kind["success"])
+        results.extend(success_results)
+        assert all(status == 200 for _, status, _ in success_results)
+        assert {
+            int(payload["value"])
+            for _, _, payload in success_results
+        } == {
+            index
+            for index in indices
+            if _timeout_load_kind(index) == "success"
+        }
+        successful_connection_ids = {
+            str(payload["connection_id"])
+            for _, _, payload in success_results
+        }
+        assert request_ids.isdisjoint(successful_connection_ids)
+    finally:
+        for event in starts.values():
+            event.set()
+        for task in tasks.values():
+            if not task.done():
+                task.cancel()
+        for task in tasks.values():
+            if not task.done() or task.cancelled():
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        if id_stop is not None:
+            id_stop.set()
+        if id_sampler is not None:
+            await id_sampler
+        await _close_holders(holders)
+        pool_stop.set()
+        maximum_connections = await pool_sampler
+
+    assert len(results) == 100
+    return {
+        "results": results,
+        "maximum_connections": maximum_connections,
+        "retired_connection_ids": request_ids,
+    }
+
+
+async def _run_timeout_lane(
+    *,
+    client: AsyncClient,
+    state: FrameworkState,
+    observer: Connection,
+    serialized_wsgi: bool,
+) -> dict[str, object]:
+    stop = asyncio.Event()
+    ticker = asyncio.create_task(event_loop_ticks(stop, interval=0.01))
+    all_results: list[tuple[str, int, dict[str, object]]] = []
+    maximum_connections = 0
+    retired_connection_ids: set[str] = set()
+    try:
+        for wave in range(5):
+            result = await _run_timeout_wave(
+                client=client,
+                state=state,
+                observer=observer,
+                indices=range(wave * 100, (wave + 1) * 100),
+                serialized_wsgi=serialized_wsgi,
+            )
+            all_results.extend(result["results"])
+            maximum_connections = max(
+                maximum_connections,
+                int(result["maximum_connections"]),
+            )
+            retired_connection_ids.update(
+                result["retired_connection_ids"]
+            )
+        assert await scalar(state.connection, "SELECT 1010") == 1010
+    finally:
+        stop.set()
+        ticks = await ticker
+
+    timeout_payloads = [
+        payload
+        for _, status, payload in all_results
+        if status == 504
+    ]
+    return {
+        "total": len(all_results),
+        "successful": sum(
+            status == 200 for _, status, _ in all_results
+        ),
+        "acquire_timeouts": sum(
+            payload.get("phase") == "acquire"
+            for payload in timeout_payloads
+        ),
+        "operation_timeouts": sum(
+            payload.get("phase") == "operation"
+            for payload in timeout_payloads
+        ),
+        "timeout_payloads": timeout_payloads,
+        "maximum_connections": maximum_connections,
+        "ticks": ticks,
+        "retired_connection_ids": retired_connection_ids,
+    }
 
 
 @case("FRAME-001")
@@ -862,3 +1116,146 @@ async def test_framework_outputs_never_disclose_credentials(
         sql_auth_config.denied_password,
     ):
         assert secret not in combined
+
+
+@case("TIME-010")
+@pytest.mark.framework
+@pytest.mark.timeout(60)
+@pytest.mark.asyncio
+async def test_framework_operation_timeout_recovery_load(
+    sql_auth_config,
+    sa_connection,
+    unique_sql_name,
+) -> None:
+    TimeoutConfig = getattr(fastmssql, "TimeoutConfig", None)
+    assert TimeoutConfig is not None
+    pool_config = PoolConfig(
+        max_size=20,
+        min_idle=5,
+        test_on_check_out=False,
+        retry_connection=False,
+    )
+    timeout_config = TimeoutConfig(
+        acquire_timeout_secs=0.10,
+        operation_timeout_secs=0.12,
+    )
+
+    fastapi_state = FrameworkState.create(
+        sql_auth_config,
+        application_name=unique_sql_name("strict_timeout_fastapi"),
+        pool_config=pool_config,
+        timeout_config=timeout_config,
+    )
+    fastapi_app = create_fastapi_app(
+        fastapi_state,
+        "[unused_timeout_table]",
+    )
+    async with LifespanManager(fastapi_app):
+        async with asgi_client(fastapi_app) as client:
+            fastapi_result = await _run_timeout_lane(
+                client=client,
+                state=fastapi_state,
+                observer=sa_connection,
+                serialized_wsgi=False,
+            )
+    await wait_for_session_count(
+        sa_connection,
+        fastapi_state.application_name,
+        expected=0,
+    )
+
+    flask_state = FrameworkState.create(
+        sql_auth_config,
+        application_name=unique_sql_name("strict_timeout_flask_asgi"),
+        pool_config=pool_config,
+        timeout_config=timeout_config,
+    )
+    async with adapted_flask_lifespan(flask_state) as adapted_app:
+        async with asgi_client(adapted_app) as client:
+            flask_result = await _run_timeout_lane(
+                client=client,
+                state=flask_state,
+                observer=sa_connection,
+                # asgiref's WsgiToAsgi dispatch is thread-sensitive and
+                # serializes WSGI calls. The 100 scheduled tasks still prove
+                # persistent-loop correctness; held pooled transactions create
+                # deterministic checkout pressure without claiming native-ASGI
+                # inter-request parallelism for Flask.
+                serialized_wsgi=True,
+            )
+    await wait_for_session_count(
+        sa_connection,
+        flask_state.application_name,
+        expected=0,
+    )
+
+    # Plain Flask/WSGI remains a functional compatibility lane only. Its
+    # per-request event loop is deliberately excluded from the 1,000-operation
+    # true-async load accounting.
+    wsgi_state = FrameworkState.create(
+        sql_auth_config,
+        application_name=unique_sql_name("strict_timeout_flask_wsgi"),
+        max_size=1,
+        min_idle=0,
+        timeout_config=timeout_config,
+    )
+    wsgi_app = create_flask_app(wsgi_state)
+    try:
+        wsgi_response = await flask_request(
+            wsgi_app,
+            "/timeout/10?profile=wait",
+        )
+        assert wsgi_response.status_code == 504
+        assert wsgi_response.get_json()["type"] == "OperationTimeoutError"
+        assert wsgi_response.get_json()["phase"] == "operation"
+        assert await scalar(wsgi_state.connection, "SELECT 1010") == 1010
+    finally:
+        await wsgi_state.connection.disconnect()
+    await wait_for_session_count(
+        sa_connection,
+        wsgi_state.application_name,
+        expected=0,
+    )
+
+    lanes = (fastapi_result, flask_result)
+    total_operations = sum(int(lane["total"]) for lane in lanes)
+    successful = sum(int(lane["successful"]) for lane in lanes)
+    acquire_timeouts = sum(
+        int(lane["acquire_timeouts"]) for lane in lanes
+    )
+    operation_timeouts = sum(
+        int(lane["operation_timeouts"]) for lane in lanes
+    )
+    timeout_payloads = [
+        payload
+        for lane in lanes
+        for payload in lane["timeout_payloads"]
+    ]
+    max_observed_pool_connections = max(
+        int(lane["maximum_connections"]) for lane in lanes
+    )
+
+    assert total_operations == 1000
+    assert successful == 600
+    assert acquire_timeouts == 200
+    assert operation_timeouts == 200
+    assert {
+        payload["type"] for payload in timeout_payloads
+    } == {"OperationTimeoutError"}
+    assert all(
+        payload["retryable"] is (payload["phase"] == "acquire")
+        for payload in timeout_payloads
+    )
+    assert all(
+        payload["connection_discarded"]
+        is (payload["phase"] == "operation")
+        for payload in timeout_payloads
+    )
+    assert all(
+        payload["outcome_unknown"]
+        is (payload["phase"] == "operation")
+        for payload in timeout_payloads
+    )
+    assert max_observed_pool_connections == 20
+    assert all(len(lane["ticks"]) >= 20 for lane in lanes)
+    assert all(lane["retired_connection_ids"] for lane in lanes)
