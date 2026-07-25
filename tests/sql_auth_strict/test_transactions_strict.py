@@ -1239,6 +1239,7 @@ async def test_cancelled_commit_retires_lease_without_claiming_rollback(
         commit_task = asyncio.create_task(committing.commit())
         await _wait_for_row_count(sa_connection, table, 1)
         await proxy.wait_until_downstream_held()
+        proxy.expect_client_disconnect()
         commit_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await commit_task

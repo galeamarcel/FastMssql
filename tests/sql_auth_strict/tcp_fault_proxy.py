@@ -17,6 +17,7 @@ class DownstreamGateProxy:
         self._handlers: set[asyncio.Task[None]] = set()
         self._writers: set[asyncio.StreamWriter] = set()
         self._unexpected: list[BaseException] = []
+        self._pending_client_disconnects = 0
         self._aborting = False
         self.accepted_connections = 0
 
@@ -105,6 +106,10 @@ class DownstreamGateProxy:
                     await writer.wait_closed()
             self._handlers.discard(handler)
 
+    def expect_client_disconnect(self) -> None:
+        """Allow one client-side EOF or reset to complete the relay normally."""
+        self._pending_client_disconnects += 1
+
     async def _relay(
         self,
         reader: asyncio.StreamReader,
@@ -112,7 +117,20 @@ class DownstreamGateProxy:
         *,
         downstream: bool,
     ) -> None:
-        while data := await reader.read(64 * 1024):
+        while True:
+            try:
+                data = await reader.read(64 * 1024)
+            except ConnectionResetError:
+                if downstream or self._pending_client_disconnects == 0:
+                    raise
+                self._pending_client_disconnects -= 1
+                return
+
+            if not data:
+                if not downstream and self._pending_client_disconnects > 0:
+                    self._pending_client_disconnects -= 1
+                return
+
             if downstream and not self._downstream_gate.is_set():
                 self._downstream_held.set()
                 await self._downstream_gate.wait()
