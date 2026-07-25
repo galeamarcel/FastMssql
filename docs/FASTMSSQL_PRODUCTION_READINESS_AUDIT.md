@@ -1073,6 +1073,122 @@ Statusul este `VERIFIED_FORK`. Toate branchurile și commiturile sunt numai în
 ultimul upstream, branchul curat și orice PR către repository-ul original cer
 aprobarea separată a lui Marcel Galea.
 
+## Consistența defaulturilor PoolConfig — remediată și verificată
+
+Contractul public al pool-ului avea două profiluri implicite diferite.
+Reproducerile RED au măsurat:
+
+```text
+PoolConfig() cu argumente omise                  20/2/None/None/30/None/None
+PyPoolConfig::default()                          15/3/1800/300/30/None/None
+Connection(..., pool_config=None)                15/3/1800/300/30/None/None
+```
+
+Ordinea câmpurilor este `max_size`, `min_idle`, `max_lifetime_secs`,
+`idle_timeout_secs`, `connection_timeout_secs`, `test_before_acquire` și
+`retry_connection`. Cauza nu era bb8 ori SQL Server: constructorul PyO3
+repeta literal alte valori decât implementarea `PyPoolConfig::default()`.
+Analiza de proveniență urmărește introducerea configurației de pool până la
+commitul upstream `2c5620a3a490b132c950bb845b4deafaf8399aaf`.
+
+Profilul canonic este acum
+`15/3/1800/300/30/None/None`, iar aceeași sursă Rust tipată alimentează
+defaultul intern și argumentele PyO3 omise. `inspect.signature(PoolConfig)`,
+stubul `.pyi`, runtime-ul și README expun valori concrete, fără
+`...`/`Ellipsis`.
+
+Limitele de compatibilitate sunt deliberate:
+
+- fiecare valoare furnizată explicit este păstrată;
+- `None` explicit continuă să însemne că override-ul bb8 corespunzător nu este
+  setat;
+- `one()`, preset-urile de resurse/dezvoltare/throughput/performance și
+  `adaptive()` nu se schimbă;
+- profilul direct istoric `20/2/None/None/30/None/None` rămâne disponibil
+  prin argumente explicite;
+- semantica `connection_timeout_secs=None` și viitoarele deadline-uri separate
+  pentru acquire/query/tranzacție rămân un candidat independent.
+
+Istoricul TDD separat, publicat numai pe fork, este:
+
+- `docs/pool-config-default-consistency-design`
+  - `9e59249` — designul profilului canonic;
+  - `57f2d17` — planul de implementare și gate-urile;
+- `test/pool-config-default-consistency`
+  - `659a187` — contractul canonic pur/static/Rust;
+  - `06e3129` — reproducerea RED runtime și SQL-auth real;
+  - `a4877c4` — reproducerea RED pentru izolarea wheel-ului hosted;
+- `fix/pool-config-default-consistency`
+  - `b5239c7` — profilul canonic, semnătura PyO3, stubul și README;
+  - `fb1f901` — izolarea minimă a contractului wheel;
+- `test/sql-auth-validation`
+  - `f1db97b` — prima integrare tehnică;
+  - `5dc70031fc1961faf76a5ec1fdb6f28b1141c10b` — integrarea tehnică finală;
+- `docs/pool-config-default-consistency-status`
+  - `8cba60f0b40a6e78a7270216c0fedf604db6c030` — matricea și raportul
+    regenerate din artefactele SHA-ului tehnic final.
+
+Testul `POOL-001` a construit separat configurația explicită și calea
+implicită a conexiunii. Pentru fiecare cale a lansat 30 de selecturi
+parametrizate concurente, a primit exact valorile `0..29` și a măsurat:
+
+```text
+profil explicit / implicit                       15/3/1800/300/30
+maximum taskuri active / conexiuni / sesiuni     15/15/15
+sesiuni cu application_name dedicat după close   0
+```
+
+Dovada locală completă la `5dc70031` este:
+
+```text
+PoolConfig pure                                  92/92 PASS
+PoolConfig integration                           16/16 PASS
+POOL-001 pe MSSQL SQL-auth real                    1/1 PASS
+contract build PyO3                                7/7 PASS
+FastMssql Rust unit tests                         14/14 PASS
+suita strictă SQL-auth                           296/296 PASS
+cazuri raportate din specificație                285/285 PASS
+async / framework                                16/16, 28/28 PASS
+resilience / load                                  6/6, 9/9 PASS
+regresie upstream aplicabilă                     906/906 PASS
+cargo fmt / Clippy -D warnings / Ruff            PASS
+compileall / wheel cp311-abi3 curat               PASS
+cargo audit, 219 dependențe                       0 findings
+```
+
+Diferența dintre baseline-ul istoric strict `295` și rezultatul final `296`
+este un singur test determinist, fără ID, adăugat pentru harnessul TCP
+TX-034 înainte ca PoolConfig să fie reluat. Eșecul anterior `294/295` era
+exclusiv resetul client intermitent al acelui harness, nu o aserțiune
+PoolConfig. Remedierea sa păstrează toate verificările, iar registrul
+funcțional rămâne exact `285` de ID-uri.
+
+Primul gate hosted PoolConfig nu este ascuns:
+[run-ul #30171657690](https://github.com/galeamarcel/FastMssql/actions/runs/30171657690)
+de la `f1db97b` a trecut raw Cargo, `14/14` Rust și construirea/instalarea
+wheel-ului pe toate cele trei sisteme, dar fiecare job a eșuat cu exit `4`
+numai la contractul Python. Mediul intenționat minimal încărca
+`tests/conftest.py`, care importa dependența exclusiv de dezvoltare
+`python-dotenv`. Contractul RED `a4877c4` a impus invocarea izolată, iar
+`fb1f901` adaugă numai `pytest --noconftest`; nu instalează dependențe de
+dezvoltare și nu reduce cele trei aserțiuni.
+
+Gate-urile finale au trecut la același SHA tehnic `5dc70031`:
+
+- [RustSec / dependency security](https://github.com/galeamarcel/FastMssql/actions/runs/30172198251)
+  — zero vulnerabilități și zero warnings;
+- [Ubuntu](https://github.com/galeamarcel/FastMssql/actions/runs/30172198247/job/89715087601),
+  [macOS](https://github.com/galeamarcel/FastMssql/actions/runs/30172198247/job/89715087582)
+  și
+  [Windows](https://github.com/galeamarcel/FastMssql/actions/runs/30172198247/job/89715087599)
+  — raw Cargo, `14/14` teste Rust, wheel ABI3 instalat și contractul Python
+  izolat, toate cu concluzia `success`.
+
+Nu a fost creat niciun branch upstream, nu s-a făcut push și nu s-a deschis
+niciun PR către `Rivendael/FastMssql`. PR-21 din roadmap este numai un
+candidat `VERIFIED_FORK`; rebase-ul curat și publicarea cer o aprobare nouă,
+separată.
+
 ## Corecții și nuanțări față de primul audit
 
 - Testul istoric cu 99.999 de operații a utilizat 100/200 de obiecte
@@ -1482,12 +1598,15 @@ funcție ar necesita lucru la nivelul driverului TDS:
 11. `fix/pyo3-build-test-separation` și
     `fix/pyo3-linux-libpython-runtime` — **buildul extensiei separat de raw
     Cargo și gate-ul Linux/macOS/Windows finalizate și verificate hosted**
-12. `feat/timeouts-lifecycle-observability`
-13. `feat/typed-parameters`
-14. `feat/resultsets-streaming`
-15. `feat/batch-bulk`
-16. `fix/named-instance`
-17. `test/production-framework-matrix`
+12. `fix/pool-config-default-consistency` — **defaulturile explicite și
+    implicite canonice, introspecția, stubul și limitele reale de pool
+    finalizate și verificate hosted**
+13. `feat/timeouts-lifecycle-observability`
+14. `feat/typed-parameters`
+15. `feat/resultsets-streaming`
+16. `feat/batch-bulk`
+17. `fix/named-instance`
+18. `test/production-framework-matrix`
 
 Orice remediere FastMssql va fi făcută numai pe forkul
 `galeamarcel/FastMssql`.
@@ -1509,6 +1628,8 @@ upstream fără aprobarea explicită a proprietarului forkului.
 - [x] un SPID omorât este eliminat și pool-ul se recuperează;
 - [x] `connect()` și contextul async validează SQL Server implicit, iar
   `ping()` oferă readiness live prin pool;
+- [x] `PoolConfig()` și `Connection(..., pool_config=None)` folosesc același
+  profil `15/3/1800/300/30`, iar pool-ul real rămâne limitat la 15 sesiuni;
 - [x] starea de sesiune acoperită de matrice nu trece între lease-urile pooled;
 - [x] două `begin()` concurente sunt respinse determinist;
 - [x] anularea unei operații tranzacționale elimină automat conexiunea, iar
@@ -1531,30 +1652,31 @@ upstream fără aprobarea explicită a proprietarului forkului.
 - Fork: `https://github.com/galeamarcel/FastMssql.git`
 - Branch cumulativ: `test/sql-auth-validation`
 - HEAD tehnic verificat:
-  `438a86ef91c2d5ea819008f2c2bf52c568e3a4c9`
+  `5dc70031fc1961faf76a5ec1fdb6f28b1141c10b`
 - `origin` indică forkul; `upstream` permite numai fetch, cu push
   `DISABLED`.
-- Ultimul snapshot cu runner local/package/SQL complet este `f163d7b`:
-  containerul `fastmssql-sql-auth-dev` healthy; CONN-020–CONN-024,
-  FRAME-025–FRAME-026 și LOAD-009 8/8 PASS; readiness load 1.000/1.000 probe
-  la concurență 100 și maximum 20 sesiuni.
-- Tot la `f163d7b`: contractul PyO3 inițial 5/5; strict 295/295,
-  true-async 16/16, framework 28/28, resilience 6/6 și load 9/9 PASS;
-  upstream 901/901 PASS; exact 285/285 ID-uri din specificație.
-- Tot la `f163d7b`: Rust 13/13; Tiberius 123/123 unit și 20/20 doctests
-  executate PASS, 1 doctest ignorat intenționat; wheel ABI3 instalat și
-  importat dintr-un virtualenv CPython 3.13.14 curat.
-- Follow-up-ul exact la `438a86e`: contractul PyO3 extins 6/6 PASS și gate-ul
-  hosted
-  [#30155107955](https://github.com/galeamarcel/FastMssql/actions/runs/30155107955),
-  success separat pe Linux, macOS și Windows. Delta `f163d7b..438a86e`
-  modifică numai contractul și workflow-ul, fără runtime, manifeste sau
-  runner SQL-auth.
-- La snapshotul local complet: `cargo fmt`, Clippy cu `-D warnings`, Ruff,
-  `compileall` PASS; `cargo audit` a scanat 219 dependențe cu zero findings;
-  loginurile SQL-auth au zero sesiuni rămase după teardown.
-- Ramura locală și `origin/test/sql-auth-validation` sunt în paritate `0/0`;
-  nu există push și nu există PR către upstream.
+- La același SHA: PoolConfig pur `92/92`, integrare `16/16`, `POOL-001`
+  `1/1`, contract PyO3 `7/7` și FastMssql Rust `14/14` PASS. Profilurile
+  explicit și implicit sunt `15/3/1800/300/30`, iar proba live a rămas
+  limitată la `15/15/15` taskuri active/conexiuni/sesiuni și zero sesiuni
+  după teardown.
+- Tot la `5dc70031`: strict `296/296`, true-async `16/16`, framework
+  `28/28`, resilience `6/6`, load `9/9`, upstream `906/906` și exact
+  `285/285` ID-uri din specificație, toate PASS.
+- Wheel-ul `cp311-abi3` a fost construit, instalat și importat dintr-un
+  virtualenv curat. `cargo fmt`, Clippy cu `-D warnings`, Ruff și `compileall`
+  au trecut; `cargo audit` a scanat 219 dependențe cu zero findings.
+- Gate-ul hosted
+  [#30172198247](https://github.com/galeamarcel/FastMssql/actions/runs/30172198247)
+  a trecut separat pe Ubuntu, macOS și Windows: raw Cargo, `14/14` teste Rust,
+  wheel instalat și contract Python izolat. Gate-ul
+  [RustSec #30172198251](https://github.com/galeamarcel/FastMssql/actions/runs/30172198251)
+  a trecut cu zero vulnerabilități și zero warnings.
+- Evidența generată la SHA-ul tehnic este commitul documentar
+  `8cba60f0b40a6e78a7270216c0fedf604db6c030`; commiturile narative ulterioare
+  nu schimbă arborele tehnic verificat.
+- Ramura tehnică locală și `origin/test/sql-auth-validation` sunt în paritate
+  `0/0`; nu există push și nu există PR către upstream.
 
 Starea de mai sus este rezultatul arborelui tehnic exact înaintea acestui
 update documentar. Branchurile validate au fost integrate numai în fork; nu

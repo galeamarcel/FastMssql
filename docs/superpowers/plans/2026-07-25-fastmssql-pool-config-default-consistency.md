@@ -149,7 +149,7 @@ focused pure PoolConfig              92
 focused PoolConfig integration       16
 PyO3 build contract                   7
 Rust unit tests                      14
-strict functional                   295
+strict functional                   296
 async strict                         16
 framework                            28
 resilience                            6
@@ -158,8 +158,40 @@ SQL-auth specification IDs          285
 applicable upstream regression      906
 ```
 
+The cumulative baseline gained one unmarked deterministic TCP-proxy harness
+test before PoolConfig resumed, so final strict collection is 296 while the
+SQL-auth specification registry remains exactly 285 IDs. The historical
+`295` count above remains the measured collection at `f35176c`; no PoolConfig
+assertion or specification case was removed or weakened.
+
 Any different count is investigated and recorded; it is never silently
 rounded to a percentage.
+
+## Verified Execution Outcome
+
+The first cumulative technical merge, `f1db97ba3547a0f5268f631bfd6b445d613a2dde`,
+was locally green but exposed a hosted-only isolation defect in
+[run #30171657690](https://github.com/galeamarcel/FastMssql/actions/runs/30171657690).
+Raw Cargo, all `14/14` Rust tests and wheel installation passed on Ubuntu,
+macOS and Windows; only the wheel contract exited `4` because repository
+`tests/conftest.py` imported the development-only `python-dotenv` package into
+the deliberately minimal wheel environment.
+
+The additional RED commit `a4877c429868a71fd6cfaf22adc5917fc38c3c73`
+requires the isolated invocation. GREEN commit
+`fb1f901be2e4b5bae3d9bf825ce76c52b9a4112c` adds
+`pytest --noconftest` without installing development dependencies or weakening
+the three assertions. The final technical merge is
+`5dc70031fc1961faf76a5ec1fdb6f28b1141c10b`.
+
+At that exact SHA,
+[run #30172198247](https://github.com/galeamarcel/FastMssql/actions/runs/30172198247)
+passed raw Cargo, `14/14` Rust tests, ABI3 wheel build/install and the isolated
+PoolConfig Python contract independently on Ubuntu, macOS and Windows.
+[RustSec run #30172198251](https://github.com/galeamarcel/FastMssql/actions/runs/30172198251)
+also passed with zero vulnerabilities and zero warnings. Local enterprise
+evidence is `296/296` strict, `285/285` specification IDs, `16/16` async,
+`28/28` framework, `6/6` resilience, `9/9` load and `906/906` upstream.
 
 ---
 
@@ -1335,7 +1367,7 @@ Expected exact final lanes:
 
 ```text
 cargo test              14/14 PASS
-strict functional      295/295 PASS
+strict functional      296/296 PASS
 async                    16/16 PASS
 framework                28/28 PASS
 resilience                6/6 PASS
@@ -1555,6 +1587,8 @@ SHA.
 - Modify: `docs/FASTMSSQL_PRODUCTION_READINESS_AUDIT.md`
 - Modify:
   `docs/superpowers/plans/2026-07-24-fastmssql-upstream-pr-roadmap.md`
+- Modify:
+  `docs/superpowers/plans/2026-07-25-fastmssql-pool-config-default-consistency.md`
 
 **Interfaces:**
 
@@ -1567,21 +1601,19 @@ SHA.
 Run in the main worktree:
 
 ```bash
+pool_technical_sha="5dc70031fc1961faf76a5ec1fdb6f28b1141c10b"
 git worktree add \
   .worktrees/docs-pool-config-default-consistency-status \
   -b docs/pool-config-default-consistency-status \
-  test/sql-auth-validation
+  "${pool_technical_sha}"
 ln -s ../../.env.sql-auth.local \
   .worktrees/docs-pool-config-default-consistency-status/.env.sql-auth.local
+test "$(
+  git -C .worktrees/docs-pool-config-default-consistency-status rev-parse HEAD
+)" = "${pool_technical_sha}"
 ```
 
-Verify:
-
-```bash
-git -C .worktrees/docs-pool-config-default-consistency-status rev-parse HEAD
-```
-
-Expected: exact `technical_sha`.
+Expected: exact hosted-green `pool_technical_sha`.
 
 - [ ] **Step 2: Regenerate matrix/report from the verified artifacts**
 
@@ -1592,8 +1624,10 @@ set -euo pipefail
 set -a
 source .env.sql-auth.local
 set +a
-verification_artifacts="../verify-pool-config-default-consistency/.artifacts/sql-auth"
-uv run python scripts/sql_auth/generate_report.py \
+verification_worktree="../verify-pool-config-default-consistency"
+verification_artifacts="${verification_worktree}/.artifacts/sql-auth"
+"${verification_worktree}/.venv/bin/python" \
+  scripts/sql_auth/generate_report.py \
   --spec docs/superpowers/specs/2026-07-24-fastmssql-sql-auth-validation-design.md \
   --strict-results "${verification_artifacts}/strict-results.json" \
   --artifact-dir "${verification_artifacts}" \
@@ -1603,9 +1637,31 @@ uv run python scripts/sql_auth/generate_report.py \
 ```
 
 Expected: `285/285` ID records are PASS and all runner lanes have exit code
-zero. No credential value appears in either document.
+zero. The report `Git commit` field equals `pool_technical_sha`; no credential
+value appears in either document.
 
-- [ ] **Step 3: Add the measured PoolConfig audit section**
+- [ ] **Step 3: Commit the generated evidence before narrative edits**
+
+Run:
+
+```bash
+git diff --check
+git add \
+  docs/SQL_AUTH_TEST_MATRIX.md \
+  docs/SQL_AUTH_TEST_REPORT.md
+git commit -m "docs: refresh SQL-auth evidence for canonical PoolConfig"
+pool_evidence_commit="$(git rev-parse HEAD)"
+printf 'pool_evidence_commit=%s\n' "${pool_evidence_commit}"
+git merge --no-ff docs/tcp-fault-proxy-client-reset-design \
+  -m "merge: preserve verified PoolConfig execution plan"
+```
+
+Expected: the evidence commit is `8cba60f0b40a6e78a7270216c0fedf604db6c030`.
+The audit can cite it without self-reference. The later merge carries only
+the already reviewed cumulative execution-plan corrections through `f7398d0`;
+it does not change or regenerate the evidence.
+
+- [ ] **Step 4: Add the measured PoolConfig audit section**
 
 Add a section named
 `## Consistența defaulturilor PoolConfig — remediată și verificată` to
@@ -1621,7 +1677,7 @@ Add a section named
 6. focused `92` pure, `16` integration and `POOL-001` real-server results;
 7. saturation at exactly 15 sessions for both construction paths and zero
    candidate sessions after disconnect;
-8. Rust `14/14`, PyO3 contract `7/7`, strict `295/295`, async `16/16`,
+8. Rust `14/14`, PyO3 contract `7/7`, strict `296/296`, async `16/16`,
    framework `28/28`, resilience `6/6`, load `9/9`, specification
    `285/285`, upstream `906/906`;
 9. wheel, Ruff, compileall, Clippy and RustSec evidence;
@@ -1633,7 +1689,7 @@ Add a section named
 Use measured commit IDs, SHA and URLs from the completed tasks, not forecast
 values.
 
-- [ ] **Step 4: Update the audit order and acceptance checklist**
+- [ ] **Step 5: Update the audit order and acceptance checklist**
 
 In `## Ordinea recomandată a branch-urilor`, insert:
 
@@ -1658,7 +1714,7 @@ Update `## Starea verificată curentă` with `technical_sha`, exact local counts
 and hosted URLs while preserving the distinction between technical and
 documentation-only commits.
 
-- [ ] **Step 5: Record the future upstream candidate as PR-21**
+- [ ] **Step 6: Record the future upstream candidate as PR-21**
 
 In
 `docs/superpowers/plans/2026-07-24-fastmssql-upstream-pr-roadmap.md`:
@@ -1674,14 +1730,14 @@ future title                 fix: align PoolConfig default construction
 classification               VERIFIED_FORK / requires fresh upstream rebase
 public API change            omitted PoolConfig arguments become canonical
 compatibility note           historical direct profile remains explicit
-required evidence            RED, 906 upstream, 295 strict, 285 IDs,
+required evidence            RED, 906 upstream, 296 strict, 285 IDs,
                              14 Rust, 7 PyO3, three hosted OS jobs
 publication                  forbidden until a new explicit user approval
 ```
 
 Do not create the future clean branch or PR.
 
-- [ ] **Step 6: Self-review all status documentation**
+- [ ] **Step 7: Self-review all status documentation**
 
 Run:
 
@@ -1709,10 +1765,10 @@ git diff --stat
 git status --short --branch
 ```
 
-Expected: no placeholders, whitespace failures or secret values. Only the four
+Expected: no placeholders, whitespace failures or secret values. Only the
 approved documentation artifacts differ.
 
-- [ ] **Step 7: Commit and publish the status branch to the fork**
+- [ ] **Step 8: Commit and publish the status branch to the fork**
 
 Run:
 
@@ -1721,7 +1777,8 @@ git add \
   docs/SQL_AUTH_TEST_MATRIX.md \
   docs/SQL_AUTH_TEST_REPORT.md \
   docs/FASTMSSQL_PRODUCTION_READINESS_AUDIT.md \
-  docs/superpowers/plans/2026-07-24-fastmssql-upstream-pr-roadmap.md
+  docs/superpowers/plans/2026-07-24-fastmssql-upstream-pr-roadmap.md \
+  docs/superpowers/plans/2026-07-25-fastmssql-pool-config-default-consistency.md
 git commit -m "docs: record canonical PoolConfig defaults"
 git push -u origin docs/pool-config-default-consistency-status
 git rev-list --left-right --count \
