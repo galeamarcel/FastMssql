@@ -41,6 +41,22 @@ def _connection(
     )
 
 
+def _default_connection(
+    config: SqlAuthConfig,
+    *,
+    application_name: str,
+) -> Connection:
+    return Connection(
+        server=config.host,
+        port=config.port,
+        database=config.database,
+        username=config.owner_user,
+        password=config.owner_password,
+        ssl_config=SslConfig.development(),
+        application_name=application_name,
+    )
+
+
 def _assert_pool_invariants(stats: dict) -> None:
     assert stats["connected"] is True
     assert 0 <= stats["idle_connections"] <= stats["connections"]
@@ -94,6 +110,27 @@ async def _application_sessions(
         )
     ).rows()
     return {int(row["session_id"]) for row in rows}
+
+
+async def _wait_for_application_sessions_absent(
+    sa_connection: Connection,
+    application_name: str,
+    *,
+    timeout: float = 3.0,
+) -> None:
+    deadline = time.monotonic() + timeout
+    remaining: set[int] = set()
+    while time.monotonic() < deadline:
+        remaining = await _application_sessions(
+            sa_connection, application_name
+        )
+        if not remaining:
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError(
+        f"application sessions remained for {application_name}: "
+        f"{sorted(remaining)}"
+    )
 
 
 async def _server_connection_id(
@@ -154,23 +191,109 @@ async def _wait_for_active_request(
 
 @case("POOL-001")
 @pytest.mark.asyncio
+@pytest.mark.timeout(20)
 async def test_default_pool_config_matches_runtime(
+    sa_connection: Connection,
     sql_auth_config: SqlAuthConfig,
+    unique_sql_name: Callable[[str], str],
 ) -> None:
-    pool_config = PoolConfig()
-    assert pool_config.max_size == 20
-    assert pool_config.min_idle == 2
-    assert pool_config.max_lifetime_secs is None
-    assert pool_config.idle_timeout_secs is None
-    assert pool_config.connection_timeout_secs == 30
-    connection = _connection(sql_auth_config, pool_config)
-    assert await connection.connect() is True
-    stats = await connection.pool_stats()
-    _assert_pool_invariants(stats)
-    assert stats["max_size"] == pool_config.max_size
-    assert stats["min_idle"] == pool_config.min_idle
-    assert stats["connections"] >= pool_config.min_idle
-    assert await connection.disconnect() is True
+    explicit_config = PoolConfig()
+    canonical = (15, 3, 1800, 300, 30, None, None)
+    observed: dict[str, dict[str, object]] = {}
+
+    for mode in ("explicit", "implicit"):
+        application_name = unique_sql_name(
+            f"fastmssql_pool_defaults_{mode}"
+        )
+        assert (
+            await _application_sessions(sa_connection, application_name)
+            == set()
+        )
+        connection = (
+            _connection(
+                sql_auth_config,
+                explicit_config,
+                application_name=application_name,
+            )
+            if mode == "explicit"
+            else _default_connection(
+                sql_auth_config,
+                application_name=application_name,
+            )
+        )
+        tasks: list[asyncio.Task[int]] = []
+        disconnected = False
+        try:
+            assert await connection.connect() is True
+            initial = await connection.pool_stats()
+            _assert_pool_invariants(initial)
+            tasks = [
+                asyncio.create_task(
+                    scalar(
+                        connection,
+                        "WAITFOR DELAY '00:00:00.750'; SELECT @P1",
+                        [value],
+                    )
+                )
+                for value in range(30)
+            ]
+            try:
+                saturated = await _wait_for_active(
+                    connection,
+                    int(initial["max_size"]),
+                    timeout=4.0,
+                )
+                sessions = await _application_sessions(
+                    sa_connection, application_name
+                )
+            finally:
+                values = await asyncio.gather(*tasks)
+            _assert_pool_invariants(saturated)
+            observed[mode] = {
+                "max_size": initial["max_size"],
+                "min_idle": initial["min_idle"],
+                "warm_connections": initial["connections"],
+                "active_connections": saturated["active_connections"],
+                "connections": saturated["connections"],
+                "server_sessions": len(sessions),
+                "values": values,
+            }
+        finally:
+            disconnected = await connection.disconnect()
+            await _wait_for_application_sessions_absent(
+                sa_connection, application_name
+            )
+        assert disconnected is True
+
+    assert (
+        explicit_config.max_size,
+        explicit_config.min_idle,
+        explicit_config.max_lifetime_secs,
+        explicit_config.idle_timeout_secs,
+        explicit_config.connection_timeout_secs,
+        explicit_config.test_on_check_out,
+        explicit_config.retry_connection,
+    ) == canonical
+    for result in observed.values():
+        assert result["max_size"] == 15
+        assert result["min_idle"] == 3
+        assert 3 <= int(result["warm_connections"]) <= 15
+        assert result["active_connections"] == 15
+        assert result["connections"] == 15
+        assert result["server_sessions"] == 15
+        assert result["values"] == list(range(30))
+    for stable_key in (
+        "max_size",
+        "min_idle",
+        "active_connections",
+        "connections",
+        "server_sessions",
+        "values",
+    ):
+        assert (
+            observed["explicit"][stable_key]
+            == observed["implicit"][stable_key]
+        )
 
 
 @case("POOL-002")

@@ -77,3 +77,33 @@ jobs:
 
       - name: Run Rust unit tests
         run: cargo test --locked
+
+      - name: Build Python extension wheel
+        shell: bash
+        run: |
+          mkdir -p .artifacts/pool-contract-wheel
+          uvx --from maturin==1.14.1 maturin build \
+            --release \
+            --locked \
+            --out .artifacts/pool-contract-wheel
+
+      - name: Install extension contract environment
+        shell: bash
+        run: |
+          uv venv --python "${PYTHON_VERSION}" .pool-contract-venv
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            contract_python=".pool-contract-venv/Scripts/python.exe"
+          else
+            contract_python=".pool-contract-venv/bin/python"
+          fi
+          uv pip install \
+            --python "${contract_python}" \
+            pytest==9.1.1 \
+            .artifacts/pool-contract-wheel/*.whl
+          echo "POOL_CONTRACT_PYTHON=${contract_python}" >> "${GITHUB_ENV}"
+
+      - name: Verify PoolConfig Python contract
+        shell: bash
+        run: |
+          "${POOL_CONTRACT_PYTHON}" \
+            -m pytest tests/test_pool_config_default_contract.py -q
