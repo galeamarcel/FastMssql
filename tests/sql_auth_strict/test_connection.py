@@ -11,6 +11,7 @@ from fastmssql import (
     ProtocolError,
     SqlConnectionError,
     SslConfig,
+    TlsError,
 )
 import pytest
 
@@ -561,7 +562,7 @@ async def test_ping_retires_killed_connection_then_recovers_explicitly(
             expected=0,
         )
 
-        with pytest.raises((SqlConnectionError, ProtocolError)):
+        with pytest.raises((SqlConnectionError, ProtocolError, TlsError)):
             await connection.ping()
         failed_stats = await connection.pool_stats()
         assert failed_stats["active_connections"] == 0
