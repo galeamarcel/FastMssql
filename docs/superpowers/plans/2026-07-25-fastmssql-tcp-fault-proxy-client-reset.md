@@ -659,8 +659,8 @@ uv run python -m compileall -q \
   tests/sql_auth_strict/tcp_fault_proxy.py \
   tests/sql_auth_strict/test_transactions_strict.py
 git diff --check
-git diff --name-status test/tcp-fault-proxy-client-reset...HEAD
-git diff test/tcp-fault-proxy-client-reset...HEAD -- \
+git diff --name-status
+git diff -- \
   tests/sql_auth_strict/tcp_fault_proxy.py \
   tests/sql_auth_strict/test_transactions_strict.py
 ```
@@ -770,7 +770,7 @@ Run:
 set -euo pipefail
 git diff --check
 git status --short --branch
-git diff --name-status test/tcp-fault-proxy-client-reset...HEAD
+git diff --name-status
 git add \
   tests/sql_auth_strict/tcp_fault_proxy.py \
   tests/sql_auth_strict/test_transactions_strict.py
