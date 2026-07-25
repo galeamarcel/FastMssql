@@ -49,6 +49,100 @@ pub fn requires_direct_batch(command: &str) -> bool {
     })
 }
 
+/// Return whether execution can leave the physical session under a different
+/// security principal, even if a later statement in the batch fails.
+///
+/// SQL Server can put a RESETCONNECTION request into kill state after an
+/// unbalanced `EXECUTE AS USER`. Retiring the connection immediately avoids
+/// both cross-lease privilege leakage and an error on the next caller. Tokens
+/// inside strings, quoted identifiers, and comments are intentionally ignored.
+pub fn requires_connection_retirement(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let mut index = 0;
+    let mut previous_was_execute = false;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' | b'"' => {
+                let quote = bytes[index];
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == quote {
+                        if bytes.get(index + 1) == Some(&quote) {
+                            index += 2;
+                        } else {
+                            index += 1;
+                            break;
+                        }
+                    } else {
+                        index += 1;
+                    }
+                }
+                previous_was_execute = false;
+            }
+            b'[' => {
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b']' {
+                        if bytes.get(index + 1) == Some(&b']') {
+                            index += 2;
+                        } else {
+                            index += 1;
+                            break;
+                        }
+                    } else {
+                        index += 1;
+                    }
+                }
+                previous_was_execute = false;
+            }
+            b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                let mut depth = 1usize;
+                while index < bytes.len() && depth > 0 {
+                    if bytes[index..].starts_with(b"/*") {
+                        depth += 1;
+                        index += 2;
+                    } else if bytes[index..].starts_with(b"*/") {
+                        depth -= 1;
+                        index += 2;
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            byte if byte.is_ascii_alphanumeric() || byte == b'_' => {
+                let start = index;
+                index += 1;
+                while index < bytes.len()
+                    && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+                {
+                    index += 1;
+                }
+                let token = &sql[start..index];
+                if token.eq_ignore_ascii_case("SETUSER")
+                    || (previous_was_execute && token.eq_ignore_ascii_case("AS"))
+                {
+                    return true;
+                }
+                previous_was_execute =
+                    token.eq_ignore_ascii_case("EXECUTE") || token.eq_ignore_ascii_case("EXEC");
+            }
+            _ => {
+                index += 1;
+            }
+        }
+    }
+
+    false
+}
+
 /// Wrap `Vec<Row>` into a `Py<PyAny>` via `PyQueryStream`.
 /// Shared between connection.rs and transaction.rs.
 pub fn wrap_query_stream(rows: Vec<Row>) -> PyResult<Py<PyAny>> {
@@ -99,7 +193,7 @@ pub async fn execute_unparameterized_command(
 
 #[cfg(test)]
 mod tests {
-    use super::requires_direct_batch;
+    use super::{requires_connection_retirement, requires_direct_batch};
 
     #[test]
     fn create_and_alter_require_direct_batch_scope() {
@@ -122,5 +216,35 @@ mod tests {
         assert!(!requires_direct_batch("INSERT INTO [t] VALUES (1)"));
         assert!(!requires_direct_batch("SELECT 1"));
         assert!(!requires_direct_batch("-- comment only"));
+    }
+
+    #[test]
+    fn session_impersonation_requires_connection_retirement() {
+        assert!(requires_connection_retirement(
+            "EXECUTE AS USER = N'limited_user'"
+        ));
+        assert!(requires_connection_retirement(
+            "IF 1 = 1 EXEC /* security boundary */ AS LOGIN = 'limited'"
+        ));
+        assert!(requires_connection_retirement("SETUSER 'limited'"));
+    }
+
+    #[test]
+    fn quoted_or_commented_impersonation_text_does_not_retire_connection() {
+        assert!(!requires_connection_retirement(
+            "SELECT N'EXECUTE AS USER = ''limited'''"
+        ));
+        assert!(!requires_connection_retirement(
+            "SELECT [EXECUTE AS USER] FROM [audit]"
+        ));
+        assert!(!requires_connection_retirement(
+            "-- EXECUTE AS USER = 'limited'\nSELECT 1"
+        ));
+        assert!(!requires_connection_retirement(
+            "/* outer /* EXECUTE AS USER = 'limited' */ comment */ SELECT 1"
+        ));
+        assert!(!requires_connection_retirement(
+            "EXEC dbo.do_work @message = N'AS'"
+        ));
     }
 }

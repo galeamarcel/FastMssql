@@ -368,14 +368,14 @@ async def test_parameter_mixed_types_in_batch(test_config: Config):
     """Test batch operations with mixed parameter types."""
     try:
         async with Connection(test_config.connection_string) as conn:
-            # Create temp table
+            # Create an isolated test table
             await conn.execute("""
-                IF OBJECT_ID('tempdb..##mixed_types', 'U') IS NOT NULL
-                    DROP TABLE ##mixed_types
+                IF OBJECT_ID('dbo.fm_mixed_types', 'U') IS NOT NULL
+                    DROP TABLE dbo.fm_mixed_types
             """)
 
             await conn.execute("""
-                CREATE TABLE ##mixed_types (
+                CREATE TABLE dbo.fm_mixed_types (
                     id INT,
                     name VARCHAR(50),
                     score FLOAT,
@@ -386,15 +386,15 @@ async def test_parameter_mixed_types_in_batch(test_config: Config):
             # Batch with different types
             batch_items = [
                 (
-                    "INSERT INTO ##mixed_types VALUES (@P1, @P2, @P3, @P4)",
+                    "INSERT INTO dbo.fm_mixed_types VALUES (@P1, @P2, @P3, @P4)",
                     [1, "Alice", 95.5, True],
                 ),
                 (
-                    "INSERT INTO ##mixed_types VALUES (@P1, @P2, @P3, @P4)",
+                    "INSERT INTO dbo.fm_mixed_types VALUES (@P1, @P2, @P3, @P4)",
                     [2, "Bob", 87.3, False],
                 ),
                 (
-                    "INSERT INTO ##mixed_types VALUES (@P1, @P2, @P3, @P4)",
+                    "INSERT INTO dbo.fm_mixed_types VALUES (@P1, @P2, @P3, @P4)",
                     [3, "Charlie", 92.1, True],
                 ),
             ]
@@ -403,11 +403,11 @@ async def test_parameter_mixed_types_in_batch(test_config: Config):
             assert len(results) == 3
 
             # Verify data
-            result = await conn.query("SELECT COUNT(*) as cnt FROM ##mixed_types")
+            result = await conn.query("SELECT COUNT(*) as cnt FROM dbo.fm_mixed_types")
             assert result.rows()[0]["cnt"] == 3
 
             # Cleanup
-            await conn.execute("DROP TABLE ##mixed_types")
+            await conn.execute("DROP TABLE dbo.fm_mixed_types")
     except Exception as e:
         pytest.fail(f"Database not available: {e}")
 

@@ -17,7 +17,7 @@ import pytest
 
 from sql_auth_strict.cases import case
 from sql_auth_strict.config import SqlAuthConfig
-from sql_auth_strict.helpers import scalar
+from sql_auth_strict.helpers import quote_identifier, scalar
 
 
 pytestmark = [pytest.mark.sql_auth_strict, pytest.mark.integration]
@@ -656,3 +656,415 @@ async def test_rapid_context_lifecycle_does_not_leak_sessions(
             break
         await asyncio.sleep(0.05)
     assert remaining == set()
+
+
+@case("POOL-018")
+@pytest.mark.asyncio
+async def test_checkout_reset_rolls_back_leaked_local_transaction(
+    sql_auth_config: SqlAuthConfig,
+    unique_sql_name: Callable[[str], str],
+) -> None:
+    table = quote_identifier(unique_sql_name("strict_pool_reset_tx"))
+    connection = _connection(
+        sql_auth_config,
+        PoolConfig(
+            max_size=1,
+            min_idle=1,
+            max_lifetime_secs=None,
+            idle_timeout_secs=None,
+            connection_timeout_secs=2,
+            test_on_check_out=False,
+            retry_connection=False,
+        ),
+    )
+
+    async with connection:
+        await connection.execute(f"CREATE TABLE {table} (id INT NOT NULL PRIMARY KEY)")
+        first_session = int(await scalar(connection, "SELECT @@SPID"))
+        baseline = (
+            await connection.query(
+                f"""
+                SELECT
+                    XACT_STATE() AS transaction_state,
+                    COUNT_BIG(*) AS visible_rows
+                FROM {table}
+                """
+            )
+        ).fetchone()
+        assert baseline is not None
+        assert baseline["visible_rows"] == 0
+        baseline_transaction_state = int(
+            baseline["transaction_state"]
+        )
+
+        try:
+            leaked_transaction = await connection.simple_query(
+                f"""
+                BEGIN TRANSACTION;
+                INSERT INTO {table} (id) VALUES (1);
+                SELECT @@SPID AS session_id;
+                """
+            )
+            leaked_row = leaked_transaction.fetchone()
+            assert leaked_row is not None
+            assert leaked_row["session_id"] == first_session
+
+            observed = (
+                await connection.query(
+                    f"""
+                    SELECT
+                        @@SPID AS session_id,
+                        @@TRANCOUNT AS transaction_count,
+                        XACT_STATE() AS transaction_state,
+                        COUNT_BIG(*) AS visible_rows
+                    FROM {table}
+                    """
+                )
+            ).fetchone()
+            assert observed is not None
+            assert observed.to_dict() == {
+                "session_id": first_session,
+                "transaction_count": 0,
+                "transaction_state": baseline_transaction_state,
+                "visible_rows": 0,
+            }
+        finally:
+            await connection.simple_query(
+                f"""
+                IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+                DROP TABLE IF EXISTS {table};
+                """
+            )
+
+
+@case("POOL-019")
+@pytest.mark.asyncio
+async def test_nonfatal_sql_error_still_resets_session_state(
+    sql_auth_config: SqlAuthConfig,
+) -> None:
+    connection = _connection(
+        sql_auth_config,
+        PoolConfig(
+            max_size=1,
+            min_idle=1,
+            max_lifetime_secs=None,
+            idle_timeout_secs=None,
+            connection_timeout_secs=2,
+            test_on_check_out=False,
+            retry_connection=False,
+        ),
+    )
+
+    async with connection:
+        first_session = int(await scalar(connection, "SELECT @@SPID"))
+
+        with pytest.raises(SqlError) as captured:
+            await connection.simple_query(
+                """
+                EXEC sys.sp_set_session_context
+                    @key = N'fastmssql_pool_reset_after_error',
+                    @value = N'contaminated',
+                    @read_only = 1;
+                THROW 51019, N'expected reset reproduction', 1;
+                """
+            )
+        assert captured.value.code == 51019
+        assert captured.value.severity == 16
+
+        observed = (
+            await connection.query(
+                """
+                SELECT
+                    @@SPID AS session_id,
+                    CONVERT(
+                        NVARCHAR(128),
+                        SESSION_CONTEXT(
+                            N'fastmssql_pool_reset_after_error'
+                        )
+                    ) AS leaked_value
+                """
+            )
+        ).fetchone()
+        assert observed is not None
+        assert observed.to_dict() == {
+            "session_id": first_session,
+            "leaked_value": None,
+        }
+
+
+@case("POOL-020")
+@pytest.mark.asyncio
+async def test_checkout_validation_resets_state_before_health_probe(
+    sql_auth_config: SqlAuthConfig,
+) -> None:
+    connection = _connection(
+        sql_auth_config,
+        PoolConfig(
+            max_size=1,
+            min_idle=1,
+            max_lifetime_secs=None,
+            idle_timeout_secs=None,
+            connection_timeout_secs=2,
+            test_on_check_out=True,
+            retry_connection=False,
+        ),
+    )
+
+    async with connection:
+        first_session = int(await scalar(connection, "SELECT @@SPID"))
+        await connection.simple_query(
+            """
+            EXEC sys.sp_set_session_context
+                @key = N'fastmssql_pool_checkout_validation',
+                @value = N'contaminated',
+                @read_only = 1;
+            """
+        )
+
+        observed = (
+            await connection.query(
+                """
+                SELECT
+                    @@SPID AS session_id,
+                    CONVERT(
+                        NVARCHAR(128),
+                        SESSION_CONTEXT(
+                            N'fastmssql_pool_checkout_validation'
+                        )
+                    ) AS leaked_value
+                """
+            )
+        ).fetchone()
+        assert observed is not None
+        assert observed.to_dict() == {
+            "session_id": first_session,
+            "leaked_value": None,
+        }
+
+
+@case("POOL-021")
+@pytest.mark.asyncio
+async def test_impersonated_session_is_retired_before_next_checkout(
+    sa_connection: Connection,
+    sql_auth_config: SqlAuthConfig,
+    unique_sql_name: Callable[[str], str],
+) -> None:
+    user_name = unique_sql_name("strict_pool_impersonated")
+    quoted_user = quote_identifier(user_name)
+    await sa_connection.execute(f"CREATE USER {quoted_user} WITHOUT LOGIN")
+
+    try:
+        connection = _connection(
+            sql_auth_config,
+            PoolConfig(
+                max_size=1,
+                min_idle=1,
+                max_lifetime_secs=None,
+                idle_timeout_secs=None,
+                connection_timeout_secs=2,
+                test_on_check_out=False,
+                retry_connection=False,
+            ),
+        )
+        async with connection:
+            baseline = (
+                await connection.query(
+                    """
+                    SELECT
+                        @@SPID AS session_id,
+                        USER_NAME() AS database_principal,
+                        SUSER_SNAME() AS server_principal
+                    """
+                )
+            ).fetchone()
+            assert baseline is not None
+            baseline_connection_id = await _server_connection_id(
+                sa_connection, int(baseline["session_id"])
+            )
+
+            impersonated = (
+                await connection.simple_query(
+                    f"""
+                    EXECUTE AS USER = N'{user_name}' WITH NO REVERT;
+                    SELECT
+                        @@SPID AS session_id,
+                        USER_NAME() AS database_principal;
+                    """
+                )
+            ).fetchone()
+            assert impersonated is not None
+            assert impersonated.to_dict() == {
+                "session_id": baseline["session_id"],
+                "database_principal": user_name,
+            }
+
+            restored = (
+                await connection.query(
+                    """
+                    SELECT
+                        @@SPID AS session_id,
+                        USER_NAME() AS database_principal,
+                        SUSER_SNAME() AS server_principal
+                    """
+                )
+            ).fetchone()
+            assert restored is not None
+            restored_connection_id = await _server_connection_id(
+                sa_connection, int(restored["session_id"])
+            )
+            assert restored_connection_id != baseline_connection_id
+            assert (
+                restored["database_principal"]
+                == baseline["database_principal"]
+            )
+            assert restored["server_principal"] == baseline["server_principal"]
+    finally:
+        await sa_connection.execute(f"DROP USER IF EXISTS {quoted_user}")
+
+
+@case("POOL-022")
+@pytest.mark.asyncio
+async def test_faulting_impersonation_batch_retires_session(
+    sa_connection: Connection,
+    sql_auth_config: SqlAuthConfig,
+    unique_sql_name: Callable[[str], str],
+) -> None:
+    user_name = unique_sql_name("strict_pool_faulted_impersonation")
+    quoted_user = quote_identifier(user_name)
+    await sa_connection.execute(f"CREATE USER {quoted_user} WITHOUT LOGIN")
+
+    try:
+        connection = _connection(
+            sql_auth_config,
+            PoolConfig(
+                max_size=1,
+                min_idle=1,
+                max_lifetime_secs=None,
+                idle_timeout_secs=None,
+                connection_timeout_secs=2,
+                test_on_check_out=False,
+                retry_connection=False,
+            ),
+        )
+        async with connection:
+            baseline = (
+                await connection.query(
+                    """
+                    SELECT
+                        @@SPID AS session_id,
+                        USER_NAME() AS database_principal,
+                        SUSER_SNAME() AS server_principal
+                    """
+                )
+            ).fetchone()
+            assert baseline is not None
+            baseline_connection_id = await _server_connection_id(
+                sa_connection, int(baseline["session_id"])
+            )
+
+            with pytest.raises(SqlError) as captured:
+                await connection.simple_query(
+                    f"""
+                    EXECUTE AS USER = N'{user_name}' WITH NO REVERT;
+                    THROW 51022, N'expected impersonation failure', 1;
+                    """
+                )
+            assert captured.value.code == 51022
+            assert captured.value.severity == 16
+
+            restored = (
+                await connection.query(
+                    """
+                    SELECT
+                        @@SPID AS session_id,
+                        USER_NAME() AS database_principal,
+                        SUSER_SNAME() AS server_principal
+                    """
+                )
+            ).fetchone()
+            assert restored is not None
+            restored_connection_id = await _server_connection_id(
+                sa_connection, int(restored["session_id"])
+            )
+            assert restored_connection_id != baseline_connection_id
+            assert (
+                restored["database_principal"]
+                == baseline["database_principal"]
+            )
+            assert restored["server_principal"] == baseline["server_principal"]
+    finally:
+        await sa_connection.execute(f"DROP USER IF EXISTS {quoted_user}")
+
+
+@case("POOL-023")
+@pytest.mark.asyncio
+async def test_dynamic_impersonation_is_scope_bound(
+    sa_connection: Connection,
+    sql_auth_config: SqlAuthConfig,
+    unique_sql_name: Callable[[str], str],
+) -> None:
+    user_name = unique_sql_name("strict_pool_dynamic_impersonation")
+    quoted_user = quote_identifier(user_name)
+    await sa_connection.execute(f"CREATE USER {quoted_user} WITHOUT LOGIN")
+
+    try:
+        connection = _connection(
+            sql_auth_config,
+            PoolConfig(
+                max_size=1,
+                min_idle=1,
+                max_lifetime_secs=None,
+                idle_timeout_secs=None,
+                connection_timeout_secs=2,
+                test_on_check_out=False,
+                retry_connection=False,
+            ),
+        )
+        async with connection:
+            baseline = (
+                await connection.query(
+                    """
+                    SELECT
+                        @@SPID AS session_id,
+                        USER_NAME() AS database_principal,
+                        SUSER_SNAME() AS server_principal
+                    """
+                )
+            ).fetchone()
+            assert baseline is not None
+            baseline_connection_id = await _server_connection_id(
+                sa_connection, int(baseline["session_id"])
+            )
+
+            scoped_result = (
+                await connection.simple_query(
+                    f"""
+                    EXEC(N'EXECUTE AS USER = N''{user_name}'';');
+                    SELECT
+                        @@SPID AS session_id,
+                        USER_NAME() AS database_principal,
+                        SUSER_SNAME() AS server_principal;
+                    """
+                )
+            ).fetchone()
+            assert scoped_result is not None
+            assert scoped_result.to_dict() == baseline.to_dict()
+
+            next_lease = (
+                await connection.query(
+                    """
+                    SELECT
+                        @@SPID AS session_id,
+                        USER_NAME() AS database_principal,
+                        SUSER_SNAME() AS server_principal
+                    """
+                )
+            ).fetchone()
+            assert next_lease is not None
+            next_connection_id = await _server_connection_id(
+                sa_connection, int(next_lease["session_id"])
+            )
+            assert next_connection_id == baseline_connection_id
+            assert next_lease.to_dict() == baseline.to_dict()
+    finally:
+        await sa_connection.execute(f"DROP USER IF EXISTS {quoted_user}")

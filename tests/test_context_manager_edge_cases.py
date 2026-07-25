@@ -202,39 +202,39 @@ async def test_context_manager_with_execute(test_config: Config):
     """Test context manager with execute (non-SELECT) operations."""
     try:
         async with Connection(test_config.connection_string) as conn:
-            # Create temp table
+            # Create an isolated test table
             await conn.execute("""
-                IF OBJECT_ID('tempdb..##test_ctx', 'U') IS NOT NULL
-                    DROP TABLE ##test_ctx
+                IF OBJECT_ID('dbo.fm_test_ctx', 'U') IS NOT NULL
+                    DROP TABLE dbo.fm_test_ctx
             """)
 
             await conn.execute("""
-                CREATE TABLE ##test_ctx (id INT, name VARCHAR(50))
+                CREATE TABLE dbo.fm_test_ctx (id INT, name VARCHAR(50))
             """)
 
             # Insert
             result = await conn.execute(
-                "INSERT INTO ##test_ctx VALUES (@P1, @P2)", [1, "test"]
+                "INSERT INTO dbo.fm_test_ctx VALUES (@P1, @P2)", [1, "test"]
             )
             assert result == 1
 
             # Query
-            result = await conn.query("SELECT * FROM ##test_ctx")
+            result = await conn.query("SELECT * FROM dbo.fm_test_ctx")
             assert result.has_rows()
             assert result.rows()[0]["id"] == 1
 
             # Update
             result = await conn.execute(
-                "UPDATE ##test_ctx SET name = @P1 WHERE id = @P2", ["updated", 1]
+                "UPDATE dbo.fm_test_ctx SET name = @P1 WHERE id = @P2", ["updated", 1]
             )
             assert result == 1
 
             # Delete
-            result = await conn.execute("DELETE FROM ##test_ctx WHERE id = @P1", [1])
+            result = await conn.execute("DELETE FROM dbo.fm_test_ctx WHERE id = @P1", [1])
             assert result == 1
 
             # Cleanup
-            await conn.execute("DROP TABLE ##test_ctx")
+            await conn.execute("DROP TABLE dbo.fm_test_ctx")
     except Exception as e:
         pytest.fail(f"Database not available: {e}")
 
@@ -342,21 +342,21 @@ async def test_context_manager_with_batch_operations(test_config: Config):
     """Test context manager with batch operations."""
     try:
         async with Connection(test_config.connection_string) as conn:
-            # Create temp table
+            # Create an isolated test table
             await conn.execute("""
-                IF OBJECT_ID('tempdb..##batch_test', 'U') IS NOT NULL
-                    DROP TABLE ##batch_test
+                IF OBJECT_ID('dbo.fm_batch_test', 'U') IS NOT NULL
+                    DROP TABLE dbo.fm_batch_test
             """)
 
             await conn.execute("""
-                CREATE TABLE ##batch_test (id INT PRIMARY KEY, value VARCHAR(50))
+                CREATE TABLE dbo.fm_batch_test (id INT PRIMARY KEY, value VARCHAR(50))
             """)
 
             # Execute batch
             batch_items = [
-                ("INSERT INTO ##batch_test VALUES (@P1, @P2)", [1, "one"]),
-                ("INSERT INTO ##batch_test VALUES (@P1, @P2)", [2, "two"]),
-                ("INSERT INTO ##batch_test VALUES (@P1, @P2)", [3, "three"]),
+                ("INSERT INTO dbo.fm_batch_test VALUES (@P1, @P2)", [1, "one"]),
+                ("INSERT INTO dbo.fm_batch_test VALUES (@P1, @P2)", [2, "two"]),
+                ("INSERT INTO dbo.fm_batch_test VALUES (@P1, @P2)", [3, "three"]),
             ]
 
             results = await conn.execute_batch(batch_items)
@@ -364,10 +364,10 @@ async def test_context_manager_with_batch_operations(test_config: Config):
             assert all(r == 1 for r in results)
 
             # Verify data
-            result = await conn.query("SELECT COUNT(*) as cnt FROM ##batch_test")
+            result = await conn.query("SELECT COUNT(*) as cnt FROM dbo.fm_batch_test")
             assert result.rows()[0]["cnt"] == 3
 
             # Cleanup
-            await conn.execute("DROP TABLE ##batch_test")
+            await conn.execute("DROP TABLE dbo.fm_batch_test")
     except Exception as e:
         pytest.fail(f"Database not available: {e}")

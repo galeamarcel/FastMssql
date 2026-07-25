@@ -1,7 +1,10 @@
 use std::fmt::Write;
 
 use crate::azure_auth::PyAzureCredential;
-use crate::helpers::{catch_driver_panic, execute_unparameterized_command, requires_direct_batch};
+use crate::helpers::{
+    catch_driver_panic, execute_unparameterized_command, requires_connection_retirement,
+    requires_direct_batch,
+};
 use crate::parameter_conversion::{
     FastParameter, MAX_USER_QUERY_PARAMETERS, TypedNull, convert_parameters_to_fast,
     params_as_sql_refs, python_to_fast_parameter,
@@ -231,6 +234,9 @@ pub fn query_batch<'p>(
     queries: &Bound<'p, PyList>,
 ) -> PyResult<Bound<'p, PyAny>> {
     let batch_queries = parse_batch_items(queries, py)?;
+    let retire_after_operation = batch_queries
+        .iter()
+        .any(|(sql, _)| requires_connection_retirement(sql));
 
     let pool = Arc::clone(&pool);
     let config = Arc::clone(&config);
@@ -249,7 +255,7 @@ pub fn query_batch<'p>(
             catch_driver_panic(query_batch_on_connection(&mut conn, batch_queries)).await;
         let all_results = match operation {
             Ok(result) => {
-                conn.complete_with_result(&result);
+                conn.complete_with_result_and_retirement(&result, retire_after_operation);
                 result?
             }
             Err(driver_panic) => return Err(driver_panic),

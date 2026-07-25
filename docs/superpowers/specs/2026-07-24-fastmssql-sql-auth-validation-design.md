@@ -242,6 +242,19 @@ evidence reference.
 - `POOL-015`: checkout validation behavior.
 - `POOL-016`: broken connection is not returned as healthy.
 - `POOL-017`: rapid connect/disconnect does not leak sessions.
+- `POOL-018`: checkout reset rolls back a leaked local transaction without
+  replacing the physical SQL Server session.
+- `POOL-019`: a nonfatal SQL error still causes complete session-state reset
+  before the physical connection is reused.
+- `POOL-020`: checkout validation resets the prior lease before its health
+  probe and preserves the healthy physical SQL Server session.
+- `POOL-021`: a session that executes database-user impersonation is retired
+  before another pool lease can observe that security context.
+- `POOL-022`: a batch that changes the database principal before raising a
+  nonfatal SQL error still retires the physical session.
+- `POOL-023`: scope-bound database-user impersonation inside dynamic SQL
+  reverts before the operation completes and does not unnecessarily retire the
+  physical session.
 
 ### SQL — query and command execution
 
@@ -265,10 +278,13 @@ evidence reference.
 - `SQL-018`: stored procedure with return status.
 - `SQL-019`: trigger side effects.
 - `SQL-020`: identity, sequence, default, and computed columns.
-- `SQL-021`: local temporary table behavior on `Connection` is documented.
+- `SQL-021`: local temporary tables are isolated between pooled `Connection`
+  leases while the physical SQL Server session is reused.
 - `SQL-022`: local temporary table persists on `Transaction`.
 - `SQL-023`: multiple result-set behavior is explicitly asserted.
-- `SQL-024`: session-level `SET` state behavior through the pool is documented.
+- `SQL-024`: database context, `SET` options, isolation level,
+  `CONTEXT_INFO`, and read-only `SESSION_CONTEXT` values are reset to the login
+  baseline between pooled `Connection` leases for both Batch and RPC requests.
 - `SQL-025`: comments, multiline SQL, and trailing semicolons.
 
 ### PARAM — Python-to-SQL parameters

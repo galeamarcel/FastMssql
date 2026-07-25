@@ -9,7 +9,7 @@ use crate::{
     tds::{
         codec::{
             self, Encode, LoginMessage, Packet, PacketCodec, PacketHeader, PacketStatus,
-            PreloginMessage, TokenDone,
+            PacketType, PreloginMessage, TokenDone,
         },
         stream::TokenStream,
         Context, HEADER_BYTES,
@@ -57,6 +57,7 @@ where
     flushed: bool,
     context: Context,
     buf: BytesMut,
+    reset_connection_on_next_request: bool,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> Debug for Connection<S> {
@@ -66,6 +67,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Debug for Connection<S> {
             .field("flushed", &self.flushed)
             .field("context", &self.context)
             .field("buf", &self.buf.as_ref().hex_dump())
+            .field(
+                "reset_connection_on_next_request",
+                &self.reset_connection_on_next_request,
+            )
             .finish()
     }
 }
@@ -86,6 +91,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             context,
             flushed: false,
             buf: BytesMut::new(),
+            reset_connection_on_next_request: false,
         };
 
         let fed_auth_required = matches!(config.auth, AuthMethod::AADToken(_));
@@ -172,15 +178,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         let mut payload = BytesMut::new();
         item.encode(&mut payload)?;
 
+        let reset_connection = self.reset_connection_on_next_request
+            && matches!(
+                header.r#type(),
+                PacketType::SQLBatch | PacketType::Rpc | PacketType::TransactionManagerReq
+            );
+        let mut first_packet = true;
+
         while !payload.is_empty() {
             let writable = cmp::min(payload.len(), packet_size);
             let split_payload = payload.split_to(writable);
-
-            if payload.is_empty() {
-                header.set_status(PacketStatus::EndOfMessage);
-            } else {
-                header.set_status(PacketStatus::NormalMessage);
-            }
+            let last_packet = payload.is_empty();
+            header.set_status(PacketStatus::for_request_packet(
+                reset_connection,
+                first_packet,
+                last_packet,
+            ));
 
             event!(
                 Level::TRACE,
@@ -189,11 +202,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             );
 
             self.write_to_wire(header, split_payload).await?;
+            if reset_connection && first_packet {
+                self.reset_connection_on_next_request = false;
+            }
+            first_packet = false;
         }
 
         self.flush_sink().await?;
 
         Ok(())
+    }
+
+    pub(crate) fn reset_connection_on_next_request(&mut self) {
+        self.context.reset_for_connection_pool();
+        self.reset_connection_on_next_request = true;
+    }
+
+    pub(crate) fn is_connection_reset_pending(&self) -> bool {
+        self.reset_connection_on_next_request
     }
 
     /// Sends a packet of data to the database.
@@ -467,6 +493,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 context,
                 flushed: false,
                 buf: BytesMut::new(),
+                reset_connection_on_next_request: false,
             })
         } else {
             event!(

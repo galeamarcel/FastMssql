@@ -74,9 +74,20 @@ impl ManagedConnection {
         self.disposition = ConnectionDisposition::Broken;
     }
 
+    fn mark_clean(&mut self) {
+        self.disposition = ConnectionDisposition::Clean;
+    }
+
     fn mark_needs_reset(&mut self) {
         if self.disposition != ConnectionDisposition::Broken {
             self.disposition = ConnectionDisposition::NeedsReset;
+        }
+    }
+
+    fn prepare_for_checkout(&mut self) {
+        if self.disposition == ConnectionDisposition::NeedsReset {
+            self.client.reset_connection_on_next_request();
+            self.mark_clean();
         }
     }
 
@@ -256,13 +267,17 @@ impl bb8::ManageConnection for AzureConnectionManager {
     }
 
     async fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
-        // Roll back any uncommitted transaction that might have leaked onto this
-        // connection (e.g., future dropped between BEGIN and COMMIT), then confirm
-        // the connection is still alive — combined into a single round-trip.
-        // This runs only when test_on_check_out = true or on periodic lifetime /
-        // idle-timeout health checks — never on every routine checkout.
+        // A checkout validation query is itself the next application request,
+        // so it must carry RESETCONNECTION before inspecting the connection.
+        conn.prepare_for_checkout();
+        // Cancellation during validation must not return a partially consumed
+        // reset/health response to the pool.
+        conn.mark_unusable();
         conn.simple_query("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION; SELECT 1")
+            .await?
+            .into_results()
             .await?;
+        conn.mark_clean();
         Ok(())
     }
 
@@ -284,7 +299,8 @@ pub(crate) struct PooledOperationGuard<'a> {
 }
 
 impl<'a> PooledOperationGuard<'a> {
-    pub(crate) fn new(connection: bb8::PooledConnection<'a, AzureConnectionManager>) -> Self {
+    pub(crate) fn new(mut connection: bb8::PooledConnection<'a, AzureConnectionManager>) -> Self {
+        connection.prepare_for_checkout();
         Self {
             connection,
             completed: false,
@@ -296,7 +312,20 @@ impl<'a> PooledOperationGuard<'a> {
         self.completed = true;
     }
 
-    pub(crate) fn complete_with_result<T>(&mut self, result: &PyResult<T>) {
+    pub(crate) fn complete_with_result_and_retirement<T>(
+        &mut self,
+        result: &PyResult<T>,
+        retire_after_operation: bool,
+    ) {
+        if retire_after_operation {
+            // EXECUTE AS can take effect before a later statement raises a
+            // nonfatal SQL error. Never return that physical security context
+            // to the pool, regardless of the operation's final result.
+            self.connection.mark_unusable();
+            self.completed = true;
+            return;
+        }
+
         match result {
             Ok(_) => self.connection.mark_needs_reset(),
             Err(error) => self.connection.apply_operation_error(error),
