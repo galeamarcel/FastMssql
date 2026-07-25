@@ -162,6 +162,41 @@ async def test_tcp_fault_proxy_smoke(
         await asyncio.wait_for(proxy.close(), timeout=2.0)
 
 
+@pytest.mark.asyncio
+async def test_tcp_fault_proxy_closes_server_leg_after_client_disconnect(
+    sa_connection: Connection,
+    sql_auth_config: SqlAuthConfig,
+    unique_sql_name: Callable[[str], str],
+) -> None:
+    proxy = DownstreamGateProxy(
+        sql_auth_config.host,
+        sql_auth_config.port,
+    )
+    await proxy.start()
+    connection = _pooled_transaction_connection(
+        sql_auth_config,
+        max_size=1,
+        application_name=unique_sql_name("strict_proxy_shutdown"),
+        server=proxy.host,
+        port=proxy.port,
+    )
+    session_id: int | None = None
+
+    try:
+        session_id = await scalar(connection, "SELECT @@SPID")
+        assert proxy.accepted_connections == 1
+        await connection.disconnect()
+
+        await _wait_for_session_absent(
+            sa_connection,
+            session_id,
+            timeout=2.0,
+        )
+    finally:
+        await connection.disconnect()
+        await proxy.close()
+
+
 async def _wait_for_pool_active(
     connection: Connection,
     expected: int,
