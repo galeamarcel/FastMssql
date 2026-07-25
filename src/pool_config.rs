@@ -1,6 +1,14 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+const DEFAULT_MAX_SIZE: u32 = 15;
+const DEFAULT_MIN_IDLE: u32 = 3;
+const DEFAULT_MAX_LIFETIME_SECS: u64 = 1800;
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_TEST_ON_CHECK_OUT: Option<bool> = None;
+const DEFAULT_RETRY_CONNECTION: Option<bool> = None;
+
 /// Configuration for the bb8 connection pool
 #[pyclass(name = "PoolConfig", from_py_object)]
 #[derive(Clone)]
@@ -14,10 +22,37 @@ pub struct PyPoolConfig {
     pub retry_connection: Option<bool>,
 }
 
+impl PyPoolConfig {
+    fn canonical_default() -> Self {
+        Self {
+            max_size: DEFAULT_MAX_SIZE,
+            min_idle: Some(DEFAULT_MIN_IDLE),
+            max_lifetime: Some(std::time::Duration::from_secs(DEFAULT_MAX_LIFETIME_SECS)),
+            idle_timeout: Some(std::time::Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)),
+            connection_timeout: Some(std::time::Duration::from_secs(
+                DEFAULT_CONNECTION_TIMEOUT_SECS,
+            )),
+            test_on_check_out: DEFAULT_TEST_ON_CHECK_OUT,
+            retry_connection: DEFAULT_RETRY_CONNECTION,
+        }
+    }
+}
+
 #[pymethods]
 impl PyPoolConfig {
     #[new]
-    #[pyo3(signature = (max_size = 20, min_idle = Some(2), max_lifetime_secs = None, idle_timeout_secs = None, connection_timeout_secs = Some(30), test_on_check_out = None, retry_connection = None))]
+    #[pyo3(
+        signature = (
+            max_size = DEFAULT_MAX_SIZE,
+            min_idle = Some(DEFAULT_MIN_IDLE),
+            max_lifetime_secs = Some(DEFAULT_MAX_LIFETIME_SECS),
+            idle_timeout_secs = Some(DEFAULT_IDLE_TIMEOUT_SECS),
+            connection_timeout_secs = Some(DEFAULT_CONNECTION_TIMEOUT_SECS),
+            test_on_check_out = DEFAULT_TEST_ON_CHECK_OUT,
+            retry_connection = DEFAULT_RETRY_CONNECTION
+        ),
+        text_signature = "(max_size=15, min_idle=3, max_lifetime_secs=1800, idle_timeout_secs=300, connection_timeout_secs=30, test_on_check_out=None, retry_connection=None)"
+    )]
     pub fn new(
         max_size: u32,
         min_idle: Option<u32>,
@@ -302,15 +337,7 @@ impl PyPoolConfig {
 
 impl Default for PyPoolConfig {
     fn default() -> Self {
-        PyPoolConfig {
-            max_size: 15,      // Balanced default for typical workloads (was 10)
-            min_idle: Some(3), // Slightly higher min_idle to keep connections ready
-            max_lifetime: Some(std::time::Duration::from_secs(1800)),
-            idle_timeout: Some(std::time::Duration::from_secs(300)),
-            connection_timeout: Some(std::time::Duration::from_secs(30)),
-            test_on_check_out: None,
-            retry_connection: None,
-        }
+        Self::canonical_default()
     }
 }
 

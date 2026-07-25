@@ -19,10 +19,10 @@ class PoolConfig:
 
     Attributes:
         max_size: Maximum number of connections in the pool (default: 15)
-        min_idle: Minimum number of idle connections to maintain (default: 3)
-        max_lifetime_secs: Maximum lifetime of a connection in seconds (default: None = unlimited)
-        idle_timeout_secs: Timeout for idle connections in seconds (default: None = no timeout)
-        connection_timeout_secs: Timeout for acquiring a connection in seconds (default: 30)
+        min_idle: Minimum idle connections to maintain (default: 3; None leaves the FastMssql override unset)
+        max_lifetime_secs: Maximum connection lifetime in seconds (default: 1800; None leaves the FastMssql override unset)
+        idle_timeout_secs: Idle connection timeout in seconds (default: 300; None leaves the FastMssql override unset)
+        connection_timeout_secs: Pool acquisition timeout in seconds (default: 30; None leaves the FastMssql override unset)
         test_on_check_out: Whether to test connections when checking out (default: None)
         retry_connection: Whether to retry connection attempts (default: None)
 
@@ -43,10 +43,10 @@ class PoolConfig:
     def __init__(
         self,
         max_size: int = 15,
-        min_idle: int = 3,
-        max_lifetime_secs: Optional[int] = None,
-        idle_timeout_secs: Optional[int] = None,
-        connection_timeout_secs: int = 30,
+        min_idle: Optional[int] = 3,
+        max_lifetime_secs: Optional[int] = 1800,
+        idle_timeout_secs: Optional[int] = 300,
+        connection_timeout_secs: Optional[int] = 30,
         test_on_check_out: Optional[bool] = None,
         retry_connection: Optional[bool] = None,
     ) -> None: ...
