@@ -54,6 +54,14 @@ impl Context {
         self.transaction_desc = desc;
     }
 
+    pub fn reset_for_connection_pool(&mut self) {
+        // RESETCONNECTION rolls back a local transaction before processing the
+        // next request. That request must therefore carry a zero transaction
+        // descriptor rather than the descriptor from the previous lease.
+        self.transaction_desc = [0; 8];
+        self.last_meta = None;
+    }
+
     pub fn version(&self) -> FeatureLevel {
         self.version
     }
@@ -65,5 +73,20 @@ impl Context {
     #[cfg(any(windows, all(unix, feature = "integrated-auth-gssapi")))]
     pub fn spn(&self) -> &str {
         self.spn.as_deref().unwrap_or("")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Context;
+
+    #[test]
+    fn pool_reset_clears_the_client_transaction_descriptor() {
+        let mut context = Context::new();
+        context.set_transaction_descriptor([7; 8]);
+
+        context.reset_for_connection_pool();
+
+        assert_eq!(context.transaction_descriptor(), [0; 8]);
     }
 }

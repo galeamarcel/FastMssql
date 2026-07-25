@@ -10,7 +10,8 @@ use crate::azure_auth::PyAzureCredential;
 use crate::batch::{bulk_insert, execute_batch, query_batch};
 use crate::connection_config::config_from_ado_string;
 use crate::helpers::{
-    catch_driver_panic, execute_unparameterized_command, requires_direct_batch, wrap_query_stream,
+    catch_driver_panic, execute_unparameterized_command, requires_connection_retirement,
+    requires_direct_batch, wrap_query_stream,
 };
 use crate::parameter_conversion::{FastParameter, convert_parameters_to_fast, params_as_sql_refs};
 use crate::pool_config::PyPoolConfig;
@@ -76,6 +77,7 @@ impl PyConnection {
         query: &str,
         parameters: &[FastParameter],
     ) -> PyResult<Vec<Row>> {
+        let retire_after_operation = requires_connection_retirement(query);
         let mut conn = Self::get_pool_connection(pool).await?;
         let tiberius_params = params_as_sql_refs(parameters);
 
@@ -94,7 +96,7 @@ impl PyConnection {
 
         match operation {
             Ok(result) => {
-                conn.complete_with_result(&result);
+                conn.complete_with_result_and_retirement(&result, retire_after_operation);
                 result
             }
             Err(driver_panic) => Err(driver_panic),
@@ -106,6 +108,7 @@ impl PyConnection {
         pool: &ConnectionPool,
         query: &str,
     ) -> PyResult<Vec<Row>> {
+        let retire_after_operation = requires_connection_retirement(query);
         let mut conn = Self::get_pool_connection(pool).await?;
 
         let operation = catch_driver_panic(async {
@@ -123,7 +126,7 @@ impl PyConnection {
 
         match operation {
             Ok(result) => {
-                conn.complete_with_result(&result);
+                conn.complete_with_result_and_retirement(&result, retire_after_operation);
                 result
             }
             Err(driver_panic) => Err(driver_panic),
@@ -136,6 +139,7 @@ impl PyConnection {
         query: &str,
         parameters: &[FastParameter],
     ) -> PyResult<u64> {
+        let retire_after_operation = requires_connection_retirement(query);
         let mut conn = Self::get_pool_connection(pool).await?;
         let operation = catch_driver_panic(async {
             if parameters.is_empty() && requires_direct_batch(query) {
@@ -152,7 +156,7 @@ impl PyConnection {
 
         match operation {
             Ok(result) => {
-                conn.complete_with_result(&result);
+                conn.complete_with_result_and_retirement(&result, retire_after_operation);
                 result
             }
             Err(driver_panic) => Err(driver_panic),

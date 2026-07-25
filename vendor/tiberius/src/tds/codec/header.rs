@@ -33,8 +33,31 @@ uint_enum! {
         IgnoreEvent = 3,
         /// [client to server ONLY] [>= TDSv7.1]
         ResetConnection = 0x08,
+        /// RESETCONNECTION combined with EndOfMessage for a one-packet request.
+        ResetConnectionEndOfMessage = 0x09,
         /// [client to server ONLY] [>= TDSv7.3]
         ResetConnectionSkipTran = 0x10,
+        /// RESETCONNECTIONSKIPTRAN combined with EndOfMessage.
+        ResetConnectionSkipTranEndOfMessage = 0x11,
+    }
+}
+
+impl PacketStatus {
+    /// Status for one packet in an application request.
+    ///
+    /// MS-TDS 2.2.3.1.2 requires RESETCONNECTION only on the first packet. A
+    /// single-packet request must carry both RESETCONNECTION and EOM (0x09).
+    pub(crate) fn for_request_packet(
+        reset_connection: bool,
+        first_packet: bool,
+        last_packet: bool,
+    ) -> Self {
+        match (reset_connection && first_packet, last_packet) {
+            (true, true) => Self::ResetConnectionEndOfMessage,
+            (true, false) => Self::ResetConnection,
+            (false, true) => Self::EndOfMessage,
+            (false, false) => Self::NormalMessage,
+        }
     }
 }
 
@@ -142,6 +165,48 @@ where
         dst.put_u8(self.window);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PacketStatus;
+
+    #[test]
+    fn reset_connection_is_only_on_the_first_request_packet() {
+        assert_eq!(
+            PacketStatus::for_request_packet(true, true, false),
+            PacketStatus::ResetConnection
+        );
+        assert_eq!(
+            PacketStatus::for_request_packet(true, false, false),
+            PacketStatus::NormalMessage
+        );
+        assert_eq!(
+            PacketStatus::for_request_packet(true, false, true),
+            PacketStatus::EndOfMessage
+        );
+    }
+
+    #[test]
+    fn single_packet_reset_combines_reset_connection_and_eom() {
+        assert_eq!(
+            PacketStatus::for_request_packet(true, true, true),
+            PacketStatus::ResetConnectionEndOfMessage
+        );
+        assert_eq!(PacketStatus::ResetConnectionEndOfMessage as u8, 0x09);
+    }
+
+    #[test]
+    fn ordinary_request_statuses_are_unchanged() {
+        assert_eq!(
+            PacketStatus::for_request_packet(false, true, false),
+            PacketStatus::NormalMessage
+        );
+        assert_eq!(
+            PacketStatus::for_request_packet(false, false, true),
+            PacketStatus::EndOfMessage
+        );
     }
 }
 

@@ -75,6 +75,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         })
     }
 
+    /// Reset the SQL Server session immediately before the next application
+    /// request while retaining the physical transport connection.
+    ///
+    /// The next Batch or RPC request carries the MS-TDS RESETCONNECTION status
+    /// bit. Because MS-TDS explicitly excludes transaction isolation level
+    /// from the server-side reset, that request is also prefixed with
+    /// `SET TRANSACTION ISOLATION LEVEL READ COMMITTED`.
+    pub fn reset_connection_on_next_request(&mut self) {
+        self.connection.reset_connection_on_next_request();
+    }
+
     /// Executes SQL statements in the SQL Server, returning the number rows
     /// affected. Useful for `INSERT`, `UPDATE` and `DELETE` statements. The
     /// `query` can define the parameter placement by annotating them with
@@ -124,6 +135,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         params: &[&dyn ToSql],
     ) -> crate::Result<ExecuteResult> {
         self.connection.flush_stream().await?;
+        let query =
+            Self::query_with_reset_baseline(query, self.connection.is_connection_reset_pending());
         let rpc_params = Self::rpc_params(query);
 
         let params = params.iter().map(|s| s.to_sql());
@@ -186,6 +199,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         'a: 'b,
     {
         self.connection.flush_stream().await?;
+        let query =
+            Self::query_with_reset_baseline(query, self.connection.is_connection_reset_pending());
         let rpc_params = Self::rpc_params(query);
 
         let params = params.iter().map(|p| p.to_sql());
@@ -237,6 +252,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         'a: 'b,
     {
         self.connection.flush_stream().await?;
+        let query =
+            Self::query_with_reset_baseline(query, self.connection.is_connection_reset_pending());
 
         let req = BatchRequest::new(query, self.connection.context().transaction_descriptor());
 
@@ -305,6 +322,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
 
         // retrieve column metadata from server
         let query = format!("SELECT TOP 0 * FROM {}", table);
+        let query =
+            Self::query_with_reset_baseline(query, self.connection.is_connection_reset_pending());
 
         let req = BatchRequest::new(query, self.connection.context().transaction_descriptor());
 
@@ -350,6 +369,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     /// Closes this database connection explicitly.
     pub async fn close(self) -> crate::Result<()> {
         self.connection.close().await
+    }
+
+    fn query_with_reset_baseline<'a>(
+        query: impl Into<Cow<'a, str>>,
+        reset_connection: bool,
+    ) -> Cow<'a, str> {
+        let query = query.into();
+        if !reset_connection {
+            return query;
+        }
+
+        const ISOLATION_BASELINE: &str = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED;\n";
+        let mut prefixed = String::with_capacity(ISOLATION_BASELINE.len() + query.len());
+        prefixed.push_str(ISOLATION_BASELINE);
+        prefixed.push_str(query.as_ref());
+        Cow::Owned(prefixed)
     }
 
     pub(crate) fn rpc_params<'a>(query: impl Into<Cow<'a, str>>) -> Vec<RpcParam<'a>> {
@@ -406,5 +441,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         self.connection.send(PacketHeader::rpc(id), req).await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod reset_connection_tests {
+    use super::Client;
+    use std::borrow::Cow;
+
+    #[test]
+    fn ordinary_query_is_borrowed_without_rewrite() {
+        let query = Client::<futures_util::io::Cursor<Vec<u8>>>::query_with_reset_baseline(
+            "SELECT 1", false,
+        );
+        assert_eq!(query, Cow::Borrowed("SELECT 1"));
+    }
+
+    #[test]
+    fn reset_query_restores_the_isolation_level_exception() {
+        let query = Client::<futures_util::io::Cursor<Vec<u8>>>::query_with_reset_baseline(
+            "SELECT 1", true,
+        );
+        assert_eq!(
+            query,
+            Cow::<str>::Owned(
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED;\nSELECT 1".to_owned()
+            )
+        );
     }
 }
