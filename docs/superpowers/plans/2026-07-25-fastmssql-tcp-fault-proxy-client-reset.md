@@ -964,7 +964,7 @@ if rg -n '\| (FAIL|ERROR|NOT RUN|SKIPPED) \|' \
   docs/SQL_AUTH_TEST_MATRIX.md; then
   exit 1
 fi
-if rg -F -n \
+if rg -l -F \
   -e "${FASTMSSQL_SQL_AUTH_SA_PASSWORD}" \
   -e "${FASTMSSQL_SQL_AUTH_OWNER_PASSWORD}" \
   -e "${FASTMSSQL_SQL_AUTH_READONLY_PASSWORD}" \
@@ -1189,7 +1189,7 @@ if rg -n 'TO''DO|T''BD|FIX''ME|PLACE''HOLDER' \
   docs/SQL_AUTH_TEST_REPORT.md; then
   exit 1
 fi
-if rg -F -n \
+if rg -l -F \
   -e "${FASTMSSQL_SQL_AUTH_SA_PASSWORD}" \
   -e "${FASTMSSQL_SQL_AUTH_OWNER_PASSWORD}" \
   -e "${FASTMSSQL_SQL_AUTH_READONLY_PASSWORD}" \
@@ -1540,7 +1540,7 @@ if rg -n '\| (FAIL|ERROR|NOT RUN|SKIPPED) \|' \
   docs/SQL_AUTH_TEST_MATRIX.md; then
   exit 1
 fi
-if rg -F -n \
+if rg -l -F \
   -e "${FASTMSSQL_SQL_AUTH_SA_PASSWORD}" \
   -e "${FASTMSSQL_SQL_AUTH_OWNER_PASSWORD}" \
   -e "${FASTMSSQL_SQL_AUTH_READONLY_PASSWORD}" \
@@ -1708,8 +1708,8 @@ set +a
 verification_worktree="../verify-pool-config-default-consistency"
 verification_artifacts="${verification_worktree}/.artifacts/sql-auth"
 "${verification_worktree}/.venv/bin/python" \
-  "${verification_worktree}/scripts/sql_auth/generate_report.py" \
-  --spec "${verification_worktree}/docs/superpowers/specs/2026-07-24-fastmssql-sql-auth-validation-design.md" \
+  scripts/sql_auth/generate_report.py \
+  --spec docs/superpowers/specs/2026-07-24-fastmssql-sql-auth-validation-design.md \
   --strict-results "${verification_artifacts}/strict-results.json" \
   --artifact-dir "${verification_artifacts}" \
   --matrix-output docs/SQL_AUTH_TEST_MATRIX.md \
@@ -1719,9 +1719,34 @@ verification_artifacts="${verification_worktree}/.artifacts/sql-auth"
 
 Expected: `285/285` cases and lanes
 `296/16/28/6/9/906`, all green. The report's `Git commit` field must equal
-the detached `pool_technical_sha`, not the documentation-only status SHA.
+`pool_technical_sha`, because the status branch still points exactly to that
+commit while generation runs. The detached worktree supplies only its
+verified interpreter and artifacts.
 
-- [ ] **Step 3: Correct only post-harness PoolConfig plan counts**
+- [ ] **Step 3: Commit the generated evidence before documentation edits**
+
+Run:
+
+```bash
+git add \
+  docs/SQL_AUTH_TEST_MATRIX.md \
+  docs/SQL_AUTH_TEST_REPORT.md
+git commit -m "docs: refresh SQL-auth evidence for canonical PoolConfig"
+pool_evidence_commit="$(git rev-parse HEAD)"
+printf 'pool_evidence_commit=%s\n' "${pool_evidence_commit}"
+```
+
+The later audit can now cite measured evidence without self-reference.
+
+- [ ] **Step 4: Carry final execution-plan corrections and update counts**
+
+Merge the execution-plan self-review commits only after the report has been
+generated at `pool_technical_sha`:
+
+```bash
+git merge --no-ff docs/tcp-fault-proxy-client-reset-design \
+  -m "merge: preserve verified PoolConfig execution plan"
+```
 
 In
 `docs/superpowers/plans/2026-07-25-fastmssql-pool-config-default-consistency.md`:
@@ -1743,7 +1768,7 @@ SQL-auth specification registry remains exactly 285 IDs.
 
 Do not change PoolConfig source, tests, expected profile or hosted contract.
 
-- [ ] **Step 4: Add the measured PoolConfig audit section and roadmap record**
+- [ ] **Step 5: Add the measured PoolConfig audit section and roadmap record**
 
 Add this heading to
 `docs/FASTMSSQL_PRODUCTION_READINESS_AUDIT.md`:
@@ -1762,7 +1787,7 @@ URLs:
 3. upstream provenance commit `2c5620a`;
 4. canonical seven-field profile `15/3/1800/300/30/None/None`;
 5. explicit-`None` and preset/adaptive compatibility boundaries;
-6. exact design, RED, GREEN and status branch/commit IDs;
+6. exact design, RED, GREEN, technical and `pool_evidence_commit` IDs;
 7. focused pure, integration, PyO3 and real `POOL-001` results;
 8. peak `15/15/15` active/connections/sessions for both explicit and implicit
    construction paths, parameter values `0..29`, and zero sessions after
@@ -1832,7 +1857,7 @@ publication                  forbidden until new explicit user approval
 
 Do not create the future clean branch, an upstream branch or a pull request.
 
-- [ ] **Step 5: Self-review, commit and publish PoolConfig status**
+- [ ] **Step 6: Self-review, commit and publish PoolConfig status**
 
 Run:
 
@@ -1846,14 +1871,15 @@ if rg -n 'TO''DO|T''BD|FIX''ME|PLACE''HOLDER' \
   docs/SQL_AUTH_TEST_REPORT.md \
   docs/FASTMSSQL_PRODUCTION_READINESS_AUDIT.md \
   docs/superpowers/plans/2026-07-24-fastmssql-upstream-pr-roadmap.md \
-  docs/superpowers/plans/2026-07-25-fastmssql-pool-config-default-consistency.md; then
+  docs/superpowers/plans/2026-07-25-fastmssql-pool-config-default-consistency.md \
+  docs/superpowers/plans/2026-07-25-fastmssql-tcp-fault-proxy-client-reset.md; then
   exit 1
 fi
 if rg -n '\| (FAIL|ERROR|NOT RUN|SKIPPED) \|' \
   docs/SQL_AUTH_TEST_MATRIX.md; then
   exit 1
 fi
-if rg -F -n \
+if rg -l -F \
   -e "${FASTMSSQL_SQL_AUTH_SA_PASSWORD}" \
   -e "${FASTMSSQL_SQL_AUTH_OWNER_PASSWORD}" \
   -e "${FASTMSSQL_SQL_AUTH_READONLY_PASSWORD}" \
@@ -1867,7 +1893,8 @@ git add \
   docs/SQL_AUTH_TEST_REPORT.md \
   docs/FASTMSSQL_PRODUCTION_READINESS_AUDIT.md \
   docs/superpowers/plans/2026-07-24-fastmssql-upstream-pr-roadmap.md \
-  docs/superpowers/plans/2026-07-25-fastmssql-pool-config-default-consistency.md
+  docs/superpowers/plans/2026-07-25-fastmssql-pool-config-default-consistency.md \
+  docs/superpowers/plans/2026-07-25-fastmssql-tcp-fault-proxy-client-reset.md
 git commit -m "docs: record canonical PoolConfig defaults"
 git push -u origin docs/pool-config-default-consistency-status
 git rev-list --left-right --count \
@@ -1876,7 +1903,7 @@ git rev-list --left-right --count \
 
 Expected: parity `0 0`, author Marcel Galea, no secret or placeholder.
 
-- [ ] **Step 6: Merge final status and require final hosted gates**
+- [ ] **Step 7: Merge final status and require final hosted gates**
 
 Run in the main worktree:
 
@@ -1935,7 +1962,7 @@ gh run view \
 Require dependency-security and all three Rust/extension jobs at exactly
 `pool_final_sha`, even though the final merge is documentation-only.
 
-- [ ] **Step 7: Prove repository boundary and close only these candidates**
+- [ ] **Step 8: Prove repository boundary and close only these candidates**
 
 Run:
 
@@ -1958,7 +1985,7 @@ git rev-list --left-right --count \
 Expected: upstream PR results `[]`, cumulative parity `0 0`, and upstream push
 URL still `DISABLED`.
 
-- [ ] **Step 8: Select the next unresolved enterprise audit item**
+- [ ] **Step 9: Select the next unresolved enterprise audit item**
 
 Read the newly committed
 `docs/FASTMSSQL_PRODUCTION_READINESS_AUDIT.md`, identify the first unresolved
