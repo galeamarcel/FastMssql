@@ -145,6 +145,15 @@ class SqlConnectionError(Exception):
     port: Optional[int]
     ...
 
+class CommitOutcomeUnknown(Exception):
+    """COMMIT may have been applied but its completion was not confirmed."""
+
+    message: str
+    operation: str
+    retryable: bool
+    connection_discarded: bool
+    ...
+
 class TlsError(Exception):
     """
     Raised when a TLS/SSL handshake error occurs.

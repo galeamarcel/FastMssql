@@ -204,8 +204,10 @@ def test_commit_outcome_unknown_is_a_distinct_public_exception() -> None:
   -q --tb=short
 ```
 
-Expected: matrix tests pass with 274 IDs; TX-027 fails because the public
-exception does not exist.
+Expected at this intermediate checkpoint: TX-027 fails because the public
+exception does not exist, iar
+`test_every_spec_case_is_attached_to_test_source` remains RED until
+TX-028–TX-031 are added in Tasks 4–5. All other matrix contracts pass.
 
 - [ ] **Step 6: Commit the specification contract**
 
@@ -371,10 +373,13 @@ class DownstreamGateProxy:
 
     async def close(self) -> None:
         if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
+            server = self._server
             self._server = None
-        await self.abort_connections()
+            server.close()
+            await self.abort_connections()
+            await server.wait_closed()
+        else:
+            await self.abort_connections()
         self.resume_downstream()
         if self._unexpected:
             rendered = " | ".join(

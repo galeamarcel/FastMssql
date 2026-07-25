@@ -4,6 +4,7 @@ from typing import Any, Coroutine, Dict, List, Optional, Tuple, StrEnum
 from .fastmssql import (
     AzureCredential,
     AzureCredentialType,
+    CommitOutcomeUnknown,
     ConversionError,
     EncryptionLevel,
     FastRow,
@@ -339,6 +340,7 @@ __all__ = [
     "ApplicationIntent",
     "AzureCredential",
     "AzureCredentialType",
+    "CommitOutcomeUnknown",
     "ConversionError",
     "Connection",
     "EncryptionLevel",

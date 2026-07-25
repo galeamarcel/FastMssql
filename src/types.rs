@@ -9,9 +9,28 @@ use tiberius::{ColumnType, Row, error::Error as TError};
 
 create_exception!(crate::fastmssql, SqlError, PyException);
 create_exception!(crate::fastmssql, SqlConnectionError, PyException);
+create_exception!(crate::fastmssql, CommitOutcomeUnknown, PyException);
 create_exception!(crate::fastmssql, TlsError, PyException);
 create_exception!(crate::fastmssql, ProtocolError, PyException);
 create_exception!(crate::fastmssql, ConversionError, PyException);
+
+const UNKNOWN_COMMIT_MESSAGE: &str =
+    "COMMIT completion was not confirmed; the transaction outcome is unknown";
+
+pub(crate) fn create_commit_outcome_unknown(cause: PyErr) -> PyResult<PyErr> {
+    Python::attach(|py| {
+        let error = CommitOutcomeUnknown::new_err(UNKNOWN_COMMIT_MESSAGE);
+        {
+            let value = error.value(py);
+            value.setattr("message", UNKNOWN_COMMIT_MESSAGE)?;
+            value.setattr("operation", "commit")?;
+            value.setattr("retryable", false)?;
+            value.setattr("connection_discarded", true)?;
+        }
+        error.set_cause(py, Some(cause));
+        Ok(error)
+    })
+}
 
 fn is_tls_io_failure(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
