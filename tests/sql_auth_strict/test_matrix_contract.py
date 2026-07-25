@@ -297,13 +297,20 @@ def test_extended_transaction_stress_harness_is_bounded_and_opt_in() -> None:
     assert "--profiles" in source
     assert "--connection-strategy" in source
     assert "per-transaction" in source
+    assert '"pooled"' in source
+    assert "--pool-size" in source
+    assert "shared_pool.transaction()" in source
+    assert "distinct sampled SQL sessions exceeded pool size" in source
     assert "transactions must be between 1 and 99,999" in source
     assert "concurrency must be between 1 and 500" in source
     shell_source = shell_runner.read_text(encoding="utf-8")
     assert ".env.sql-auth.local" in shell_source
     assert "10_000:100,99_999:100" in shell_source
     assert "99_999:200" in shell_source
-    assert "--connection-strategy persistent" in shell_source
+    assert "FASTMSSQL_TRANSACTION_STRESS_STRATEGY" in shell_source
+    assert "FASTMSSQL_TRANSACTION_STRESS_POOL_SIZE" in shell_source
+    assert '--connection-strategy "${strategy}"' in shell_source
+    assert '--pool-size "${pool_size}"' in shell_source
     assert "transaction_stress.py" in shell_source
     assert "run_transaction_stress.sh" not in (
         ROOT / "scripts/sql_auth/run_all.sh"
