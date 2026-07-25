@@ -89,7 +89,7 @@ Snapshotul tehnic verificat la ultima actualizare:
 - HEAD tehnic verificat pentru retragerea automată după anulare:
   `c30c02ac6d0aac10576ce9c140cb4c3161e5717e`;
 - HEAD cumulativ publicat după actualizarea auditului:
-  `15fd2aaec25205439f39a14fca5e9aad8f7e2297`;
+  `13c0925cc9b686c58f545bf43ea9ab958cf13dd9`;
 - bază upstream în referințele locale:
   `e45f301f46128e7114c27097b608a4b2d7f429cf`;
 - versiune de bază: `v0.7.7`;
