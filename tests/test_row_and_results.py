@@ -222,14 +222,14 @@ async def test_execution_result_affected_rows(test_config: Config):
     """Test affected_rows() for INSERT/UPDATE/DELETE operations."""
     try:
         async with Connection(test_config.connection_string) as conn:
-            # Create temp table for testing
+            # Create an isolated test table for testing
             await conn.execute("""
-                IF OBJECT_ID('tempdb..##test_rows', 'U') IS NOT NULL
-                    DROP TABLE ##test_rows
+                IF OBJECT_ID('dbo.fm_test_rows', 'U') IS NOT NULL
+                    DROP TABLE dbo.fm_test_rows
             """)
 
             await conn.execute("""
-                CREATE TABLE ##test_rows (
+                CREATE TABLE dbo.fm_test_rows (
                     id INT PRIMARY KEY,
                     value VARCHAR(50)
                 )
@@ -237,22 +237,22 @@ async def test_execution_result_affected_rows(test_config: Config):
 
             # Test INSERT
             result = await conn.execute(
-                "INSERT INTO ##test_rows (id, value) VALUES (@P1, @P2)", [1, "test"]
+                "INSERT INTO dbo.fm_test_rows (id, value) VALUES (@P1, @P2)", [1, "test"]
             )
             assert result == 1
 
             # Test UPDATE
             result = await conn.execute(
-                "UPDATE ##test_rows SET value = @P1 WHERE id = @P2", ["updated", 1]
+                "UPDATE dbo.fm_test_rows SET value = @P1 WHERE id = @P2", ["updated", 1]
             )
             assert result == 1
 
             # Test DELETE
-            result = await conn.execute("DELETE FROM ##test_rows WHERE id = @P1", [1])
+            result = await conn.execute("DELETE FROM dbo.fm_test_rows WHERE id = @P1", [1])
             assert result == 1
 
             # Cleanup
-            await conn.execute("DROP TABLE ##test_rows")
+            await conn.execute("DROP TABLE dbo.fm_test_rows")
     except Exception as e:
         pytest.fail(f"Database not available: {e}")
 

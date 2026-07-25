@@ -246,6 +246,15 @@ evidence reference.
   replacing the physical SQL Server session.
 - `POOL-019`: a nonfatal SQL error still causes complete session-state reset
   before the physical connection is reused.
+- `POOL-020`: checkout validation resets the prior lease before its health
+  probe and preserves the healthy physical SQL Server session.
+- `POOL-021`: a session that executes database-user impersonation is retired
+  before another pool lease can observe that security context.
+- `POOL-022`: a batch that changes the database principal before raising a
+  nonfatal SQL error still retires the physical session.
+- `POOL-023`: scope-bound database-user impersonation inside dynamic SQL
+  reverts before the operation completes and does not unnecessarily retire the
+  physical session.
 
 ### SQL — query and command execution
 
