@@ -1,7 +1,7 @@
 use std::fmt::Write;
 
 use crate::azure_auth::PyAzureCredential;
-use crate::deadline::OperationName;
+use crate::deadline::{DeadlineElapsed, OperationName, TimeoutPhase, deadline_from, run_until};
 use crate::helpers::{
     catch_driver_panic, execute_unparameterized_command, requires_connection_retirement,
     requires_direct_batch,
@@ -13,10 +13,10 @@ use crate::parameter_conversion::{
 use crate::pool_config::PyPoolConfig;
 use crate::pool_manager::{
     ConnectionPool, PooledOperationGuard, connect_client_with_timeout,
-    ensure_pool_initialized_with_auth, map_pool_checkout_error,
+    ensure_pool_initialized_with_auth, map_pool_checkout_error, timeout_error_or_metadata_failure,
 };
 use crate::timeout_config::PyTimeoutConfig;
-use crate::types::create_sql_error;
+use crate::types::{TimeoutErrorMetadata, create_sql_error};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
@@ -28,6 +28,16 @@ use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 
 type SqlClient = tiberius::Client<tokio_util::compat::Compat<TcpStream>>;
+
+const MAX_BULK_PARAMETERS_PER_INSERT: usize = 2_000;
+const MAX_ROWS_PER_VALUES_INSERT: usize = 1_000;
+
+fn bulk_rows_per_batch(column_count: usize) -> usize {
+    debug_assert!(column_count > 0);
+    (MAX_BULK_PARAMETERS_PER_INSERT / column_count)
+        .max(1)
+        .min(MAX_ROWS_PER_VALUES_INSERT)
+}
 
 async fn consume_simple_command(
     connection: &mut SqlClient,
@@ -42,6 +52,50 @@ async fn consume_simple_command(
         .await
         .map_err(|error| create_sql_error(error, error_context))?;
     Ok(())
+}
+
+fn operation_timeout_error(
+    elapsed: DeadlineElapsed,
+    operation: OperationName,
+    outcome_unknown: bool,
+) -> PyErr {
+    timeout_error_or_metadata_failure(
+        elapsed,
+        TimeoutErrorMetadata {
+            operation,
+            retryable: false,
+            connection_discarded: true,
+            outcome_unknown,
+        },
+    )
+}
+
+fn attach_cleanup_cause(primary: PyErr, cleanup: PyErr) -> PyErr {
+    Python::attach(|py| primary.set_cause(py, Some(cleanup)));
+    primary
+}
+
+async fn rollback_after_failure(
+    connection: &mut SqlClient,
+    timeout_config: &PyTimeoutConfig,
+    operation: OperationName,
+    error_context: &'static str,
+) -> PyResult<()> {
+    let deadline = deadline_from(TimeoutPhase::Rollback, timeout_config.rollback_timeout);
+    match run_until(
+        deadline,
+        catch_driver_panic(consume_simple_command(
+            connection,
+            "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION",
+            error_context,
+        )),
+    )
+    .await
+    {
+        Err(elapsed) => Err(operation_timeout_error(elapsed, operation, false)),
+        Ok(Err(driver_panic)) => Err(driver_panic),
+        Ok(Ok(result)) => result,
+    }
 }
 
 /// Parses batch items (SQL queries with parameters) from a Python list.
@@ -186,22 +240,58 @@ pub fn execute_batch<'p>(
         )
         .await?;
 
-        conn.simple_query("BEGIN TRANSACTION")
-            .await
-            .map_err(|e| create_sql_error(e, "Failed to start transaction"))?;
+        let deadline = deadline_from(TimeoutPhase::Operation, timeout_config.operation_timeout);
+        let mut transaction_started = false;
+        let operation = run_until(
+            deadline,
+            catch_driver_panic(async {
+                consume_simple_command(
+                    &mut conn,
+                    "BEGIN TRANSACTION",
+                    "Failed to start transaction",
+                )
+                .await?;
+                transaction_started = true;
 
-        let all_results = match execute_batch_on_connection(&mut conn, batch_commands).await {
-            Ok(results) => results,
-            Err(e) => {
-                // Best-effort rollback; ignore secondary errors.
-                let _ = conn.simple_query("ROLLBACK TRANSACTION").await;
-                return Err(e);
+                let all_results = execute_batch_on_connection(&mut conn, batch_commands).await?;
+
+                consume_simple_command(
+                    &mut conn,
+                    "COMMIT TRANSACTION",
+                    "Failed to commit batch transaction",
+                )
+                .await?;
+                transaction_started = false;
+                Ok::<Vec<u64>, PyErr>(all_results)
+            }),
+        )
+        .await;
+
+        let all_results = match operation {
+            Err(elapsed) => {
+                return Err(operation_timeout_error(
+                    elapsed,
+                    OperationName::ExecuteBatch,
+                    true,
+                ));
+            }
+            Ok(Err(driver_panic)) => return Err(driver_panic),
+            Ok(Ok(Ok(results))) => results,
+            Ok(Ok(Err(primary))) => {
+                if transaction_started
+                    && let Err(cleanup) = rollback_after_failure(
+                        &mut conn,
+                        &timeout_config,
+                        OperationName::ExecuteBatch,
+                        "Failed to roll back batch transaction",
+                    )
+                    .await
+                {
+                    return Err(attach_cleanup_cause(primary, cleanup));
+                }
+                return Err(primary);
             }
         };
-
-        conn.simple_query("COMMIT TRANSACTION")
-            .await
-            .map_err(|e| create_sql_error(e, "Failed to commit batch transaction"))?;
 
         // conn drops here — TCP connection closed cleanly.
         // On future cancellation the OS closes the socket; SQL Server rolls back.
@@ -251,14 +341,25 @@ pub fn query_batch<'p>(
         })?;
         let mut conn = PooledOperationGuard::new(pooled);
 
-        let operation =
-            catch_driver_panic(query_batch_on_connection(&mut conn, batch_queries)).await;
+        let deadline = deadline_from(TimeoutPhase::Operation, timeout_config.operation_timeout);
+        let operation = run_until(
+            deadline,
+            catch_driver_panic(query_batch_on_connection(&mut conn, batch_queries)),
+        )
+        .await;
         let all_results = match operation {
-            Ok(result) => {
+            Err(elapsed) => {
+                return Err(operation_timeout_error(
+                    elapsed,
+                    OperationName::QueryBatch,
+                    true,
+                ));
+            }
+            Ok(Ok(result)) => {
                 conn.complete_with_result_and_retirement(&result, retire_after_operation);
                 result?
             }
-            Err(driver_panic) => return Err(driver_panic),
+            Ok(Err(driver_panic)) => return Err(driver_panic),
         };
 
         Python::attach(|py| -> PyResult<Py<PyAny>> {
@@ -386,10 +487,9 @@ pub fn bulk_insert<'p>(
 
     let col_count = columns.len();
 
-    // Hard limit for SQL Server is 2100. We use 2000 to be safe.
-    // Calculate rows_per_batch here (sync, GIL-held phase) so chunking drives
-    // conversion rather than being applied after a full allocation.
-    let rows_per_batch = (2000usize / col_count).max(1);
+    // Respect both SQL Server limits: at most 1,000 row constructors in one
+    // INSERT ... VALUES statement and a conservative 2,000 parameters.
+    let rows_per_batch = bulk_rows_per_batch(col_count);
     let chunk_capacity = rows_per_batch * col_count;
 
     // Build owned chunks of at most `rows_per_batch` rows while still holding
@@ -432,6 +532,15 @@ pub fn bulk_insert<'p>(
         chunks.push(current_chunk);
     }
 
+    // Validate and quote all identifiers before acquiring a lease or opening a
+    // server-side transaction.
+    let quoted_table = quote_identifier(&table_name)?;
+    let columns_sql = columns
+        .iter()
+        .map(|column| quote_identifier(column))
+        .collect::<PyResult<Vec<_>>>()?
+        .join(", ");
+
     future_into_py(py, async move {
         let pool_ref = ensure_pool_initialized_with_auth(
             pool,
@@ -452,98 +561,128 @@ pub fn bulk_insert<'p>(
         })?;
         let mut conn = PooledOperationGuard::new(pooled);
 
-        consume_simple_command(
-            &mut conn,
-            "BEGIN TRANSACTION",
-            "Failed to start bulk transaction",
-        )
-        .await?;
+        let deadline = deadline_from(TimeoutPhase::Operation, timeout_config.operation_timeout);
+        let mut transaction_started = false;
+        let operation = run_until(
+            deadline,
+            catch_driver_panic(async {
+                consume_simple_command(
+                    &mut conn,
+                    "BEGIN TRANSACTION",
+                    "Failed to start bulk transaction",
+                )
+                .await?;
+                transaction_started = true;
 
-        let mut total_affected = 0u64;
+                let mut total_affected = 0u64;
 
-        // Quote identifiers to prevent SQL injection (bracket-quote per SQL Server rules).
-        // Returns Err if any name contains a null byte.
-        let quoted_table = quote_identifier(&table_name)?;
-        let columns_sql = columns
-            .iter()
-            .map(|c| quote_identifier(c))
-            .collect::<PyResult<Vec<_>>>()?
-            .join(", ");
+                // Drain chunks via into_iter: each Vec<FastParameter> is moved
+                // out and freed before the next request.
+                for chunk in chunks {
+                    let row_count_in_batch = chunk.len() / col_count;
+                    let mut sql = String::with_capacity(100 + row_count_in_batch * (col_count * 5));
+                    sql.push_str("INSERT INTO ");
+                    sql.push_str(&quoted_table);
+                    sql.push_str(" (");
+                    sql.push_str(&columns_sql);
+                    sql.push_str(") VALUES ");
 
-        // Drain chunks via into_iter: each Vec<FastParameter> is moved out and
-        // dropped at the end of its loop body, freeing memory progressively
-        // instead of holding all rows alive until the final query completes.
-        for chunk in chunks {
-            let row_count_in_batch = chunk.len() / col_count;
-
-            // Optimize: Use String with pre-allocated capacity instead of format!
-            let mut sql = String::with_capacity(100 + row_count_in_batch * (col_count * 5));
-            sql.push_str("INSERT INTO ");
-            sql.push_str(&quoted_table);
-            sql.push_str(" (");
-            sql.push_str(&columns_sql);
-            sql.push_str(") VALUES ");
-
-            // Optimize: Build value placeholders more efficiently
-            for r in 0..row_count_in_batch {
-                if r > 0 {
-                    sql.push(',');
-                }
-                sql.push('(');
-                for c in 1..=col_count {
-                    if c > 1 {
-                        sql.push(',');
+                    for row in 0..row_count_in_batch {
+                        if row > 0 {
+                            sql.push(',');
+                        }
+                        sql.push('(');
+                        for column in 1..=col_count {
+                            if column > 1 {
+                                sql.push(',');
+                            }
+                            sql.push('@');
+                            sql.push('P');
+                            let parameter_number = (row * col_count) + column;
+                            let _ = write!(sql, "{}", parameter_number);
+                        }
+                        sql.push(')');
                     }
-                    sql.push('@');
-                    sql.push('P');
-                    // Optimized: write integer directly into pre-allocated buffer
-                    let param_num = (r * col_count) + c;
-                    let _ = write!(sql, "{}", param_num);
+
+                    let mut params: SmallVec<[&dyn tiberius::ToSql; 128]> =
+                        SmallVec::with_capacity(chunk.len());
+                    for parameter in &chunk {
+                        params.push(parameter as &dyn tiberius::ToSql);
+                    }
+
+                    let result = conn
+                        .execute(sql, &params)
+                        .await
+                        .map_err(|error| create_sql_error(error, "Batch execution failed"))?;
+                    total_affected += result.rows_affected().iter().sum::<u64>();
                 }
-                sql.push(')');
-            }
 
-            // Use SmallVec to avoid heap allocation for small parameter sets
-            let mut params: SmallVec<[&dyn tiberius::ToSql; 128]> =
-                SmallVec::with_capacity(chunk.len());
-            for p in &chunk {
-                params.push(p as &dyn tiberius::ToSql);
-            }
+                consume_simple_command(
+                    &mut conn,
+                    "COMMIT TRANSACTION",
+                    "Failed to commit bulk transaction",
+                )
+                .await?;
+                transaction_started = false;
+                Ok::<u64, PyErr>(total_affected)
+            }),
+        )
+        .await;
 
-            let result = match conn.execute(sql, &params).await {
-                Ok(result) => result,
-                Err(error) => {
-                    let primary = create_sql_error(error, "Batch execution failed");
-                    conn.observe_error(&primary);
-                    let rollback = consume_simple_command(
+        let total_affected = match operation {
+            Err(elapsed) => {
+                return Err(operation_timeout_error(
+                    elapsed,
+                    OperationName::BulkInsert,
+                    true,
+                ));
+            }
+            Ok(Err(driver_panic)) => return Err(driver_panic),
+            Ok(Ok(Ok(total))) => {
+                conn.complete();
+                total
+            }
+            Ok(Ok(Err(primary))) => {
+                conn.observe_error(&primary);
+                let result = if transaction_started {
+                    rollback_after_failure(
                         &mut conn,
-                        "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION",
+                        &timeout_config,
+                        OperationName::BulkInsert,
                         "Failed to roll back bulk transaction",
                     )
-                    .await;
-                    if rollback.is_ok() {
+                    .await
+                } else {
+                    Ok(())
+                };
+                match result {
+                    Ok(()) => {
                         conn.complete();
+                        return Err(primary);
                     }
-                    return Err(primary);
+                    Err(cleanup) => {
+                        return Err(attach_cleanup_cause(primary, cleanup));
+                    }
                 }
-            };
-
-            total_affected += result.rows_affected().iter().sum::<u64>();
-            // `chunk` is dropped here — its FastParameter memory is freed before
-            // the next batch is sent.
-        }
-
-        consume_simple_command(
-            &mut conn,
-            "COMMIT TRANSACTION",
-            "Failed to commit bulk transaction",
-        )
-        .await?;
-        conn.complete();
+            }
+        };
 
         Python::attach(|py| {
             let res = total_affected.into_pyobject(py)?;
             Ok(res.into_any().unbind())
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bulk_rows_per_batch;
+
+    #[test]
+    fn bulk_chunking_respects_row_constructor_and_parameter_limits() {
+        assert_eq!(bulk_rows_per_batch(1), 1_000);
+        assert_eq!(bulk_rows_per_batch(2), 1_000);
+        assert_eq!(bulk_rows_per_batch(3), 666);
+        assert_eq!(bulk_rows_per_batch(2_000), 1);
+    }
 }

@@ -7,11 +7,13 @@ import time
 from fastmssql import (
     ApplicationIntent,
     Connection,
+    OperationTimeoutError,
     PoolConfig,
     ProtocolError,
     SqlConnectionError,
     SslConfig,
     TlsError,
+    TimeoutConfig,
 )
 import pytest
 
@@ -642,18 +644,25 @@ async def test_ping_timeout_retires_partial_tds_response(
             test_on_check_out=False,
             retry_connection=False,
         ),
+        timeout_config=TimeoutConfig(
+            acquire_timeout_secs=1.0,
+            operation_timeout_secs=1.0,
+        ),
     )
     try:
         assert await connection.connect() is True
         _, first_connection_id = await _pool_identity(connection)
         proxy.pause_downstream()
         started = time.monotonic()
-        with pytest.raises(
-            SqlConnectionError,
-            match="Connection readiness timed out",
-        ):
+        with pytest.raises(SqlConnectionError) as captured:
             await connection.ping()
         elapsed = time.monotonic() - started
+        assert isinstance(captured.value, OperationTimeoutError)
+        assert captured.value.operation == "ping"
+        assert captured.value.phase == "operation"
+        assert captured.value.retryable is False
+        assert captured.value.connection_discarded is True
+        assert captured.value.outcome_unknown is False
         assert 0.8 <= elapsed < 2.0
         await proxy.wait_until_downstream_held()
         proxy.resume_downstream()

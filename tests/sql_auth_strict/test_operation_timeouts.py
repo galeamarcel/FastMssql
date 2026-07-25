@@ -779,10 +779,10 @@ async def test_batch_and_bulk_share_one_absolute_operation_budget(
         bulk_requests = await bulk_sampler
         await bulk_connection.disconnect()
 
-    # One-column bulk chunks contain 2,000 rows. The first 160 ms request
+    # One-column bulk chunks contain 1,000 rows. The first 160 ms request
     # completes, the second starts, and the shared 250 ms budget expires
     # before a third request can start. A reset-per-chunk timeout would allow
-    # all three requests to run.
+    # all five requests to run.
     assert len(bulk_requests) == 2
 
     async def bulk_rolled_back() -> bool:
