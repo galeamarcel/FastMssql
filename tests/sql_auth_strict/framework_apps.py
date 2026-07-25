@@ -169,9 +169,9 @@ def create_fastapi_app(
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        await state.connection.connect()
-        app.state.fastmssql = state
         try:
+            await state.connection.connect()
+            app.state.fastmssql = state
             yield
         finally:
             await state.connection.disconnect()
@@ -330,3 +330,12 @@ def create_flask_app(state: FrameworkState) -> Flask:
 
 def create_adapted_flask_app(state: FrameworkState) -> WsgiToAsgi:
     return WsgiToAsgi(create_flask_app(state))
+
+
+@asynccontextmanager
+async def adapted_flask_lifespan(state: FrameworkState):
+    try:
+        await state.connection.connect()
+        yield create_adapted_flask_app(state)
+    finally:
+        await state.connection.disconnect()

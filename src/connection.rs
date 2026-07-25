@@ -17,10 +17,13 @@ use crate::parameter_conversion::{FastParameter, convert_parameters_to_fast, par
 use crate::pool_config::PyPoolConfig;
 use crate::pool_manager::{
     ConnectionPool, PooledOperationGuard, ensure_pool_initialized_with_auth,
+    map_pool_checkout_error,
 };
 use crate::ssl_config::PySslConfig;
 use crate::transaction::Transaction;
 use crate::types::{create_connection_error, create_sql_error};
+
+const READINESS_QUERY: &str = "SELECT 1";
 
 struct ConnectionHandles {
     pool: Arc<RwLock<Option<ConnectionPool>>>,
@@ -60,16 +63,44 @@ impl PyConnection {
     }
 
     async fn get_pool_connection(pool: &ConnectionPool) -> PyResult<PooledOperationGuard<'_>> {
-        let connection = pool.get().await.map_err(|e| match e {
-            bb8::RunError::TimedOut => create_connection_error(
-                "Connection pool timeout - all connections are busy. \
-                     Try reducing concurrent requests or increasing pool size.",
-            ),
-            bb8::RunError::User(e) => {
-                create_connection_error(format!("Failed to get connection from pool: {}", e))
-            }
-        })?;
+        let connection = pool.get().await.map_err(map_pool_checkout_error)?;
         Ok(PooledOperationGuard::new(connection))
+    }
+
+    async fn validate_pool_readiness(pool: &ConnectionPool) -> PyResult<()> {
+        let readiness_timeout = pool.config().connection_timeout;
+        let readiness = async {
+            let mut connection = Self::get_pool_connection(pool).await?;
+            let operation = catch_driver_panic(async {
+                connection
+                    .simple_query(READINESS_QUERY)
+                    .await
+                    .map_err(|error| create_sql_error(error, "Connection readiness query failed"))?
+                    .into_results()
+                    .await
+                    .map_err(|error| {
+                        create_sql_error(error, "Failed to consume connection readiness response")
+                    })?;
+                Ok::<(), PyErr>(())
+            })
+            .await;
+
+            match operation {
+                Ok(result) => {
+                    connection.complete_with_result_and_retirement(&result, false);
+                    result
+                }
+                Err(driver_panic) => Err(driver_panic),
+            }
+        };
+
+        match tokio::time::timeout(readiness_timeout, readiness).await {
+            Ok(result) => result,
+            Err(_) => Err(create_connection_error(format!(
+                "Connection readiness timed out after {:.3} seconds",
+                readiness_timeout.as_secs_f64(),
+            ))),
+        }
     }
 
     #[inline]
@@ -297,6 +328,10 @@ impl PyConnection {
         })
     }
 
+    /// Return whether this object currently owns a pool handle.
+    ///
+    /// This method performs no network I/O and does not prove SQL Server
+    /// readiness. Use `ping()` for a live readiness check.
     pub fn is_connected<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let pool = self.pool.clone();
         future_into_py(py, async move {
@@ -356,7 +391,8 @@ impl PyConnection {
         let slf_clone = slf.clone().unbind();
 
         future_into_py(py, async move {
-            let _ = handles.ensure_connected().await?;
+            let pool = handles.ensure_connected().await?;
+            Self::validate_pool_readiness(&pool).await?;
             Python::try_attach(|py| Ok(slf_clone.clone_ref(py))).ok_or_else(|| {
                 pyo3::exceptions::PyRuntimeError::new_err("Failed to attach Python runtime thread")
             })?
@@ -377,10 +413,32 @@ impl PyConnection {
         })
     }
 
-    pub fn connect<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+    /// Initialize the shared pool and, by default, verify SQL Server readiness.
+    ///
+    /// Set `validate=False` only for intentional lazy pool allocation. A lazy
+    /// pool is not proof that SQL Server is reachable.
+    #[pyo3(signature = (validate = true))]
+    pub fn connect<'p>(&self, py: Python<'p>, validate: bool) -> PyResult<Bound<'p, PyAny>> {
         let handles = self.clone_handles();
         future_into_py(py, async move {
-            let _ = handles.ensure_connected().await?;
+            let pool = handles.ensure_connected().await?;
+            if validate {
+                Self::validate_pool_readiness(&pool).await?;
+            }
+            Ok(true)
+        })
+    }
+
+    /// Execute a complete `SELECT 1` round-trip through the shared pool.
+    ///
+    /// Returns `True` on success and raises a typed FastMssql exception on
+    /// checkout, authentication, TLS, SQL, protocol, I/O, panic, or timeout
+    /// failure.
+    pub fn ping<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+        let handles = self.clone_handles();
+        future_into_py(py, async move {
+            let pool = handles.ensure_connected().await?;
+            Self::validate_pool_readiness(&pool).await?;
             Ok(true)
         })
     }

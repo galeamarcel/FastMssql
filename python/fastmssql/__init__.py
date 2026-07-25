@@ -48,6 +48,33 @@ class Connection:
     def __getattr__(self, name):
         return getattr(self._conn, name)
 
+    async def connect(self, validate: bool = True) -> bool:
+        """Initialize the pool and validate SQL Server by default.
+
+        Pass ``validate=False`` only to allocate the pool lazily without
+        claiming readiness.
+        """
+        return await self._conn.connect(validate)
+
+    async def ping(self) -> bool:
+        """Run a complete ``SELECT 1`` through the shared pool.
+
+        Returns ``True`` on success and raises a typed FastMssql exception on
+        failure.
+        """
+        return await self._conn.ping()
+
+    async def disconnect(self) -> bool:
+        """Drop this connection object's pool handle."""
+        return await self._conn.disconnect()
+
+    async def is_connected(self) -> bool:
+        """Return whether this object owns a pool handle.
+
+        This performs no network I/O. Use ``ping()`` for SQL Server readiness.
+        """
+        return await self._conn.is_connected()
+
     async def __aenter__(self):
         await self._conn.__aenter__()
         return self

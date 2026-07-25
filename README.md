@@ -58,19 +58,27 @@ async def main():
         for row in result.rows():
             print(row['version'])
 
-        # Pool statistics (tuple: connected, connections, idle, max_size, min_idle)
-        connected, connections, idle, max_size, min_idle = await conn.pool_stats()
-        print(f"Pool: connected={connected}, size={connections}/{max_size}, idle={idle}, min_idle={min_idle}")
+        stats = await conn.pool_stats()
+        print(
+            "Pool: "
+            f"connected={stats['connected']}, "
+            f"size={stats['connections']}/{stats['max_size']}, "
+            f"idle={stats['idle_connections']}, "
+            f"min_idle={stats['min_idle']}"
+        )
 
 asyncio.run(main())
 ```
 
 ## Explicit Connection Management
 
-When not utilizing Python's context manager (async with), **FastMssql** uses *lazy connection initialization*:
-if you call `query()` or `execute()` on a new `Connection`, the underlying pool is created if not already present.
+`query()`, `execute()`, and the other data methods still initialize the pool
+lazily when needed. Explicit `connect()` is strict by default: it returns only
+after a complete `SELECT 1` round-trip through the shared pool.
 
-For more control, you can explicitly connect and disconnect:
+Use `connect(validate=False)` only when allocating the pool lazily is
+intentional. `is_connected()` reports whether the object owns a pool handle;
+it performs no network I/O. Use `ping()` for current SQL Server readiness.
 
 ```python
 import asyncio
@@ -80,20 +88,69 @@ async def main():
     conn_str = "Server=localhost;Database=master;User Id=myuser;Password=mypass"
     conn = Connection(conn_str)
 
-    # Explicitly connect
     await conn.connect()
-    assert await conn.is_connected()
+    assert await conn.is_connected()  # pool handle exists
+    assert await conn.ping()          # live SQL Server round-trip
 
-    # Run queries
     result = await conn.query("SELECT 42 as answer")
-    print(result.rows()[0]["answer"])  # -> 42
+    print(result.rows()[0]["answer"])
 
-    # Explicitly disconnect
     await conn.disconnect()
     assert not await conn.is_connected()
 
 asyncio.run(main())
 ```
+
+The intentional lazy-allocation path is explicit:
+
+```python
+await conn.connect(validate=False)
+assert await conn.is_connected()  # pool handle only
+await conn.ping()                 # first required readiness check
+```
+
+`async with Connection(...)` always validates SQL Server before entering the
+context body.
+
+### FastAPI startup and readiness
+
+Use one shared connection for the application lifespan. Put startup inside the
+`try` so a failed validation also drops the pool handle:
+
+```python
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastmssql import Connection
+
+conn_str = "Server=localhost;Database=app;User Id=myuser;Password=mypass"
+database = Connection(conn_str)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        await database.connect()  # strict SELECT 1 round-trip
+        app.state.database = database
+        yield
+    finally:
+        await database.disconnect()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/ready")
+async def ready():
+    await database.ping()
+    return {"ready": True}
+```
+
+An unreachable SQL Server prevents lifespan startup. A readiness endpoint uses
+`ping()`, not `is_connected()`. Flask `async def` under WSGI remains
+functionally compatible but has per-request event-loop limits; Flask through
+an ASGI adapter should use the same persistent startup/cleanup ownership
+pattern.
 
 ## Usage
 
