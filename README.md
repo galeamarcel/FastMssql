@@ -515,11 +515,13 @@ The five settings have distinct boundaries:
 | `transaction_timeout_secs` | `transaction` | absolute lifetime after SQL Server confirms `BEGIN` |
 | `rollback_timeout_secs` | `rollback` | explicit rollback and rollback performed by `close()` |
 
-Every configured number must be finite, at least one nanosecond, and small
-enough to form a deadline on the platform's monotonic clock; booleans are
-rejected. Subsecond values are supported. `None` means that FastMssql does not
-install a deadline for that phase and is accepted for connect, operation,
-transaction and rollback. Acquisition must always be bounded, so
+Every configured number must be finite, between one nanosecond and
+3,153,600,000 seconds (100 × 365 days) inclusive, and able to form a deadline
+on the platform's monotonic clock; booleans are rejected. The explicit
+100-year ceiling keeps validation identical on Linux, macOS, and Windows.
+Subsecond values are supported. `None` means that FastMssql does not install a
+deadline for that phase and is accepted for connect, operation, transaction
+and rollback. Acquisition must always be bounded, so
 `acquire_timeout_secs` cannot be `None`. Operating-system, network,
 infrastructure or SQL Server timeouts may still apply when a FastMssql
 deadline is disabled.

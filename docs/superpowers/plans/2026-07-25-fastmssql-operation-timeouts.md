@@ -2568,8 +2568,12 @@ Expected: detached SHA exactly equals the technical merge.
 Run from `.worktrees/verify-operation-timeouts`:
 
 ```bash
+set -e
 cargo test --locked
 uv run pytest --noconftest tests/test_timeout_config_contract.py -q
+set -a
+source .env.sql-auth.local
+set +a
 uv run pytest tests/sql_auth_strict/test_operation_timeouts.py -vv
 uv run pytest tests/sql_auth_strict/test_matrix_contract.py -q
 ```
