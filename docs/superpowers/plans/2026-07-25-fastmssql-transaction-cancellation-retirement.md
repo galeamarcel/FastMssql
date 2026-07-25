@@ -60,17 +60,21 @@ the middle of a token. Transport close is the conservative P0 behavior.
 ## Branch graph
 
 ```text
-test/sql-auth-validation at 126369d
+test/sql-auth-validation at 052bb43
   |
   +-- docs/transaction-cancellation-retirement-design
   |     0de5706 design
-  |     <plan commit>
+  |     3ece52e plan
   |
   +-- test/transaction-cancellation-retirement
-  |     RED TX-032–TX-034
+  |     1757094 RED TX-032–TX-034
   |
   +-- fix/transaction-cancellation-retirement
-  |     epoch + RAII retirement
+  |     c5dcd2d epoch + RAII retirement
+  |     ec7ba56 verified branch head
+  |
+  +-- test/sql-auth-validation at c30c02a
+  |     exact verified cumulative merge
   |
   +-- docs/transaction-cancellation-retirement-status
         audit and candidate evidence
@@ -112,7 +116,7 @@ The design must contain:
 - pooled, direct and cancelled-COMMIT contracts;
 - explicit exclusions.
 
-- [ ] **Step 3: Commit and push design artifacts**
+- [x] **Step 3: Commit and push design artifacts**
 
 ```bash
 git add \
@@ -121,7 +125,7 @@ git commit -m "docs: plan automatic transaction cancellation retirement"
 git push -u origin docs/transaction-cancellation-retirement-design
 ```
 
-- [ ] **Step 4: Merge only into the cumulative fork**
+- [x] **Step 4: Merge only into the cumulative fork**
 
 ```bash
 git merge --no-ff docs/transaction-cancellation-retirement-design \
@@ -144,7 +148,7 @@ Do not merge the separate executive upstream registry branch.
 
 **Produces:** TX-032, TX-033 and TX-034; exact specification total 277.
 
-- [ ] **Step 1: Create the test branch**
+- [x] **Step 1: Create the test branch**
 
 ```bash
 git worktree add \
@@ -155,7 +159,7 @@ ln -s ../../.env.sql-auth.local \
   .worktrees/test-transaction-cancellation-retirement/.env.sql-auth.local
 ```
 
-- [ ] **Step 2: Add DMV identity helpers**
+- [x] **Step 2: Add DMV identity helpers**
 
 In `test_transactions_strict.py`, add helpers that:
 
@@ -180,7 +184,7 @@ WHERE request.session_id <> @@SPID
 
 Deadlines must be bounded and failures must report the token/session.
 
-- [ ] **Step 3: Add TX-032 pooled autonomous retirement**
+- [x] **Step 3: Add TX-032 pooled autonomous retirement**
 
 Test name:
 
@@ -201,7 +205,7 @@ Required assertions:
 - A rejects `commit()` with the indeterminate-state message;
 - later `close()` remains idempotent.
 
-- [ ] **Step 4: Add TX-033 direct autonomous rollback**
+- [x] **Step 4: Add TX-033 direct autonomous rollback**
 
 Test name:
 
@@ -221,7 +225,7 @@ Required assertions:
 - observer sees zero rows;
 - two later `close()` calls succeed.
 
-- [ ] **Step 5: Add TX-034 cancelled durable COMMIT**
+- [x] **Step 5: Add TX-034 cancelled durable COMMIT**
 
 Test name:
 
@@ -246,7 +250,7 @@ Use `DownstreamGateProxy`:
 
 The test must never accept rollback as an alternative outcome.
 
-- [ ] **Step 6: Extend the specification and exact matrix count**
+- [x] **Step 6: Extend the specification and exact matrix count**
 
 Add:
 
@@ -259,7 +263,7 @@ TX-034 cancelled durable COMMIT retires without claiming rollback
 Change every matrix contract occurrence from 274 to 277, including test names,
 error messages and report totals.
 
-- [ ] **Step 7: Run the focused baseline**
+- [x] **Step 7: Run the focused baseline**
 
 Build the unchanged production source, then run:
 
@@ -284,7 +288,7 @@ TX-034 commit transaction retains its lease until explicit close
 All test `finally` blocks must explicitly close sockets and cancel waiter tasks
 so the RED run leaves SQL Server clean.
 
-- [ ] **Step 8: Run contract checks**
+- [x] **Step 8: Run contract checks**
 
 ```bash
 ../../.venv/bin/ruff check \
@@ -297,7 +301,7 @@ git diff --check
 
 Expected: contract checks PASS while the three behavior tests remain RED.
 
-- [ ] **Step 9: Commit and push the RED branch**
+- [x] **Step 9: Commit and push the RED branch**
 
 ```bash
 git add \
@@ -320,7 +324,7 @@ git push -u origin test/transaction-cancellation-retirement
 
 **Produces:** automatic physical connection retirement after cancellation.
 
-- [ ] **Step 1: Create the fix branch from RED**
+- [x] **Step 1: Create the fix branch from RED**
 
 ```bash
 git worktree add \
@@ -331,7 +335,7 @@ ln -s ../../.env.sql-auth.local \
   .worktrees/fix-transaction-cancellation-retirement/.env.sql-auth.local
 ```
 
-- [ ] **Step 2: Add in-flight state classification**
+- [x] **Step 2: Add in-flight state classification**
 
 Add:
 
@@ -349,7 +353,7 @@ impl TransactionState {
 }
 ```
 
-- [ ] **Step 3: Add the session operation epoch**
+- [x] **Step 3: Add the session operation epoch**
 
 Extend:
 
@@ -388,7 +392,7 @@ fn retire_cancelled_operation(&mut self, epoch: u64) {
 The epoch check is mandatory. A delayed cleanup task must not retire a new
 operation after `close()` and reuse.
 
-- [ ] **Step 4: Add the RAII guard**
+- [x] **Step 4: Add the RAII guard**
 
 Use an unarmed guard:
 
@@ -418,7 +422,7 @@ fn disarm(&mut self)
 Do not block in `Drop`. Do not ignore an error path that could return the
 connection to the pool.
 
-- [ ] **Step 5: Arm every data operation**
+- [x] **Step 5: Arm every data operation**
 
 Change `begin_data_operation` to return:
 
@@ -439,7 +443,7 @@ For `query`, `simple_query`, `execute`, `execute_batch` and `query_batch`:
 - disarm after the state transition on every normal/error return;
 - then propagate the result.
 
-- [ ] **Step 6: Arm every transaction command**
+- [x] **Step 6: Arm every transaction command**
 
 In `execute_transaction_command`:
 
@@ -452,7 +456,7 @@ In `execute_transaction_command`:
 
 No second `COMMIT`/`ROLLBACK` is allowed in cleanup.
 
-- [ ] **Step 7: Add Rust unit tests for stale cleanup**
+- [x] **Step 7: Add Rust unit tests for stale cleanup**
 
 Unit-test at least:
 
@@ -464,7 +468,7 @@ Unit-test at least:
 Tests may construct `TransactionSession` without a connection to isolate the
 state contract.
 
-- [ ] **Step 8: Build and run GREEN focused tests**
+- [x] **Step 8: Build and run GREEN focused tests**
 
 ```bash
 cargo fmt --check
@@ -483,7 +487,7 @@ Expected: TX-032–TX-034 PASS. The existing TX-026 contract may need an
 intentional expectation update because the waiter should now recover before
 the explicit compatibility `close()`.
 
-- [ ] **Step 9: Update TX-026 without weakening it**
+- [x] **Step 9: Update TX-026 without weakening it**
 
 If TX-026 fails because it still expects the waiter to remain blocked, update
 it to assert the stronger contract:
@@ -495,7 +499,7 @@ it to assert the stronger contract:
 
 Do not remove any server-side or pool-bound assertion.
 
-- [ ] **Step 10: Commit and push the fix**
+- [x] **Step 10: Commit and push the fix**
 
 ```bash
 git add src/transaction.rs tests/sql_auth_strict/test_transactions_strict.py
@@ -513,7 +517,7 @@ the production fix when practical.
 **Files:** no production edits unless a newly reproduced defect requires its
 own branch.
 
-- [ ] **Step 1: Static and Rust gates**
+- [x] **Step 1: Static and Rust gates**
 
 ```bash
 cargo fmt --check
@@ -526,7 +530,7 @@ cargo clippy --locked --all-targets -- -D warnings
 git diff --check
 ```
 
-- [ ] **Step 2: Transaction and cancellation regressions**
+- [x] **Step 2: Transaction and cancellation regressions**
 
 Run:
 
@@ -543,7 +547,7 @@ Run:
 
 Export the six upstream fixture variables to the SQL-auth upstream database.
 
-- [ ] **Step 3: Complete strict suite**
+- [x] **Step 3: Complete strict suite**
 
 ```bash
 FASTMSSQL_SQL_AUTH_RESULTS_PATH=/private/tmp/tx-cancel-strict.json \
@@ -554,7 +558,7 @@ FASTMSSQL_LOAD_METRICS_PATH=/private/tmp/tx-cancel-load.json \
 
 Expected: exact 277/277 case IDs and zero failures.
 
-- [ ] **Step 4: Complete applicable upstream suite**
+- [x] **Step 4: Complete applicable upstream suite**
 
 Run `pytest -n 1 tests`, ignoring:
 
@@ -569,7 +573,7 @@ tests/sql_auth_strict
 
 Expected: zero failures.
 
-- [ ] **Step 5: Pooled transaction stress**
+- [x] **Step 5: Pooled transaction stress**
 
 ```bash
 FASTMSSQL_TRANSACTION_STRESS_STRATEGY=pooled \
@@ -586,7 +590,7 @@ Expected:
 - smoke PASS;
 - zero remaining application sessions.
 
-- [ ] **Step 6: Cancellation storm with DMV cleanup**
+- [x] **Step 6: Cancellation storm with DMV cleanup**
 
 Add or reuse a bounded test that cancels more transaction operations than
 `pool.max_size`, then proves:
@@ -598,7 +602,7 @@ Add or reuse a bounded test that cancels more transaction operations than
 - replacements do not reuse the old `connection_id` values;
 - no application sessions remain after disconnect.
 
-- [ ] **Step 7: Repository safety**
+- [x] **Step 7: Repository safety**
 
 ```bash
 git status --short
@@ -619,7 +623,7 @@ Expected:
 
 ### Task 5: Integrate only into the fork
 
-- [ ] **Step 1: Merge the verified fix**
+- [x] **Step 1: Merge the verified fix**
 
 ```bash
 git -C /Users/marcelgalea/Developer/fast_mssql_testdev/FastMssql \
@@ -627,12 +631,12 @@ git -C /Users/marcelgalea/Developer/fast_mssql_testdev/FastMssql \
   -m "merge: retire cancelled transaction connections"
 ```
 
-- [ ] **Step 2: Rebuild and verify the exact merged tree**
+- [x] **Step 2: Rebuild and verify the exact merged tree**
 
 Run Rust tests and TX-026/TX-032–TX-034 on the merged source, not an editable
 install pointing at the feature worktree.
 
-- [ ] **Step 3: Push only the cumulative fork branch**
+- [x] **Step 3: Push only the cumulative fork branch**
 
 ```bash
 git push origin test/sql-auth-validation
@@ -652,11 +656,11 @@ Do not push or create anything against `upstream`.
 - Modify separately:
   `docs/superpowers/plans/2026-07-25-fastmssql-upstream-contribution-plan.md`
 
-- [ ] **Step 1: Create `docs/transaction-cancellation-retirement-status`**
+- [x] **Step 1: Create `docs/transaction-cancellation-retirement-status`**
 
 Base the branch on the exact verified cumulative source.
 
-- [ ] **Step 2: Correct the P0 audit based on evidence**
+- [x] **Step 2: Correct the P0 audit based on evidence**
 
 Record separately:
 
@@ -670,7 +674,7 @@ Record separately:
 - TDS `ATTENTION` is deferred as same-socket reuse/lifecycle work, not claimed
   as implemented.
 
-- [ ] **Step 3: Add the upstream candidate**
+- [x] **Step 3: Add the upstream candidate**
 
 Use the next registry ID only after final evidence. State:
 
