@@ -82,11 +82,11 @@ La apariția unei diferențe, ordinea de autoritate este:
 
 ## Snapshot curent
 
-Snapshotul folosit la crearea documentului:
+Snapshotul tehnic verificat la ultima actualizare:
 
 - data: `2026-07-25`;
 - fork cumulativ: `test/sql-auth-validation`;
-- HEAD cumulativ: `a75c12eb9951d4870f1cc954c7b2ca241b02b6bd`;
+- HEAD cumulativ: `9d51d0765a4718fd1748711ac3a669c5f165efcf`;
 - bază upstream în referințele locale:
   `e45f301f46128e7114c27097b608a4b2d7f429cf`;
 - versiune de bază: `v0.7.7`;
@@ -135,10 +135,46 @@ Nicio stare sub `APPROVED_TO_PUBLISH` nu autorizează `gh pr create`.
 | PR-13 | eliminarea advisory-urilor RustSec din stackul TLS | teste `2f202a5`, `b110277`; fix `5ada01e` | `BLOCKED_DEPENDENCY` | forma Tiberius aprobată: release, commit Git pin-uit sau patch acceptat |
 | PR-14 | gate RustSec obligatoriu pentru build și release | teste `88ef5bd`, `76a661d`, `ac66048`; fixuri `3887ddd`, `1d13280` | `READY_TO_PORT` | adaptare minimă la workflow-urile ultimului upstream |
 | PR-15 | `RESETCONNECTION` TDS și izolarea sesiunilor pooled | teste `6cc1d55`, `dcada81`, `122f713`; fix `16f076a` | `BLOCKED_DEPENDENCY` | traseu Tiberius, rebase upstream și declararea invalidării obiectelor de sesiune |
-| PR-16 | state machine atomic pentru tranzacții concurente | branch `test/transaction-state-machine` | `IN_PROGRESS` | TX-020/TX-021 RED, implementare Rust GREEN, fără dublu `BEGIN` sau dublă finalizare |
+| PR-16 | state machine atomic pentru tranzacții concurente | test `ff844b7`; fix `b86b0ac`; cumulativ `9d51d07` | `VERIFIED_FORK` | rebase curat, RED/GREEN pe ultimul upstream și comparație obligatorie cu draftul #121 |
 
 Hash-urile scurte identifică sursa de lucru, nu sunt instrucțiuni de
 cherry-pick orb. Pentru fiecare PR se extrage numai diff-ul subiectului său.
+
+### Dovada de promovare pentru PR-16
+
+Reproducerea TX-020/TX-021 din `ff844b7` a fost RED în toate cele 10 variante:
+burst de 16 apeluri `begin()` și combinațiile concurente `commit/commit`,
+`rollback/rollback`, `commit/rollback`, `rollback/commit`, prin wrapperul public
+și direct prin clasa Rust expusă.
+
+Remedierea `b86b0ac` păstrează conexiunea și starea într-o singură sesiune
+protejată de mutex în Rust. Validarea, starea in-flight, comanda TDS, consumarea
+completă a răspunsului și tranziția terminală formează aceeași secțiune
+atomică. Anularea și panicurile rămân fail-closed până la `close()`.
+
+Dovada GREEN pe source tree-ul cumulativ `9d51d07`:
+
+```text
+TX-020/TX-021 focalizat           10/10 PASS
+strict transaction + compat      46/46 PASS
+strict SQL-auth complet           329/329 PASS
+upstream aplicabil                896/896 PASS
+FastMssql Rust unit tests         9/9 PASS
+cargo fmt / Clippy -D warnings    PASS
+cargo audit, 219 dependențe       0 findings
+10.000 tx, concurrency 100        PASS, 3.580,03 tx/s
+99.999 tx, concurrency 100        PASS, 3.841,77 tx/s
+99.999 tx, concurrency 200        PASS, 3.609,59 tx/s
+remaining application sessions   0
+```
+
+Commitul independent `9c2a88f` corectează numai contractul harness-ului de
+restart pentru EOF TLS fără `close_notify`. Eșecul a fost reprodus și fără
+PR-16, deci nu intră în diff-ul candidatului upstream.
+
+PR-16 nu include transaction leasing, `CommitOutcomeUnknown`, TDS `ATTENTION`
+sau retry pentru operații de scriere. Acestea rămân PR-17/PR-18 ori candidați
+separați.
 
 ## Candidați rezervați după PR-16
 
@@ -473,9 +509,12 @@ FASTMSSQL_TRANSACTION_STRESS_PROFILES="10_000:100" \
 ./scripts/sql_auth/run_transaction_stress.sh
 ```
 
-Promovarea la `99999` tranzacții se face după trecerea nivelului de `10000`;
-testul măsoară driverul și respectarea limitelor de pool, nu capacitatea maximă
-a SQL Server. Profilul extins folosește exact
+Promovarea la `99999` tranzacții se face după trecerea nivelului de `10000`.
+Strategia persistentă actuală măsoară driverul cu un obiect `Transaction` și o
+conexiune fizică per worker, nu transaction leasing și nici capacitatea maximă
+a SQL Server. După implementarea PR-17, un contract separat trebuie să
+demonstreze că sesiunile nu depășesc `pool.max_size`. Profilul extins folosește
+exact
 `FASTMSSQL_TRANSACTION_STRESS_PROFILES="99_999:100,99_999:200"`.
 
 - [ ] **Step 4: Verifică diff-ul și istoricul**
