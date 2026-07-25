@@ -37,6 +37,9 @@ pub(crate) enum OperationName {
     Commit,
     Rollback,
     Close,
+    // Reserved for a future public transaction factory that performs I/O.
+    // Connection.transaction() is currently synchronous and cannot time out.
+    #[allow(dead_code)]
     Transaction,
 }
 

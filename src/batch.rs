@@ -34,9 +34,7 @@ const MAX_ROWS_PER_VALUES_INSERT: usize = 1_000;
 
 fn bulk_rows_per_batch(column_count: usize) -> usize {
     debug_assert!(column_count > 0);
-    (MAX_BULK_PARAMETERS_PER_INSERT / column_count)
-        .max(1)
-        .min(MAX_ROWS_PER_VALUES_INSERT)
+    (MAX_BULK_PARAMETERS_PER_INSERT / column_count).clamp(1, MAX_ROWS_PER_VALUES_INSERT)
 }
 
 async fn consume_simple_command(

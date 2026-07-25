@@ -11,7 +11,10 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use crate::azure_auth::PyAzureCredential;
 use crate::batch::{execute_batch_on_connection, parse_batch_items, query_batch_on_connection};
 use crate::connection_config::config_from_ado_string;
-use crate::deadline::OperationName;
+use crate::deadline::{
+    Deadline, DeadlineElapsed, OperationName, TimeoutPhase, deadline_from, earliest_deadline,
+    run_until,
+};
 use crate::helpers::{
     catch_driver_panic, execute_unparameterized_command, requires_direct_batch, wrap_query_stream,
 };
@@ -19,11 +22,13 @@ use crate::parameter_conversion::{convert_parameters_to_fast, params_as_sql_refs
 use crate::pool_config::PyPoolConfig;
 use crate::pool_manager::{
     ConnectionPool, OwnedPooledConnection, acquire_owned_connection, connect_client_with_timeout,
-    ensure_pool_initialized_with_auth,
+    ensure_pool_initialized_with_auth, timeout_error_or_metadata_failure,
 };
 use crate::ssl_config::PySslConfig;
 use crate::timeout_config::PyTimeoutConfig;
-use crate::types::{SqlError, create_commit_outcome_unknown, create_sql_error};
+use crate::types::{
+    SqlError, TimeoutErrorMetadata, create_commit_outcome_unknown, create_sql_error,
+};
 
 type SingleConnectionType = Client<tokio_util::compat::Compat<TcpStream>>;
 
@@ -148,6 +153,7 @@ struct TransactionSession {
     conn: Option<TransactionConnection>,
     state: TransactionState,
     operation_epoch: u64,
+    lifetime_deadline: Option<Deadline>,
 }
 
 impl Default for TransactionSession {
@@ -156,15 +162,30 @@ impl Default for TransactionSession {
             conn: None,
             state: TransactionState::Idle,
             operation_epoch: 0,
+            lifetime_deadline: None,
         }
     }
 }
 
 impl TransactionSession {
+    fn transition_to(&mut self, state: TransactionState) {
+        self.state = state;
+        if matches!(
+            state,
+            TransactionState::Idle
+                | TransactionState::Committed
+                | TransactionState::RolledBack
+                | TransactionState::Failed
+                | TransactionState::Closing
+        ) {
+            self.lifetime_deadline = None;
+        }
+    }
+
     fn enter_in_flight(&mut self, state: TransactionState) -> u64 {
         debug_assert!(state.is_in_flight());
         self.operation_epoch = self.operation_epoch.wrapping_add(1);
-        self.state = state;
+        self.transition_to(state);
         self.operation_epoch
     }
 
@@ -177,7 +198,24 @@ impl TransactionSession {
             connection.mark_unusable();
         }
         self.conn.take();
-        self.state = TransactionState::Failed;
+        self.transition_to(TransactionState::Failed);
+    }
+
+    fn retire_expired_lifetime(&mut self) -> Option<DeadlineElapsed> {
+        let lifetime = self.lifetime_deadline?;
+        if lifetime.at > tokio::time::Instant::now() {
+            return None;
+        }
+
+        if let Some(connection) = self.conn.as_mut() {
+            connection.mark_unusable();
+        }
+        self.conn.take();
+        self.transition_to(TransactionState::Failed);
+        Some(DeadlineElapsed {
+            timeout: lifetime.timeout,
+            phase: TimeoutPhase::Transaction,
+        })
     }
 }
 
@@ -241,6 +279,14 @@ enum TransactionCommand {
 }
 
 impl TransactionCommand {
+    fn operation_name(self) -> OperationName {
+        match self {
+            Self::Begin => OperationName::Begin,
+            Self::Commit => OperationName::Commit,
+            Self::Rollback => OperationName::Rollback,
+        }
+    }
+
     fn sql(self) -> &'static str {
         match self {
             Self::Begin => "BEGIN TRANSACTION",
@@ -311,6 +357,25 @@ impl TransactionCommand {
     }
 }
 
+fn command_deadline(
+    command: TransactionCommand,
+    timeout_config: &PyTimeoutConfig,
+    lifetime_deadline: Option<Deadline>,
+) -> Option<Deadline> {
+    match command {
+        TransactionCommand::Begin => {
+            deadline_from(TimeoutPhase::Operation, timeout_config.operation_timeout)
+        }
+        TransactionCommand::Commit => earliest_deadline(
+            deadline_from(TimeoutPhase::Operation, timeout_config.operation_timeout),
+            lifetime_deadline,
+        ),
+        TransactionCommand::Rollback => {
+            deadline_from(TimeoutPhase::Rollback, timeout_config.rollback_timeout)
+        }
+    }
+}
+
 fn is_deterministic_commit_rejection(error: &PyErr) -> bool {
     Python::attach(|py| {
         if !error.is_instance_of::<SqlError>(py) {
@@ -322,6 +387,22 @@ fn is_deterministic_commit_rejection(error: &PyErr) -> bool {
             .and_then(|value| value.extract::<u8>())
             .is_ok_and(|severity| severity <= 19)
     })
+}
+
+fn transaction_timeout_error(
+    elapsed: DeadlineElapsed,
+    operation: OperationName,
+    outcome_unknown: bool,
+) -> PyErr {
+    timeout_error_or_metadata_failure(
+        elapsed,
+        TimeoutErrorMetadata {
+            operation,
+            retryable: false,
+            connection_discarded: true,
+            outcome_unknown,
+        },
+    )
 }
 
 struct TransactionHandles {
@@ -471,27 +552,39 @@ impl Transaction {
 
             let execution_result = {
                 let mut session = handles.session.lock().await;
-                let (previous_state, epoch) = Self::begin_data_operation(&mut session)?;
+                let (previous_state, epoch, deadline) = Self::begin_data_operation(
+                    &mut session,
+                    OperationName::Query,
+                    &handles.timeout_config,
+                )?;
                 cancellation_guard.arm(epoch);
                 let operation = match session.conn.as_mut() {
                     Some(conn_ref) => {
                         let tiberius_params = params_as_sql_refs(&fast_parameters);
-                        catch_driver_panic(async {
-                            conn_ref
-                                .query(&query, &tiberius_params)
-                                .await
-                                .map_err(|e| create_sql_error(e, "Query execution failed"))?
-                                .into_first_result()
-                                .await
-                                .map_err(|e| create_sql_error(e, "Failed to get results"))
-                        })
+                        run_until(
+                            deadline,
+                            catch_driver_panic(async {
+                                conn_ref
+                                    .query(&query, &tiberius_params)
+                                    .await
+                                    .map_err(|e| create_sql_error(e, "Query execution failed"))?
+                                    .into_first_result()
+                                    .await
+                                    .map_err(|e| create_sql_error(e, "Failed to get results"))
+                            }),
+                        )
                         .await
                     }
-                    None => Ok(Err(PyRuntimeError::new_err(
+                    None => Ok(Ok(Err(PyRuntimeError::new_err(
                         "Connection is not established",
-                    ))),
+                    )))),
                 };
-                Self::finish_data_operation(&mut session, previous_state, operation)
+                Self::finish_data_operation(
+                    &mut session,
+                    previous_state,
+                    OperationName::Query,
+                    operation,
+                )
             };
             cancellation_guard.disarm();
 
@@ -511,26 +604,38 @@ impl Transaction {
 
             let execution_result = {
                 let mut session = handles.session.lock().await;
-                let (previous_state, epoch) = Self::begin_data_operation(&mut session)?;
+                let (previous_state, epoch, deadline) = Self::begin_data_operation(
+                    &mut session,
+                    OperationName::SimpleQuery,
+                    &handles.timeout_config,
+                )?;
                 cancellation_guard.arm(epoch);
                 let operation = match session.conn.as_mut() {
                     Some(conn_ref) => {
-                        catch_driver_panic(async {
-                            conn_ref
-                                .simple_query(&query)
-                                .await
-                                .map_err(|e| create_sql_error(e, "Query execution failed"))?
-                                .into_first_result()
-                                .await
-                                .map_err(|e| create_sql_error(e, "Failed to get results"))
-                        })
+                        run_until(
+                            deadline,
+                            catch_driver_panic(async {
+                                conn_ref
+                                    .simple_query(&query)
+                                    .await
+                                    .map_err(|e| create_sql_error(e, "Query execution failed"))?
+                                    .into_first_result()
+                                    .await
+                                    .map_err(|e| create_sql_error(e, "Failed to get results"))
+                            }),
+                        )
                         .await
                     }
-                    None => Ok(Err(PyRuntimeError::new_err(
+                    None => Ok(Ok(Err(PyRuntimeError::new_err(
                         "Connection is not established",
-                    ))),
+                    )))),
                 };
-                Self::finish_data_operation(&mut session, previous_state, operation)
+                Self::finish_data_operation(
+                    &mut session,
+                    previous_state,
+                    OperationName::SimpleQuery,
+                    operation,
+                )
             };
             cancellation_guard.disarm();
 
@@ -556,34 +661,48 @@ impl Transaction {
 
             let affected = {
                 let mut session = handles.session.lock().await;
-                let (previous_state, epoch) = Self::begin_data_operation(&mut session)?;
+                let (previous_state, epoch, deadline) = Self::begin_data_operation(
+                    &mut session,
+                    OperationName::Execute,
+                    &handles.timeout_config,
+                )?;
                 cancellation_guard.arm(epoch);
                 let operation = match session.conn.as_mut() {
                     Some(conn_ref) => {
-                        catch_driver_panic(async {
-                            if fast_parameters.is_empty() && requires_direct_batch(&command) {
-                                execute_unparameterized_command(
-                                    conn_ref,
-                                    &command,
-                                    "Command execution failed",
-                                )
-                                .await
-                            } else {
-                                let tiberius_params = params_as_sql_refs(&fast_parameters);
-                                conn_ref
-                                    .execute(&command, &tiberius_params)
+                        run_until(
+                            deadline,
+                            catch_driver_panic(async {
+                                if fast_parameters.is_empty() && requires_direct_batch(&command) {
+                                    execute_unparameterized_command(
+                                        conn_ref,
+                                        &command,
+                                        "Command execution failed",
+                                    )
                                     .await
-                                    .map(|result| result.total())
-                                    .map_err(|e| create_sql_error(e, "Command execution failed"))
-                            }
-                        })
+                                } else {
+                                    let tiberius_params = params_as_sql_refs(&fast_parameters);
+                                    conn_ref
+                                        .execute(&command, &tiberius_params)
+                                        .await
+                                        .map(|result| result.total())
+                                        .map_err(|e| {
+                                            create_sql_error(e, "Command execution failed")
+                                        })
+                                }
+                            }),
+                        )
                         .await
                     }
-                    None => Ok(Err(PyRuntimeError::new_err(
+                    None => Ok(Ok(Err(PyRuntimeError::new_err(
                         "Connection is not established",
-                    ))),
+                    )))),
                 };
-                Self::finish_data_operation(&mut session, previous_state, operation)
+                Self::finish_data_operation(
+                    &mut session,
+                    previous_state,
+                    OperationName::Execute,
+                    operation,
+                )
             };
             cancellation_guard.disarm();
 
@@ -610,18 +729,33 @@ impl Transaction {
 
             let all_results = {
                 let mut session = handles.session.lock().await;
-                let (previous_state, epoch) = Self::begin_data_operation(&mut session)?;
+                let (previous_state, epoch, deadline) = Self::begin_data_operation(
+                    &mut session,
+                    OperationName::ExecuteBatch,
+                    &handles.timeout_config,
+                )?;
                 cancellation_guard.arm(epoch);
                 let operation = match session.conn.as_mut() {
                     Some(conn_ref) => {
-                        catch_driver_panic(execute_batch_on_connection(conn_ref, batch_commands))
-                            .await
+                        run_until(
+                            deadline,
+                            catch_driver_panic(execute_batch_on_connection(
+                                conn_ref,
+                                batch_commands,
+                            )),
+                        )
+                        .await
                     }
-                    None => Ok(Err(PyRuntimeError::new_err(
+                    None => Ok(Ok(Err(PyRuntimeError::new_err(
                         "Connection is not established",
-                    ))),
+                    )))),
                 };
-                Self::finish_data_operation(&mut session, previous_state, operation)
+                Self::finish_data_operation(
+                    &mut session,
+                    previous_state,
+                    OperationName::ExecuteBatch,
+                    operation,
+                )
             };
             cancellation_guard.disarm();
             let all_results = all_results?;
@@ -650,17 +784,30 @@ impl Transaction {
 
             let all_results = {
                 let mut session = handles.session.lock().await;
-                let (previous_state, epoch) = Self::begin_data_operation(&mut session)?;
+                let (previous_state, epoch, deadline) = Self::begin_data_operation(
+                    &mut session,
+                    OperationName::QueryBatch,
+                    &handles.timeout_config,
+                )?;
                 cancellation_guard.arm(epoch);
                 let operation = match session.conn.as_mut() {
                     Some(conn_ref) => {
-                        catch_driver_panic(query_batch_on_connection(conn_ref, batch_queries)).await
+                        run_until(
+                            deadline,
+                            catch_driver_panic(query_batch_on_connection(conn_ref, batch_queries)),
+                        )
+                        .await
                     }
-                    None => Ok(Err(PyRuntimeError::new_err(
+                    None => Ok(Ok(Err(PyRuntimeError::new_err(
                         "Connection is not established",
-                    ))),
+                    )))),
                 };
-                Self::finish_data_operation(&mut session, previous_state, operation)
+                Self::finish_data_operation(
+                    &mut session,
+                    previous_state,
+                    OperationName::QueryBatch,
+                    operation,
+                )
             };
             cancellation_guard.disarm();
             let all_results = all_results?;
@@ -682,56 +829,93 @@ impl Transaction {
 
         future_into_py(py, async move {
             handles.ensure_connected(OperationName::Begin).await?;
-            Self::execute_transaction_command(&handles.session, TransactionCommand::Begin).await
+            Self::execute_transaction_command(
+                &handles.session,
+                TransactionCommand::Begin,
+                &handles.timeout_config,
+            )
+            .await
         })
     }
 
     pub fn commit<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let session = Arc::clone(&self.session);
+        let timeout_config = self.timeout_config.clone();
         future_into_py(py, async move {
-            Self::execute_transaction_command(&session, TransactionCommand::Commit).await
+            Self::execute_transaction_command(&session, TransactionCommand::Commit, &timeout_config)
+                .await
         })
     }
 
     pub fn rollback<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let session = Arc::clone(&self.session);
+        let timeout_config = self.timeout_config.clone();
         future_into_py(py, async move {
-            Self::execute_transaction_command(&session, TransactionCommand::Rollback).await
+            Self::execute_transaction_command(
+                &session,
+                TransactionCommand::Rollback,
+                &timeout_config,
+            )
+            .await
         })
     }
 
     /// Release the direct socket or shared pool lease.
     pub fn close<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let session = Arc::clone(&self.session);
+        let timeout_config = self.timeout_config.clone();
 
         future_into_py(py, async move {
             let mut session = session.lock().await;
             let previous_state = session.state;
             let mut conn = session.conn.take();
-            session.state = TransactionState::Closing;
+            session.transition_to(TransactionState::Closing);
+            let mut close_result: PyResult<()> = Ok(());
 
             if let Some(conn_ref) = conn.as_mut() {
                 if previous_state == TransactionState::Active {
                     conn_ref.begin_operation();
-                    let rollback = catch_driver_panic(async {
-                        conn_ref
-                            .simple_query("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION")
-                            .await
-                            .map_err(|error| {
-                                create_sql_error(error, "Failed to close transaction")
-                            })?
-                            .into_results()
-                            .await
-                            .map_err(|error| {
-                                create_sql_error(error, "Failed to close transaction")
-                            })?;
-                        Ok(())
-                    })
+                    let deadline =
+                        deadline_from(TimeoutPhase::Rollback, timeout_config.rollback_timeout);
+                    let rollback = run_until(
+                        deadline,
+                        catch_driver_panic(async {
+                            conn_ref
+                                .simple_query("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION")
+                                .await
+                                .map_err(|error| {
+                                    create_sql_error(error, "Failed to close transaction")
+                                })?
+                                .into_results()
+                                .await
+                                .map_err(|error| {
+                                    create_sql_error(error, "Failed to close transaction")
+                                })?;
+                            Ok(())
+                        }),
+                    )
                     .await;
 
                     match rollback {
-                        Ok(result @ Ok(())) => conn_ref.finish_operation(&result),
-                        Ok(Err(_)) | Err(_) => conn_ref.mark_unusable(),
+                        Err(elapsed) => {
+                            conn_ref.mark_unusable();
+                            close_result = Err(transaction_timeout_error(
+                                elapsed,
+                                OperationName::Close,
+                                false,
+                            ));
+                        }
+                        Ok(Err(driver_panic)) => {
+                            conn_ref.mark_unusable();
+                            close_result = Err(driver_panic);
+                        }
+                        Ok(Ok(result @ Ok(()))) => {
+                            conn_ref.finish_operation(&result);
+                        }
+                        Ok(Ok(Err(error))) => {
+                            conn_ref.mark_unusable();
+                            close_result = Err(error);
+                        }
                     }
                 } else if matches!(
                     previous_state,
@@ -750,8 +934,8 @@ impl Transaction {
             // a pooled lease returns only a fully consumed response; an
             // in-flight/cancelled lease is marked Broken and bb8 retires it.
             drop(conn);
-            session.state = TransactionState::Idle;
-            Ok(())
+            session.transition_to(TransactionState::Idle);
+            close_result
         })
     }
 
@@ -795,26 +979,48 @@ impl Transaction {
         }
     }
 
-    fn begin_data_operation(session: &mut TransactionSession) -> PyResult<(TransactionState, u64)> {
+    fn begin_data_operation(
+        session: &mut TransactionSession,
+        operation: OperationName,
+        timeout_config: &PyTimeoutConfig,
+    ) -> PyResult<(TransactionState, u64, Option<Deadline>)> {
         session.state.ensure_connection_usable()?;
+
+        if let Some(elapsed) = session.retire_expired_lifetime() {
+            return Err(transaction_timeout_error(elapsed, operation, false));
+        }
+
         let previous_state = session.state;
+        let active_deadline = earliest_deadline(
+            deadline_from(TimeoutPhase::Operation, timeout_config.operation_timeout),
+            session.lifetime_deadline,
+        );
         let connection = session
             .conn
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
         connection.begin_operation();
         let epoch = session.enter_in_flight(TransactionState::Executing);
-        Ok((previous_state, epoch))
+        Ok((previous_state, epoch, active_deadline))
     }
 
     fn finish_data_operation<T>(
         session: &mut TransactionSession,
         previous_state: TransactionState,
-        operation: Result<PyResult<T>, PyErr>,
+        operation_name: OperationName,
+        operation: Result<Result<PyResult<T>, PyErr>, DeadlineElapsed>,
     ) -> PyResult<T> {
         let (result, driver_panicked) = match operation {
-            Ok(result) => (result, false),
-            Err(driver_panic) => (Err(driver_panic), true),
+            Err(elapsed) => {
+                if let Some(connection) = session.conn.as_mut() {
+                    connection.mark_unusable();
+                }
+                session.conn.take();
+                session.transition_to(TransactionState::Failed);
+                return Err(transaction_timeout_error(elapsed, operation_name, true));
+            }
+            Ok(Ok(result)) => (result, false),
+            Ok(Err(driver_panic)) => (Err(driver_panic), true),
         };
 
         let connection_broken = match session.conn.as_mut() {
@@ -831,9 +1037,9 @@ impl Transaction {
 
         if connection_broken {
             session.conn.take();
-            session.state = TransactionState::Failed;
+            session.transition_to(TransactionState::Failed);
         } else {
-            session.state = previous_state;
+            session.transition_to(previous_state);
         }
 
         result
@@ -842,6 +1048,7 @@ impl Transaction {
     async fn execute_transaction_command(
         session: &Arc<AsyncMutex<TransactionSession>>,
         command: TransactionCommand,
+        timeout_config: &PyTimeoutConfig,
     ) -> PyResult<()> {
         let mut cancellation_guard = TransactionCancellationGuard::new(Arc::clone(session));
         let mut session = session.lock().await;
@@ -849,6 +1056,18 @@ impl Transaction {
         if session.conn.is_none() {
             return Err(PyRuntimeError::new_err("Connection is not established"));
         }
+
+        if matches!(command, TransactionCommand::Commit)
+            && let Some(elapsed) = session.retire_expired_lifetime()
+        {
+            return Err(transaction_timeout_error(
+                elapsed,
+                OperationName::Commit,
+                false,
+            ));
+        }
+
+        let deadline = command_deadline(command, timeout_config, session.lifetime_deadline);
         if let Some(connection) = session.conn.as_mut() {
             connection.begin_operation();
         }
@@ -857,58 +1076,91 @@ impl Transaction {
 
         let operation = match session.conn.as_mut() {
             Some(conn_ref) => {
-                catch_driver_panic(async {
-                    conn_ref
-                        .simple_query(command.sql())
-                        .await
-                        .map_err(|error| create_sql_error(error, command.error_context()))?
-                        .into_results()
-                        .await
-                        .map_err(|error| create_sql_error(error, command.error_context()))?;
-                    Ok(())
-                })
+                run_until(
+                    deadline,
+                    catch_driver_panic(async {
+                        conn_ref
+                            .simple_query(command.sql())
+                            .await
+                            .map_err(|error| create_sql_error(error, command.error_context()))?
+                            .into_results()
+                            .await
+                            .map_err(|error| create_sql_error(error, command.error_context()))?;
+                        Ok(())
+                    }),
+                )
                 .await
             }
-            None => Ok(Err(PyRuntimeError::new_err(
+            None => Ok(Ok(Err(PyRuntimeError::new_err(
                 "Connection is not established",
-            ))),
+            )))),
         };
 
-        let (result, driver_panicked) = match operation {
-            Ok(result) => (result, false),
-            Err(driver_panic) => (Err(driver_panic), true),
-        };
-
-        if let Some(connection) = session.conn.as_mut() {
-            if driver_panicked {
-                connection.mark_unusable();
-            } else {
-                connection.finish_operation(&result);
-            }
-        }
-
-        let command_result = match result {
-            Ok(()) => {
-                session.state = command.completed_state();
-                let release_pool_lease = command.releases_pool_lease()
-                    && session
-                        .conn
-                        .as_ref()
-                        .is_some_and(TransactionConnection::is_pooled);
-                if release_pool_lease {
-                    session.conn.take();
+        let command_result = match operation {
+            Err(elapsed) => {
+                if let Some(connection) = session.conn.as_mut() {
+                    connection.mark_unusable();
                 }
-                Ok(())
-            }
-            Err(error) => {
                 session.conn.take();
-                session.state = TransactionState::Failed;
-                if matches!(command, TransactionCommand::Commit)
-                    && !is_deterministic_commit_rejection(&error)
-                {
-                    create_commit_outcome_unknown(error).and_then(Err)
+                session.transition_to(TransactionState::Failed);
+                let timeout = transaction_timeout_error(
+                    elapsed,
+                    command.operation_name(),
+                    matches!(command, TransactionCommand::Commit),
+                );
+                if matches!(command, TransactionCommand::Commit) {
+                    create_commit_outcome_unknown(timeout).and_then(Err)
                 } else {
-                    Err(error)
+                    Err(timeout)
+                }
+            }
+            Ok(Err(driver_panic)) => {
+                if let Some(connection) = session.conn.as_mut() {
+                    connection.mark_unusable();
+                }
+                session.conn.take();
+                session.transition_to(TransactionState::Failed);
+                if matches!(command, TransactionCommand::Commit) {
+                    create_commit_outcome_unknown(driver_panic).and_then(Err)
+                } else {
+                    Err(driver_panic)
+                }
+            }
+            Ok(Ok(result)) => {
+                if let Some(connection) = session.conn.as_mut() {
+                    connection.finish_operation(&result);
+                }
+
+                match result {
+                    Ok(()) => {
+                        session.transition_to(command.completed_state());
+                        if matches!(command, TransactionCommand::Begin) {
+                            session.lifetime_deadline = deadline_from(
+                                TimeoutPhase::Transaction,
+                                timeout_config.transaction_timeout,
+                            );
+                        }
+                        let release_pool_lease = command.releases_pool_lease()
+                            && session
+                                .conn
+                                .as_ref()
+                                .is_some_and(TransactionConnection::is_pooled);
+                        if release_pool_lease {
+                            session.conn.take();
+                        }
+                        Ok(())
+                    }
+                    Err(error) => {
+                        session.conn.take();
+                        session.transition_to(TransactionState::Failed);
+                        if matches!(command, TransactionCommand::Commit)
+                            && !is_deterministic_commit_rejection(&error)
+                        {
+                            create_commit_outcome_unknown(error).and_then(Err)
+                        } else {
+                            Err(error)
+                        }
+                    }
                 }
             }
         };
@@ -964,7 +1216,11 @@ impl Transaction {
 
 #[cfg(test)]
 mod cancellation_retirement_tests {
-    use super::{TransactionSession, TransactionState};
+    use super::{TransactionCommand, TransactionSession, TransactionState, command_deadline};
+    use crate::deadline::{Deadline, TimeoutPhase};
+    use crate::timeout_config::PyTimeoutConfig;
+    use std::time::Duration;
+    use tokio::time::Instant;
 
     #[test]
     fn matching_in_flight_epoch_becomes_failed() {
@@ -993,7 +1249,7 @@ mod cancellation_retirement_tests {
     fn matching_epoch_does_not_change_a_terminal_state() {
         let mut session = TransactionSession::default();
         let epoch = session.enter_in_flight(TransactionState::Committing);
-        session.state = TransactionState::Committed;
+        session.transition_to(TransactionState::Committed);
 
         session.retire_cancelled_operation(epoch);
 
@@ -1010,5 +1266,77 @@ mod cancellation_retirement_tests {
 
         assert_eq!(session.state, TransactionState::Failed);
         assert!(session.conn.is_none());
+    }
+
+    #[test]
+    fn expired_lifetime_retires_only_the_current_session_state() {
+        let mut session = TransactionSession {
+            state: TransactionState::Active,
+            operation_epoch: 41,
+            lifetime_deadline: Some(Deadline {
+                at: Instant::now() - Duration::from_millis(1),
+                timeout: Duration::from_millis(250),
+                phase: TimeoutPhase::Transaction,
+            }),
+            ..TransactionSession::default()
+        };
+
+        let elapsed = session
+            .retire_expired_lifetime()
+            .expect("the lifetime must be expired");
+
+        assert_eq!(elapsed.phase, TimeoutPhase::Transaction);
+        assert_eq!(elapsed.timeout, Duration::from_millis(250));
+        assert_eq!(session.operation_epoch, 41);
+        assert_eq!(session.state, TransactionState::Failed);
+        assert!(session.conn.is_none());
+        assert!(session.lifetime_deadline.is_none());
+    }
+
+    #[test]
+    fn rollback_deadline_is_independent_of_transaction_lifetime() {
+        let mut timeout_config = PyTimeoutConfig::explicit_default();
+        timeout_config.operation_timeout = Some(Duration::from_millis(10));
+        timeout_config.rollback_timeout = Some(Duration::from_secs(3));
+        let lifetime = Deadline {
+            at: Instant::now() + Duration::from_millis(1),
+            timeout: Duration::from_millis(250),
+            phase: TimeoutPhase::Transaction,
+        };
+
+        let selected = command_deadline(
+            TransactionCommand::Rollback,
+            &timeout_config,
+            Some(lifetime),
+        )
+        .expect("rollback must have its own deadline");
+
+        assert_eq!(selected.phase, TimeoutPhase::Rollback);
+        assert_eq!(selected.timeout, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn every_terminal_state_clears_the_lifetime_deadline() {
+        for state in [
+            TransactionState::Idle,
+            TransactionState::Committed,
+            TransactionState::RolledBack,
+            TransactionState::Failed,
+            TransactionState::Closing,
+        ] {
+            let mut session = TransactionSession {
+                lifetime_deadline: Some(Deadline {
+                    at: Instant::now() + Duration::from_secs(1),
+                    timeout: Duration::from_secs(1),
+                    phase: TimeoutPhase::Transaction,
+                }),
+                ..TransactionSession::default()
+            };
+
+            session.transition_to(state);
+
+            assert_eq!(session.state, state);
+            assert!(session.lifetime_deadline.is_none());
+        }
     }
 }

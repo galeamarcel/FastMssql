@@ -236,8 +236,10 @@ mod tests {
 
     #[test]
     fn compatibility_uses_legacy_pool_timeout() {
-        let mut pool = PyPoolConfig::default();
-        pool.connection_timeout = Some(Duration::from_secs(2));
+        let pool = PyPoolConfig {
+            connection_timeout: Some(Duration::from_secs(2)),
+            ..PyPoolConfig::default()
+        };
 
         let timeout = PyTimeoutConfig::from_pool_compatibility(&pool);
 
