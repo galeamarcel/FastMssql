@@ -872,7 +872,8 @@ set -euo pipefail
 uv sync --locked --all-extras --dev
 uv run ruff check .
 uv run python -m compileall -q python tests scripts
-scripts/security/audit_dependencies.sh
+PATH=/private/tmp/fastmssql-cargo-audit-0.22.2/bin:${PATH} \
+  scripts/security/audit_dependencies.sh
 scripts/sql_auth/run_all.sh
 ```
 
@@ -898,7 +899,7 @@ required runner lanes         all exit 0
 Run:
 
 ```bash
-uv run python - <<'PY'
+.venv/bin/python - <<'PY'
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
@@ -931,9 +932,21 @@ for filename, total in expected.items():
     )
 print("exact JUnit totals: PASS")
 PY
-jq -e \
-  '.cases | length == 285 and all(.[]; .outcome == "passed")' \
-  .artifacts/sql-auth/strict-results.json
+.venv/bin/python - <<'PY'
+from pathlib import Path
+import json
+
+merged: dict[str, str] = {}
+for path in sorted(Path(".artifacts/sql-auth").glob("*-results.json")):
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 1, path
+    for case_id, result in payload["cases"].items():
+        assert case_id not in merged, (case_id, merged[case_id], path.name)
+        assert result["outcome"] == "passed", (case_id, result["outcome"])
+        merged[case_id] = path.name
+assert len(merged) == 285, len(merged)
+print("exact SQL-auth case union: 285/285 PASS")
+PY
 ```
 
 Expected: every total is exact and all 285 case IDs have `passed` outcome.
@@ -1090,9 +1103,11 @@ set -euo pipefail
 set -a
 source .env.sql-auth.local
 set +a
-verification_artifacts="../verify-tcp-fault-proxy-client-reset/.artifacts/sql-auth"
-uv run python scripts/sql_auth/generate_report.py \
-  --spec docs/superpowers/specs/2026-07-24-fastmssql-sql-auth-validation-design.md \
+verification_worktree="../verify-tcp-fault-proxy-client-reset"
+verification_artifacts="${verification_worktree}/.artifacts/sql-auth"
+"${verification_worktree}/.venv/bin/python" \
+  "${verification_worktree}/scripts/sql_auth/generate_report.py" \
+  --spec "${verification_worktree}/docs/superpowers/specs/2026-07-24-fastmssql-sql-auth-validation-design.md" \
   --strict-results "${verification_artifacts}/strict-results.json" \
   --artifact-dir "${verification_artifacts}" \
   --matrix-output docs/SQL_AUTH_TEST_MATRIX.md \
@@ -1101,7 +1116,9 @@ uv run python scripts/sql_auth/generate_report.py \
 ```
 
 Expected: matrix `285/285` PASS and report lanes
-`296/16/28/6/9/902`, all exit zero.
+`296/16/28/6/9/902`, all exit zero. Running the generator resolved from the
+detached verification worktree also makes the report's `Git commit` field
+equal `technical_sha`, rather than the later documentation-only status SHA.
 
 - [ ] **Step 3: Commit the generated evidence first**
 
@@ -1369,7 +1386,8 @@ cargo build --locked
 cargo test --locked
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
-scripts/security/audit_dependencies.sh
+PATH=/private/tmp/fastmssql-cargo-audit-0.22.2/bin:${PATH} \
+  scripts/security/audit_dependencies.sh
 uv run ruff check .
 uv run python -m compileall -q python tests scripts
 uv run pytest tests/test_pyo3_build_contract.py -q
@@ -1459,7 +1477,7 @@ required runner lanes         all exit 0
 Verify exact totals:
 
 ```bash
-uv run python - <<'PY'
+.venv/bin/python - <<'PY'
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
@@ -1492,9 +1510,21 @@ for filename, total in expected.items():
     )
 print("refreshed PoolConfig JUnit totals: PASS")
 PY
-jq -e \
-  '.cases | length == 285 and all(.[]; .outcome == "passed")' \
-  .artifacts/sql-auth/strict-results.json
+.venv/bin/python - <<'PY'
+from pathlib import Path
+import json
+
+merged: dict[str, str] = {}
+for path in sorted(Path(".artifacts/sql-auth").glob("*-results.json")):
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 1, path
+    for case_id, result in payload["cases"].items():
+        assert case_id not in merged, (case_id, merged[case_id], path.name)
+        assert result["outcome"] == "passed", (case_id, result["outcome"])
+        merged[case_id] = path.name
+assert len(merged) == 285, len(merged)
+print("exact SQL-auth case union: 285/285 PASS")
+PY
 set -a
 source .env.sql-auth.local
 set +a
@@ -1667,9 +1697,11 @@ set -euo pipefail
 set -a
 source .env.sql-auth.local
 set +a
-verification_artifacts="../verify-pool-config-default-consistency/.artifacts/sql-auth"
-uv run python scripts/sql_auth/generate_report.py \
-  --spec docs/superpowers/specs/2026-07-24-fastmssql-sql-auth-validation-design.md \
+verification_worktree="../verify-pool-config-default-consistency"
+verification_artifacts="${verification_worktree}/.artifacts/sql-auth"
+"${verification_worktree}/.venv/bin/python" \
+  "${verification_worktree}/scripts/sql_auth/generate_report.py" \
+  --spec "${verification_worktree}/docs/superpowers/specs/2026-07-24-fastmssql-sql-auth-validation-design.md" \
   --strict-results "${verification_artifacts}/strict-results.json" \
   --artifact-dir "${verification_artifacts}" \
   --matrix-output docs/SQL_AUTH_TEST_MATRIX.md \
@@ -1678,7 +1710,8 @@ uv run python scripts/sql_auth/generate_report.py \
 ```
 
 Expected: `285/285` cases and lanes
-`296/16/28/6/9/906`, all green.
+`296/16/28/6/9/906`, all green. The report's `Git commit` field must equal
+the detached `pool_technical_sha`, not the documentation-only status SHA.
 
 - [ ] **Step 3: Correct only post-harness PoolConfig plan counts**
 
