@@ -760,3 +760,88 @@ async def test_concurrent_write_transactions_preserve_exact_state(
         )
     finally:
         await owner_connection.execute(f"DROP TABLE IF EXISTS {table}")
+
+
+@case("LOAD-009")
+@pytest.mark.load
+@pytest.mark.asyncio
+async def test_thousand_readiness_probes_remain_pool_bounded(
+    sql_auth_config: SqlAuthConfig,
+    sa_connection: Connection,
+    unique_sql_name: Callable[[str], str],
+    record_load_metric,
+) -> None:
+    probe_count = 1_000
+    concurrency = 100
+    max_size = 20
+    application_name = unique_sql_name("strict_load_readiness")
+    connection = _connection(
+        sql_auth_config,
+        max_size=max_size,
+        min_idle=0,
+        application_name=application_name,
+    )
+    semaphore = asyncio.Semaphore(concurrency)
+    sampling_done = asyncio.Event()
+    sampled_session_counts: list[int] = []
+
+    async def probe() -> bool:
+        async with semaphore:
+            return await connection.ping()
+
+    async def sample_sessions() -> None:
+        while not sampling_done.is_set():
+            sampled_session_counts.append(
+                await _application_session_count(
+                    sa_connection,
+                    application_name,
+                )
+            )
+            await asyncio.sleep(0.005)
+
+    sampler = asyncio.create_task(sample_sessions())
+    try:
+        started = time.monotonic()
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(*(probe() for _ in range(probe_count))),
+            timeout=30.0,
+        )
+        elapsed = time.monotonic() - started
+        sampling_done.set()
+        await sampler
+
+        assert outcomes == [True] * probe_count
+        assert sampled_session_counts
+        assert max(sampled_session_counts) <= max_size
+        stats = await connection.pool_stats()
+        assert stats["active_connections"] == 0
+        assert stats["connections"] <= max_size
+        assert await scalar(connection, "SELECT 9009") == 9009
+        record_load_metric(
+            "LOAD-009",
+            probe_count=probe_count,
+            task_concurrency=concurrency,
+            pool_max_size=max_size,
+            peak_observed_sessions=max(sampled_session_counts),
+            elapsed_seconds=elapsed,
+            probes_per_second=probe_count / elapsed,
+        )
+    finally:
+        sampling_done.set()
+        if not sampler.done():
+            await sampler
+        await connection.disconnect()
+
+    deadline = time.monotonic() + 4.0
+    while time.monotonic() < deadline:
+        remaining = await _application_session_count(
+            sa_connection,
+            application_name,
+        )
+        if remaining == 0:
+            break
+        await asyncio.sleep(0.02)
+    else:
+        raise AssertionError(
+            f"readiness load left {remaining} SQL application session(s)"
+        )

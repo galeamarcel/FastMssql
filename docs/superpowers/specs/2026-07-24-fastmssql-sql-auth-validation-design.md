@@ -222,6 +222,16 @@ evidence reference.
 - `CONN-017`: nested/reentrant context behavior is deterministic.
 - `CONN-018`: `is_connected()` state transitions.
 - `CONN-019`: `pool_stats()` keys and arithmetic invariants.
+- `CONN-020`: default `connect()` rejects lazy pool allocation as readiness
+  when the SQL Server endpoint is unreachable.
+- `CONN-021`: `connect(validate=False)` preserves explicit lazy allocation and
+  `ping()` still detects the unreachable endpoint.
+- `CONN-022`: default `connect()` creates an authenticated SQL session before
+  any application query when `min_idle=0`.
+- `CONN-023`: async connection context entry validates SQL Server before
+  entering the body.
+- `CONN-024`: a failed `ping()` on a killed physical connection retires it and
+  a second explicit `ping()` recovers on a different `connection_id`.
 
 ### POOL — pooling behavior
 
@@ -516,6 +526,9 @@ numbers are recorded because AMD64 emulation can add host-specific variance.
 - `LOAD-007`: post-load smoke query proves recovery.
 - `LOAD-008`: concurrent write transactions use independent SQL sessions,
   overlap in time, and preserve exact commit/rollback state.
+- `LOAD-009`: 1,000 readiness probes at task concurrency 100 remain bounded by
+  `pool.max_size=20`, preserve a post-load query, and leave zero application
+  sessions after disconnect.
 
 The required `LOAD-008` gate runs 1,000 transactions at concurrency 50. An
 explicit, opt-in transaction stress harness additionally runs 10,000 and
@@ -572,6 +585,10 @@ machine-readable metrics.
   the FastMssql pool remains usable afterward.
 - `FRAME-024`: adapted Flask startup and shutdown leave the FastMssql pool
   disconnected and no test-owned active SQL sessions.
+- `FRAME-025`: FastAPI lifespan rejects an unreachable SQL Server before
+  serving and cleans its failed-startup pool.
+- `FRAME-026`: persistent-loop Flask-through-ASGI startup rejects an
+  unreachable SQL Server before serving and remains safe to shut down.
 
 Performance results are diagnostic unless a correctness/resource invariant is
 violated. No marketing claim is declared proven from a single emulated host.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import importlib.metadata
 import json
 import os
@@ -15,12 +16,13 @@ from flask import Flask
 import pytest
 import pytest_asyncio
 
-from fastmssql import Connection, SqlError
+from fastmssql import Connection, SqlConnectionError, SqlError
 from httpx import ASGITransport, AsyncClient
 from sql_auth_strict.cases import case
 from sql_auth_strict.framework_apps import (
     FrameworkState,
     IntentionalRollback,
+    adapted_flask_lifespan,
     create_adapted_flask_app,
     create_fastapi_app,
     create_flask_app,
@@ -689,6 +691,66 @@ async def test_adapted_flask_shutdown_removes_app_sessions(
     finally:
         await state.connection.disconnect()
     assert await state.connection.is_connected() is False
+    await wait_for_session_count(
+        sa_connection,
+        state.application_name,
+        expected=0,
+    )
+
+
+@case("FRAME-025")
+@pytest.mark.asyncio
+async def test_fastapi_lifespan_rejects_unreachable_sql_before_serving(
+    sql_auth_config,
+    sa_connection,
+    unique_sql_name,
+) -> None:
+    unreachable = replace(sql_auth_config, host="127.0.0.1", port=1)
+    state = FrameworkState.create(
+        unreachable,
+        application_name=unique_sql_name("strict_fastapi_unreachable"),
+        max_size=1,
+        min_idle=0,
+    )
+    app = create_fastapi_app(state, "[unused_framework_table]")
+    serving_started = False
+
+    with pytest.raises(SqlConnectionError):
+        async with LifespanManager(app):
+            serving_started = True
+
+    assert serving_started is False
+    assert await state.connection.is_connected() is False
+    await wait_for_session_count(
+        sa_connection,
+        state.application_name,
+        expected=0,
+    )
+
+
+@case("FRAME-026")
+@pytest.mark.asyncio
+async def test_adapted_flask_startup_rejects_unreachable_sql_before_serving(
+    sql_auth_config,
+    sa_connection,
+    unique_sql_name,
+) -> None:
+    unreachable = replace(sql_auth_config, host="127.0.0.1", port=1)
+    state = FrameworkState.create(
+        unreachable,
+        application_name=unique_sql_name("strict_flask_asgi_unreachable"),
+        max_size=1,
+        min_idle=0,
+    )
+    serving_started = False
+
+    with pytest.raises(SqlConnectionError):
+        async with adapted_flask_lifespan(state):
+            serving_started = True
+
+    assert serving_started is False
+    assert await state.connection.is_connected() is False
+    assert await state.connection.disconnect() is False
     await wait_for_session_count(
         sa_connection,
         state.application_name,
