@@ -86,10 +86,10 @@ Snapshotul tehnic verificat la ultima actualizare:
 
 - data: `2026-07-25`;
 - fork cumulativ: `test/sql-auth-validation`;
-- HEAD tehnic verificat pentru rezultatul necunoscut după COMMIT:
-  `510ea9a4f274efc0f72de91bc627f3e751038fdd`;
+- HEAD tehnic verificat pentru retragerea automată după anulare:
+  `c30c02ac6d0aac10576ce9c140cb4c3161e5717e`;
 - HEAD cumulativ publicat după actualizarea auditului:
-  `126369d655ed33bfbc49e5bc24d152519442250f`;
+  `15fd2aaec25205439f39a14fca5e9aad8f7e2297`;
 - bază upstream în referințele locale:
   `e45f301f46128e7114c27097b608a4b2d7f429cf`;
 - versiune de bază: `v0.7.7`;
@@ -141,6 +141,7 @@ Nicio stare sub `APPROVED_TO_PUBLISH` nu autorizează `gh pr create`.
 | PR-16 | state machine atomic pentru tranzacții concurente | test `ff844b7`; fix `b86b0ac`; cumulativ `9d51d07` | `VERIFIED_FORK` | rebase curat, RED/GREEN pe ultimul upstream și comparație obligatorie cu draftul #121 |
 | PR-17 | tranzacții pe lease rezervat din pool-ul comun | teste `3aee0da`, `a7e35d9`; fix `8027b67`; stress `4662c70`, `adac307`; cumulativ `7d4955d` | `VERIFIED_FORK` | rebase curat, fixture-uri portabile și comparație obligatorie cu draftul #121 |
 | PR-18 | `CommitOutcomeUnknown` după răspuns COMMIT pierdut, fără rollback/retry | test `97ba0d2`; fixuri `fba743a`, `5428d5a`, `59a5559`; cumulativ `510ea9a` | `VERIFIED_FORK` | rebase curat, fault fixture portabil și comparație obligatorie cu draftul #121 |
+| PR-19 | retragerea automată a conexiunii după anularea unei operații tranzacționale | test `1757094`; fix `c5dcd2d`; proxy `0491eb9`, `a5cc2bd`, `6939418`; dovezi `969f23d`, `ec7ba56`; cumulativ `c30c02a` | `VERIFIED_FORK` | rebase curat, fixture DMV portabil și comparație obligatorie cu draftul #121 |
 
 Hash-urile scurte identifică sursa de lucru, nu sunt instrucțiuni de
 cherry-pick orb. Pentru fiecare PR se extrage numai diff-ul subiectului său.
@@ -155,7 +156,9 @@ burst de 16 apeluri `begin()` și combinațiile concurente `commit/commit`,
 Remedierea `b86b0ac` păstrează conexiunea și starea într-o singură sesiune
 protejată de mutex în Rust. Validarea, starea in-flight, comanda TDS, consumarea
 completă a răspunsului și tranziția terminală formează aceeași secțiune
-atomică. Anularea și panicurile rămân fail-closed până la `close()`.
+atomică. La checkpointul PR-16, anularea și panicurile rămâneau fail-closed
+până la `close()`; dependența de cleanup explicit este eliminată separat prin
+PR-19.
 
 Dovada GREEN pe source tree-ul cumulativ `9d51d07`:
 
@@ -180,7 +183,8 @@ PR-16, deci nu intră în diff-ul candidatului upstream.
 PR-16 nu include transaction leasing, `CommitOutcomeUnknown`, TDS `ATTENTION`
 sau retry pentru operații de scriere. Transaction leasing este implementat și
 verificat separat ca PR-17; rezultatul necunoscut al COMMIT-ului este
-implementat și verificat separat ca PR-18.
+implementat și verificat separat ca PR-18; retragerea autonomă după anulare
+este implementată și verificată separat ca PR-19.
 
 ### Dovada de promovare pentru PR-17
 
@@ -188,7 +192,9 @@ Reproducerea TX-022–TX-026 din `3aee0da` a fost RED în toate cele cinci
 contracte deoarece API-ul `Connection.transaction()` nu exista. Contractele
 cer același SPID pe durata tranzacției, același buget pentru query și
 tranzacție, backpressure la `pool.max_size`, resetarea stării între lease-uri
-și retragerea fail-closed după anulare.
+și marcarea fail-closed după anulare. La checkpointul PR-17, testul de anulare
+folosea încă `close()` explicit pentru retragerea fizică; cleanup-ul autonom
+este demonstrat separat de PR-19.
 
 Corecția de test `a7e35d9` identifică socketul prin
 `sys.dm_exec_connections.connection_id`: SQL Server poate reutiliza imediat un
@@ -233,7 +239,8 @@ backpressure, nu doar throughput.
 PR-17 nu include `CommitOutcomeUnknown`, retry automat, TDS `ATTENTION`,
 tranzacții distribuite, savepoints sau graceful shutdown general. Diff-ul
 upstream va fi reconstruit din ultimul `upstream/master` și comparat cu draftul
-#121 înainte de orice cerere de publicare.
+#121 înainte de orice cerere de publicare. Retragerea automată după anulare
+rămâne candidatul separat PR-19.
 
 ### Dovada de promovare pentru PR-18
 
@@ -303,8 +310,8 @@ smoke-test `PASS` și zero operații eșuate.
 
 PR-18 nu include TDS `ATTENTION`, timeouturi generale, retry transparent,
 tranzacții distribuite, recovery automat, savepoints sau refactorizarea tuturor
-erorilor de cleanup. Anularea Python rămâne `CancelledError` și retrage
-socketul fail-closed.
+erorilor de cleanup. Anularea Python rămâne `CancelledError`; cleanup-ul
+autonom al conexiunii tranzacționale este candidatul separat PR-19.
 
 Înainte de upstream, diff-ul trebuie reconstruit din ultimul
 `upstream/master`, dovada „row visible before response abort” trebuie păstrată
@@ -312,7 +319,90 @@ socketul fail-closed.
 explicit cu draftul #121. Starea rămâne `VERIFIED_FORK`; publicarea nu este
 aprobată.
 
-## Candidați rezervați după PR-18
+### Dovada de promovare pentru PR-19
+
+Reproducerea TX-032–TX-034 din `1757094` separă trei căi care păstrau
+conexiunea tranzacțională după anularea future-ului Python:
+
+```text
+TX-032 pooled data operation          requestul rămânea activ
+TX-033 direct data operation          sesiunea rămânea activă
+TX-034 COMMIT deja durabil            lease-ul rămânea captiv
+```
+
+`TransactionSession` deținea socketul direct sau
+`OwnedPooledConnection` într-un `Arc<AsyncMutex<...>>`. Drop-ul future-ului
+elibera mutexul, dar conexiunea rămânea în sesiunea aflată în `Executing` sau
+`Committing`, astfel încât requestul, sesiunea ori waiterul pool-ului depindeau
+de un `close()` ulterior.
+
+Remedierea `c5dcd2d` adaugă:
+
+- un epoch monoton pentru fiecare operație in-flight;
+- un guard RAII armat numai după tranziția validă;
+- cleanup condiționat de perechea stare/epoch;
+- retragerea socketului direct sau marcarea lease-ului pooled `Broken`;
+- fallback Tokio când mutexul nu poate fi obținut sincron în `Drop`;
+- starea terminală `Failed`, fără retry, rollback sau settlement suplimentar.
+
+Contractele păstrează `asyncio.CancelledError`. Închiderea transportului
+termină requestul și sesiunea SQL Server; lucrul necomis este rollback-uit de
+server. Dacă `COMMIT` era deja durabil, rândul rămâne durabil, iar driverul nu
+pretinde rollback și nu repetă operația.
+
+Commiturile auxiliare păstrează dovada fizică:
+
+- `41c53a8` întărește TX-026 pentru recuperarea autonomă a waiterului;
+- `0491eb9` reproduce segmentul server-side half-open al proxy-ului;
+- `a5cc2bd` închide ambele segmente când un relay TCP se termină;
+- `6939418` identifică sesiunea prin `(session_id, connection_id)`;
+- `969f23d` și `ec7ba56` demonstrează retragerea identității fizice, nu doar
+  eventuala reutilizare a SPID-ului numeric.
+
+Dovada GREEN pe source tree-ul integrat în `c30c02a`:
+
+```text
+TX-026 + TX-032–TX-034 + proxy       5/5 PASS
+strict transaction/async/batch      140/140 PASS
+strict SQL-auth complet              344/344 PASS în 124,32 s
+cazuri raportate din specificație    277/277 PASS
+upstream aplicabil                   896/896 PASS în 62,99 s
+FastMssql Rust unit tests            13/13 PASS
+Tiberius vendored unit tests         123/123 PASS
+cargo fmt / Clippy / Ruff            PASS
+cargo audit, 219 dependențe          0 findings
+```
+
+Storm-ul dedicat a anulat 20 de taskuri peste un pool de 5: toate au întors
+`CancelledError`, cele 5 conexiuni fizice active au fost retrase, 5
+replacement-uri au primit `connection_id` noi, pool-ul și-a recuperat
+capacitatea, iar după `disconnect()` au rămas zero sesiuni.
+
+Stress-ul pooled cu `pool.max_size=100` a produs:
+
+```text
+10.000 tx, concurrency 100     PASS, 3.200,19 tx/s
+99.999 tx, concurrency 100     PASS, 3.357,20 tx/s
+99.999 tx, concurrency 200     PASS, 3.422,57 tx/s
+maximum physical/SQL sessions  100
+remaining application sessions 0
+```
+
+Ambele profile de 99.999 au exact 50.000 commituri și 49.999 rollback-uri,
+smoke-test final `PASS` și zero operații eșuate.
+
+PR-19 nu include timeouturi publice, retry, schimbarea semanticii
+`CancelledError`, tranzacții distribuite sau TDS `ATTENTION`. Închiderea
+transportului este contractul P0 sigur și verificat. `ATTENTION` plus drenarea
+până la `DONE_ATTN` rămâne o optimizare P1 separată dacă se dorește
+reutilizarea aceleiași sesiuni.
+
+Înainte de upstream, diff-ul trebuie reconstruit din ultimul
+`upstream/master`, testele DMV trebuie transformate într-un fixture acceptabil
+CI-ului original, iar schimbarea trebuie comparată explicit cu draftul #121.
+Starea rămâne `VERIFIED_FORK`; publicarea nu este aprobată.
+
+## Candidați rezervați după PR-19
 
 Acești candidați nu sunt considerați implementați:
 
@@ -351,6 +441,7 @@ Lot C — pool și protocol
 
 Lot D — tranzacții
   PR-16 + PR-17 -> PR-18
+  PR-16 + PR-17 -> PR-19
 
 Lot E — API sau split suplimentar
   PR-04, PR-05, PR-07, PR-08, PR-09, PR-10, PR-11
