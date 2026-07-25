@@ -629,16 +629,33 @@ class Connection:
         """
         ...
 
-    def connect(self) -> Coroutine[Any, Any, bool]:
-        """Explicitly initialize the connection pool."""
+    def connect(
+        self,
+        validate: bool = True,
+    ) -> Coroutine[Any, Any, bool]:
+        """Initialize the pool and validate SQL Server by default.
+
+        Set validate=False for intentional lazy pool allocation without a
+        readiness claim.
+        """
+        ...
+
+    def ping(self) -> Coroutine[Any, Any, bool]:
+        """Execute SELECT 1 through the shared pool.
+
+        Return True on success and raise a typed FastMssql exception on failure.
+        """
         ...
 
     def disconnect(self) -> Coroutine[Any, Any, bool]:
-        """Explicitly close the connection pool and all connections."""
+        """Drop this connection object's pool handle."""
         ...
 
     def is_connected(self) -> Coroutine[Any, Any, bool]:
-        """Check if the connection pool is active and ready."""
+        """Return whether this object currently owns a pool handle.
+
+        This method performs no network I/O. Use ping() for readiness.
+        """
         ...
 
     def query(
@@ -745,7 +762,7 @@ class Connection:
         Get connection pool statistics.
 
         Returns a dictionary with the following keys:
-        - connected (bool): Whether the pool is initialized and connected
+        - connected (bool): Whether this object owns a pool handle
         - connections (int): Total number of connections in the pool
         - idle_connections (int): Number of idle connections available
         - active_connections (int): Number of connections currently in use
@@ -759,7 +776,7 @@ class Connection:
         ...
 
     async def __aenter__(self) -> _RustConnection:
-        """Async context manager entry (initializes pool)."""
+        """Validate SQL Server readiness before entering the async context."""
         ...
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
