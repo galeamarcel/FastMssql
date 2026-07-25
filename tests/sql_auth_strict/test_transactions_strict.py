@@ -361,7 +361,14 @@ async def test_cancelled_transaction_lease_is_retired_and_waiter_recovers(
 
     try:
         await cancelled.begin()
-        cancelled_session = await scalar(cancelled, "SELECT @@SPID")
+        cancelled_connection_id = await scalar(
+            cancelled,
+            """
+            SELECT CONVERT(NVARCHAR(36), connection_id)
+            FROM sys.dm_exec_connections
+            WHERE session_id = @@SPID
+            """,
+        )
         query_task = asyncio.create_task(
             cancelled.simple_query(
                 "WAITFOR DELAY '00:00:05'; "
@@ -385,8 +392,15 @@ async def test_cancelled_transaction_lease_is_retired_and_waiter_recovers(
 
         await cancelled.close()
         await asyncio.wait_for(waiting_begin, timeout=2.0)
-        recovered_session = await scalar(waiting, "SELECT @@SPID")
-        assert recovered_session != cancelled_session
+        recovered_connection_id = await scalar(
+            waiting,
+            """
+            SELECT CONVERT(NVARCHAR(36), connection_id)
+            FROM sys.dm_exec_connections
+            WHERE session_id = @@SPID
+            """,
+        )
+        assert recovered_connection_id != cancelled_connection_id
         await _wait_for_request(sa_connection, token, present=False)
 
         stats = await connection.pool_stats()
