@@ -49,7 +49,7 @@ La data redactării:
 
 - `upstream/master`: `e45f301` — versiunea `v0.7.7`;
 - branch audit: `test/sql-auth-validation`;
-- snapshotul tehnic anterior acestui update documentar este `7d4955d`;
+- snapshotul tehnic anterior acestui update documentar este `510ea9a`;
 - unicul PR upstream deschis este draftul
   [#121 — Improve transactions behavior and safety](https://github.com/Rivendael/FastMssql/pull/121);
 - PR-ul #121 modifică masiv tranzacțiile și timeouturile, deci orice PR care
@@ -106,7 +106,8 @@ PR-uri cu decizie de supply chain
     ├── PR-14 gate RustSec obligatoriu înainte de release
     ├── PR-15 RESETCONNECTION TDS și izolarea sesiunilor pooled
     ├── PR-16 mașină atomică de stare pentru tranzacții
-    └── PR-17 transaction leasing din pool
+    ├── PR-17 transaction leasing din pool
+    └── PR-18 rezultat necunoscut după COMMIT
 
 Funcții enterprise viitoare
     └── intake individual după implementare și audit
@@ -589,7 +590,7 @@ git commit -m "fix: preserve connection endpoint in errors"
 
 **Priority:** P0, `Broken` verificat; acest PR rămâne limitat la conexiunile
 nesigure și anulare. Resetarea `NeedsReset` este candidatul separat PR-15, iar
-`CommitOutcomeUnknown` aparține branchului de tranzacții.
+`CommitOutcomeUnknown` aparține candidatului separat PR-18.
 
 **Source commits:**
 
@@ -626,7 +627,8 @@ nesigure și anulare. Resetarea `NeedsReset` este candidatul separat PR-15, iar
 - o eroare SQL de severitate non-fatală păstrează același `connection_id`;
 - resetarea efectivă pentru `NeedsReset` este implementată și verificată
   separat în `16f076a`, candidatul PR-15;
-- `CommitOutcomeUnknown` nu este implementat și nu trebuie amestecat în PR-06.
+- `CommitOutcomeUnknown` nu face parte din PR-06; este implementat și verificat
+  separat în PR-18.
 
 - [x] **Step 1: Nu cherry-pick-ui commitul în forma actuală**
 
@@ -655,7 +657,7 @@ enum ConnectionDisposition {
 revizuit independent pentru eliminarea socketurilor nesigure, dar branchul
 upstream trebuie construit astfel încât să nu pretindă că `NeedsReset` este
 consumat dacă PR-15 nu este încă prezent. `CommitOutcomeUnknown` rămâne
-obligatoriu pe branchul tranzacțiilor.
+obligatoriu, dar numai pe branchul separat PR-18.
 
 - [ ] **Step 3: Adaugă fault injection**
 
@@ -1330,8 +1332,8 @@ explicită a proprietarului forkului.
 ### Task 15: PR-16 — Mașină atomică de stare pentru tranzacții
 
 **Priority:** P0 implementat și verificat pe fork. Transaction leasing este
-implementat separat și documentat ca PR-17; `CommitOutcomeUnknown` rămâne un
-PR P0 separat.
+implementat separat și documentat ca PR-17; `CommitOutcomeUnknown` este
+implementat separat și documentat ca PR-18.
 
 **Source test branch:** `test/transaction-state-machine`
 
@@ -1461,7 +1463,8 @@ forkului.
 **Status:** `VERIFIED_FORK`
 
 **Priority:** P0 implementat și verificat pe fork.
-`CommitOutcomeUnknown` și TDS `ATTENTION` rămân schimbări P0 separate.
+`CommitOutcomeUnknown` este implementat separat în PR-18, iar TDS `ATTENTION`
+rămâne o schimbare P0 distinctă.
 
 **Source test branch:** `test/transaction-leasing`
 
@@ -1621,6 +1624,181 @@ proprietarului forkului.
 
 ---
 
+### Task 17: PR-18 — Rezultat necunoscut după pierderea confirmării COMMIT
+
+**Status:** `VERIFIED_FORK`
+
+**Priority:** P0 implementat și verificat pe fork. Publicarea upstream nu este
+aprobată.
+
+**Source design branch:** `docs/commit-outcome-unknown-design`
+
+**Source design commits:**
+
+- `52572a5` — specificația comportamentală;
+- `23344ce` — planul TDD și fault injection.
+
+**Source test branch:** `test/commit-outcome-unknown`
+
+**Source test commit:** `97ba0d2`
+
+**Source implementation branch:** `fix/commit-outcome-unknown`
+
+**Source implementation commits:**
+
+- `fba743a` — excepția publică și stuburile;
+- `5428d5a` — clasificarea erorilor după intrarea în `Committing`;
+- `59a5559` — context manager fără rollback după rezultat necunoscut.
+
+**Cumulative fork commit:** `510ea9a`
+
+**Proposed clean upstream branch:** `fix/upstream-commit-outcome-unknown`
+
+**Proposed title:** `fix: expose unknown outcomes after unconfirmed commit`
+
+**Files on the verified fork:**
+
+- Modify: `src/types.rs`
+- Modify: `src/lib.rs`
+- Modify: `src/transaction.rs`
+- Modify: `python/fastmssql/__init__.py`
+- Modify: `python/fastmssql/__init__.pyi`
+- Modify: `python/fastmssql/fastmssql.pyi`
+- Test: `tests/sql_auth_strict/test_transactions_strict.py`
+- Test utility: `tests/sql_auth_strict/tcp_fault_proxy.py`
+- Test contract: `tests/sql_auth_strict/test_matrix_contract.py`
+
+**Interfaces:**
+
+- Produces clasa publică independentă `CommitOutcomeUnknown`.
+- Expune `message`, `operation="commit"`, `retryable=False` și
+  `connection_discarded=True`.
+- Păstrează eroarea originală în `__cause__`.
+- Retrage socketul direct sau pooled înainte de întoarcerea în Python.
+- Nu execută rollback, retry sau reconciliere automată.
+- Păstrează un refuz SQL Server determinist, non-fatal, ca `SqlError`.
+
+**Root cause:**
+
+După trimiterea `COMMIT`, pierderea răspunsului nu spune dacă serverul a aplicat
+sau nu tranzacția. Implementarea anterioară expunea eroarea generică de
+transport/TLS și wrapperul Python încerca rollback, sugerând incorect că
+tranzacția nu fusese comisă. Retry-ul aceleiași operații de business ar putea
+produce efecte duplicate.
+
+- [x] **Step 1: Reproduce determinist rezultatul necunoscut**
+
+TX-027–TX-031 folosesc un proxy TCP transparent pentru traficul TLS. Proxy-ul
+oprește numai direcția server -> client în timpul `COMMIT`; o conexiune
+observator confirmă mai întâi că rândul este persistent, apoi proxy-ul
+întrerupe socketul înainte ca răspunsul să ajungă la driver.
+
+Baseline-ul a produs:
+
+```text
+selecția RED                         4 FAIL, 17 PASS în 0,47 s
+tip public                           absent
+pooled COMMIT cu răspuns pierdut     TlsError, deși rândul era persistent
+direct COMMIT cu răspuns pierdut     TlsError, deși rândul era persistent
+context manager intermediar          1 rollback incorect
+control SQL 3902 / severity 16       SqlError, PASS
+```
+
+- [x] **Step 2: Adaugă tipul public distinct**
+
+`CommitOutcomeUnknown` nu moștenește `SqlConnectionError` sau `SqlError`.
+Aceasta obligă aplicația să trateze rezultatul de business necunoscut separat
+de un eșec obișnuit de conectare. Instanțele create de driver au atributele
+stabile declarate în runtime și în ambele stuburi.
+
+- [x] **Step 3: Clasifică fail-closed după intrarea în COMMIT**
+
+După o tranziție validă `Active -> Committing`, numai un `SqlError` cu
+severitate disponibilă 0–19 este un refuz determinist. Severitățile fatale,
+metadata lipsă, erorile de transport/TLS/protocol și panicurile sunt
+conservator necunoscute. Conexiunea este marcată/retrasă, eliminată din
+sesiunea tranzacției și starea devine `Failed` înainte de construirea erorii
+publice.
+
+Această politică poate clasifica drept „necunoscut” un transport failure care
+a apărut înainte ca serverul să aplice commitul. Acest fals pozitiv este sigur:
+aplicația trebuie să reconcilieze printr-o cheie idempotentă sau un
+identificator de business, nu să repete automat scrierea.
+
+- [x] **Step 4: Elimină rollback-ul presupus din context manager**
+
+La auto-commit, `CommitOutcomeUnknown` este propagată direct. Contractul
+verifică exact un `begin`, un `commit`, zero `rollback` și un `close`.
+Orice altă eroare de commit păstrează comportamentul istoric în acest PR; o
+eventuală agregare a erorilor de cleanup aparține unui candidat separat.
+
+- [x] **Step 5: Verifică faultul, regresia și load-ul**
+
+Rezultatele pe arborele integrat `510ea9a`:
+
+```text
+TX-027–TX-031 focalizat              5/5 PASS
+tranzacții stricte + upstream       100/100 PASS
+suita strictă SQL-auth              340/340 PASS în 127,85 s
+cazuri raportate din specificație   274/274 PASS
+upstream aplicabil                  896/896 PASS în 64,09 s
+FastMssql Rust unit tests           9/9 PASS
+cargo fmt / Clippy -D warnings      PASS
+cargo audit, 219 dependențe         0 findings
+```
+
+Testul pooled verifică un `connection_id` diferit pentru waiterul următor;
+testul direct verifică `is_connected() == False`. Atributele publice și
+`__cause__` sunt verificate, iar controlul SQL 3902 rămâne `SqlError`.
+
+Stress cu `pool.max_size=100`:
+
+```text
+10.000 tx, concurrency 100     2.999,82 tx/s
+99.999 tx, concurrency 100     3.203,11 tx/s
+99.999 tx, concurrency 200     3.544,56 tx/s
+maximum physical/SQL sessions  100
+remaining application sessions 0
+```
+
+Ambele profile de 99.999 au exact 50.000 commituri și 49.999 rollback-uri,
+smoke-test final `PASS` și zero operații eșuate.
+
+- [ ] **Step 6: Reaplică minim peste ultimul upstream și compară #121**
+
+Branchul pentru upstream trebuie creat din ultimul `upstream/master`, nu din
+istoricul cumulativ. Se confirmă RED pe acea bază, se reaplică numai tipul,
+clasificarea, wrapperul și un fault test portabil, apoi se compară explicit cu
+[#121](https://github.com/Rivendael/FastMssql/pull/121). Draftul atinge aceeași
+mașină de stare și poate necesita adaptarea hook-ului de clasificare.
+
+- [ ] **Step 7: Decide forma fixture-ului de fault upstream**
+
+Proxy-ul in-process este determinist și nu necesită privilegii de rețea, dar
+testul actual folosește fixture-urile Docker SQL-auth ale forkului. Candidatul
+curat trebuie să păstreze dovada „row visible before response abort” într-o
+formă acceptabilă pentru CI-ul upstream, fără a relaxa testul la o simplă
+excepție de transport.
+
+- [ ] **Step 8: Păstrează limitele în candidați separați**
+
+PR-18 nu va include:
+
+- TDS `ATTENTION` sau timeouturi generale;
+- retry transparent pentru `COMMIT` sau alte scrieri;
+- reconciliere automată ori presupunere de rollback;
+- tranzacții distribuite;
+- savepoints, isolation ergonomics sau observabilitate generală;
+- refactorizarea tuturor excepțiilor de cleanup.
+
+- [ ] **Step 9: Cere aprobarea pentru publicare**
+
+Prezintă diff-ul curat, comparația cu #121, dovada RED/GREEN și compromisul
+clasificării conservative. Nu executa `git push` pentru branchul upstream și
+nu executa `gh pr create` fără aprobarea explicită a proprietarului forkului.
+
+---
+
 ## Funcții enterprise care vor intra ulterior în roadmap
 
 Fiecare funcție primește propriul candidat numai după ce este implementată pe
@@ -1632,6 +1810,7 @@ fork, testată live și auditată.
 |---|---|---|
 | Transaction state | PR-16, tranziții atomice în Rust | implementat/verificat pe fork; rebase și comparație cu #121 înainte de upstream |
 | Session leasing | PR-17, tranzacții pe conexiuni rezervate din pool | implementat/verificat pe fork; rebase și comparație cu #121 înainte de upstream |
+| Commit outcome | PR-18, `CommitOutcomeUnknown` fără rollback/retry | implementat/verificat pe fork; fault fixture portabil, rebase și comparație cu #121 înainte de upstream |
 | TDS session reset | PR-15, bit `RESETCONNECTION` | implementat/verificat pe fork; traseu Tiberius și aprobare înainte de upstream |
 | True async streaming | stream Python async cu backpressure | memorie limitată, early close, lease recovery |
 | Typed parameters | tip/direction/precision/scale/length | wire metadata verificată prin SQL Server |

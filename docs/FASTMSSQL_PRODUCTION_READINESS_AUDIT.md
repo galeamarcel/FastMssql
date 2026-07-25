@@ -6,9 +6,9 @@ Branch: `test/sql-auth-validation`
 Commit: `3cc5700b5142f3e84c83767e2ff114f87a19c5dd`
 
 Ultima actualizare live: 25 iulie 2026
-Ultimul fix verificat: `feat/transaction-leasing` la `8027b67`
+Ultimul fix verificat: `fix/commit-outcome-unknown` la `59a5559`
 Ultimul harness de load verificat: `adac307`
-Ultimul branch cumulativ verificat: `test/sql-auth-validation` la `7d4955d`
+Ultimul branch cumulativ verificat: `test/sql-auth-validation` la `510ea9a`
 Ultimul gate CI verificat: `ci/dependency-security-gate` la `3887ddd`, cu
 checkout menținut la `1d13280`; rularea hosted
 [#30130204804](https://github.com/galeamarcel/FastMssql/actions/runs/30130204804)
@@ -20,11 +20,15 @@ FastMssql are o bază reală pentru acces MSSQL nativ și true-async, fără ODB
 TLS, dependențele RustSec, eliminarea conexiunilor pooled defecte și izolarea
 sesiunilor reutilizate au acum remedieri verificate pe fork. Mașina atomică de
 stare și leasingul tranzacțiilor din pool sunt de asemenea implementate și
-verificate. Biblioteca nu este încă declarată pregătită pentru producție
-critică sau multi-tenant până când nu este închisă categoria P0 rămasă:
+verificate. Pierderea confirmării după `COMMIT` este acum clasificată distinct,
+fără rollback sau retry automat. Biblioteca nu este încă declarată pregătită
+pentru producție critică sau multi-tenant până când nu este închisă categoria
+P0 rămasă:
 
-1. anularea tranzacțiilor și rezultatul necunoscut după pierderea confirmării
-   pentru COMMIT.
+1. anularea/timeoutul TDS trebuie să confirme terminarea requestului
+   server-side; retragerea fail-closed a socketului client este implementată,
+   dar protocolul public `ATTENTION` și drenarea răspunsului nu sunt încă
+   disponibile.
 
 API-ul enterprise recomandat este acum `Connection.transaction()`: rezervă un
 lease din același pool bb8 folosit de query-urile obișnuite, păstrează aceeași
@@ -206,7 +210,8 @@ Limitele rămase sunt intenționat vizibile:
   `16f076a`, descrisă în secțiunea următoare;
 - la acest checkpoint, `Transaction` folosea încă o conexiune directă;
   leasingul este închis ulterior prin `8027b67`, iar
-  `CommitOutcomeUnknown` rămâne deschis;
+  `CommitOutcomeUnknown` era încă deschis și este închis ulterior prin
+  `5428d5a`;
 - un EOF după o conexiune TLS deja stabilită poate fi expus momentan ca
   `TlsError` din cauza euristicii de substring. Conexiunea este eliminată
   corect, dar taxonomia trebuie corectată separat în PR-11.
@@ -301,7 +306,8 @@ Limite rămase la acest checkpoint:
 - tranzacțiile distribuite nu sunt un contract FastMssql suportat sau testat;
   MS-TDS le enumeră separat de resetarea standard;
 - API-ul recomandat primește ulterior lease din pool prin `8027b67`;
-  `CommitOutcomeUnknown` rămâne deschis;
+  `CommitOutcomeUnknown` era încă deschis și este închis ulterior prin
+  `5428d5a`;
 - pentru un PR FastMssql upstream, patchul protocolar trebuie acceptat în
   Tiberius sau consumat printr-o strategie de dependență aprobată. Nu a fost
   creat sau publicat niciun fork Tiberius.
@@ -469,13 +475,118 @@ pool-ul fără ca numărul conexiunilor fizice să depășească 100.
 
 Limite rămase:
 
-- pierderea confirmării după trimiterea `COMMIT` trebuie expusă distinct ca
-  `CommitOutcomeUnknown`; nu este sigur nici rollback-ul presupus, nici retry-ul
-  automat;
+- la checkpointul PR-17, pierderea confirmării după trimiterea `COMMIT` era
+  încă deschisă; această problemă este închisă separat de remedierea următoare;
 - anularea fail-closed retrage socketul, dar nu există încă pachet TDS
   `ATTENTION` public;
 - tranzacțiile distribuite nu sunt suportate sau testate;
 - înaintea unui PR upstream, diff-ul trebuie reaplicat peste ultimul
+  `upstream/master` și comparat cu draftul #121.
+
+### Rezultat necunoscut după COMMIT — remediat și verificat
+
+Branchurile și commiturile sunt separate:
+
+- `docs/commit-outcome-unknown-design`
+  - `52572a5` — specificația comportamentală și modelul de eroare;
+  - `23344ce` — planul TDD și fault injection;
+- `test/commit-outcome-unknown`
+  - `97ba0d2` — reproducerea deterministă TX-027–TX-031 și proxy-ul TCP
+    transparent pentru trafic TLS;
+- `fix/commit-outcome-unknown`
+  - `fba743a` — excepția publică și stuburile;
+  - `5428d5a` — clasificarea fail-closed a erorilor de `COMMIT`;
+  - `59a5559` — context manager-ul nu mai presupune rollback după un rezultat
+    necunoscut;
+- branch cumulativ `test/sql-auth-validation`
+  - `510ea9a` — integrarea completă pe fork.
+
+Cauza confirmată era imposibilitatea de a distinge un eșec determinist al
+serverului de pierderea răspunsului după ce `COMMIT` a intrat în execuție:
+
+```text
+COMMIT trimis -> SQL Server aplică tranzacția -> răspuns TLS pierdut
+  -> TlsError generic
+  -> wrapperul presupune că commitul a eșuat și încearcă rollback
+```
+
+Rollback-ul nu poate anula un commit deja aplicat, iar retry-ul poate dubla o
+operație de business. Contractul nou expune o excepție independentă,
+`CommitOutcomeUnknown`, cu atribute stabile:
+
+```text
+operation = "commit"
+retryable = False
+connection_discarded = True
+__cause__ = eroarea originală de transport/TLS/protocol
+```
+
+Clasificarea este intenționat conservatoare. După tranziția validă
+`Active -> Committing`, numai un `SqlError` confirmat cu severitate 0–19 este
+considerat refuz determinist și rămâne `SqlError`. Severitățile fatale,
+metadata de severitate absentă, erorile de transport/TLS/protocol și panicurile
+devin `CommitOutcomeUnknown`. Înainte ca excepția să revină în Python, starea
+tranzacției este `Failed`, socketul direct este eliminat, iar lease-ul pooled
+este retras. Nu există retry sau apel de rollback automat.
+
+Reproducerea folosește un proxy TCP transparent, compatibil cu criptarea TLS:
+
+1. tranzacția inserează un rând prin proxy;
+2. proxy-ul oprește bytes-ii server -> client în timpul `COMMIT`;
+3. o conexiune observator directă la SQL Server confirmă că rândul este deja
+   vizibil;
+4. proxy-ul întrerupe socketul înainte ca răspunsul să ajungă la driver;
+5. atât calea pooled, cât și constructorul direct returnează
+   `CommitOutcomeUnknown`.
+
+Pentru calea pooled, testul verifică faptul că următorul waiter primește un
+`sys.dm_exec_connections.connection_id` diferit. Pentru calea directă,
+`is_connected()` devine `False`. Context manager-ul propagă aceeași excepție
+cu exact un `commit`, zero `rollback` și exact un `close`.
+
+Dovada RED:
+
+- 4 FAIL și 17 PASS în 0,47 s pe codul anterior;
+- TX-027: tipul public lipsea;
+- TX-028 și TX-029: tranzacția era demonstrabil aplicată, dar excepția era
+  `TlsError`;
+- TX-030: după introducerea izolată a tipului, wrapperul apela încă rollback
+  o dată;
+- TX-031 a rămas control GREEN: refuzul SQL 3902, severitate 16, este
+  `SqlError`, nu rezultat necunoscut.
+
+Dovada GREEN pe arborele integrat:
+
+```text
+TX-027–TX-031 focalizat              5/5 PASS
+tranzacții stricte + upstream       100/100 PASS
+suita strictă SQL-auth              340/340 PASS în 127,85 s
+cazuri raportate din specificație   274/274 PASS
+regresie upstream aplicabilă        896/896 PASS în 64,09 s
+FastMssql Rust unit tests           9/9 PASS
+cargo fmt / Clippy -D warnings      PASS
+cargo audit, 219 dependențe         0 findings
+```
+
+Stress-ul pooled pe `pool.max_size=100` a rămas bounded:
+
+```text
+10.000 tx, concurrency 100     2.999,82 tx/s, maximum 100 conexiuni
+99.999 tx, concurrency 100     3.203,11 tx/s, maximum 100 conexiuni
+99.999 tx, concurrency 200     3.544,56 tx/s, maximum 100 conexiuni
+```
+
+Profilele de 99.999 au produs exact 50.000 commituri și 49.999 rollback-uri.
+Fiecare profil a avut smoke-test `PASS` și zero sesiuni de aplicație rămase.
+
+Limite păstrate explicit:
+
+- anularea Python continuă să expună `CancelledError`; socketul este retras,
+  dar FastMssql nu trimite încă TDS `ATTENTION`;
+- nu există retry transparent, reconciliere automată sau presupunere de
+  rollback;
+- nu sunt implementate tranzacții distribuite sau recovery coordinator;
+- înainte de upstream, candidatul trebuie reaplicat minim peste ultimul
   `upstream/master` și comparat cu draftul #121.
 
 ## Corecții și nuanțări față de primul audit
@@ -512,9 +623,10 @@ Limite rămase:
 | Configurație TLS | Când se folosește `connection_string`, `ssl_config` este ignorat. Combinația CA + trust necondiționat poate ajunge la panic Rust expus ca `PanicException`. | O singură sursă TLS, validare înainte de Tiberius, conflicte returnate ca `ValueError` și niciun panic peste FFI. | **REMEDIAT și verificat** în `0b5d6ca`. |
 | Dependențe | Lockfile-ul inițial avea 12 vulnerabilități RustSec și un warning de mentenanță. | Eliminarea dependenței directe `quinn-proto`, actualizarea lockfile-ului și modernizarea ramurii TLS Tiberius. | **REMEDIAT și verificat** în `5ada01e`; gate CI hosted verde prin `3887ddd`/`1d13280`; SBOM rămâne separat. |
 | Izolarea sesiunilor | `SESSION_CONTEXT` a rămas vizibil următorului utilizator al aceleiași conexiuni. Un simplu `ROLLBACK` nu curăță temp tables, `SET` options, isolation level, `CONTEXT_INFO`, `USE`, impersonation etc. | Reset TDS înainte de reutilizare și teste de contaminare între lease-uri. | **REMEDIAT și verificat** în `16f076a`: `RESETCONNECTION` este piggyback pe următoarea cerere, isolation level este restaurat explicit, iar contexte de securitate persistente retrag conexiunea. |
-| Conexiuni defecte | Guard-ul putea marca operația drept completă chiar când Python primea o eroare fatală de server/protocol/I/O. O conexiune omorâtă era reutilizată și eșua repetat cu EOF. | Dispoziție explicită `NeedsReset`, `Broken`, `CommitOutcomeUnknown`; conexiunile suspecte sunt eliminate. | **REMEDIAT pentru căile pooled obișnuite** prin `85e295f` + `16f076a`: `Broken` este eliminat și `NeedsReset` este resetat. `CommitOutcomeUnknown` rămâne P0 separat pe calea tranzacțiilor. |
+| Conexiuni defecte | Guard-ul putea marca operația drept completă chiar când Python primea o eroare fatală de server/protocol/I/O. O conexiune omorâtă era reutilizată și eșua repetat cu EOF. | Dispoziție explicită `NeedsReset`, `Broken`, `CommitOutcomeUnknown`; conexiunile suspecte sunt eliminate. | **REMEDIAT și verificat**: `Broken` este eliminat prin `85e295f`, `NeedsReset` este consumat prin `16f076a`, iar rezultatul COMMIT incert este clasificat prin `5428d5a`. |
 | Tranzacții | `Transaction` deschidea conexiuni directe, în afara pool-ului, limitelor și metricilor. Două apeluri concurente `begin()` produceau `@@TRANCOUNT=2`. | Stare de tranzacție păstrată în Rust și tranzacție pornită pe un lease din pool. | **REMEDIAT și verificat pentru API-ul recomandat**: mașina atomică de stare este în `b86b0ac`, iar `Connection.transaction()` folosește pool-ul comun prin `8027b67`; constructorul direct rămâne numai pentru compatibilitate. |
-| COMMIT și anulare | Dacă se pierde ACK-ul după COMMIT, aplicația nu poate ști dacă tranzacția s-a aplicat. Nu este sigur să presupunem rollback sau să repetăm automat. | Excepție `CommitOutcomeUnknown`, eliminarea socketului și niciun retry automat. | **DESCHIS**. |
+| Confirmare COMMIT | Dacă se pierde răspunsul după COMMIT, aplicația nu poate ști dacă tranzacția s-a aplicat. Nu este sigur să presupunem rollback sau să repetăm automat. | Excepție `CommitOutcomeUnknown`, eliminarea socketului și niciun retry automat. | **REMEDIAT și verificat** prin `fba743a` + `5428d5a` + `59a5559`, integrat în `510ea9a`. |
+| Anulare TDS | Anularea Python retrage fail-closed socketul, dar nu există încă un API Tiberius public pentru `ATTENTION` și drenarea răspunsului. | Trimitere TDS `ATTENTION`, consumarea confirmării, deadline și dovadă că requestul server-side s-a încheiat. | **PARȚIAL**: capacitatea pool-ului se recuperează și socketul incert este retras; terminarea protocolară explicită rămâne P0. |
 
 ### Dependențe și RustSec
 
@@ -617,9 +729,10 @@ fără un round-trip T-SQL separat.
 `Clean`, `NeedsReset` și `Broken` sunt stări Rust reale. `Broken` este consumat
 de `bb8::ManageConnection::has_broken` și socketul este eliminat. `NeedsReset`
 armează resetul protocolar, iar conexiunea poate redeveni curată numai după ce
-răspunsul cererii a fost consumat complet. `CommitOutcomeUnknown` va fi
-introdus pe calea de tranzacție, unde poate fi distins de un eșec înainte de
-trimiterea `COMMIT`.
+răspunsul cererii a fost consumat complet. În `5428d5a`,
+`CommitOutcomeUnknown` este rezultatul public terminal al unei erori
+nedeterministe după intrarea în `Committing`; conexiunea a fost deja eliminată
+înainte ca excepția să fie construită.
 
 ## Probleme P1
 
@@ -869,12 +982,15 @@ funcție ar necesita lucru la nivelul driverului TDS:
 6. `fix/transaction-state-machine` — **starea atomică finalizată și verificată**
 7. `feat/transaction-leasing` — **lease-ul tranzacțional din pool, limitele și
    stress-ul bounded finalizate și verificate**
-8. `feat/timeouts-lifecycle-observability`
-9. `feat/typed-parameters`
-10. `feat/resultsets-streaming`
-11. `feat/batch-bulk`
-12. `fix/named-instance`
-13. `test/production-framework-matrix`
+8. `fix/commit-outcome-unknown` — **clasificarea rezultatului COMMIT incert,
+   retragerea socketului și lipsa retry/rollback automat finalizate și
+   verificate**
+9. `feat/timeouts-lifecycle-observability`
+10. `feat/typed-parameters`
+11. `feat/resultsets-streaming`
+12. `feat/batch-bulk`
+13. `fix/named-instance`
+14. `test/production-framework-matrix`
 
 Orice remediere FastMssql va fi făcută numai pe forkul
 `galeamarcel/FastMssql`.
@@ -895,7 +1011,8 @@ upstream fără aprobarea explicită a proprietarului forkului.
 - [x] starea de sesiune acoperită de matrice nu trece între lease-urile pooled;
 - [x] două `begin()` concurente sunt respinse determinist;
 - [ ] timeout/anulare elimină conexiunea și requestul server-side se încheie;
-- [ ] ACK pierdut după COMMIT produce `CommitOutcomeUnknown`, fără retry;
+- [x] răspunsul pierdut după COMMIT produce `CommitOutcomeUnknown`, fără
+  rollback sau retry automat;
 - [x] numărul sesiunilor tranzacționale nu depășește `pool.max_size`, inclusiv
   la 99.999 operații și concurență mai mare decât pool-ul;
 - [ ] streamingul menține memoria limitată și gestionează închiderea anticipată;
