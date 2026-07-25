@@ -133,6 +133,150 @@ def _pooled_transaction_connection(
     )
 
 
+class _ScriptedRelayReader:
+    def __init__(self, *events: bytes | BaseException) -> None:
+        self._events = list(events)
+
+    async def read(self, limit: int) -> bytes:
+        assert limit == 64 * 1024
+        if not self._events:
+            raise AssertionError("scripted relay reader exhausted")
+        event = self._events.pop(0)
+        if isinstance(event, BaseException):
+            raise event
+        return event
+
+
+class _ScriptedRelayWriter:
+    def __init__(
+        self,
+        *,
+        write_error: BaseException | None = None,
+        drain_error: BaseException | None = None,
+    ) -> None:
+        self._write_error = write_error
+        self._drain_error = drain_error
+        self.writes: list[bytes] = []
+
+    def write(self, data: bytes) -> None:
+        if self._write_error is not None:
+            raise self._write_error
+        self.writes.append(data)
+
+    async def drain(self) -> None:
+        if self._drain_error is not None:
+            raise self._drain_error
+
+
+@pytest.mark.asyncio
+async def test_tcp_fault_proxy_expected_client_disconnect_is_one_shot_and_scoped(
+) -> None:
+    proxy = DownstreamGateProxy("127.0.0.1", 1433)
+    writer = _ScriptedRelayWriter()
+
+    await proxy._relay(
+        _ScriptedRelayReader(b""),
+        writer,
+        downstream=False,
+    )
+    with pytest.raises(ConnectionResetError, match="undeclared client"):
+        await proxy._relay(
+            _ScriptedRelayReader(
+                ConnectionResetError(54, "undeclared client reset")
+            ),
+            writer,
+            downstream=False,
+        )
+
+    proxy.expect_client_disconnect()
+    await proxy._relay(
+        _ScriptedRelayReader(
+            ConnectionResetError(54, "declared client reset")
+        ),
+        writer,
+        downstream=False,
+    )
+    with pytest.raises(ConnectionResetError, match="second client"):
+        await proxy._relay(
+            _ScriptedRelayReader(
+                ConnectionResetError(54, "second client reset")
+            ),
+            writer,
+            downstream=False,
+        )
+
+    proxy.expect_client_disconnect()
+    with pytest.raises(ConnectionResetError, match="server reset"):
+        await proxy._relay(
+            _ScriptedRelayReader(
+                ConnectionResetError(54, "server reset")
+            ),
+            writer,
+            downstream=True,
+        )
+    await proxy._relay(
+        _ScriptedRelayReader(b""),
+        writer,
+        downstream=False,
+    )
+    with pytest.raises(ConnectionResetError, match="after client EOF"):
+        await proxy._relay(
+            _ScriptedRelayReader(
+                ConnectionResetError(54, "reset after client EOF")
+            ),
+            writer,
+            downstream=False,
+        )
+
+    proxy.expect_client_disconnect()
+    with pytest.raises(ConnectionResetError, match="writer write"):
+        await proxy._relay(
+            _ScriptedRelayReader(b"request"),
+            _ScriptedRelayWriter(
+                write_error=ConnectionResetError(54, "writer write reset")
+            ),
+            downstream=False,
+        )
+    await proxy._relay(
+        _ScriptedRelayReader(b""),
+        writer,
+        downstream=False,
+    )
+    with pytest.raises(ConnectionResetError, match="after write"):
+        await proxy._relay(
+            _ScriptedRelayReader(
+                ConnectionResetError(54, "reset after write failure")
+            ),
+            writer,
+            downstream=False,
+        )
+
+    proxy.expect_client_disconnect()
+    drain_writer = _ScriptedRelayWriter(
+        drain_error=ConnectionResetError(54, "writer drain reset")
+    )
+    with pytest.raises(ConnectionResetError, match="writer drain"):
+        await proxy._relay(
+            _ScriptedRelayReader(b"request"),
+            drain_writer,
+            downstream=False,
+        )
+    assert drain_writer.writes == [b"request"]
+    await proxy._relay(
+        _ScriptedRelayReader(b""),
+        writer,
+        downstream=False,
+    )
+    with pytest.raises(ConnectionResetError, match="after drain"):
+        await proxy._relay(
+            _ScriptedRelayReader(
+                ConnectionResetError(54, "reset after drain failure")
+            ),
+            writer,
+            downstream=False,
+        )
+
+
 @pytest.mark.asyncio
 async def test_tcp_fault_proxy_smoke(
     sql_auth_config: SqlAuthConfig,
@@ -1095,6 +1239,7 @@ async def test_cancelled_commit_retires_lease_without_claiming_rollback(
         commit_task = asyncio.create_task(committing.commit())
         await _wait_for_row_count(sa_connection, table, 1)
         await proxy.wait_until_downstream_held()
+        proxy.expect_client_disconnect()
         commit_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await commit_task
