@@ -110,7 +110,15 @@ def test_hosted_gate_builds_extension_and_checks_pool_defaults() -> None:
     assert "uvx --from maturin==1.14.1 maturin build" in workflow
     assert "uv pip install" in workflow
     assert '--python "${contract_python}"' in workflow
-    assert "-m pytest tests/test_pool_config_default_contract.py -q" in workflow
+    assert (
+        "-m pytest --noconftest "
+        "tests/test_pool_config_default_contract.py -q"
+        in workflow
+    )
+    assert (
+        "-m pytest tests/test_pool_config_default_contract.py -q"
+        not in workflow
+    )
     assert workflow.index("cargo test --locked") < workflow.index(
         "uvx --from maturin==1.14.1 maturin build"
     )
