@@ -22,7 +22,9 @@ use crate::pool_manager::{
     ensure_pool_initialized_with_auth,
 };
 use crate::ssl_config::PySslConfig;
-use crate::types::{create_connection_error, create_sql_error};
+use crate::types::{
+    SqlError, create_commit_outcome_unknown, create_connection_error, create_sql_error,
+};
 
 type SingleConnectionType = Client<tokio_util::compat::Compat<TcpStream>>;
 
@@ -232,6 +234,19 @@ impl TransactionCommand {
             )),
         }
     }
+}
+
+fn is_deterministic_commit_rejection(error: &PyErr) -> bool {
+    Python::attach(|py| {
+        if !error.is_instance_of::<SqlError>(py) {
+            return false;
+        }
+        error
+            .value(py)
+            .getattr("severity")
+            .and_then(|value| value.extract::<u8>())
+            .is_ok_and(|severity| severity <= 19)
+    })
 }
 
 struct TransactionHandles {
@@ -707,6 +722,9 @@ impl Transaction {
     ) -> PyResult<()> {
         let mut session = session.lock().await;
         command.validate(session.state)?;
+        if session.conn.is_none() {
+            return Err(PyRuntimeError::new_err("Connection is not established"));
+        }
         session.state = command.in_flight_state();
 
         let operation = match session.conn.as_mut() {
@@ -758,7 +776,14 @@ impl Transaction {
             Err(error) => {
                 session.conn.take();
                 session.state = TransactionState::Failed;
-                Err(error)
+                let public_error = if matches!(command, TransactionCommand::Commit)
+                    && !is_deterministic_commit_rejection(&error)
+                {
+                    create_commit_outcome_unknown(error)?
+                } else {
+                    error
+                };
+                Err(public_error)
             }
         }
     }
