@@ -684,7 +684,7 @@ VERIFIED_FORK
 
 Never use `APPROVED_TO_PUBLISH`.
 
-- [ ] **Step 4: Commit, push and merge cumulative docs**
+- [x] **Step 4: Commit, push and merge cumulative docs**
 
 ```bash
 git add \
@@ -696,30 +696,51 @@ git push -u origin docs/transaction-cancellation-retirement-status
 
 Merge only into `test/sql-auth-validation` and push only to `origin`.
 
-- [ ] **Step 5: Update the separate executive registry**
+Executed:
+
+```text
+status commit                         9bc0d8e
+cumulative documentation merge       15fd2aa
+published remote                      origin/test/sql-auth-validation
+```
+
+- [x] **Step 5: Update the separate executive registry**
 
 In `.worktrees/docs-upstream-pr-plan`, update only
 `2026-07-25-fastmssql-upstream-contribution-plan.md`, commit and push
 `docs/upstream-pr-plan`. Keep this branch intentionally separate.
 
+Executed:
+
+```text
+executive registry commit             8983d22
+published remote branch               origin/docs/upstream-pr-plan
+merged into cumulative branch         no, intentionally separate
+candidate state                        VERIFIED_FORK
+```
+
 ---
 
 ## Completion evidence
 
-This plan is complete only when all are true:
+Recorded on the exact verified technical tree `c30c02a`:
 
 ```text
-TX-032–TX-034                        PASS
-TX-026 strengthened                  PASS
-strict SQL-auth IDs                  277/277
-strict suite                         zero failures
-applicable upstream suite            zero failures
-Rust / fmt / Clippy / RustSec         PASS
-pooled stress                         bounded at pool.max_size
-cancelled request/session cleanup     bounded without close()
-cancelled pooled connection IDs       replaced
+TX-026 + TX-032–TX-034 + proxy       5/5 PASS
+transaction/async/batch regressions   140/140 PASS
+strict SQL-auth suite                 344/344 PASS
+strict SQL-auth IDs                   277/277 PASS
+applicable upstream suite             896/896 PASS
+FastMssql Rust unit tests             13/13 PASS
+Tiberius vendored unit tests          123/123 PASS
+fmt / Clippy / Ruff / compileall      PASS
+RustSec, 219 dependencies             0 findings
+pooled stress                         bounded at pool.max_size=100
+cancellation storm                    20/20 CancelledError
+cancelled request/session cleanup     zero remaining without close()
+cancelled pooled connection IDs       all 5 replaced
 cancelled direct transaction          rolled back by session close
-cancelled durable COMMIT               not rolled back or retried
+cancelled durable COMMIT              not rolled back or retried
 origin                                galeamarcel/FastMssql
 upstream push                         DISABLED
 upstream PR                           not created
