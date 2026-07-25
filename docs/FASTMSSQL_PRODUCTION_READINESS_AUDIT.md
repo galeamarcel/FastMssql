@@ -1276,7 +1276,9 @@ Istoricul separat de design, RED, GREEN și integrare este:
   - `776f9033975f8727fba57f51effb81c8fafd9acb` — merge-ul tehnic final;
 - `docs/operation-timeouts-status`
   - `eec7e83c878aa158b3ba4f0840461a023cb9f14e` — matricea și raportul
-    regenerate din artefactele feature-ului final.
+    regenerate din artefactele feature-ului final;
+  - `ec6161b6a1420f3e85d318fc073562dc674d68ed` — auditul și roadmap-ul
+    upstream actualizate după self-review.
 
 Self-review-ul local a găsit două defecte suplimentare înainte de închidere:
 
@@ -1845,7 +1847,8 @@ upstream fără aprobarea explicită a proprietarului forkului.
 - `origin` indică forkul; `upstream` permite numai fetch, cu push
   `DISABLED`.
 - Feature-ul final este `822ab2a`; raportul generat din artefactele sale este
-  `eec7e83`, cu commitul tehnic al merge-ului `776f903` în antet.
+  `eec7e83`, iar statusul narativ este `ec6161b`; raportul păstrează commitul
+  tehnic al merge-ului `776f903` în antet.
 - La acest source tree: FastMssql Rust `23/23`, contractele instalate
   TimeoutConfig + PoolConfig `12/12`, strict `305/305`, true-async `16/16`,
   framework `29/29`, resilience `6/6`, load `9/9`, upstream `915/915` și

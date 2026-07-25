@@ -52,7 +52,7 @@ La data redactării:
 - snapshotul tehnic anterior acestui update documentar este
   `776f9033975f8727fba57f51effb81c8fafd9acb`;
 - feature-ul deadline-urilor este `822ab2a`, iar evidența generată este
-  `eec7e83`;
+  `eec7e83`; statusul auditat este `ec6161b`;
 - unicul PR upstream deschis este draftul
   [#121 — Improve transactions behavior and safety](https://github.com/Rivendael/FastMssql/pull/121);
 - PR-ul #121 modifică masiv tranzacțiile și timeouturile, deci orice PR care
@@ -2246,6 +2246,7 @@ fork RED branches            test/operation-timeouts
 fork RED SHAs                9d579d4, 2d8e526
 technical merge SHA          776f9033975f8727fba57f51effb81c8fafd9acb
 evidence SHA                 eec7e83c878aa158b3ba4f0840461a023cb9f14e
+audited status SHA           ec6161b6a1420f3e85d318fc073562dc674d68ed
 future clean branch          feat/upstream-operation-timeouts
 future title                 feat: add fail-closed operation deadlines
 case IDs                     TIME-001 through TIME-010
