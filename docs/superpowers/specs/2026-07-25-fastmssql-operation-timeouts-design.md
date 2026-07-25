@@ -228,9 +228,14 @@ class TimeoutConfig:
 All fields are readable and writable with the same validation:
 
 - every numeric value must be finite and strictly greater than zero;
+- every numeric value must be at least one nanosecond and no greater than
+  `3_153_600_000` seconds (100 × 365 days), inclusive, so validation is
+  deterministic across Linux, macOS and Windows;
 - booleans are rejected rather than interpreted as `0.0` or `1.0`;
 - `NaN`, positive/negative infinity, zero and negative values raise
   `ValueError` before a pool or socket is created;
+- a value above the portable 100-year ceiling raises `ValueError` even when a
+  particular operating system could represent a larger monotonic instant;
 - `acquire_timeout_secs=None` is rejected;
 - optional `None` values mean that FastMssql does not install a deadline for
   that phase.

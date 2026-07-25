@@ -205,6 +205,10 @@ def test_timeout_stubs_and_readme_match_runtime_contract() -> None:
         text = stub.read_text(encoding="utf-8")
         assert "timeout_config: Optional[TimeoutConfig] = None" in text
         assert "def timeout_config(self) -> TimeoutConfig" in text
+
+    readme = README.read_text(encoding="utf-8")
+    assert "3,153,600,000 seconds" in readme
+    assert "100-year ceiling" in readme
     wrapper = WRAPPER_STUB.read_text(encoding="utf-8")
     assert "    OperationTimeoutError," in wrapper
     assert "    TimeoutConfig," in wrapper

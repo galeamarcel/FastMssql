@@ -6,6 +6,11 @@ use std::time::Duration;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const MIN_TIMEOUT_SECONDS: f64 = 1e-9;
+// std::time::Instant documents roughly one hundred years as the portable
+// duration range across supported operating systems. Keep configuration
+// semantics identical on Linux, macOS, and Windows instead of exposing each
+// platform's larger implementation-specific ceiling.
+const MAX_PORTABLE_TIMEOUT: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
 
 #[derive(Clone, Copy)]
 struct OptionalSeconds(Option<f64>);
@@ -79,6 +84,11 @@ fn validate_runtime_deadline(name: &str, duration: Duration) -> PyResult<Duratio
     if duration.is_zero() {
         return Err(PyValueError::new_err(format!(
             "{name} must be at least 0.000000001 seconds"
+        )));
+    }
+    if duration > MAX_PORTABLE_TIMEOUT {
+        return Err(PyValueError::new_err(format!(
+            "{name} is too large; timeout values must not exceed 3153600000 seconds (100 years)"
         )));
     }
     if tokio::time::Instant::now().checked_add(duration).is_none() {
