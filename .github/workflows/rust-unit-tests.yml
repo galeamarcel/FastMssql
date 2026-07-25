@@ -106,4 +106,4 @@ jobs:
         shell: bash
         run: |
           "${POOL_CONTRACT_PYTHON}" \
-            -m pytest tests/test_pool_config_default_contract.py -q
+            -m pytest --noconftest tests/test_pool_config_default_contract.py -q
