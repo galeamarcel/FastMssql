@@ -1420,6 +1420,12 @@ test "${FASTMSSQL_SQL_AUTH_CONTAINER:-fastmssql-sql-auth-dev}" = \
 docker compose --env-file .env.sql-auth.local \
   -f docker-compose.sql-auth.yml up -d sqlserver
 scripts/sql_auth/provision.sh
+export FASTMSSQL_TEST_CONNECTION_STRING="Server=${FASTMSSQL_SQL_AUTH_HOST},${FASTMSSQL_SQL_AUTH_PORT};Database=fastmssql_upstream_regression;User Id=${FASTMSSQL_SQL_AUTH_OWNER_USER};Password=${FASTMSSQL_SQL_AUTH_OWNER_PASSWORD};Encrypt=True;TrustServerCertificate=True"
+export FAST_MSSQL_TEST_DB_USER="${FASTMSSQL_SQL_AUTH_OWNER_USER}"
+export FAST_MSSQL_TEST_DB_PASSWORD="${FASTMSSQL_SQL_AUTH_OWNER_PASSWORD}"
+export FAST_MSSQL_TEST_SERVER="${FASTMSSQL_SQL_AUTH_HOST}"
+export FAST_MSSQL_TEST_PORT="${FASTMSSQL_SQL_AUTH_PORT}"
+export FAST_MSSQL_TEST_DATABASE="fastmssql_upstream_regression"
 uv run pytest \
   tests/test_pool_config.py \
   tests/test_pool_config_validation.py \
