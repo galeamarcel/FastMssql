@@ -76,7 +76,12 @@ class DownstreamGateProxy:
                 self._relay(server_reader, client_writer, downstream=True)
             )
             try:
-                await asyncio.gather(upstream, downstream)
+                completed, _ = await asyncio.wait(
+                    (upstream, downstream),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for relay in completed:
+                    await relay
             finally:
                 upstream.cancel()
                 downstream.cancel()
