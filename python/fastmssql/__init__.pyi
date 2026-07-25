@@ -218,6 +218,10 @@ class Connection:
         """
         ...
 
+    def transaction(self) -> Transaction:
+        """Create a transaction backed by this connection's shared pool."""
+        ...
+
     async def __aenter__(self) -> Connection:
         """Async context manager entry (initializes pool)."""
         ...
@@ -228,10 +232,10 @@ class Connection:
 
 class Transaction:
     """
-    Single dedicated connection for SQL Server transactions.
+    SQL Server transaction on a shared pool lease or direct connection.
 
-    Provides a non-pooled connection where all operations happen on the same
-    underlying connection, ensuring transaction safety for BEGIN/COMMIT/ROLLBACK.
+    Prefer Connection.transaction() for bounded enterprise concurrency. The
+    direct constructor remains available for backward compatibility.
 
     Example:
         async with Transaction(server="localhost", database="mydb") as conn:

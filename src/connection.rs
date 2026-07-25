@@ -19,6 +19,7 @@ use crate::pool_manager::{
     ConnectionPool, PooledOperationGuard, ensure_pool_initialized_with_auth,
 };
 use crate::ssl_config::PySslConfig;
+use crate::transaction::Transaction;
 use crate::types::{create_connection_error, create_sql_error};
 
 struct ConnectionHandles {
@@ -337,6 +338,17 @@ impl PyConnection {
                 pyo3::exceptions::PyRuntimeError::new_err("Failed to attach Python runtime thread")
             })?
         })
+    }
+
+    /// Create a transaction that reserves one lease from this connection's
+    /// shared pool until COMMIT, ROLLBACK, or close.
+    pub fn transaction(&self) -> Transaction {
+        Transaction::from_pool(
+            Arc::clone(&self.pool),
+            Arc::clone(&self.config),
+            self.pool_config.clone(),
+            self.azure_credential.clone(),
+        )
     }
 
     pub fn __aenter__<'p>(slf: Bound<'p, Self>, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {

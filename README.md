@@ -392,7 +392,11 @@ Default pool (if omitted): `max_size=15`, `min_idle=3`.
 
 ### Transactions
 
-For workloads that require SQL Server transactions with guaranteed connection isolation, use the `Transaction` class. Unlike `Connection` (which uses connection pooling), `Transaction` maintains a dedicated, non-pooled connection for the lifetime of the transaction. This ensures all operations within the transaction run on the same connection, preventing connection-switching issues.
+Create production transactions from a `Connection`. `transaction()` reserves
+one physical session from that connection's bb8 pool, keeps the same SPID for
+the entire active transaction, and releases the lease immediately after
+`COMMIT` or `ROLLBACK`. Transactions and ordinary queries therefore share the
+same `pool.max_size` budget.
 
 #### Automatic transaction control (recommended)
 
@@ -400,23 +404,26 @@ Use the context manager for automatic `BEGIN`, `COMMIT`, and `ROLLBACK`:
 
 ```python
 import asyncio
-from fastmssql import Transaction
+from fastmssql import Connection, PoolConfig
 
 async def main():
     conn_str = "Server=localhost;Database=master;User Id=myuser;Password=mypass"
-    
-    async with Transaction(conn_str) as transaction:
-        # Automatically calls BEGIN
-        await transaction.execute(
-            "INSERT INTO orders (customer_id, total) VALUES (@P1, @P2)",
-            [123, 99.99]
-        )
-        await transaction.execute(
-            "INSERT INTO order_items (order_id, product_id, qty) VALUES (@P1, @P2, @P3)",
-            [1, 456, 2]
-        )
-        # Automatically calls COMMIT on successful exit
-        # or ROLLBACK if an exception occurs
+
+    async with Connection(
+        conn_str,
+        pool_config=PoolConfig(max_size=20, min_idle=2),
+    ) as database:
+        async with database.transaction() as transaction:
+            await transaction.execute(
+                "INSERT INTO orders (customer_id, total) VALUES (@P1, @P2)",
+                [123, 99.99],
+            )
+            await transaction.execute(
+                "INSERT INTO order_items (order_id, product_id, qty) "
+                "VALUES (@P1, @P2, @P3)",
+                [1, 456, 2],
+            )
+            # COMMIT on success; ROLLBACK when the block raises.
 
 asyncio.run(main())
 ```
@@ -427,42 +434,54 @@ For more control, explicitly call `begin()`, `commit()`, and `rollback()`:
 
 ```python
 import asyncio
-from fastmssql import Transaction, SqlError
+from fastmssql import Connection, PoolConfig, SqlError
 
 async def main():
     conn_str = "Server=localhost;Database=master;User Id=myuser;Password=mypass"
-    transaction = Transaction(conn_str)
-    
+    database = Connection(conn_str, pool_config=PoolConfig(max_size=20))
+    transaction = database.transaction()
+
     try:
         await transaction.begin()
-        
-        result = await transaction.query("SELECT @@VERSION as version")
-        print(result.rows()[0]['version'])
-        
-        await transaction.execute("UPDATE accounts SET balance = balance - @P1 WHERE id = @P2", [50, 1])
-        await transaction.execute("UPDATE accounts SET balance = balance + @P1 WHERE id = @P2", [50, 2])
-        
-        await transaction.commit()
-    except SqlError as e:
-        await transaction.rollback()
+        await transaction.execute(
+            "UPDATE accounts SET balance = balance - @P1 WHERE id = @P2",
+            [50, 1],
+        )
+        await transaction.execute(
+            "UPDATE accounts SET balance = balance + @P1 WHERE id = @P2",
+            [50, 2],
+        )
+        await transaction.commit()  # releases the pool lease
+    except SqlError:
+        await transaction.rollback()  # also releases the lease
         raise
     finally:
         await transaction.close()
+        await database.disconnect()
 
 asyncio.run(main())
 ```
 
-#### Key differences: Transaction vs Connection
+When an operation is cancelled while TDS is in flight, the transaction becomes
+fail-closed. Call `close()`; the uncertain physical connection is retired
+instead of being returned to the pool.
 
-| Feature | Transaction | Connection |
-|---------|-------------|------------|
-| Connection | Dedicated, non-pooled | Pooled (bb8) |
-| Use case | SQL transactions, ACID operations | General queries, connection reuse |
-| Isolation | Single connection per instance | Connection may vary per operation |
-| Pooling | None (direct TcpStream) | Configurable pool settings |
-| Lifecycle | Held until `.close()` or context exit | Released to pool after each operation |
+#### Direct constructor compatibility
 
-Choose `Transaction` when you need guaranteed transaction isolation; use `Connection` for typical queries and high-concurrency workloads with connection pooling.
+`Transaction(conn_str)` remains supported for backward compatibility. It owns
+a dedicated direct socket and is not bounded by another `Connection` object's
+pool:
+
+```python
+from fastmssql import Transaction
+
+async with Transaction(conn_str) as transaction:
+    await transaction.execute("INSERT INTO audit_log(message) VALUES (@P1)", ["ok"])
+```
+
+For concurrent production workloads, prefer `Connection.transaction()` so
+transactions and non-transactional operations obey one explicit capacity
+limit.
 
 
 ### SSL/TLS

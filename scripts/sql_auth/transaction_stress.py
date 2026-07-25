@@ -180,6 +180,7 @@ async def run_profile(
     profile: Profile,
     *,
     connection_strategy: str,
+    pool_size: int,
     rss_growth_limit_bytes: int,
 ) -> dict[str, object]:
     suffix = uuid4().hex[:12]
@@ -189,6 +190,14 @@ async def run_profile(
     observer = settings.connection(
         application_name=f"{application_name}_observer",
         max_size=2,
+    )
+    shared_pool = (
+        settings.connection(
+            application_name=application_name,
+            max_size=pool_size,
+        )
+        if connection_strategy == "pooled"
+        else None
     )
     await observer.execute(
         f"CREATE TABLE {table} (id INT PRIMARY KEY, value BIGINT NOT NULL)"
@@ -274,19 +283,65 @@ async def run_profile(
             finally:
                 await transaction.close()
 
-    worker = (
-        persistent_worker
-        if connection_strategy == "persistent"
-        else per_transaction_worker
-    )
+    async def pooled_worker() -> None:
+        if shared_pool is None:
+            raise AssertionError("pooled worker requires a shared pool")
+        transaction = shared_pool.transaction()
+        try:
+            while True:
+                value = await claim_value()
+                if value is None:
+                    return
+                # A full-concurrency barrier would deadlock when concurrency is
+                # intentionally greater than pool_size: the checked-out leases
+                # would wait for tasks that are correctly blocked in pool.get().
+                await execute_transaction(
+                    transaction,
+                    value,
+                    synchronize=False,
+                )
+        finally:
+            await transaction.close()
+
+    worker = {
+        "persistent": persistent_worker,
+        "per-transaction": per_transaction_worker,
+        "pooled": pooled_worker,
+    }[connection_strategy]
 
     started = time.monotonic()
+    pool_stats: dict | None = None
+    pooled_session_count: int | None = None
     try:
         async with asyncio.TaskGroup() as task_group:
             for _ in range(profile.concurrency):
                 task_group.create_task(worker())
         elapsed = time.monotonic() - started
+        if shared_pool is not None:
+            pool_stats = await shared_pool.pool_stats()
+            if pool_stats["connections"] > pool_size:
+                raise AssertionError(
+                    "shared transaction pool exceeded max_size: "
+                    f"{pool_stats['connections']} > {pool_size}"
+                )
+            if pool_stats["active_connections"] != 0:
+                raise AssertionError(
+                    "transaction leases remained active after workers: "
+                    f"{pool_stats['active_connections']}"
+                )
+            pooled_session_count = await application_session_count(
+                observer,
+                application_name,
+            )
+            if pooled_session_count > pool_size:
+                raise AssertionError(
+                    "SQL application sessions exceeded pool size: "
+                    f"{pooled_session_count} > {pool_size}"
+                )
+            await shared_pool.disconnect()
     except BaseException:
+        if shared_pool is not None:
+            await shared_pool.disconnect()
         await observer.execute(f"DROP TABLE IF EXISTS {table}")
         await observer.disconnect()
         raise
@@ -316,7 +371,19 @@ async def run_profile(
             raise AssertionError(
                 f"found {rolled_back_rows} rows from rolled-back transactions"
             )
-        minimum_sessions = min(profile.concurrency, sample_limit) // 2
+        if connection_strategy == "pooled":
+            if len(sampled_session_ids) > pool_size:
+                raise AssertionError(
+                    "distinct sampled SQL sessions exceeded pool size: "
+                    f"{len(sampled_session_ids)} > {pool_size}"
+                )
+            minimum_sessions = min(
+                pool_size,
+                profile.concurrency,
+                sample_limit,
+            ) // 2
+        else:
+            minimum_sessions = min(profile.concurrency, sample_limit) // 2
         if len(sampled_session_ids) < minimum_sessions:
             raise AssertionError(
                 "insufficient distinct SQL sessions: "
@@ -342,10 +409,18 @@ async def run_profile(
             "concurrency": profile.concurrency,
             "connection_strategy": connection_strategy,
             "physical_connection_count": (
-                profile.concurrency
-                if connection_strategy == "persistent"
-                else profile.transactions
+                pool_stats["connections"]
+                if pool_stats is not None
+                else (
+                    profile.concurrency
+                    if connection_strategy == "persistent"
+                    else profile.transactions
+                )
             ),
+            "pool_size": (
+                pool_size if connection_strategy == "pooled" else None
+            ),
+            "pooled_application_sessions": pooled_session_count,
             "committed": expected_count,
             "rolled_back": profile.transactions - expected_count,
             "elapsed_seconds": elapsed,
@@ -389,6 +464,7 @@ async def run(args: argparse.Namespace) -> int:
             settings,
             profile,
             connection_strategy=args.connection_strategy,
+            pool_size=args.pool_size,
             rss_growth_limit_bytes=args.rss_growth_limit_mb * 1024 * 1024,
         )
         metrics.append(result)
@@ -418,19 +494,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metrics-output", type=Path, required=True)
     parser.add_argument(
         "--connection-strategy",
-        choices=("persistent", "per-transaction"),
+        choices=("persistent", "per-transaction", "pooled"),
         default="persistent",
         help=(
-            "reuse one Transaction connection per worker or open a new "
-            "connection for every transaction"
+            "reuse one direct Transaction per worker, open a direct connection "
+            "per transaction, or lease transactions from one shared pool"
         ),
+    )
+    parser.add_argument(
+        "--pool-size",
+        type=int,
+        default=100,
+        help="shared pool max_size for the pooled strategy (1-500)",
     )
     parser.add_argument(
         "--rss-growth-limit-mb",
         type=int,
         default=512,
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not 1 <= args.pool_size <= MAX_CONCURRENCY:
+        parser.error("--pool-size must be between 1 and 500")
+    return args
 
 
 if __name__ == "__main__":

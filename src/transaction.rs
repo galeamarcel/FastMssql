@@ -2,10 +2,11 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 use pyo3_async_runtimes::tokio::future_into_py;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use tiberius::{AuthMethod, Client, Config};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use crate::azure_auth::PyAzureCredential;
@@ -15,22 +16,99 @@ use crate::helpers::{
     catch_driver_panic, execute_unparameterized_command, requires_direct_batch, wrap_query_stream,
 };
 use crate::parameter_conversion::{convert_parameters_to_fast, params_as_sql_refs};
+use crate::pool_config::PyPoolConfig;
+use crate::pool_manager::{
+    ConnectionPool, OwnedPooledConnection, acquire_owned_connection,
+    ensure_pool_initialized_with_auth,
+};
 use crate::ssl_config::PySslConfig;
 use crate::types::{create_connection_error, create_sql_error};
 
-/// Type for a single direct connection (not pooled)
 type SingleConnectionType = Client<tokio_util::compat::Compat<TcpStream>>;
+
+/// A transaction can use the legacy direct socket or an owned bb8 lease.
+///
+/// `PooledConnection<'static, _>` owns an internal pool handle, so it can live
+/// for the whole SQL transaction while remaining counted against
+/// `pool.max_size`.
+enum TransactionConnection {
+    Direct(SingleConnectionType),
+    Pooled(OwnedPooledConnection),
+}
+
+impl TransactionConnection {
+    fn is_pooled(&self) -> bool {
+        matches!(self, Self::Pooled(_))
+    }
+
+    fn prepare_for_checkout(&mut self) {
+        if let Self::Pooled(connection) = self {
+            connection.prepare_for_checkout();
+        }
+    }
+
+    /// Mark the TDS stream unsafe before the request's first await. If Python
+    /// cancels the future, no completion path can accidentally restore it.
+    fn begin_operation(&mut self) {
+        if let Self::Pooled(connection) = self {
+            connection.begin_operation();
+        }
+    }
+
+    fn finish_operation<T>(&mut self, result: &PyResult<T>) {
+        if let Self::Pooled(connection) = self {
+            match result {
+                Ok(_) => connection.finish_operation_success(),
+                Err(error) => connection.apply_operation_error(error),
+            }
+        }
+    }
+
+    fn mark_unusable(&mut self) {
+        if let Self::Pooled(connection) = self {
+            connection.mark_unusable();
+        }
+    }
+
+    fn is_reusable(&self) -> bool {
+        match self {
+            Self::Direct(_) => true,
+            Self::Pooled(connection) => connection.is_reusable(),
+        }
+    }
+}
+
+impl Deref for TransactionConnection {
+    type Target = SingleConnectionType;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Direct(connection) => connection,
+            Self::Pooled(connection) => connection,
+        }
+    }
+}
+
+impl DerefMut for TransactionConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Direct(connection) => connection,
+            Self::Pooled(connection) => connection,
+        }
+    }
+}
 
 /// Authoritative transaction lifecycle stored in Rust.
 ///
-/// In-flight states are written before awaiting the TDS command. If Python
-/// cancels that future, the object remains fail-closed until `close()` drops
-/// the physical connection instead of guessing the server-side outcome.
+/// In-flight states are written before awaiting TDS. If Python cancels that
+/// future, the object remains fail-closed until `close()` drops or retires the
+/// physical connection instead of guessing the server-side outcome.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TransactionState {
     Idle,
     Beginning,
     Active,
+    Executing,
     Committing,
     Committed,
     RollingBack,
@@ -44,6 +122,7 @@ impl TransactionState {
         match self {
             Self::Idle | Self::Active | Self::Committed | Self::RolledBack => Ok(()),
             Self::Beginning
+            | Self::Executing
             | Self::Committing
             | Self::RollingBack
             | Self::Failed
@@ -54,11 +133,11 @@ impl TransactionState {
     }
 }
 
-/// The client and its transaction state share one mutex so validation, the
-/// wire command, response consumption, and the final transition are atomic
-/// with respect to every concurrent transaction operation.
+/// The connection and transaction state share one mutex so validation, wire
+/// I/O, response consumption, and the final transition are atomic with respect
+/// to every concurrent operation on this object.
 struct TransactionSession {
-    conn: Option<SingleConnectionType>,
+    conn: Option<TransactionConnection>,
     state: TransactionState,
 }
 
@@ -69,6 +148,12 @@ impl Default for TransactionSession {
             state: TransactionState::Idle,
         }
     }
+}
+
+#[derive(Clone)]
+struct SharedPoolSource {
+    pool: Arc<RwLock<Option<ConnectionPool>>>,
+    pool_config: PyPoolConfig,
 }
 
 #[derive(Clone, Copy)]
@@ -111,6 +196,10 @@ impl TransactionCommand {
         }
     }
 
+    fn releases_pool_lease(self) -> bool {
+        matches!(self, Self::Commit | Self::Rollback)
+    }
+
     fn validate(self, state: TransactionState) -> PyResult<()> {
         match (self, state) {
             (
@@ -133,6 +222,7 @@ impl TransactionCommand {
             (
                 _,
                 TransactionState::Beginning
+                | TransactionState::Executing
                 | TransactionState::Committing
                 | TransactionState::RollingBack
                 | TransactionState::Failed
@@ -144,11 +234,11 @@ impl TransactionCommand {
     }
 }
 
-/// Bundles the three cloned handles needed for async transaction operations.
 struct TransactionHandles {
     session: Arc<AsyncMutex<TransactionSession>>,
     config: Arc<Config>,
-    azure_credential: Option<PyAzureCredential>,
+    azure_credential: Option<Arc<PyAzureCredential>>,
+    pool_source: Option<SharedPoolSource>,
 }
 
 impl TransactionHandles {
@@ -157,20 +247,24 @@ impl TransactionHandles {
             &self.session,
             &self.config,
             self.azure_credential.as_ref(),
+            self.pool_source.as_ref(),
         )
         .await
     }
 }
 
-/// A single dedicated connection (not pooled) for transaction support.
-/// This holds one physical database connection that persists across queries,
-/// allowing SQL Server transactions (BEGIN/COMMIT/ROLLBACK) to work correctly.
+/// A SQL Server transaction session.
+///
+/// `Connection.transaction()` constructs a transaction backed by an owned
+/// lease from that connection's shared pool. The public constructor remains a
+/// compatibility path backed by one direct socket.
 #[pyclass(name = "Transaction")]
 pub struct Transaction {
     session: Arc<AsyncMutex<TransactionSession>>,
     config: Arc<Config>,
     _ssl_config: Option<PySslConfig>,
-    azure_credential: Option<PyAzureCredential>,
+    azure_credential: Option<Arc<PyAzureCredential>>,
+    pool_source: Option<SharedPoolSource>,
 }
 
 #[pymethods]
@@ -191,7 +285,6 @@ impl Transaction {
         instance_name: Option<String>,
         application_name: Option<String>,
     ) -> PyResult<Self> {
-        // Store the original server parameter for validation before it gets reassigned
         let server_param = server.clone();
 
         let config = if let Some(conn_str) = connection_string {
@@ -212,9 +305,6 @@ impl Transaction {
                     PyValueError::new_err("password is required when username is provided")
                 })?;
                 config.authentication(AuthMethod::sql_server(user, &pwd));
-            } else if azure_credential.is_some() {
-                // Azure authentication will be set up dynamically during connection
-                // No authentication is set on config here since we need to acquire tokens asynchronously
             }
             if let Some(p) = port {
                 config.port(p);
@@ -247,23 +337,22 @@ impl Transaction {
             ));
         };
 
-        // Validate authentication configuration when using individual parameters
         if server_param.is_some() && username.is_none() && azure_credential.is_none() {
             return Err(PyValueError::new_err(
                 "When using individual connection parameters, either username/password or azure_credential must be provided",
             ));
         }
 
-        Ok(Transaction {
+        Ok(Self {
             session: Arc::new(AsyncMutex::new(TransactionSession::default())),
             config: Arc::new(config),
             _ssl_config: ssl_config,
-            azure_credential,
+            azure_credential: azure_credential.map(Arc::new),
+            pool_source: None,
         })
     }
 
-    /// Execute a SQL query that returns rows (SELECT statements)
-    /// Returns rows as QueryStream
+    /// Execute a SQL query that returns rows.
     #[pyo3(signature = (query, parameters=None))]
     pub fn query<'p>(
         &self,
@@ -279,38 +368,32 @@ impl Transaction {
 
             let execution_result = {
                 let mut session = handles.session.lock().await;
-                let conn_ref = session
-                    .conn
-                    .as_mut()
-                    .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
-
-                let tiberius_params = params_as_sql_refs(&fast_parameters);
-                let operation = catch_driver_panic(async {
-                    conn_ref
-                        .query(&query, &tiberius_params)
-                        .await
-                        .map_err(|e| create_sql_error(e, "Query execution failed"))?
-                        .into_first_result()
-                        .await
-                        .map_err(|e| create_sql_error(e, "Failed to get results"))
-                })
-                .await;
-                match operation {
-                    Ok(result) => result?,
-                    Err(driver_panic) => {
-                        session.conn.take();
-                        session.state = TransactionState::Failed;
-                        return Err(driver_panic);
-                    }
-                }
+                let previous_state = Self::begin_data_operation(&mut session)?;
+                let operation = {
+                    let conn_ref = session
+                        .conn
+                        .as_mut()
+                        .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
+                    let tiberius_params = params_as_sql_refs(&fast_parameters);
+                    catch_driver_panic(async {
+                        conn_ref
+                            .query(&query, &tiberius_params)
+                            .await
+                            .map_err(|e| create_sql_error(e, "Query execution failed"))?
+                            .into_first_result()
+                            .await
+                            .map_err(|e| create_sql_error(e, "Failed to get results"))
+                    })
+                    .await
+                };
+                Self::finish_data_operation(&mut session, previous_state, operation)?
             };
 
             wrap_query_stream(execution_result)
         })
     }
 
-    /// Execute a raw (non-prepared statement) SQL query
-    /// Returns rows as QueryStream
+    /// Execute a raw (non-prepared) SQL query.
     #[pyo3(signature = (query))]
     pub fn simple_query<'p>(&self, py: Python<'p>, query: String) -> PyResult<Bound<'p, PyAny>> {
         let handles = self.clone_handles();
@@ -320,37 +403,31 @@ impl Transaction {
 
             let execution_result = {
                 let mut session = handles.session.lock().await;
-                let conn_ref = session
-                    .conn
-                    .as_mut()
-                    .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
-
-                let operation = catch_driver_panic(async {
-                    conn_ref
-                        .simple_query(&query)
-                        .await
-                        .map_err(|e| create_sql_error(e, "Query execution failed"))?
-                        .into_first_result()
-                        .await
-                        .map_err(|e| create_sql_error(e, "Failed to get results"))
-                })
-                .await;
-                match operation {
-                    Ok(result) => result?,
-                    Err(driver_panic) => {
-                        session.conn.take();
-                        session.state = TransactionState::Failed;
-                        return Err(driver_panic);
-                    }
-                }
+                let previous_state = Self::begin_data_operation(&mut session)?;
+                let operation = {
+                    let conn_ref = session
+                        .conn
+                        .as_mut()
+                        .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
+                    catch_driver_panic(async {
+                        conn_ref
+                            .simple_query(&query)
+                            .await
+                            .map_err(|e| create_sql_error(e, "Query execution failed"))?
+                            .into_first_result()
+                            .await
+                            .map_err(|e| create_sql_error(e, "Failed to get results"))
+                    })
+                    .await
+                };
+                Self::finish_data_operation(&mut session, previous_state, operation)?
             };
 
             wrap_query_stream(execution_result)
         })
     }
 
-    /// Execute a SQL command that doesn't return rows (INSERT/UPDATE/DELETE/DDL)
-    /// Returns the number of affected rows
+    /// Execute an INSERT/UPDATE/DELETE/DDL command.
     #[pyo3(signature = (command, parameters=None))]
     pub fn execute<'p>(
         &self,
@@ -366,46 +443,39 @@ impl Transaction {
 
             let affected = {
                 let mut session = handles.session.lock().await;
-                let conn_ref = session
-                    .conn
-                    .as_mut()
-                    .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
-
-                let operation = catch_driver_panic(async {
-                    if fast_parameters.is_empty() && requires_direct_batch(&command) {
-                        execute_unparameterized_command(
-                            conn_ref,
-                            &command,
-                            "Command execution failed",
-                        )
-                        .await
-                    } else {
-                        let tiberius_params = params_as_sql_refs(&fast_parameters);
-                        conn_ref
-                            .execute(&command, &tiberius_params)
+                let previous_state = Self::begin_data_operation(&mut session)?;
+                let operation = {
+                    let conn_ref = session
+                        .conn
+                        .as_mut()
+                        .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
+                    catch_driver_panic(async {
+                        if fast_parameters.is_empty() && requires_direct_batch(&command) {
+                            execute_unparameterized_command(
+                                conn_ref,
+                                &command,
+                                "Command execution failed",
+                            )
                             .await
-                            .map(|result| result.total())
-                            .map_err(|e| create_sql_error(e, "Command execution failed"))
-                    }
-                })
-                .await;
-                match operation {
-                    Ok(result) => result?,
-                    Err(driver_panic) => {
-                        session.conn.take();
-                        session.state = TransactionState::Failed;
-                        return Err(driver_panic);
-                    }
-                }
+                        } else {
+                            let tiberius_params = params_as_sql_refs(&fast_parameters);
+                            conn_ref
+                                .execute(&command, &tiberius_params)
+                                .await
+                                .map(|result| result.total())
+                                .map_err(|e| create_sql_error(e, "Command execution failed"))
+                        }
+                    })
+                    .await
+                };
+                Self::finish_data_operation(&mut session, previous_state, operation)?
             };
 
             Ok(affected)
         })
     }
 
-    /// Execute multiple batch commands on the transaction connection.
-    /// Does NOT wrap in automatic transaction - use begin/commit/rollback manually.
-    /// Returns list of row counts affected by each command.
+    /// Execute multiple commands in sequence on the transaction lease.
     #[pyo3(signature = (commands))]
     pub fn execute_batch<'p>(
         &self,
@@ -420,21 +490,15 @@ impl Transaction {
 
             let all_results = {
                 let mut session = handles.session.lock().await;
-                let conn_ref = session
-                    .conn
-                    .as_mut()
-                    .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
-
-                let operation =
-                    catch_driver_panic(execute_batch_on_connection(conn_ref, batch_commands)).await;
-                match operation {
-                    Ok(result) => result?,
-                    Err(driver_panic) => {
-                        session.conn.take();
-                        session.state = TransactionState::Failed;
-                        return Err(driver_panic);
-                    }
-                }
+                let previous_state = Self::begin_data_operation(&mut session)?;
+                let operation = {
+                    let conn_ref = session
+                        .conn
+                        .as_mut()
+                        .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
+                    catch_driver_panic(execute_batch_on_connection(conn_ref, batch_commands)).await
+                };
+                Self::finish_data_operation(&mut session, previous_state, operation)?
             };
 
             Python::attach(|py| {
@@ -444,8 +508,7 @@ impl Transaction {
         })
     }
 
-    /// Execute multiple batch queries on the transaction connection.
-    /// Returns list of QueryStream objects, one per query.
+    /// Execute multiple queries in sequence on the transaction lease.
     #[pyo3(signature = (queries))]
     pub fn query_batch<'p>(
         &self,
@@ -460,21 +523,15 @@ impl Transaction {
 
             let all_results = {
                 let mut session = handles.session.lock().await;
-                let conn_ref = session
-                    .conn
-                    .as_mut()
-                    .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
-
-                let operation =
-                    catch_driver_panic(query_batch_on_connection(conn_ref, batch_queries)).await;
-                match operation {
-                    Ok(result) => result?,
-                    Err(driver_panic) => {
-                        session.conn.take();
-                        session.state = TransactionState::Failed;
-                        return Err(driver_panic);
-                    }
-                }
+                let previous_state = Self::begin_data_operation(&mut session)?;
+                let operation = {
+                    let conn_ref = session
+                        .conn
+                        .as_mut()
+                        .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
+                    catch_driver_panic(query_batch_on_connection(conn_ref, batch_queries)).await
+                };
+                Self::finish_data_operation(&mut session, previous_state, operation)?
             };
 
             Python::attach(|py| -> PyResult<Py<PyAny>> {
@@ -489,7 +546,6 @@ impl Transaction {
         })
     }
 
-    /// Begin a transaction
     pub fn begin<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let handles = self.clone_handles();
 
@@ -499,25 +555,21 @@ impl Transaction {
         })
     }
 
-    /// Commit the current transaction
     pub fn commit<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let session = Arc::clone(&self.session);
-
         future_into_py(py, async move {
             Self::execute_transaction_command(&session, TransactionCommand::Commit).await
         })
     }
 
-    /// Rollback the current transaction
     pub fn rollback<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let session = Arc::clone(&self.session);
-
         future_into_py(py, async move {
             Self::execute_transaction_command(&session, TransactionCommand::Rollback).await
         })
     }
 
-    /// Close the connection
+    /// Release the direct socket or shared pool lease.
     pub fn close<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let session = Arc::clone(&self.session);
 
@@ -527,28 +579,52 @@ impl Transaction {
             let mut conn = session.conn.take();
             session.state = TransactionState::Closing;
 
-            if previous_state == TransactionState::Active
-                && let Some(conn_ref) = conn.as_mut()
-                && let Ok(stream) = conn_ref
-                    .simple_query("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION")
-                    .await
-            {
-                let _ = stream.into_results().await;
+            if let Some(conn_ref) = conn.as_mut() {
+                if previous_state == TransactionState::Active {
+                    conn_ref.begin_operation();
+                    let rollback = catch_driver_panic(async {
+                        conn_ref
+                            .simple_query("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION")
+                            .await
+                            .map_err(|error| {
+                                create_sql_error(error, "Failed to close transaction")
+                            })?
+                            .into_results()
+                            .await
+                            .map_err(|error| {
+                                create_sql_error(error, "Failed to close transaction")
+                            })?;
+                        Ok(())
+                    })
+                    .await;
+
+                    match rollback {
+                        Ok(result @ Ok(())) => conn_ref.finish_operation(&result),
+                        Ok(Err(_)) | Err(_) => conn_ref.mark_unusable(),
+                    }
+                } else if matches!(
+                    previous_state,
+                    TransactionState::Idle
+                        | TransactionState::Committed
+                        | TransactionState::RolledBack
+                ) {
+                    let clean_result: PyResult<()> = Ok(());
+                    conn_ref.finish_operation(&clean_result);
+                } else {
+                    conn_ref.mark_unusable();
+                }
             }
 
-            // Dropping the physical connection guarantees server-side rollback even
-            // if the best-effort command could not be acknowledged.
+            // Dropping a direct socket guarantees server-side rollback. Dropping
+            // a pooled lease returns only a fully consumed response; an
+            // in-flight/cancelled lease is marked Broken and bb8 retires it.
             drop(conn);
             session.state = TransactionState::Idle;
             Ok(())
         })
     }
 
-    /// Check if connected
     pub fn is_connected(&self) -> bool {
-        // Derive connectivity from the actual connection object rather than a stale flag.
-        // If the lock is held (query in progress), the connection is active → true.
-        // If we can peek and it's Some, connected. If None, not connected.
         match self.session.try_lock() {
             Ok(session) => session.conn.is_some(),
             Err(_) => true,
@@ -557,16 +633,74 @@ impl Transaction {
 }
 
 impl Transaction {
-    /// Clone the three fields needed for async transaction operations into a single struct.
+    pub(crate) fn from_pool(
+        pool: Arc<RwLock<Option<ConnectionPool>>>,
+        config: Arc<Config>,
+        pool_config: PyPoolConfig,
+        azure_credential: Option<Arc<PyAzureCredential>>,
+    ) -> Self {
+        Self {
+            session: Arc::new(AsyncMutex::new(TransactionSession::default())),
+            config,
+            _ssl_config: None,
+            azure_credential,
+            pool_source: Some(SharedPoolSource { pool, pool_config }),
+        }
+    }
+
     fn clone_handles(&self) -> TransactionHandles {
         TransactionHandles {
             session: Arc::clone(&self.session),
             config: Arc::clone(&self.config),
             azure_credential: self.azure_credential.clone(),
+            pool_source: self.pool_source.clone(),
         }
     }
 
-    /// Execute a transaction control command (BEGIN/COMMIT/ROLLBACK).
+    fn begin_data_operation(session: &mut TransactionSession) -> PyResult<TransactionState> {
+        session.state.ensure_connection_usable()?;
+        let previous_state = session.state;
+        let connection = session
+            .conn
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
+        connection.begin_operation();
+        session.state = TransactionState::Executing;
+        Ok(previous_state)
+    }
+
+    fn finish_data_operation<T>(
+        session: &mut TransactionSession,
+        previous_state: TransactionState,
+        operation: Result<PyResult<T>, PyErr>,
+    ) -> PyResult<T> {
+        let (result, driver_panicked) = match operation {
+            Ok(result) => (result, false),
+            Err(driver_panic) => (Err(driver_panic), true),
+        };
+
+        let connection_broken = match session.conn.as_mut() {
+            Some(connection) => {
+                if driver_panicked {
+                    connection.mark_unusable();
+                } else {
+                    connection.finish_operation(&result);
+                }
+                driver_panicked || !connection.is_reusable()
+            }
+            None => true,
+        };
+
+        if connection_broken {
+            session.conn.take();
+            session.state = TransactionState::Failed;
+        } else {
+            session.state = previous_state;
+        }
+
+        result
+    }
+
     async fn execute_transaction_command(
         session: &Arc<AsyncMutex<TransactionSession>>,
         command: TransactionCommand,
@@ -577,6 +711,7 @@ impl Transaction {
 
         let operation = match session.conn.as_mut() {
             Some(conn_ref) => {
+                conn_ref.begin_operation();
                 catch_driver_panic(async {
                     conn_ref
                         .simple_query(command.sql())
@@ -594,14 +729,30 @@ impl Transaction {
             ))),
         };
 
-        let result = match operation {
-            Ok(result) => result,
-            Err(driver_panic) => Err(driver_panic),
+        let (result, driver_panicked) = match operation {
+            Ok(result) => (result, false),
+            Err(driver_panic) => (Err(driver_panic), true),
         };
+
+        if let Some(connection) = session.conn.as_mut() {
+            if driver_panicked {
+                connection.mark_unusable();
+            } else {
+                connection.finish_operation(&result);
+            }
+        }
 
         match result {
             Ok(()) => {
                 session.state = command.completed_state();
+                let release_pool_lease = command.releases_pool_lease()
+                    && session
+                        .conn
+                        .as_ref()
+                        .is_some_and(TransactionConnection::is_pooled);
+                if release_pool_lease {
+                    session.conn.take();
+                }
                 Ok(())
             }
             Err(error) => {
@@ -612,44 +763,52 @@ impl Transaction {
         }
     }
 
-    /// Ensure connection is established. Initializes connection if needed.
-    /// Returns error if connection fails.
     async fn ensure_connected_inner(
         session: &Arc<AsyncMutex<TransactionSession>>,
         config: &Arc<Config>,
-        azure_credential: Option<&PyAzureCredential>,
+        azure_credential: Option<&Arc<PyAzureCredential>>,
+        pool_source: Option<&SharedPoolSource>,
     ) -> PyResult<()> {
         let mut session = session.lock().await;
         session.state.ensure_connection_usable()?;
 
-        if session.conn.is_none() {
+        if session.conn.is_some() {
+            return Ok(());
+        }
+
+        let mut connection = if let Some(source) = pool_source {
+            let pool = ensure_pool_initialized_with_auth(
+                Arc::clone(&source.pool),
+                Arc::clone(config),
+                &source.pool_config,
+                azure_credential.cloned(),
+            )
+            .await?;
+            let lease = acquire_owned_connection(&pool).await?;
+            TransactionConnection::Pooled(lease)
+        } else {
             let address = config.get_addr();
-            let tcp_stream = TcpStream::connect(&address).await.map_err(|e| {
-                create_connection_error(format!("Failed to connect to server {address}: {e}"))
+            let tcp_stream = TcpStream::connect(&address).await.map_err(|error| {
+                create_connection_error(format!("Failed to connect to server {address}: {error}"))
+            })?;
+            tcp_stream.set_nodelay(true).map_err(|error| {
+                create_connection_error(format!("Failed to set TCP_NODELAY: {error}"))
             })?;
 
-            // Disable Nagle algorithm — identical to pool connections in pool_manager.rs.
-            // Without this, small TDS packets (common for parameterised queries) may be
-            // buffered by the OS for up to 200 ms before transmission.
-            tcp_stream.set_nodelay(true).map_err(|e| {
-                create_connection_error(format!("Failed to set TCP_NODELAY: {}", e))
-            })?;
-
-            let compat_stream = tcp_stream.compat();
-
-            // Configure authentication
             let mut auth_config = (**config).clone();
-            if let Some(azure_cred) = azure_credential {
-                let auth_method = azure_cred.to_auth_method().await?;
+            if let Some(azure_credential) = azure_credential {
+                let auth_method = azure_credential.to_auth_method().await?;
                 auth_config.authentication(auth_method);
             }
 
-            let new_conn: SingleConnectionType = Client::connect(auth_config, compat_stream)
+            let direct = Client::connect(auth_config, tcp_stream.compat())
                 .await
-                .map_err(|e| create_sql_error(e, "Failed to connect to database"))?;
-            session.conn = Some(new_conn);
-        }
+                .map_err(|error| create_sql_error(error, "Failed to connect to database"))?;
+            TransactionConnection::Direct(direct)
+        };
 
+        connection.prepare_for_checkout();
+        session.conn = Some(connection);
         Ok(())
     }
 }

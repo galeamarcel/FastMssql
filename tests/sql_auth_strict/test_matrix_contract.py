@@ -163,7 +163,7 @@ def test_report_generator_preserves_not_run_and_redacts(
     matrix = matrix_output.read_text(encoding="utf-8")
     report = report_output.read_text(encoding="utf-8")
     assert (
-        sum(line.startswith("| `") for line in matrix.splitlines()) == 264
+        sum(line.startswith("| `") for line in matrix.splitlines()) == 269
     )
     assert "| `ENV-001` | PASS |" in matrix
     assert "| `AUTH-001` | FAIL |" in matrix
@@ -230,10 +230,10 @@ def test_report_generator_can_require_complete_evidence(
     )
 
     assert completed.returncode == 1
-    assert "missing evidence for 264 case(s)" in completed.stderr
+    assert "missing evidence for 269 case(s)" in completed.stderr
     assert matrix_output.is_file()
     assert report_output.is_file()
-    assert "| NOT RUN | 264 |" in report_output.read_text(encoding="utf-8")
+    assert "| NOT RUN | 269 |" in report_output.read_text(encoding="utf-8")
 
 
 def test_config_redacts_password(monkeypatch) -> None:
@@ -244,13 +244,13 @@ def test_config_redacts_password(monkeypatch) -> None:
     assert "NeverPrintMe_2026!" not in repr(config)
 
 
-def test_approved_spec_contains_264_unique_case_ids() -> None:
+def test_approved_spec_contains_269_unique_case_ids() -> None:
     spec = ROOT / (
         "docs/superpowers/specs/"
         "2026-07-24-fastmssql-sql-auth-validation-design.md"
     )
     ids = spec_case_ids(spec)
-    assert len(ids) == 264
+    assert len(ids) == 269
 
 
 def test_framework_contract_is_wired_into_runner_and_report() -> None:
@@ -297,13 +297,20 @@ def test_extended_transaction_stress_harness_is_bounded_and_opt_in() -> None:
     assert "--profiles" in source
     assert "--connection-strategy" in source
     assert "per-transaction" in source
+    assert '"pooled"' in source
+    assert "--pool-size" in source
+    assert "shared_pool.transaction()" in source
+    assert "distinct sampled SQL sessions exceeded pool size" in source
     assert "transactions must be between 1 and 99,999" in source
     assert "concurrency must be between 1 and 500" in source
     shell_source = shell_runner.read_text(encoding="utf-8")
     assert ".env.sql-auth.local" in shell_source
     assert "10_000:100,99_999:100" in shell_source
     assert "99_999:200" in shell_source
-    assert "--connection-strategy persistent" in shell_source
+    assert "FASTMSSQL_TRANSACTION_STRESS_STRATEGY" in shell_source
+    assert "FASTMSSQL_TRANSACTION_STRESS_POOL_SIZE" in shell_source
+    assert '--connection-strategy "${strategy}"' in shell_source
+    assert '--pool-size "${pool_size}"' in shell_source
     assert "transaction_stress.py" in shell_source
     assert "run_transaction_stress.sh" not in (
         ROOT / "scripts/sql_auth/run_all.sh"

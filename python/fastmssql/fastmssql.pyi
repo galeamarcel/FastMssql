@@ -745,6 +745,10 @@ class Connection:
         """
         ...
 
+    def transaction(self) -> Transaction:
+        """Create a transaction backed by this connection's shared pool."""
+        ...
+
     async def __aenter__(self) -> _RustConnection:
         """Async context manager entry (initializes pool)."""
         ...

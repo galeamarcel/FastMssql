@@ -402,6 +402,17 @@ evidence reference.
   the public wrapper and the Rust transaction core.
 - `TX-021`: concurrent `commit()`/`rollback()` settlement has exactly one
   atomic winner and the persisted result matches that winner.
+- `TX-022`: `Connection.transaction()` reserves exactly one session from the
+  owning connection pool and keeps the same SPID for the active transaction.
+- `TX-023`: concurrent pooled transactions obey `pool.max_size`; a waiter is
+  unblocked as soon as `COMMIT` or `ROLLBACK` releases a lease.
+- `TX-024`: ordinary pooled operations and pooled transactions share the same
+  capacity budget instead of opening independent physical connections.
+- `TX-025`: a transaction lease is reset before cross-lease reuse, including
+  local temporary objects, `SESSION_CONTEXT`, and isolation level.
+- `TX-026`: cancellation makes an active transaction lease fail-closed; close
+  retires the uncertain socket and a waiter recovers on a new physical
+  `connection_id`, even if SQL Server reuses the numeric SPID.
 
 ### ASYNC — true asynchronous behavior
 
