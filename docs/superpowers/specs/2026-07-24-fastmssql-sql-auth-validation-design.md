@@ -413,6 +413,16 @@ evidence reference.
 - `TX-026`: cancellation makes an active transaction lease fail-closed; close
   retires the uncertain socket and a waiter recovers on a new physical
   `connection_id`, even if SQL Server reuses the numeric SPID.
+- `TX-027`: `CommitOutcomeUnknown` is public and independent from
+  `SqlConnectionError` and `SqlError`.
+- `TX-028`: a pooled COMMIT applied by SQL Server with its response withheld
+  raises `CommitOutcomeUnknown`, is non-retryable, retires the physical socket,
+  and releases the pool waiter.
+- `TX-029`: a direct compatibility transaction has the same typed unknown
+  outcome and closes its physical socket.
+- `TX-030`: automatic context-manager COMMIT propagates
+  `CommitOutcomeUnknown` without calling rollback or retrying.
+- `TX-031`: SQL Server error 3902 at severity 16 remains `SqlError`.
 
 ### ASYNC — true asynchronous behavior
 

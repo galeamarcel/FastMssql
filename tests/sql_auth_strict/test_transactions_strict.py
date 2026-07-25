@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Callable
 import time
 
+import fastmssql
 from fastmssql import Connection, PoolConfig, SqlError, SslConfig, Transaction
 from fastmssql.fastmssql import Transaction as RustTransaction
 import pytest
@@ -11,9 +12,63 @@ import pytest
 from sql_auth_strict.cases import case
 from sql_auth_strict.config import SqlAuthConfig
 from sql_auth_strict.helpers import CleanupRegistry, quote_identifier, scalar
+from sql_auth_strict.tcp_fault_proxy import DownstreamGateProxy
 
 
 pytestmark = [pytest.mark.sql_auth_strict, pytest.mark.integration]
+
+
+@case("TX-027")
+def test_commit_outcome_unknown_is_a_distinct_public_exception() -> None:
+    unknown_type = getattr(fastmssql, "CommitOutcomeUnknown", None)
+    assert unknown_type is not None
+    assert issubclass(unknown_type, Exception)
+    assert not issubclass(unknown_type, fastmssql.SqlConnectionError)
+    assert not issubclass(unknown_type, fastmssql.SqlError)
+    assert "CommitOutcomeUnknown" in fastmssql.__all__
+
+
+class _RecordingUnknownCommitCore:
+    def __init__(self, unknown_type: type[Exception]) -> None:
+        self._unknown_type = unknown_type
+        self.begin_calls = 0
+        self.commit_calls = 0
+        self.rollback_calls = 0
+        self.close_calls = 0
+
+    async def begin(self) -> None:
+        self.begin_calls += 1
+
+    async def commit(self) -> None:
+        self.commit_calls += 1
+        raise self._unknown_type(
+            "COMMIT completion was not confirmed; "
+            "the transaction outcome is unknown"
+        )
+
+    async def rollback(self) -> None:
+        self.rollback_calls += 1
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+@case("TX-030")
+@pytest.mark.asyncio
+async def test_context_manager_does_not_rollback_unknown_commit() -> None:
+    unknown_type = getattr(fastmssql, "CommitOutcomeUnknown", None)
+    assert unknown_type is not None
+    core = _RecordingUnknownCommitCore(unknown_type)
+    transaction = Transaction._from_rust(core)
+
+    with pytest.raises(unknown_type):
+        async with transaction:
+            pass
+
+    assert core.begin_calls == 1
+    assert core.commit_calls == 1
+    assert core.rollback_calls == 0
+    assert core.close_calls == 1
 
 
 def _observer_connection(config: SqlAuthConfig) -> Connection:
@@ -55,10 +110,12 @@ def _pooled_transaction_connection(
     *,
     max_size: int,
     application_name: str | None = None,
+    server: str | None = None,
+    port: int | None = None,
 ) -> Connection:
     return Connection(
-        server=config.host,
-        port=config.port,
+        server=server or config.host,
+        port=port or config.port,
         database=config.database,
         username=config.owner_user,
         password=config.owner_password,
@@ -74,6 +131,35 @@ def _pooled_transaction_connection(
             retry_connection=False,
         ),
     )
+
+
+@pytest.mark.asyncio
+async def test_tcp_fault_proxy_smoke(
+    sql_auth_config: SqlAuthConfig,
+) -> None:
+    proxy = DownstreamGateProxy(
+        sql_auth_config.host,
+        sql_auth_config.port,
+    )
+    await proxy.start()
+    try:
+        connection = _pooled_transaction_connection(
+            sql_auth_config,
+            max_size=1,
+            server=proxy.host,
+            port=proxy.port,
+        )
+        try:
+            result = await asyncio.wait_for(
+                scalar(connection, "SELECT 1"),
+                timeout=2.0,
+            )
+            assert result == 1
+        finally:
+            await asyncio.wait_for(connection.disconnect(), timeout=2.0)
+        assert proxy.accepted_connections == 1
+    finally:
+        await asyncio.wait_for(proxy.close(), timeout=2.0)
 
 
 async def _wait_for_pool_active(
@@ -119,6 +205,27 @@ async def _wait_for_request(
         await asyncio.sleep(0.02)
     raise AssertionError(
         f"request token {token!r} did not reach present={present}"
+    )
+
+
+async def _wait_for_row_count(
+    connection: Connection,
+    table: str,
+    expected: int,
+    *,
+    timeout: float = 3.0,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        count = await scalar(
+            connection,
+            f"SELECT COUNT(*) FROM {table} WHERE id = 1",
+        )
+        if count == expected:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(
+        f"row count in {table} did not reach {expected}"
     )
 
 
@@ -419,6 +526,216 @@ async def test_cancelled_transaction_lease_is_retired_and_waiter_recovers(
                 await waiting_begin
         await cancelled.close()
         await waiting.close()
+        await connection.disconnect()
+
+
+@case("TX-028")
+@pytest.mark.asyncio
+async def test_pooled_commit_ack_loss_is_typed_and_retires_connection(
+    sa_connection: Connection,
+    sql_auth_config: SqlAuthConfig,
+    unique_sql_name: Callable[[str], str],
+    cleanup_registry: CleanupRegistry,
+) -> None:
+    table = quote_identifier(unique_sql_name("strict_commit_unknown_pool"))
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
+    await sa_connection.execute(
+        f"CREATE TABLE {table} (id INT NOT NULL PRIMARY KEY)"
+    )
+
+    proxy = DownstreamGateProxy(
+        sql_auth_config.host,
+        sql_auth_config.port,
+    )
+    await proxy.start()
+    connection = _pooled_transaction_connection(
+        sql_auth_config,
+        max_size=1,
+        application_name=unique_sql_name("strict_commit_unknown_pool_app"),
+        server=proxy.host,
+        port=proxy.port,
+    )
+    committing = connection.transaction()
+    waiting = connection.transaction()
+    commit_task: asyncio.Task | None = None
+    waiting_begin: asyncio.Task | None = None
+
+    try:
+        await committing.begin()
+        encrypt_option = await scalar(
+            committing,
+            """
+            SELECT encrypt_option
+            FROM sys.dm_exec_connections
+            WHERE session_id = @@SPID
+            """,
+        )
+        assert encrypt_option == "TRUE"
+        original_connection_id = await scalar(
+            committing,
+            """
+            SELECT CONVERT(NVARCHAR(36), connection_id)
+            FROM sys.dm_exec_connections
+            WHERE session_id = @@SPID
+            """,
+        )
+        await committing.execute(f"INSERT INTO {table} (id) VALUES (1)")
+
+        waiting_begin = asyncio.create_task(waiting.begin())
+        await asyncio.sleep(0.05)
+        assert waiting_begin.done() is False
+
+        proxy.pause_downstream()
+        commit_task = asyncio.create_task(committing.commit())
+        await _wait_for_row_count(sa_connection, table, 1)
+        await proxy.wait_until_downstream_held()
+        await proxy.abort_connections()
+        proxy.resume_downstream()
+
+        with pytest.raises(Exception) as captured:
+            await asyncio.wait_for(commit_task, timeout=2.0)
+        error = captured.value
+        assert type(error).__name__ == "CommitOutcomeUnknown"
+        assert error.operation == "commit"
+        assert error.retryable is False
+        assert error.connection_discarded is True
+        assert error.__cause__ is not None
+        assert await scalar(
+            sa_connection,
+            f"SELECT COUNT(*) FROM {table} WHERE id = 1",
+        ) == 1
+
+        await asyncio.wait_for(waiting_begin, timeout=2.0)
+        replacement_connection_id = await scalar(
+            waiting,
+            """
+            SELECT CONVERT(NVARCHAR(36), connection_id)
+            FROM sys.dm_exec_connections
+            WHERE session_id = @@SPID
+            """,
+        )
+        assert replacement_connection_id != original_connection_id
+        stats = await connection.pool_stats()
+        assert stats["connections"] == 1
+        assert stats["active_connections"] == 1
+
+        await waiting.rollback()
+        await _wait_for_pool_active(connection, 0)
+    finally:
+        proxy.resume_downstream()
+        for task in (commit_task, waiting_begin):
+            if task is not None and not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        await committing.close()
+        await waiting.close()
+        await connection.disconnect()
+        await proxy.close()
+
+
+@case("TX-029")
+@pytest.mark.asyncio
+async def test_direct_commit_ack_loss_is_typed_and_closes_socket(
+    sa_connection: Connection,
+    sql_auth_config: SqlAuthConfig,
+    unique_sql_name: Callable[[str], str],
+    cleanup_registry: CleanupRegistry,
+) -> None:
+    table = quote_identifier(unique_sql_name("strict_commit_unknown_direct"))
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
+    await sa_connection.execute(
+        f"CREATE TABLE {table} (id INT NOT NULL PRIMARY KEY)"
+    )
+
+    proxy = DownstreamGateProxy(
+        sql_auth_config.host,
+        sql_auth_config.port,
+    )
+    await proxy.start()
+    transaction = Transaction(
+        server=proxy.host,
+        port=proxy.port,
+        database=sql_auth_config.database,
+        username=sql_auth_config.owner_user,
+        password=sql_auth_config.owner_password,
+        ssl_config=SslConfig.development(),
+    )
+    commit_task: asyncio.Task | None = None
+
+    try:
+        await transaction.begin()
+        assert await scalar(
+            transaction,
+            """
+            SELECT encrypt_option
+            FROM sys.dm_exec_connections
+            WHERE session_id = @@SPID
+            """,
+        ) == "TRUE"
+        await transaction.execute(f"INSERT INTO {table} (id) VALUES (1)")
+
+        proxy.pause_downstream()
+        commit_task = asyncio.create_task(transaction.commit())
+        await _wait_for_row_count(sa_connection, table, 1)
+        await proxy.wait_until_downstream_held()
+        await proxy.abort_connections()
+        proxy.resume_downstream()
+
+        with pytest.raises(Exception) as captured:
+            await asyncio.wait_for(commit_task, timeout=2.0)
+        assert type(captured.value).__name__ == "CommitOutcomeUnknown"
+        assert await scalar(
+            sa_connection,
+            f"SELECT COUNT(*) FROM {table} WHERE id = 1",
+        ) == 1
+        assert transaction.is_connected() is False
+    finally:
+        proxy.resume_downstream()
+        if commit_task is not None and not commit_task.done():
+            commit_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await commit_task
+        await transaction.close()
+        await transaction.close()
+        await proxy.close()
+
+
+@case("TX-031")
+@pytest.mark.asyncio
+async def test_server_commit_rejection_remains_sql_error(
+    sql_auth_config: SqlAuthConfig,
+    unique_sql_name: Callable[[str], str],
+    cleanup_registry: CleanupRegistry,
+) -> None:
+    table = quote_identifier(unique_sql_name("strict_commit_rejection"))
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
+    connection = _pooled_transaction_connection(
+        sql_auth_config,
+        max_size=1,
+    )
+    transaction = connection.transaction()
+
+    try:
+        await connection.execute(
+            f"CREATE TABLE {table} (id INT NOT NULL PRIMARY KEY)"
+        )
+        await transaction.begin()
+        with pytest.raises(SqlError) as statement_error:
+            await transaction.simple_query(
+                "SET XACT_ABORT ON; "
+                f"INSERT INTO {table} (id) VALUES (1); "
+                f"INSERT INTO {table} (id) VALUES (1)"
+            )
+        assert statement_error.value.code in {2601, 2627}
+
+        with pytest.raises(SqlError) as commit_error:
+            await transaction.commit()
+        assert commit_error.value.code == 3902
+        assert commit_error.value.severity == 16
+        assert type(commit_error.value).__name__ == "SqlError"
+    finally:
+        await transaction.close()
         await connection.disconnect()
 
 
