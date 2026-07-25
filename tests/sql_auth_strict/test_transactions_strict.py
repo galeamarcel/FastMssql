@@ -1061,6 +1061,7 @@ async def test_cancelled_commit_retires_lease_without_claiming_rollback(
 
     try:
         await committing.begin()
+        original_session_id = await scalar(committing, "SELECT @@SPID")
         original_connection_id = await scalar(
             committing,
             """
@@ -1086,6 +1087,11 @@ async def test_cancelled_commit_retires_lease_without_claiming_rollback(
         # Releasing the transparent proxy gate lets it observe the cancelled
         # client's EOF. No committing.close() occurs before the assertions.
         proxy.resume_downstream()
+        await _wait_for_session_absent(
+            sa_connection,
+            original_session_id,
+            timeout=2.0,
+        )
         await asyncio.wait_for(waiting_begin, timeout=2.0)
         replacement_connection_id = await scalar(
             waiting,
