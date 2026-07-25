@@ -50,6 +50,50 @@ def _state_contract_transaction(
     )
 
 
+def _pooled_transaction_connection(
+    config: SqlAuthConfig,
+    *,
+    max_size: int,
+    application_name: str | None = None,
+) -> Connection:
+    return Connection(
+        server=config.host,
+        port=config.port,
+        database=config.database,
+        username=config.owner_user,
+        password=config.owner_password,
+        ssl_config=SslConfig.development(),
+        application_name=application_name,
+        pool_config=PoolConfig(
+            max_size=max_size,
+            min_idle=0,
+            max_lifetime_secs=None,
+            idle_timeout_secs=None,
+            connection_timeout_secs=2,
+            test_on_check_out=False,
+            retry_connection=False,
+        ),
+    )
+
+
+async def _wait_for_pool_active(
+    connection: Connection,
+    expected: int,
+    *,
+    timeout: float = 2.0,
+) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        stats = await connection.pool_stats()
+        if stats["active_connections"] == expected:
+            return stats
+        await asyncio.sleep(0.02)
+    stats = await connection.pool_stats()
+    raise AssertionError(
+        f"expected {expected} active pooled connection(s), observed {stats}"
+    )
+
+
 async def _wait_for_request(
     sa_connection: Connection,
     token: str,
@@ -109,6 +153,259 @@ async def test_dedicated_session_id_remains_constant(
         await transaction.rollback()
     finally:
         await transaction.close()
+
+
+@case("TX-022")
+@pytest.mark.asyncio
+async def test_connection_transaction_reserves_one_shared_pool_session(
+    sql_auth_config: SqlAuthConfig,
+) -> None:
+    connection = _pooled_transaction_connection(
+        sql_auth_config,
+        max_size=2,
+    )
+    transaction = connection.transaction()
+
+    try:
+        await transaction.begin()
+        first_session = await scalar(transaction, "SELECT @@SPID")
+        second_session = await scalar(transaction, "SELECT @@SPID")
+        stats = await connection.pool_stats()
+
+        assert first_session == second_session
+        assert stats["max_size"] == 2
+        assert stats["connections"] == 1
+        assert stats["active_connections"] == 1
+        assert stats["idle_connections"] == 0
+
+        await transaction.rollback()
+        released = await _wait_for_pool_active(connection, 0)
+        assert released["connections"] == 1
+        assert released["idle_connections"] == 1
+        assert transaction.is_connected() is False
+    finally:
+        await transaction.close()
+        await connection.disconnect()
+
+
+@case("TX-023")
+@pytest.mark.asyncio
+async def test_pooled_transactions_obey_max_size_and_settlement_releases_waiter(
+    sql_auth_config: SqlAuthConfig,
+) -> None:
+    connection = _pooled_transaction_connection(
+        sql_auth_config,
+        max_size=2,
+    )
+    first = connection.transaction()
+    second = connection.transaction()
+    waiting = connection.transaction()
+    waiting_begin: asyncio.Task | None = None
+
+    try:
+        await asyncio.gather(first.begin(), second.begin())
+        first_session, second_session = await asyncio.gather(
+            scalar(first, "SELECT @@SPID"),
+            scalar(second, "SELECT @@SPID"),
+        )
+        assert first_session != second_session
+
+        saturated = await _wait_for_pool_active(connection, 2)
+        assert saturated["connections"] == 2
+        assert saturated["idle_connections"] == 0
+
+        waiting_begin = asyncio.create_task(waiting.begin())
+        await asyncio.sleep(0.1)
+        assert waiting_begin.done() is False
+
+        await first.commit()
+        await asyncio.wait_for(waiting_begin, timeout=1.0)
+        waiting_session = await scalar(waiting, "SELECT @@SPID")
+        assert waiting_session in {first_session, second_session}
+
+        still_bounded = await _wait_for_pool_active(connection, 2)
+        assert still_bounded["connections"] == 2
+        assert still_bounded["active_connections"] == 2
+
+        await second.rollback()
+        await waiting.rollback()
+        released = await _wait_for_pool_active(connection, 0)
+        assert released["connections"] == 2
+        assert released["idle_connections"] == 2
+    finally:
+        if waiting_begin is not None and not waiting_begin.done():
+            waiting_begin.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiting_begin
+        await first.close()
+        await second.close()
+        await waiting.close()
+        await connection.disconnect()
+
+
+@case("TX-024")
+@pytest.mark.asyncio
+async def test_regular_query_and_transaction_share_one_pool_budget(
+    sql_auth_config: SqlAuthConfig,
+) -> None:
+    connection = _pooled_transaction_connection(
+        sql_auth_config,
+        max_size=1,
+    )
+    transaction = connection.transaction()
+    waiting_query: asyncio.Task | None = None
+
+    try:
+        await transaction.begin()
+        transaction_session = await scalar(transaction, "SELECT @@SPID")
+        waiting_query = asyncio.create_task(scalar(connection, "SELECT @@SPID"))
+        await asyncio.sleep(0.1)
+        assert waiting_query.done() is False
+
+        stats = await connection.pool_stats()
+        assert stats["connections"] == 1
+        assert stats["active_connections"] == 1
+        assert stats["max_size"] == 1
+
+        await transaction.commit()
+        query_session = await asyncio.wait_for(waiting_query, timeout=1.0)
+        assert query_session == transaction_session
+        released = await _wait_for_pool_active(connection, 0)
+        assert released["connections"] == 1
+    finally:
+        if waiting_query is not None and not waiting_query.done():
+            waiting_query.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiting_query
+        await transaction.close()
+        await connection.disconnect()
+
+
+@case("TX-025")
+@pytest.mark.asyncio
+async def test_transaction_lease_is_reset_before_cross_lease_reuse(
+    sql_auth_config: SqlAuthConfig,
+) -> None:
+    connection = _pooled_transaction_connection(
+        sql_auth_config,
+        max_size=1,
+    )
+    first = connection.transaction()
+    second = connection.transaction()
+
+    try:
+        await first.begin()
+        first_session = await scalar(first, "SELECT @@SPID")
+        await first.execute(
+            "EXEC sys.sp_set_session_context "
+            "@key=N'fastmssql_tx_lease', @value=N'contaminated', "
+            "@read_only=1"
+        )
+        await first.execute(
+            "CREATE TABLE #fastmssql_tx_lease (value INT NOT NULL)"
+        )
+        await first.execute(
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
+        )
+        await first.commit()
+
+        await second.begin()
+        second_session = await scalar(second, "SELECT @@SPID")
+        context_value = await scalar(
+            second,
+            "SELECT CONVERT(NVARCHAR(100), "
+            "SESSION_CONTEXT(N'fastmssql_tx_lease'))",
+        )
+        temp_object = await scalar(
+            second,
+            "SELECT OBJECT_ID(N'tempdb..#fastmssql_tx_lease')",
+        )
+        isolation_level = await scalar(
+            second,
+            """
+            SELECT transaction_isolation_level
+            FROM sys.dm_exec_sessions
+            WHERE session_id = @@SPID
+            """,
+        )
+
+        assert second_session == first_session
+        assert context_value is None
+        assert temp_object is None
+        assert isolation_level == 2
+        await second.rollback()
+    finally:
+        await first.close()
+        await second.close()
+        await connection.disconnect()
+
+
+@case("TX-026")
+@pytest.mark.asyncio
+async def test_cancelled_transaction_lease_is_retired_and_waiter_recovers(
+    sa_connection: Connection,
+    sql_auth_config: SqlAuthConfig,
+    unique_sql_name: Callable[[str], str],
+) -> None:
+    application_name = unique_sql_name("strict_tx_lease_cancel")
+    token = unique_sql_name("strict_tx_lease_wait")
+    connection = _pooled_transaction_connection(
+        sql_auth_config,
+        max_size=1,
+        application_name=application_name,
+    )
+    cancelled = connection.transaction()
+    waiting = connection.transaction()
+    query_task: asyncio.Task | None = None
+    waiting_begin: asyncio.Task | None = None
+
+    try:
+        await cancelled.begin()
+        cancelled_session = await scalar(cancelled, "SELECT @@SPID")
+        query_task = asyncio.create_task(
+            cancelled.simple_query(
+                "WAITFOR DELAY '00:00:05'; "
+                f"SELECT 1 AS value /* {token} */"
+            )
+        )
+        await _wait_for_request(sa_connection, token, present=True)
+        query_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await query_task
+
+        with pytest.raises(
+            RuntimeError,
+            match="state is indeterminate; call close",
+        ):
+            await cancelled.commit()
+
+        waiting_begin = asyncio.create_task(waiting.begin())
+        await asyncio.sleep(0.1)
+        assert waiting_begin.done() is False
+
+        await cancelled.close()
+        await asyncio.wait_for(waiting_begin, timeout=2.0)
+        recovered_session = await scalar(waiting, "SELECT @@SPID")
+        assert recovered_session != cancelled_session
+        await _wait_for_request(sa_connection, token, present=False)
+
+        stats = await connection.pool_stats()
+        assert stats["connections"] == 1
+        assert stats["active_connections"] == 1
+        await waiting.rollback()
+        await _wait_for_pool_active(connection, 0)
+    finally:
+        if query_task is not None and not query_task.done():
+            query_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await query_task
+        if waiting_begin is not None and not waiting_begin.done():
+            waiting_begin.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiting_begin
+        await cancelled.close()
+        await waiting.close()
+        await connection.disconnect()
 
 
 @case("TX-002", "TX-003")
