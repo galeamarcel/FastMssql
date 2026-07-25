@@ -610,7 +610,9 @@ pub async fn warmup_pool(
     // pool.get(); this outer deadline is a safety net to guarantee that
     // warmup_pool() always returns even if bb8's own timeout is misconfigured or
     // bypassed.
-    let warmup_budget = (timeout_config.acquire_timeout * target_connections.max(1))
+    let warmup_budget = timeout_config
+        .acquire_timeout
+        .saturating_mul(target_connections.max(1))
         .min(std::time::Duration::from_secs(120));
 
     let mut set: JoinSet<Result<(), bb8::RunError<PoolConnectionError>>> = JoinSet::new();

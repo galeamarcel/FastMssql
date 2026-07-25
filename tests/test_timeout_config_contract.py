@@ -36,6 +36,12 @@ INVALID_TIMEOUT_VALUES = (
     math.inf,
     -math.inf,
 )
+UNREPRESENTABLE_TIMEOUT_VALUES = (
+    5e-324,
+    1e-12,
+    0.5e-9,
+    1e19,
+)
 
 
 def _public_type(name: str):
@@ -113,6 +119,39 @@ def test_timeout_config_mutation_preserves_validation_and_optionality() -> None:
     assert unbounded.operation_timeout_secs is None
     assert unbounded.transaction_timeout_secs is None
     assert unbounded.rollback_timeout_secs is None
+
+
+def test_timeout_config_rejects_values_that_cannot_form_runtime_deadlines() -> None:
+    timeout_type = _public_type("TimeoutConfig")
+    for field in DEFAULTS:
+        for invalid in UNREPRESENTABLE_TIMEOUT_VALUES:
+            with pytest.raises(ValueError):
+                timeout_type(**{field: invalid})
+
+            config = timeout_type()
+            original = getattr(config, field)
+            with pytest.raises(ValueError):
+                setattr(config, field, invalid)
+            assert getattr(config, field) == original
+
+
+def test_legacy_pool_timeout_cannot_bypass_deadline_representability() -> None:
+    pool_config = fastmssql.PoolConfig(
+        connection_timeout_secs=(2**64 - 1),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="PoolConfig.connection_timeout_secs is too large",
+    ):
+        fastmssql.Connection(
+            server="localhost",
+            database="master",
+            username="test_user",
+            password="test_password",
+            ssl_config=fastmssql.SslConfig.development(),
+            pool_config=pool_config,
+        )
 
 
 def test_timeout_error_is_structured_connection_error() -> None:

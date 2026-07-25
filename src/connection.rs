@@ -330,8 +330,10 @@ impl PyConnection {
         }
 
         let original_pool_config = pool_config.unwrap_or_default();
-        let effective_timeout = timeout_config
-            .unwrap_or_else(|| PyTimeoutConfig::from_pool_compatibility(&original_pool_config));
+        let effective_timeout = match timeout_config {
+            Some(timeout_config) => timeout_config,
+            None => PyTimeoutConfig::from_pool_compatibility(&original_pool_config)?,
+        };
         let effective_pool_config = effective_timeout.align_pool_config(&original_pool_config);
 
         Ok(PyConnection {

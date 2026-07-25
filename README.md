@@ -515,7 +515,8 @@ The five settings have distinct boundaries:
 | `transaction_timeout_secs` | `transaction` | absolute lifetime after SQL Server confirms `BEGIN` |
 | `rollback_timeout_secs` | `rollback` | explicit rollback and rollback performed by `close()` |
 
-Every configured number must be finite and greater than zero; booleans are
+Every configured number must be finite, at least one nanosecond, and small
+enough to form a deadline on the platform's monotonic clock; booleans are
 rejected. Subsecond values are supported. `None` means that FastMssql does not
 install a deadline for that phase and is accepted for connect, operation,
 transaction and rollback. Acquisition must always be bounded, so

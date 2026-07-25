@@ -5,6 +5,7 @@ use pyo3::types::PyBool;
 use std::time::Duration;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const MIN_TIMEOUT_SECONDS: f64 = 1e-9;
 
 #[derive(Clone, Copy)]
 struct OptionalSeconds(Option<f64>);
@@ -64,8 +65,28 @@ fn positive_finite_seconds(name: &str, value: f64) -> PyResult<Duration> {
             "{name} must be a finite number greater than 0"
         )));
     }
-    Duration::try_from_secs_f64(value)
-        .map_err(|_| PyValueError::new_err(format!("{name} must fit in a Rust Duration")))
+    if value < MIN_TIMEOUT_SECONDS {
+        return Err(PyValueError::new_err(format!(
+            "{name} must be at least 0.000000001 seconds"
+        )));
+    }
+    let duration = Duration::try_from_secs_f64(value)
+        .map_err(|_| PyValueError::new_err(format!("{name} must fit in a Rust Duration")))?;
+    validate_runtime_deadline(name, duration)
+}
+
+fn validate_runtime_deadline(name: &str, duration: Duration) -> PyResult<Duration> {
+    if duration.is_zero() {
+        return Err(PyValueError::new_err(format!(
+            "{name} must be at least 0.000000001 seconds"
+        )));
+    }
+    if tokio::time::Instant::now().checked_add(duration).is_none() {
+        return Err(PyValueError::new_err(format!(
+            "{name} is too large for this platform's monotonic clock"
+        )));
+    }
+    Ok(duration)
 }
 
 fn optional_duration(name: &str, value: OptionalSeconds) -> PyResult<Option<Duration>> {
@@ -104,15 +125,16 @@ impl PyTimeoutConfig {
         }
     }
 
-    pub(crate) fn from_pool_compatibility(pool: &PyPoolConfig) -> Self {
+    pub(crate) fn from_pool_compatibility(pool: &PyPoolConfig) -> PyResult<Self> {
         let legacy = pool.connection_timeout.unwrap_or(DEFAULT_TIMEOUT);
-        Self {
+        validate_runtime_deadline("PoolConfig.connection_timeout_secs", legacy)?;
+        Ok(Self {
             connect_timeout: Some(legacy),
             acquire_timeout: legacy,
             operation_timeout: None,
             transaction_timeout: None,
             rollback_timeout: Some(DEFAULT_TIMEOUT),
-        }
+        })
     }
 
     pub(crate) fn align_pool_config(&self, pool: &PyPoolConfig) -> PyPoolConfig {
@@ -241,7 +263,8 @@ mod tests {
             ..PyPoolConfig::default()
         };
 
-        let timeout = PyTimeoutConfig::from_pool_compatibility(&pool);
+        let timeout = PyTimeoutConfig::from_pool_compatibility(&pool)
+            .expect("two seconds must form a runtime deadline");
 
         assert_eq!(timeout.connect_timeout, Some(Duration::from_secs(2)));
         assert_eq!(timeout.acquire_timeout, Duration::from_secs(2));
