@@ -49,7 +49,7 @@ La data redactării:
 
 - `upstream/master`: `e45f301` — versiunea `v0.7.7`;
 - branch audit: `test/sql-auth-validation`;
-- snapshotul tehnic anterior acestui update documentar este `510ea9a`;
+- snapshotul tehnic anterior acestui update documentar este `c30c02a`;
 - unicul PR upstream deschis este draftul
   [#121 — Improve transactions behavior and safety](https://github.com/Rivendael/FastMssql/pull/121);
 - PR-ul #121 modifică masiv tranzacțiile și timeouturile, deci orice PR care
@@ -107,7 +107,8 @@ PR-uri cu decizie de supply chain
     ├── PR-15 RESETCONNECTION TDS și izolarea sesiunilor pooled
     ├── PR-16 mașină atomică de stare pentru tranzacții
     ├── PR-17 transaction leasing din pool
-    └── PR-18 rezultat necunoscut după COMMIT
+    ├── PR-18 rezultat necunoscut după COMMIT
+    └── PR-19 retragere automată după anularea tranzacției
 
 Funcții enterprise viitoare
     └── intake individual după implementare și audit
@@ -1440,7 +1441,7 @@ implementarea minimă. Diff-ul `src/transaction.rs` trebuie comparat explicit cu
 [#121](https://github.com/Rivendael/FastMssql/pull/121), deoarece draftul
 modifică aceeași zonă și poate schimba API-ul sau regulile de timeout.
 
-- [ ] **Step 6: Păstrează următoarele P0 în PR-uri separate**
+- [ ] **Step 6: Păstrează schimbările următoare în PR-uri separate**
 
 PR-16 nu va include:
 
@@ -1464,7 +1465,7 @@ forkului.
 
 **Priority:** P0 implementat și verificat pe fork.
 `CommitOutcomeUnknown` este implementat separat în PR-18, iar TDS `ATTENTION`
-rămâne o schimbare P0 distinctă.
+rămâne o optimizare P1 distinctă pentru reutilizarea aceleiași sesiuni.
 
 **Source test branch:** `test/transaction-leasing`
 
@@ -1799,6 +1800,168 @@ nu executa `gh pr create` fără aprobarea explicită a proprietarului forkului.
 
 ---
 
+### Task 18: PR-19 — Retragere automată după anularea tranzacției
+
+**Status:** `VERIFIED_FORK`
+
+**Priority:** P0 implementat și verificat pe fork. Publicarea upstream nu este
+aprobată.
+
+**Source design branch:** `docs/transaction-cancellation-retirement-design`
+
+**Source design commits:**
+
+- `0de5706` — analiza MS-TDS și specificația fail-closed;
+- `3ece52e` — planul TDD și criteriile de acceptare.
+
+**Source test branch:** `test/transaction-cancellation-retirement`
+
+**Source test commit:** `1757094`
+
+**Source implementation branch:** `fix/transaction-cancellation-retirement`
+
+**Source implementation commits:**
+
+- `41c53a8` — contractul TX-026 întărit pentru cleanup autonom;
+- `c5dcd2d` — epoch-ul operației și guard-ul RAII;
+- `969f23d` și `ec7ba56` — identitatea fizică a sesiunii în dovezile DMV.
+
+**Source proxy branch:** `fix/tcp-fault-proxy-shutdown`
+
+**Source proxy commits:**
+
+- `0491eb9` — reproducerea segmentului TCP server-side half-open;
+- `a5cc2bd` — închiderea ambelor segmente la terminarea unui relay;
+- `6939418` — identificarea prin `(session_id, connection_id)`.
+
+**Cumulative fork commit:** `c30c02a`
+
+**Proposed clean upstream branch:**
+`fix/upstream-transaction-cancellation-retirement`
+
+**Proposed title:**
+`fix: retire cancelled transaction connections automatically`
+
+**Files on the verified fork:**
+
+- Modify: `src/transaction.rs`
+- Test: `tests/sql_auth_strict/test_transactions_strict.py`
+- Test utility: `tests/sql_auth_strict/tcp_fault_proxy.py`
+- Test contract: `tests/sql_auth_strict/test_matrix_contract.py`
+
+**Behavior:**
+
+- Păstrează `asyncio.CancelledError`; nu îl înlocuiește cu o excepție de
+  driver.
+- Retrage automat socketul direct sau `OwnedPooledConnection` dacă un future
+  in-flight este abandonat.
+- Termină requestul și sesiunea SQL Server prin închiderea transportului.
+- Produce rollback server-side pentru lucrul necomis și recuperează
+  capacitatea pool-ului fără `close()` explicit.
+- Nu repetă nicio operație și nu pretinde rollback pentru un `COMMIT` deja
+  aplicat.
+- Protejează cleanup-ul întârziat printr-un epoch, astfel încât acesta să nu
+  poată retrage conexiunea unei operații ulterioare.
+
+**Root cause:**
+
+`TransactionSession` păstra conexiunea într-un
+`Arc<AsyncMutex<TransactionSession>>`. Anularea future-ului elibera mutexul,
+dar nu elimina conexiunea din starea `Executing` sau `Committing`; requestul,
+sesiunea ori lease-ul puteau rămâne active până la un apel explicit
+`close()`. Marcarea conexiunii ca nesigură nu era suficientă cât timp obiectul
+tranzacției continua să dețină fizic conexiunea.
+
+- [x] **Step 1: Reproduce determinist cele trei căi**
+
+Baseline-ul anterior fixului:
+
+```text
+TX-032 pooled data operation          FAIL: requestul rămânea activ
+TX-033 direct data operation          FAIL: sesiunea rămânea activă
+TX-034 COMMIT deja durabil            FAIL: lease-ul rămânea captiv
+```
+
+Contractele folosesc DMV-uri și perechea `(session_id, connection_id)`, nu
+doar SPID-ul numeric, care poate fi reutilizat imediat de SQL Server.
+
+- [x] **Step 2: Adaugă epoch-ul și guard-ul RAII**
+
+Fiecare tranziție `Beginning`, `Executing`, `Committing` sau `RollingBack`
+primește un epoch monoton. Guard-ul este armat numai după intrarea validă în
+starea in-flight și este dezarmat numai după tranziția terminală. La drop,
+cleanup-ul se aplică numai dacă epoch-ul și starea încă aparțin aceleiași
+operații.
+
+- [x] **Step 3: Retrage atât conexiunea directă, cât și lease-ul pooled**
+
+Cleanup-ul încearcă mutexul sincron și, când future-ul anulat îl deține încă
+în timpul distrugerii, programează cleanup-ul epoch-checked pe runtime-ul
+Tokio. Lease-ul pooled este marcat `Broken`; conexiunea este eliminată din
+sesiunea tranzacției și starea devine `Failed`.
+
+- [x] **Step 4: Repară fault proxy-ul și dovada identității fizice**
+
+Proxy-ul închide acum ambele segmente când unul dintre relay-uri se termină.
+Testele nu mai confundă reutilizarea SPID-ului cu reutilizarea conexiunii
+fizice și demonstrează că waiterul primește un `connection_id` nou.
+
+- [x] **Step 5: Verifică regresia, cleanup-ul și load-ul**
+
+Rezultatele pe arborele integrat `c30c02a`:
+
+```text
+TX-026 + TX-032–TX-034 + proxy       5/5 PASS
+tranzacții/async/batch + upstream    140/140 PASS
+suita strictă SQL-auth               344/344 PASS în 124,32 s
+cazuri raportate din specificație    277/277 PASS
+upstream aplicabil                   896/896 PASS în 62,99 s
+FastMssql Rust unit tests            13/13 PASS
+Tiberius vendored unit tests         123/123 PASS
+cargo fmt / Clippy / Ruff            PASS
+cargo audit, 219 dependențe          0 findings
+```
+
+Storm-ul dedicat a produs 20/20 `CancelledError`, a retras toate cele 5
+conexiuni active și le-a înlocuit cu 5 identități fizice noi; după
+`disconnect()` au rămas zero sesiuni. Stress-ul pooled de 10.000 și 99.999
+tranzacții, la concurență 100/200, nu a depășit `pool.max_size=100`, iar
+smoke-testul final a trecut.
+
+- [ ] **Step 6: Reaplică minim peste ultimul upstream și compară #121**
+
+Branchul upstream trebuie creat din ultimul `upstream/master`, nu din
+istoricul cumulativ. Se confirmă RED pe acea bază și se reaplică numai
+epoch-ul, guard-ul și testele portabile necesare. Diff-ul trebuie comparat
+explicit cu draftul
+[#121](https://github.com/Rivendael/FastMssql/pull/121), care atinge aceeași
+mașină de stare tranzacțională.
+
+- [ ] **Step 7: Decide forma fixture-ului SQL-auth upstream**
+
+Testele actuale folosesc containerul și fixture-urile stricte ale forkului.
+Candidatul curat trebuie să păstreze dovada server-side pentru dispariția
+requestului/sesiunii, rollback și înlocuirea `connection_id`, fără să relaxeze
+contractul la simpla observare a unei excepții Python.
+
+- [ ] **Step 8: Păstrează optimizările și funcțiile distincte**
+
+PR-19 nu va include:
+
+- TDS `ATTENTION`/`DONE_ATTN` pentru reutilizarea aceluiași socket;
+- timeouturi publice sau retry automat;
+- schimbarea semanticii `CancelledError`;
+- reconciliere automată pentru un `COMMIT` deja durabil;
+- tranzacții distribuite, savepoints sau lifecycle general.
+
+- [ ] **Step 9: Cere aprobarea pentru publicare**
+
+Prezintă diff-ul curat, comparația cu #121, dovada RED/GREEN, storm-ul și
+rezultatele bounded. Nu executa `git push` pentru branchul upstream și nu
+executa `gh pr create` fără aprobarea explicită a proprietarului forkului.
+
+---
+
 ## Funcții enterprise care vor intra ulterior în roadmap
 
 Fiecare funcție primește propriul candidat numai după ce este implementată pe
@@ -1811,6 +1974,7 @@ fork, testată live și auditată.
 | Transaction state | PR-16, tranziții atomice în Rust | implementat/verificat pe fork; rebase și comparație cu #121 înainte de upstream |
 | Session leasing | PR-17, tranzacții pe conexiuni rezervate din pool | implementat/verificat pe fork; rebase și comparație cu #121 înainte de upstream |
 | Commit outcome | PR-18, `CommitOutcomeUnknown` fără rollback/retry | implementat/verificat pe fork; fault fixture portabil, rebase și comparație cu #121 înainte de upstream |
+| Transaction cancellation | PR-19, retragere automată după anulare | implementat/verificat pe fork; fixture DMV portabil, rebase și comparație cu #121 înainte de upstream |
 | TDS session reset | PR-15, bit `RESETCONNECTION` | implementat/verificat pe fork; traseu Tiberius și aprobare înainte de upstream |
 | True async streaming | stream Python async cu backpressure | memorie limitată, early close, lease recovery |
 | Typed parameters | tip/direction/precision/scale/length | wire metadata verificată prin SQL Server |

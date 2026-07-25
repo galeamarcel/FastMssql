@@ -3,12 +3,13 @@
 Data auditului: 24 iulie 2026  
 Fork auditat: `https://github.com/galeamarcel/FastMssql.git`  
 Branch: `test/sql-auth-validation`  
-Commit: `3cc5700b5142f3e84c83767e2ff114f87a19c5dd`
+Commit: `c30c02ac6d0aac10576ce9c140cb4c3161e5717e`
 
 Ultima actualizare live: 25 iulie 2026
-Ultimul fix verificat: `fix/commit-outcome-unknown` la `59a5559`
+Ultimul fix verificat: `fix/transaction-cancellation-retirement` la
+`ec7ba56`, cu implementarea Rust în `c5dcd2d`
 Ultimul harness de load verificat: `adac307`
-Ultimul branch cumulativ verificat: `test/sql-auth-validation` la `510ea9a`
+Ultimul branch cumulativ verificat: `test/sql-auth-validation` la `c30c02a`
 Ultimul gate CI verificat: `ci/dependency-security-gate` la `3887ddd`, cu
 checkout menținut la `1d13280`; rularea hosted
 [#30130204804](https://github.com/galeamarcel/FastMssql/actions/runs/30130204804)
@@ -21,14 +22,23 @@ TLS, dependențele RustSec, eliminarea conexiunilor pooled defecte și izolarea
 sesiunilor reutilizate au acum remedieri verificate pe fork. Mașina atomică de
 stare și leasingul tranzacțiilor din pool sunt de asemenea implementate și
 verificate. Pierderea confirmării după `COMMIT` este acum clasificată distinct,
-fără rollback sau retry automat. Biblioteca nu este încă declarată pregătită
-pentru producție critică sau multi-tenant până când nu este închisă categoria
-P0 rămasă:
+fără rollback sau retry automat. Anularea oricărei operații pe un
+`Transaction` retrage acum automat socketul direct sau lease-ul pooled,
+termină requestul/sesiunea SQL Server și recuperează capacitatea fără
+`close()` explicit.
 
-1. anularea/timeoutul TDS trebuie să confirme terminarea requestului
-   server-side; retragerea fail-closed a socketului client este implementată,
-   dar protocolul public `ATTENTION` și drenarea răspunsului nu sunt încă
-   disponibile.
+Toate defectele P0 de corectitudine identificate de acest audit sunt închise
+pe fork. Aceasta nu declară încă biblioteca complet enterprise
+production-ready: timeouturile publice și lifecycle-ul, streamingul cu memorie
+limitată, tipurile lipsă, multiple result sets/RPC și gate-urile de packaging
+prin servere reale rămân cerințe P1/P2.
+
+Auditul corectează explicit o concluzie anterioară: TDS `ATTENTION` nu este o
+condiție necesară pentru a termina sigur un request dacă driverul închide
+transportul și retrage conexiunea. `ATTENTION` plus drenarea până la
+`DONE_ATTN` este necesar numai dacă vrem anulare protocolară și reutilizarea
+aceleiași sesiuni. Acea optimizare rămâne P1 și cere o mașină de stare
+cancellation-safe în Tiberius; nu este implementată parțial.
 
 API-ul enterprise recomandat este acum `Connection.transaction()`: rezervă un
 lease din același pool bb8 folosit de query-urile obișnuite, păstrează aceeași
@@ -387,9 +397,11 @@ Limite intenționat rămase deschise:
 
 - la checkpointul PR-16, `Transaction` deținea încă o conexiune directă;
   această limită este închisă pentru API-ul recomandat de secțiunea următoare;
-- pierderea ACK-ului după trimiterea `COMMIT` nu produce încă
-  `CommitOutcomeUnknown`;
-- nu există încă API public de anulare TDS `ATTENTION`;
+- la același checkpoint, pierderea ACK-ului după `COMMIT` și cleanup-ul
+  autonom după anulare erau încă deschise; ambele sunt închise de secțiunile
+  ulterioare;
+- nu există încă API public de anulare TDS `ATTENTION`, necesar numai pentru
+  reutilizarea aceleiași sesiuni în locul retragerii transportului;
 - înaintea unui PR upstream, schimbarea trebuie reaplicată curat peste ultimul
   `upstream/master` și comparată cu draftul upstream #121.
 
@@ -477,8 +489,11 @@ Limite rămase:
 
 - la checkpointul PR-17, pierderea confirmării după trimiterea `COMMIT` era
   încă deschisă; această problemă este închisă separat de remedierea următoare;
-- anularea fail-closed retrage socketul, dar nu există încă pachet TDS
-  `ATTENTION` public;
+- la checkpointul PR-17, cleanup-ul după anularea unei operații
+  tranzacționale depindea încă de `close()`; secțiunea de anulare de mai jos
+  închide această limită;
+- nu există pachet TDS `ATTENTION` public pentru reutilizarea aceleiași
+  sesiuni; fallback-ul verificat rămâne retragerea transportului;
 - tranzacțiile distribuite nu sunt suportate sau testate;
 - înaintea unui PR upstream, diff-ul trebuie reaplicat peste ultimul
   `upstream/master` și comparat cu draftul #121.
@@ -581,12 +596,141 @@ Fiecare profil a avut smoke-test `PASS` și zero sesiuni de aplicație rămase.
 
 Limite păstrate explicit:
 
-- anularea Python continuă să expună `CancelledError`; socketul este retras,
-  dar FastMssql nu trimite încă TDS `ATTENTION`;
+- anularea Python continuă să expună `CancelledError`; retragerea automată a
+  socketului pentru tranzacții este închisă de secțiunea următoare, iar
+  FastMssql nu pretinde reutilizarea aceleiași sesiuni prin TDS `ATTENTION`;
 - nu există retry transparent, reconciliere automată sau presupunere de
   rollback;
 - nu sunt implementate tranzacții distribuite sau recovery coordinator;
 - înainte de upstream, candidatul trebuie reaplicat minim peste ultimul
+  `upstream/master` și comparat cu draftul #121.
+
+### Anularea tranzacțiilor retrage automat conexiunea — remediată și verificată
+
+Branchurile și commiturile sunt separate:
+
+- `docs/transaction-cancellation-retirement-design`
+  - `0de5706` — analiza MS-TDS, opțiunile și specificația fail-closed;
+  - `3ece52e` — planul TDD și criteriile de acceptare;
+- `test/transaction-cancellation-retirement`
+  - `1757094` — reproducerile RED TX-032–TX-034 și matricea extinsă;
+- `fix/transaction-cancellation-retirement`
+  - `41c53a8` — contractul TX-026 întărit pentru cleanup autonom;
+  - `c5dcd2d` — epoch-ul operației și guard-ul RAII din Rust;
+  - `969f23d` + `ec7ba56` — dovada dispariției identității fizice a sesiunii;
+- `fix/tcp-fault-proxy-shutdown`
+  - `0491eb9` — reproducerea segmentului server-side rămas half-open;
+  - `a5cc2bd` — închiderea ambelor segmente când un relay TCP se termină;
+  - `6939418` — identificarea sesiunilor prin perechea
+    `(session_id, connection_id)`;
+- branch cumulativ `test/sql-auth-validation`
+  - `c30c02a` — integrarea completă, exclusiv pe fork.
+
+Cauza defectului era diferită de anularea query-urilor pooled obișnuite.
+`Transaction` păstrează socketul direct sau `OwnedPooledConnection` în
+`Arc<AsyncMutex<TransactionSession>>`. Când Python anula future-ul unei
+operații, mutexul se elibera, dar conexiunea rămânea deținută în starea
+`Executing` ori `Committing`. Ea era marcată nesigură, însă requestul,
+sesiunea și lease-ul rămâneau active până la un `close()` explicit:
+
+```text
+CancelledError
+  -> future Rust abandonat
+  -> TransactionSession păstrează conexiunea in-flight
+  -> request SQL continuă / waiterul pool rămâne blocat
+  -> numai close() retrage socketul
+```
+
+Remedierea adaugă un epoch monoton fiecărei tranziții
+`Beginning | Executing | Committing | RollingBack` și armează un guard RAII
+după ce operația intră în starea in-flight. Dacă future-ul este abandonat
+înaintea tranziției terminale, guard-ul:
+
+1. verifică epoch-ul și starea, astfel încât un cleanup întârziat să nu închidă
+   o operație ulterioară;
+2. marchează lease-ul pooled `Broken`;
+3. elimină socketul direct sau lease-ul din sesiunea tranzacției;
+4. mută starea în `Failed`;
+5. lasă închiderea transportului să termine requestul și să provoace rollback
+   server-side pentru lucrul necomis.
+
+Cleanup-ul încearcă mai întâi mutexul sincron. Dacă future-ul anulat îl
+deține încă în timpul distrugerii câmpurilor, programează imediat aceeași
+operație epoch-checked pe runtime-ul Tokio inițializat de PyO3. `close()`
+rămâne sigur și idempotent, dar nu mai este necesar pentru recuperarea
+capacității.
+
+Contractele reale SQL-auth demonstrează:
+
+- TX-032: un query tranzacțional pooled anulat închide requestul și identitatea
+  fizică veche, iar waiterul unui pool de mărime 1 începe pe alt
+  `connection_id`, fără `close()` pe obiectul anulat;
+- TX-033: o tranzacție directă anulată își închide sesiunea, iar rândul
+  necomis este rollback-uit de SQL Server;
+- TX-034: dacă SQL Server a aplicat deja `COMMIT`, anularea Python păstrează
+  `CancelledError`, retrage lease-ul și eliberează waiterul, dar rândul rămâne
+  durabil; driverul nu pretinde rollback și nu repetă comanda;
+- TX-026: waiterul este demonstrabil blocat înainte de anulare și se
+  recuperează autonom după ea;
+- fault proxy-ul închide acum ambele segmente TCP și nu confundă reutilizarea
+  numerică a SPID-ului cu reutilizarea conexiunii fizice.
+
+Reproducerea RED pe codul anterior:
+
+```text
+TX-032 pooled data operation          FAIL: requestul rămânea activ
+TX-033 direct data operation          FAIL: sesiunea rămânea activă
+TX-034 COMMIT deja durabil            FAIL: lease-ul rămânea captiv
+```
+
+Dovada GREEN pe arborele integrat `c30c02a`:
+
+```text
+TX-026 + TX-032–TX-034 + proxy       5/5 PASS
+tranzacții/async/batch + upstream    140/140 PASS
+suita strictă SQL-auth               344/344 PASS în 124,32 s
+cazuri raportate din specificație    277/277 PASS
+regresie upstream aplicabilă         896/896 PASS în 62,99 s
+FastMssql Rust unit tests            13/13 PASS
+Tiberius vendored unit tests         123/123 PASS
+cargo fmt / Clippy -D warnings       PASS
+Ruff / compileall                    PASS
+cargo audit, 219 dependențe          0 findings
+```
+
+Storm-ul dedicat a anulat 20 de taskuri tranzacționale peste un pool de 5.
+Toate cele 20 au întors `CancelledError`, cele 5 requesturi și identități
+fizice active au dispărut, 5 replacement-uri au avut `connection_id` noi,
+pool-ul a revenit la zero lease-uri active și după `disconnect()` au rămas
+zero sesiuni de aplicație.
+
+Stress-ul pooled final, cu `pool.max_size=100`, a rămas bounded:
+
+```text
+10.000 tx, concurrency 100     3.200,19 tx/s, 5.000/5.000 commit/rollback
+99.999 tx, concurrency 100     3.357,20 tx/s, 50.000/49.999 commit/rollback
+99.999 tx, concurrency 200     3.422,57 tx/s, 50.000/49.999 commit/rollback
+maximum physical/SQL sessions  100
+post-load smoke                PASS
+remaining application sessions 0
+```
+
+Decizia protocolară este intenționat conservatoare. MS-TDS cere ca un client
+care trimite `ATTENTION` să păstreze progresul decoderului și să dreneze
+răspunsul până la `DONE_ATTN`. Tiberius 0.12.3 recunoaște tipul de pachet și
+bitul `DONE_ATTN`, dar nu expune o mașină de anulare resumabilă. Trimiterea
+parțială a `ATTENTION` ar risca returnarea în pool a unui stream
+desincronizat. Închiderea transportului este contractul P0 sigur și verificat;
+`ATTENTION` cu reutilizarea aceleiași sesiuni rămâne o optimizare P1 separată.
+
+Limite păstrate explicit:
+
+- nu există încă timeout public separat pentru query/tranzacție/rollback;
+- anularea unui `COMMIT` rămâne rezultat de business care trebuie reconciliat
+  prin cheie idempotentă, chiar dacă excepția Python este `CancelledError`;
+- nu există retry automat, al doilea settlement sau presupunere de rollback;
+- tranzacțiile distribuite nu sunt suportate;
+- candidatul upstream trebuie reaplicat minim peste ultimul
   `upstream/master` și comparat cu draftul #121.
 
 ## Corecții și nuanțări față de primul audit
@@ -608,8 +752,9 @@ Limite păstrate explicit:
   extensia Tiberius locală din `16f076a` implementează și verifică această
   cale, fără round-trip separat.
 - Tiberius nu expune momentan public trimiterea unui pachet TDS `ATTENTION`.
-  Până la implementarea protocolului complet de anulare, o conexiune anulată
-  trebuie eliminată din pool.
+  Conexiunea anulată este acum eliminată automat. `ATTENTION` este necesar
+  numai pentru o viitoare reutilizare sigură a aceleiași sesiuni, după drenarea
+  `DONE_ATTN`, nu pentru terminarea requestului prin închiderea transportului.
 - O mare parte din suita strictă validează corect contractul curent, dar unele
   teste codifică explicit limitări: stream sincron și bufferizat, respingerea
   anumitor tipuri și eliminarea fusului orar. `PASS` nu înseamnă că acele
@@ -626,7 +771,7 @@ Limite păstrate explicit:
 | Conexiuni defecte | Guard-ul putea marca operația drept completă chiar când Python primea o eroare fatală de server/protocol/I/O. O conexiune omorâtă era reutilizată și eșua repetat cu EOF. | Dispoziție explicită `NeedsReset`, `Broken`, `CommitOutcomeUnknown`; conexiunile suspecte sunt eliminate. | **REMEDIAT și verificat**: `Broken` este eliminat prin `85e295f`, `NeedsReset` este consumat prin `16f076a`, iar rezultatul COMMIT incert este clasificat prin `5428d5a`. |
 | Tranzacții | `Transaction` deschidea conexiuni directe, în afara pool-ului, limitelor și metricilor. Două apeluri concurente `begin()` produceau `@@TRANCOUNT=2`. | Stare de tranzacție păstrată în Rust și tranzacție pornită pe un lease din pool. | **REMEDIAT și verificat pentru API-ul recomandat**: mașina atomică de stare este în `b86b0ac`, iar `Connection.transaction()` folosește pool-ul comun prin `8027b67`; constructorul direct rămâne numai pentru compatibilitate. |
 | Confirmare COMMIT | Dacă se pierde răspunsul după COMMIT, aplicația nu poate ști dacă tranzacția s-a aplicat. Nu este sigur să presupunem rollback sau să repetăm automat. | Excepție `CommitOutcomeUnknown`, eliminarea socketului și niciun retry automat. | **REMEDIAT și verificat** prin `fba743a` + `5428d5a` + `59a5559`, integrat în `510ea9a`. |
-| Anulare TDS | Anularea Python retrage fail-closed socketul, dar nu există încă un API Tiberius public pentru `ATTENTION` și drenarea răspunsului. | Trimitere TDS `ATTENTION`, consumarea confirmării, deadline și dovadă că requestul server-side s-a încheiat. | **PARȚIAL**: capacitatea pool-ului se recuperează și socketul incert este retras; terminarea protocolară explicită rămâne P0. |
+| Anulare request/tranzacție | Operațiile pooled obișnuite retrăgeau socketul la anulare, dar `TransactionSession` păstra socketul/lease-ul in-flight până la `close()` explicit. | Cleanup RAII epoch-checked, retragere automată și dovadă DMV pentru terminarea requestului/sesiunii, rollback și recuperarea pool-ului. | **REMEDIAT și verificat** prin `c5dcd2d`, întărit de TX-026/TX-032–TX-034 și integrat în `c30c02a`. TDS `ATTENTION` rămâne numai optimizare P1 pentru same-socket reuse. |
 
 ### Dependențe și RustSec
 
@@ -740,6 +885,9 @@ nedeterministe după intrarea în `Committing`; conexiunea a fost deja eliminat�
 
 - Timeout separat pentru connect, pool acquisition, query, transaction și
   rollback la închidere.
+- TDS `ATTENTION`, drenare până la `DONE_ATTN` și deadline de anulare numai
+  pentru reutilizarea sigură a aceleiași sesiuni; fallback-ul trebuie să
+  rămână retragerea transportului.
 - `connect()` cu `min_idle=0` este lazy: poate returna succes și
   `is_connected=True` chiar dacă endpointul nu există. Sunt necesare
   `ping()`/`ready()` cu acces real la SQL Server.
@@ -985,12 +1133,15 @@ funcție ar necesita lucru la nivelul driverului TDS:
 8. `fix/commit-outcome-unknown` — **clasificarea rezultatului COMMIT incert,
    retragerea socketului și lipsa retry/rollback automat finalizate și
    verificate**
-9. `feat/timeouts-lifecycle-observability`
-10. `feat/typed-parameters`
-11. `feat/resultsets-streaming`
-12. `feat/batch-bulk`
-13. `fix/named-instance`
-14. `test/production-framework-matrix`
+9. `fix/transaction-cancellation-retirement` — **cleanup-ul RAII
+   epoch-checked, retragerea autonomă și recuperarea pool-ului finalizate și
+   verificate**
+10. `feat/timeouts-lifecycle-observability`
+11. `feat/typed-parameters`
+12. `feat/resultsets-streaming`
+13. `feat/batch-bulk`
+14. `fix/named-instance`
+15. `test/production-framework-matrix`
 
 Orice remediere FastMssql va fi făcută numai pe forkul
 `galeamarcel/FastMssql`.
@@ -1010,7 +1161,10 @@ upstream fără aprobarea explicită a proprietarului forkului.
 - [x] un SPID omorât este eliminat și pool-ul se recuperează;
 - [x] starea de sesiune acoperită de matrice nu trece între lease-urile pooled;
 - [x] două `begin()` concurente sunt respinse determinist;
-- [ ] timeout/anulare elimină conexiunea și requestul server-side se încheie;
+- [x] anularea unei operații tranzacționale elimină automat conexiunea, iar
+  requestul și sesiunea server-side se încheie fără `close()` explicit;
+- [ ] timeouturile publice separate pentru connect/acquire/query/tranzacție
+  aplică deadline-uri și elimină conexiunea când protocolul rămâne incert;
 - [x] răspunsul pierdut după COMMIT produce `CommitOutcomeUnknown`, fără
   rollback sau retry automat;
 - [x] numărul sesiunilor tranzacționale nu depășește `pool.max_size`, inclusiv
@@ -1022,29 +1176,31 @@ upstream fără aprobarea explicită a proprietarului forkului.
 - [ ] matricea rulează prin servere reale Uvicorn/Gunicorn și din wheel-ul
   instalat.
 
-## Starea verificată la finalul auditului
+## Starea verificată curentă
 
 - Fork: `https://github.com/galeamarcel/FastMssql.git`
-- Branch: `test/sql-auth-validation`
-- HEAD: `3cc5700b5142f3e84c83767e2ff114f87a19c5dd`
-- Worktree-ul era curat înainte de adăugarea acestui raport.
-- `upstream` permite numai fetch; push este `DISABLED`.
-- Containerul `fastmssql-sql-auth-dev`: `healthy`.
-- `cargo fmt --check`: PASS.
-- `cargo test --locked`: 5/5 PASS.
+- Branch cumulativ: `test/sql-auth-validation`
+- HEAD tehnic verificat:
+  `c30c02ac6d0aac10576ce9c140cb4c3161e5717e`
+- `origin` indică forkul; `upstream` permite numai fetch, cu push
+  `DISABLED`.
+- Containerul SQL-auth `fastmssql-sql-auth-dev`: `healthy`.
+- Selecția TX-026/TX-032–TX-034 și proxy: 5/5 PASS.
+- Regresia tranzacțională/async/batch: 140/140 PASS.
+- Suita strictă SQL-auth: 344/344 PASS, cu exact 277/277 ID-uri din
+  specificație.
+- Suita upstream aplicabilă: 896/896 PASS.
+- Rust: 13/13 unit tests PASS; Tiberius vendored: 123/123 unit tests PASS.
+- `cargo fmt`, Clippy cu `-D warnings`, Ruff și `compileall`: PASS.
+- `cargo audit`: 219 dependențe scanate, zero findings.
+- Storm de anulare: 20/20 `CancelledError`, toate cele 5 conexiuni active
+  retrase și înlocuite, zero lease-uri și sesiuni rămase.
+- Stress pooled: 10.000 și 99.999 tranzacții la concurență 100/200, maximum
+  100 conexiuni fizice, smoke-test final PASS și zero sesiuni rămase.
 
-Această secțiune păstrează starea auditului inițial. Pentru starea curentă se
-folosește „Jurnal live al remedierilor”; branchurile validate sunt integrate
-ulterior în `test/sql-auth-validation`, fără push către `upstream`.
-- `cargo clippy --locked --all-targets -- -D warnings`: PASS.
-- `cargo audit`: FAIL așteptat, cu cele 12 advisory matches documentate.
-
-Matricea Python completă nu a fost rerulată în verificarea finală a auditului.
-Rezultatele înregistrate anterior rămân code-equivalent deoarece de la
-commitul testat s-au schimbat numai documentele
-[SQL_AUTH_TEST_MATRIX.md](SQL_AUTH_TEST_MATRIX.md) și
-[SQL_AUTH_TEST_REPORT.md](SQL_AUTH_TEST_REPORT.md), nu codul de producție sau
-testele.
+Starea de mai sus este rezultatul arborelui tehnic exact înaintea acestui
+update documentar. Branchurile validate au fost integrate numai în fork; nu
+s-a făcut push și nu s-a creat PR către `upstream`.
 
 Pentru evidența testului de tranzacții concurente:
 [SQL_AUTH_TRANSACTION_STRESS_REPORT.md](SQL_AUTH_TRANSACTION_STRESS_REPORT.md).
