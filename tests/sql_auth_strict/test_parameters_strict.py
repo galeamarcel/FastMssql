@@ -375,14 +375,62 @@ async def test_naive_and_timezone_aware_datetime(
 
 @case("PARAM-013")
 @pytest.mark.asyncio
-async def test_time_currently_rejected_deterministically(
+async def test_time_parameter_uses_time_7_and_rejects_offsets(
     owner_connection: Connection,
 ) -> None:
-    with pytest.raises(ValueError, match="^Unsupported type: time$"):
+    for value in (
+        time(0, 0, 0),
+        time(12, 34, 56, 123456),
+        time(23, 59, 59, 999999),
+    ):
+        row = (
+            await owner_connection.query(
+                """
+                SELECT
+                    @P1 AS value,
+                    CONVERT(
+                        VARCHAR(128),
+                        SQL_VARIANT_PROPERTY(@P1, 'BaseType')
+                    ) AS base_type,
+                    CONVERT(
+                        INT,
+                        SQL_VARIANT_PROPERTY(@P1, 'Scale')
+                    ) AS scale_value
+                """,
+                [value],
+            )
+        ).fetchone()
+        assert row is not None
+        assert type(row["value"]) is time
+        assert row["value"] == value
+        assert row["base_type"] == "time"
+        assert row["scale_value"] == 7
+
+    message = (
+        "Aware time parameter is not supported because SQL Server TIME "
+        "has no offset"
+    )
+    with pytest.raises(
+        ConversionError, match=rf"^{re.escape(message)}$"
+    ) as error:
         await owner_connection.query(
-            "SELECT CAST(@P1 AS TIME(6)) AS value",
-            [time(12, 34, 56, 123456)],
+            "SELECT @P1",
+            [
+                time(
+                    12,
+                    34,
+                    56,
+                    123456,
+                    tzinfo=timezone(timedelta(hours=2)),
+                )
+            ],
         )
+
+    assert error.value.message == message
+    assert error.value.parameter_index == 0
+    assert error.value.sql_type == "TIME(7)"
+    assert error.value.reason == "timezone_not_supported"
+    assert error.value.retryable is False
 
 
 @case("PARAM-014")
