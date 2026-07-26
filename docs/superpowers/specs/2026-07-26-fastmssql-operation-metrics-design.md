@@ -496,13 +496,15 @@ The enabled branch:
 2. increments `started`;
 3. owns an armed guard;
 4. awaits the original future;
-5. records duration data;
-6. publishes exactly one returned-result outcome;
-7. disarms the guard before returning the unchanged result.
+5. captures elapsed time immediately when the original future returns;
+6. classifies the returned result without extending the measured interval;
+7. records duration data;
+8. publishes exactly one returned-result outcome;
+9. disarms the guard before returning the unchanged result.
 
-If the wrapper is dropped while armed, the guard performs steps 5 and 6 with
-the `cancelled` outcome. Recording must not allocate, panic, attach Python or
-block.
+If the wrapper is dropped while armed, the guard captures elapsed time at the
+start of `Drop`, records duration and publishes the `cancelled` outcome.
+Recording must not allocate, panic, attach Python or block.
 
 The observer returns the original success value or the exact original `PyErr`.
 It does not wrap, log, suppress, retry or replace operation results.
@@ -930,6 +932,10 @@ Corrections made during self-review:
     leaving the added type surface implementation-defined.
 23. The load gate now fixes SQL shape, operation count, concurrency, pool size,
     trial order, warm-up, session isolation and the exact degradation formula.
+24. Error classification was moved after elapsed-time capture so PyO3 type
+    inspection cannot inflate the reported driver-operation duration. The
+    reserved `OperationName::Transaction` path is explicitly unchanged and
+    non-panicking if it ever reaches the generic observer.
 
-No placeholder, unresolved API choice, unbounded collection, hidden dependency
-or upstream write remains.
+No implementation gap, unresolved API choice, unbounded collection, hidden
+dependency or upstream write remains.
