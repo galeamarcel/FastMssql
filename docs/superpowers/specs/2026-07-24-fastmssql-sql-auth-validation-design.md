@@ -381,6 +381,8 @@ evidence reference.
 - `PARAM-022`: 2,100-parameter SQL Server boundary.
 - `PARAM-023`: parameterized SQL-injection payload remains data.
 - `PARAM-024`: conversion error class and message are stable and redacted.
+- `PARAM-031`: `Parameter.__repr__` is metadata-only, never invokes the
+  wrapped value's `__repr__`, and redacts scalar and expanded values.
 
 ### TYPE — SQL-to-Python values
 

@@ -30,14 +30,43 @@ class TestParameter:
         assert param.sql_type == "VARCHAR"
 
     def test_parameter_repr_without_type(self):
-        """Test string representation without type."""
+        """Parameter repr exposes metadata without exposing its value."""
         param = Parameter(123)
-        assert repr(param) == "Parameter(value=123)"
+        assert repr(param) == (
+            "Parameter(sql_type=None, direction='INPUT', expanded=False, "
+            "value=<redacted>)"
+        )
 
     def test_parameter_repr_with_type(self):
-        """Test string representation with type."""
+        """Typed parameter repr exposes only its safe declaration metadata."""
         param = Parameter("hello", "NVARCHAR")
-        assert repr(param) == "Parameter(value='hello', type=NVARCHAR)"
+        assert repr(param) == (
+            "Parameter(sql_type='NVARCHAR', direction='INPUT', "
+            "expanded=False, value=<redacted>)"
+        )
+
+    def test_parameter_repr_does_not_call_value_repr(self):
+        """Parameter repr must not execute arbitrary user representation code."""
+        secret = "ParameterReprSecret_MustNotLeak_2026"
+        calls = 0
+
+        class SideEffectValue:
+            def __repr__(self) -> str:
+                nonlocal calls
+                calls += 1
+                return secret
+
+        param = Parameter(SideEffectValue())
+        assert calls == 0
+
+        rendered = repr(param)
+
+        assert calls == 0
+        assert secret not in rendered
+        assert rendered == (
+            "Parameter(sql_type=None, direction='INPUT', expanded=False, "
+            "value=<redacted>)"
+        )
 
     def test_parameter_various_types(self):
         """Test parameter with various Python types."""
@@ -76,13 +105,19 @@ class TestParameter:
         assert param.sql_type == "INT"
 
     def test_parameter_automatic_expansion_repr(self):
-        """Test string representation of automatically expanded parameters."""
+        """Expanded parameter repr never exposes iterable contents."""
         values = [1, 2, 3]
         param = Parameter(values)
-        assert repr(param) == "Parameter(IN_values=[1, 2, 3])"
+        assert repr(param) == (
+            "Parameter(sql_type=None, direction='INPUT', expanded=True, "
+            "value=<redacted>)"
+        )
 
         param_with_type = Parameter(values, "INT")
-        assert repr(param_with_type) == "Parameter(IN_values=[1, 2, 3], type=INT)"
+        assert repr(param_with_type) == (
+            "Parameter(sql_type='INT', direction='INPUT', expanded=True, "
+            "value=<redacted>)"
+        )
 
     def test_parameter_automatic_iterable_detection(self):
         """Test automatic iterable detection for expansion."""

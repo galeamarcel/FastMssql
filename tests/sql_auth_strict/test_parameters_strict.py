@@ -482,3 +482,31 @@ async def test_conversion_error_is_stable_and_redacted(
     ) as error:
         await owner_connection.query("SELECT @P1", [SecretValue()])
     assert secret not in str(error.value)
+
+
+@case("PARAM-031")
+def test_parameter_repr_is_metadata_only_and_redacted() -> None:
+    secret = "StrictParameterReprSecret_MustNotLeak_2026"
+    calls = 0
+
+    class SecretValue:
+        def __repr__(self) -> str:
+            nonlocal calls
+            calls += 1
+            return secret
+
+    parameters = [
+        Parameter(secret, "NVARCHAR(MAX)"),
+        Parameter(secret.encode(), "VARBINARY(MAX)"),
+        Parameter(Decimal("1234567890.123400"), "DECIMAL(18,6)"),
+        Parameter(SecretValue()),
+        Parameter([secret, secret], "NVARCHAR(MAX)"),
+    ]
+
+    for parameter in parameters:
+        rendered = repr(parameter)
+        assert secret not in rendered
+        assert "value=<redacted>" in rendered
+        assert "direction='INPUT'" in rendered
+
+    assert calls == 0
