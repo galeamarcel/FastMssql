@@ -78,6 +78,7 @@ readonly strict_functional=(
   tests/sql_auth_strict/test_batch_strict.py
   tests/sql_auth_strict/test_transactions_strict.py
   tests/sql_auth_strict/test_operation_timeouts.py
+  tests/sql_auth_strict/test_lifecycle.py
   tests/sql_auth_strict/test_errors_tls.py
 )
 

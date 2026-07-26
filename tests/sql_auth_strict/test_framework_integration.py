@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from dataclasses import replace
 import importlib.metadata
 import json
@@ -29,6 +30,7 @@ from sql_auth_strict.framework_apps import (
     create_flask_app,
     session_count,
     wait_for_pool_active,
+    wait_for_lifecycle_state,
     wait_for_sql_request,
     wait_for_session_count,
 )
@@ -1259,3 +1261,261 @@ async def test_framework_operation_timeout_recovery_load(
     assert max_observed_pool_connections == 20
     assert all(len(lane["ticks"]) >= 20 for lane in lanes)
     assert all(lane["retired_connection_ids"] for lane in lanes)
+
+
+@case("LIFE-015")
+@pytest.mark.timeout(60)
+@pytest.mark.asyncio
+async def test_framework_lifecycle_shutdown_modes(
+    sql_auth_config,
+    sa_connection,
+    unique_sql_name,
+) -> None:
+    LifecycleConfig = getattr(fastmssql, "LifecycleConfig", None)
+    ConnectionLifecycleState = getattr(
+        fastmssql,
+        "ConnectionLifecycleState",
+        None,
+    )
+    assert LifecycleConfig is not None
+    assert ConnectionLifecycleState is not None
+
+    lifecycle_config = LifecycleConfig(
+        shutdown_timeout_secs=3.0,
+        force_timeout_secs=1.0,
+    )
+
+    async def heartbeat(
+        stop: asyncio.Event,
+        ticks: list[float],
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        while not stop.is_set():
+            ticks.append(loop.time())
+            await asyncio.sleep(0.01)
+
+    expected_late_payload = {
+        "type": "ConnectionLifecycleError",
+        "operation": "query",
+        "state": "Closing",
+        "forced": False,
+    }
+
+    fastapi_state = FrameworkState.create(
+        sql_auth_config,
+        application_name=unique_sql_name("strict_lifecycle_fastapi"),
+        lifecycle_config=lifecycle_config,
+    )
+    fastapi_app = create_fastapi_app(
+        fastapi_state,
+        "[unused_lifecycle_table]",
+    )
+    fastapi_manager = LifespanManager(fastapi_app)
+    fastapi_manager_open = False
+    fastapi_client_context = asgi_client(
+        fastapi_app,
+        raise_app_exceptions=False,
+    )
+    fastapi_client = None
+    fastapi_request: asyncio.Task | None = None
+    fastapi_shutdown: asyncio.Task | None = None
+    fastapi_stop = asyncio.Event()
+    fastapi_ticks: list[float] = []
+    fastapi_heartbeat = asyncio.create_task(
+        heartbeat(fastapi_stop, fastapi_ticks)
+    )
+    try:
+        await fastapi_manager.__aenter__()
+        fastapi_manager_open = True
+        fastapi_client = await fastapi_client_context.__aenter__()
+        fastapi_request = asyncio.create_task(
+            fastapi_client.get("/wait/15?profile=short")
+        )
+        await wait_for_sql_request(
+            sa_connection,
+            fastapi_state.application_name,
+            present=True,
+            timeout=3.0,
+        )
+
+        fastapi_shutdown = asyncio.create_task(
+            fastapi_manager.__aexit__(None, None, None)
+        )
+        await wait_for_lifecycle_state(
+            fastapi_state.connection,
+            ConnectionLifecycleState.CLOSING,
+        )
+        late_response = await fastapi_client.get(
+            "/timeout/99?profile=immediate"
+        )
+        assert late_response.status_code == 504
+        assert late_response.json() == expected_late_payload
+        assert fastapi_shutdown.done() is False
+        assert (await fastapi_request).json() == {"value": 15}
+        fastapi_request = None
+        assert await fastapi_shutdown is None
+        fastapi_shutdown = None
+        fastapi_manager_open = False
+        assert (
+            fastapi_state.connection.lifecycle_state
+            == ConnectionLifecycleState.CLOSED
+        )
+    finally:
+        fastapi_stop.set()
+        await fastapi_heartbeat
+        if fastapi_request is not None and not fastapi_request.done():
+            fastapi_request.cancel()
+            with suppress(asyncio.CancelledError):
+                await fastapi_request
+        if fastapi_shutdown is not None:
+            await fastapi_shutdown
+            fastapi_manager_open = False
+        if fastapi_client is not None:
+            await fastapi_client_context.__aexit__(None, None, None)
+        if fastapi_manager_open:
+            await fastapi_manager.__aexit__(None, None, None)
+        await fastapi_state.connection.disconnect()
+    assert len(fastapi_ticks) >= 10
+    await wait_for_session_count(
+        sa_connection,
+        fastapi_state.application_name,
+        expected=0,
+    )
+
+    flask_asgi_state = FrameworkState.create(
+        sql_auth_config,
+        application_name=unique_sql_name(
+            "strict_lifecycle_flask_asgi"
+        ),
+        lifecycle_config=lifecycle_config,
+    )
+    flask_lifespan = adapted_flask_lifespan(flask_asgi_state)
+    flask_lifespan_open = False
+    flask_client_context = None
+    flask_client = None
+    flask_holder: asyncio.Task | None = None
+    flask_shutdown: asyncio.Task | None = None
+    flask_stop = asyncio.Event()
+    flask_ticks: list[float] = []
+    flask_heartbeat = asyncio.create_task(
+        heartbeat(flask_stop, flask_ticks)
+    )
+    try:
+        adapted_app = await flask_lifespan.__aenter__()
+        flask_lifespan_open = True
+        flask_client_context = asgi_client(
+            adapted_app,
+            raise_app_exceptions=False,
+        )
+        flask_client = await flask_client_context.__aenter__()
+
+        # WsgiToAsgi serializes WSGI calls. A direct operation on the same
+        # application-scoped connection is used as the admitted holder so the
+        # late HTTP request can actually reach the driver during Closing.
+        flask_holder = asyncio.create_task(
+            scalar(
+                flask_asgi_state.connection,
+                (
+                    f"/* {flask_asgi_state.application_name} */ "
+                    "WAITFOR DELAY '00:00:01'; SELECT 15"
+                ),
+            )
+        )
+        await wait_for_sql_request(
+            sa_connection,
+            flask_asgi_state.application_name,
+            present=True,
+            timeout=3.0,
+        )
+        flask_shutdown = asyncio.create_task(
+            flask_lifespan.__aexit__(None, None, None)
+        )
+        await wait_for_lifecycle_state(
+            flask_asgi_state.connection,
+            ConnectionLifecycleState.CLOSING,
+        )
+        late_response = await flask_client.get(
+            "/timeout/99?profile=immediate"
+        )
+        assert late_response.status_code == 504
+        assert late_response.json() == expected_late_payload
+        assert flask_shutdown.done() is False
+        assert await flask_holder == 15
+        flask_holder = None
+        assert await flask_shutdown is None
+        flask_shutdown = None
+        flask_lifespan_open = False
+        assert (
+            flask_asgi_state.connection.lifecycle_state
+            == ConnectionLifecycleState.CLOSED
+        )
+    finally:
+        flask_stop.set()
+        await flask_heartbeat
+        if flask_holder is not None and not flask_holder.done():
+            flask_holder.cancel()
+            with suppress(asyncio.CancelledError):
+                await flask_holder
+        if flask_shutdown is not None:
+            await flask_shutdown
+            flask_lifespan_open = False
+        if flask_client_context is not None and flask_client is not None:
+            await flask_client_context.__aexit__(None, None, None)
+        if flask_lifespan_open:
+            await flask_lifespan.__aexit__(None, None, None)
+        await flask_asgi_state.connection.disconnect()
+    assert len(flask_ticks) >= 10
+    await wait_for_session_count(
+        sa_connection,
+        flask_asgi_state.application_name,
+        expected=0,
+    )
+
+    # Plain Flask/WSGI gets a fresh event loop per async request. This lane
+    # proves functional close/reopen compatibility only, not true async
+    # inter-request concurrency.
+    flask_wsgi_state = FrameworkState.create(
+        sql_auth_config,
+        application_name=unique_sql_name(
+            "strict_lifecycle_flask_wsgi"
+        ),
+        max_size=1,
+        lifecycle_config=lifecycle_config,
+    )
+    flask_wsgi_app = create_flask_app(flask_wsgi_state)
+    try:
+        first = await flask_request(flask_wsgi_app, "/loop")
+        assert first.status_code == 200
+        assert first.get_json()["sql_value"] == 15
+        assert await flask_wsgi_state.connection.disconnect() is True
+        assert (
+            flask_wsgi_state.connection.lifecycle_state
+            == ConnectionLifecycleState.CLOSED
+        )
+        await wait_for_session_count(
+            sa_connection,
+            flask_wsgi_state.application_name,
+            expected=0,
+        )
+
+        second = await flask_request(flask_wsgi_app, "/loop")
+        assert second.status_code == 200
+        assert second.get_json()["sql_value"] == 15
+        assert first.get_json()["loop_id"] != second.get_json()["loop_id"]
+        assert len(flask_wsgi_state.loops) == 2
+        assert (
+            flask_wsgi_state.connection.lifecycle_state
+            == ConnectionLifecycleState.OPEN
+        )
+        assert await flask_wsgi_state.connection.disconnect() is True
+        assert (
+            flask_wsgi_state.connection.lifecycle_state
+            == ConnectionLifecycleState.CLOSED
+        )
+    finally:
+        await flask_wsgi_state.connection.disconnect()
+    await wait_for_session_count(
+        sa_connection,
+        flask_wsgi_state.application_name,
+        expected=0,
+    )

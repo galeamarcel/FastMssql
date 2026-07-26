@@ -163,7 +163,7 @@ def test_report_generator_preserves_not_run_and_redacts(
     matrix = matrix_output.read_text(encoding="utf-8")
     report = report_output.read_text(encoding="utf-8")
     assert (
-        sum(line.startswith("| `") for line in matrix.splitlines()) == 295
+        sum(line.startswith("| `") for line in matrix.splitlines()) == 310
     )
     assert "| `ENV-001` | PASS |" in matrix
     assert "| `AUTH-001` | FAIL |" in matrix
@@ -230,10 +230,10 @@ def test_report_generator_can_require_complete_evidence(
     )
 
     assert completed.returncode == 1
-    assert "missing evidence for 295 case(s)" in completed.stderr
+    assert "missing evidence for 310 case(s)" in completed.stderr
     assert matrix_output.is_file()
     assert report_output.is_file()
-    assert "| NOT RUN | 295 |" in report_output.read_text(encoding="utf-8")
+    assert "| NOT RUN | 310 |" in report_output.read_text(encoding="utf-8")
 
 
 def test_config_redacts_password(monkeypatch) -> None:
@@ -244,13 +244,13 @@ def test_config_redacts_password(monkeypatch) -> None:
     assert "NeverPrintMe_2026!" not in repr(config)
 
 
-def test_approved_spec_contains_295_unique_case_ids() -> None:
+def test_approved_spec_contains_310_unique_case_ids() -> None:
     spec = ROOT / (
         "docs/superpowers/specs/"
         "2026-07-24-fastmssql-sql-auth-validation-design.md"
     )
     ids = spec_case_ids(spec)
-    assert len(ids) == 295
+    assert len(ids) == 310
 
 
 def test_framework_contract_is_wired_into_runner_and_report() -> None:
