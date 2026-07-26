@@ -104,10 +104,6 @@ struct OperationMetric {
 }
 
 impl OperationMetric {
-    #[allow(
-        dead_code,
-        reason = "constructed by the registry wired in the next commit"
-    )]
     fn new() -> Self {
         Self {
             started: AtomicU64::new(0),
@@ -163,10 +159,6 @@ impl OperationMetric {
         );
     }
 
-    #[allow(
-        dead_code,
-        reason = "consumed by the registry wired in the next commit"
-    )]
     fn snapshot(&self) -> OperationMetricSnapshot {
         let outcomes = std::array::from_fn(|index| self.outcomes[index].load(Ordering::Acquire));
         let mut completed = 0_u64;
@@ -250,7 +242,6 @@ pub(crate) struct OperationMetricsSnapshot {
 }
 
 impl OperationMetricsSnapshot {
-    #[allow(dead_code)]
     pub(crate) fn disabled() -> Self {
         Self {
             enabled: false,
@@ -268,7 +259,6 @@ impl OperationMetricsSnapshot {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn to_python(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let root = PyDict::new(py);
         root.set_item("schema_version", 1)?;
@@ -321,20 +311,12 @@ pub(crate) struct OperationMetricsRegistry {
 }
 
 impl OperationMetricsRegistry {
-    #[allow(
-        dead_code,
-        reason = "constructed by Connection instrumentation in the next commit"
-    )]
     pub(crate) fn new() -> Self {
         Self {
             operations: std::array::from_fn(|_| OperationMetric::new()),
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "consumed by Connection.operation_stats in the next commit"
-    )]
     pub(crate) fn snapshot(&self) -> OperationMetricsSnapshot {
         OperationMetricsSnapshot {
             enabled: true,
@@ -403,7 +385,6 @@ fn classify_result<T>(result: &PyResult<T>) -> OperationOutcome {
     })
 }
 
-#[allow(dead_code)]
 pub(crate) async fn observe_operation<F, T>(
     metrics: Option<Arc<OperationMetricsRegistry>>,
     operation: OperationName,
