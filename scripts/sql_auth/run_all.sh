@@ -72,6 +72,7 @@ readonly strict_functional=(
   tests/sql_auth_strict/test_connection.py
   tests/sql_auth_strict/test_pool.py
   tests/sql_auth_strict/test_pool_observability.py
+  tests/sql_auth_strict/test_operation_metrics.py
   tests/sql_auth_strict/test_sql_features.py
   tests/sql_auth_strict/test_parameters_strict.py
   tests/sql_auth_strict/test_type_mapping_strict.py

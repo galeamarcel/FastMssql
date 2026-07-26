@@ -288,6 +288,41 @@ evidence reference.
 - `OBS-010`: SQL, parameters, application/database/login identifiers and
   credentials are absent from pool statistics and evidence.
 
+### OPMET — operation duration and outcome metrics
+
+- `OPMET-001`: exported configuration API, exact bool/default/repr behavior,
+  constructor compatibility and isolated-copy semantics.
+- `OPMET-002`: disabled exact schema remains zero across success, error and
+  cancellation; returned snapshots are mutation-isolated.
+- `OPMET-003`: successful connect/query/simple-query/execute calls publish
+  exact counts, durations and cumulative buckets.
+- `OPMET-004`: returned SQL/lifecycle errors increment only `errors`, while
+  synchronous pre-future validation is excluded.
+- `OPMET-005`: a pool acquisition deadline increments only `timed_out` and
+  preserves recovery.
+- `OPMET-006`: operation and graceful-shutdown deadline errors increment only
+  `timed_out` for their public operations and preserve lifecycle recovery.
+- `OPMET-007`: server-confirmed cancellation increments only `cancelled`,
+  safely retires the transport and preserves recovery.
+- `OPMET-008`: pooled transaction operations aggregate into their owner and
+  standalone direct transactions do not.
+- `OPMET-009`: connect, ping, context, disconnect and reconnect keep one
+  connection-lifetime registry without internal-operation double counting.
+- `OPMET-010`: query batch, dedicated-socket execute batch and bulk insert each
+  publish one whole-call metric with exact effects.
+- `OPMET-011`: 10,000 bounded concurrent operations plus continuous scraping
+  preserve every invariant, event-loop progress and session cleanup.
+- `OPMET-012`: statistics and evidence contain no SQL, parameters,
+  identifiers, credentials, errors or arbitrary labels.
+- `OPMET-013`: deterministic COMMIT acknowledgement loss publishes exactly one
+  `outcome_unknown` and preserves the typed error/retirement contract.
+- `OPMET-014`: FastAPI/native ASGI concurrency publishes exact operation
+  deltas without blocking event-loop progress.
+- `OPMET-015`: Flask async under WSGI publishes exact deltas while preserving
+  its distinct per-request event-loop limitation.
+- `OPMET-016`: Flask through WsgiToAsgi publishes exact concurrent deltas on a
+  persistent event loop.
+
 ### SQL — query and command execution
 
 - `SQL-001`: parameterized single-row SELECT.
