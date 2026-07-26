@@ -1937,6 +1937,121 @@ Nu s-a executat nicio operație asupra repository-ului original. `origin`
 indică exclusiv `galeamarcel/FastMssql`, iar push URL-ul remote-ului
 fetch-only pentru repository-ul original rămâne `DISABLED`.
 
+## Cursa testului lifecycle shutdown waiter — stabilizată și verificată
+
+Statusul este `VERIFIED_FORK` pentru corecția harness-ului Rust. Nu a fost
+identificat un defect nou în comportamentul lifecycle de producție și nu s-a
+schimbat contractul `ConnectionLifecycle::shutdown()`.
+
+Problema a fost descoperită în prima reverificare completă a corecției de
+terminologie: toate lane-urile SQL-auth, async, framework, resilience, load
+și regresie originală locală au trecut, dar raw `cargo test --locked` a
+raportat:
+
+```text
+53 passed, 1 failed
+lifecycle::tests::cancelled_first_shutdown_waiter_does_not_stop_shared_supervisor
+```
+
+Corecția de terminologie nu modifica niciun fișier Rust, Cargo, lifecycle sau
+dependency. Repetarea izolată a testului neschimbat de 100 de ori a produs:
+
+```text
+91 PASS
+9 FAIL
+```
+
+Scenariul pornea al doilea și al treilea waiter prin `tokio::spawn`, apoi
+elibera imediat permitul operației. `tokio::spawn` programează taskul, dar nu
+garantează că acesta a fost deja polled și abonat la canalul rezultatului.
+Pe runtime-ul Tokio current-thread, supervisorul putea observa permitul
+eliberat, publica `Closed` și termina înainte ca al treilea task să intre în
+`shutdown()`.
+
+Pentru un apelant care intră după `Closed`, `Ok(false)` este rezultatul
+corect: nu a participat la runda deja încheiată. Testul cerea însă `true`
+ambilor taskuri fără să fi demonstrat că ambii erau abonați la aceeași rundă.
+Prin urmare, aserțiunea era validă numai după o precondiție pe care testul nu
+o sincroniza.
+
+Un experiment temporar, necomis, a așteptat bounded până când senderul
+rezultatului avea exact doi receivers înainte de `drop(permit)`. Același test
+a trecut apoi:
+
+```text
+200 PASS
+0 FAIL
+```
+
+Experimentul a fost eliminat înainte de ciclul TDD formal. Istoricul publicat
+exclusiv pe fork este:
+
+- specificație: `docs/lifecycle-shutdown-waiter-test-race-design` la
+  `2dcc813a54503d804176f15dba87b874cfa1221c`;
+- plan executabil și design final:
+  `ddfc256fcce2853f4570768d3f7510ff0599ffc1`;
+- reproducător RED: `test/lifecycle-shutdown-waiter-race` la
+  `9b4a2a157b55c3bab86f677633181a2b91168929`;
+- fix test-only cu RED în ancestry:
+  `fix/lifecycle-shutdown-waiter-test-race` la
+  `075f3b2adaccda081a4c88f5b5b437e7c16994d9`;
+- merge tehnic cumulativ:
+  `ecce84d3b1be65e591879f8dc2443a9058ddb581`.
+
+Reproducătorul opt-in
+`scripts/test_lifecycle_shutdown_waiter_race.sh` rulează testul Rust real de
+200 de ori implicit, oprește la prima eroare și acceptă numai valori întregi
+între 1 și 1.000 prin
+`FASTMSSQL_LIFECYCLE_WAITER_STRESS_ITERATIONS`. El rămâne în afara runnerului
+implicit pentru a nu multiplica fiecare gate Cargo.
+
+Pe branch-ul RED, sursa Rust era neschimbată, iar reproducătorul a eșuat
+exact la:
+
+```text
+[lifecycle-waiter-stress] failed at iteration 1/200
+assertion failed: ... expect("shared shutdown must remain graceful")
+```
+
+Fixul adaugă numai în `#[cfg(test)] mod tests` un helper cu timeout Tokio de o
+secundă. Helperul citește senderul real al rundei și așteaptă exact
+`receiver_count() == 2`; abia apoi testul execută `drop(permit)`. Nu folosește
+sleep, nu acceptă `Ok(false)` pentru waiteri cunoscuți și nu introduce o
+barieră sau un yield în producție.
+
+Diff-ul FIX față de RED conține exact 22 de linii adăugate în
+`src/lifecycle.rs`, toate după `#[cfg(test)]`. Prefixul de producție al
+fișierului a rămas byte-for-byte identic, iar `Cargo.toml`, `Cargo.lock`,
+`pyproject.toml`, `src/lib.rs`, API-ul, timeouturile, valorile returnate și
+metadata de release sunt neschimbate.
+
+Dovezile GREEN sunt independente:
+
+```text
+test focal pe FIX                              1/1 PASS
+stress pe FIX                             200/200 PASS
+stress pe merge-ul publicat               200/200 PASS
+FastMssql Rust                               54/54 PASS
+cargo fmt / Clippy -D warnings                   PASS
+```
+
+Pe același merge publicat, gate-ul Docker/MSSQL complet a trecut strict
+340/340, async 16/16, framework 33/33, resilience 6/6, load 11/11, regresia
+originală locală 930/930 și matricea 337/337, cu zero failure, error, skip sau
+not-run.
+
+[Rust unit tests #30214510722](https://github.com/galeamarcel/FastMssql/actions/runs/30214510722)
+a confirmat raw Cargo, cele 54 de teste Rust, wheel-ul și contractele
+instalate separat pe Ubuntu, Windows și macOS.
+[Dependency security #30214510719](https://github.com/galeamarcel/FastMssql/actions/runs/30214510719)
+a confirmat RustSec fără vulnerabilități sau warninguri.
+
+Corecția face testul să exercite determinist scenariul pe care îl declară; nu
+face runtime-ul mai permisiv și nu ascunde un rezultat tardiv legitim.
+Toate branchurile, commiturile, merge-ul și push-urile sunt numai în
+`galeamarcel/FastMssql`. Repository-ul original nu a primit branch, commit,
+push, PR sau release, iar push URL-ul său local rămâne `DISABLED`.
+
 ## Corecții și nuanțări față de primul audit
 
 - Testul istoric cu 99.999 de operații a utilizat 100/200 de obiecte
@@ -2456,6 +2571,9 @@ upstream fără aprobarea explicită a proprietarului forkului.
   locale, `eaacc504be8582e99edab4fd05633458b8190984`, și stabilizarea test-only
   a waiterilor lifecycle,
   `ecce84d3b1be65e591879f8dc2443a9058ddb581`.
+- Pentru cursa testului lifecycle, reproducătorul neschimbat a eșuat la
+  `1/200`; după sincronizarea exactă a celor doi receivers, verificările pe
+  FIX și pe merge au trecut separat `200/200`.
 - La acest arbore: FastMssql Rust `54/54`, strict `340/340`, true-async
   `16/16`, framework `33/33`, resilience `6/6`, load `11/11`, regresia
   originală locală `930/930` și exact `337/337` ID-uri din specificație,
