@@ -398,7 +398,8 @@ async def test_checkout_validation_counts_killed_idle_connection_as_invalid(
         after = await connection.pool_stats()
         _assert_pool_metrics(after, connected=True)
 
-        assert replacement_spid != killed_spid
+        # SQL Server may immediately reuse the smallint SPID after KILL.
+        # connection_id is the stable physical-connection identity.
         assert replacement_connection_id != killed_connection_id
         assert (
             after["connections_closed_invalid"]
