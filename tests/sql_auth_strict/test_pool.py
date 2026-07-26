@@ -685,7 +685,8 @@ async def test_resources_return_after_task_cancellation(
             sa_connection,
             second_session,
         )
-        assert second_session != first_session
+        # SQL Server may immediately reuse the smallint SPID after the
+        # cancelled connection closes. connection_id is the physical identity.
         assert second_connection_id != first_connection_id
         recovered = await connection.pool_stats()
         _assert_pool_invariants(recovered)
