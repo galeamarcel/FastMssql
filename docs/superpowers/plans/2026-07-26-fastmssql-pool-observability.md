@@ -686,7 +686,7 @@ assert after["connections_closed_invalid"] \
 assert after["connections_created"] \
     == before["connections_created"] + 1
 assert after["connections_closed_broken"] \
-    == before["connections_closed_broken"]
+    == before["connections_closed_broken"] + 1
 ```
 
 Checkout validation, not a later application error, must discover the killed
@@ -694,6 +694,13 @@ idle transport. Do not require a different `@@SPID`: SQL Server can
 immediately reuse the smallint session ID after `KILL`. The
 `sys.dm_exec_connections.connection_id` UUID is the physical-connection
 identity required by this case.
+
+This intentionally proves overlapping bb8 retirement categories. bb8 records
+`connections_closed_invalid` when `is_valid()` returns an error, then invokes
+`has_broken()` while dropping the invalid lease. FastMssql marks validation
+unsafe before its first await for cancellation safety, so the killed transport
+also records `connections_closed_broken`. Do not make the categories exclusive
+or clear the broken disposition on an error path.
 
 - [ ] **Step 3: Extend maximum-lifetime retirement as `OBS-007`**
 
