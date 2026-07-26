@@ -1,7 +1,7 @@
 use crate::py_parameters::Parameters;
 use crate::type_mapping;
 use crate::types::create_parameter_conversion_error;
-use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{
@@ -214,6 +214,17 @@ fn datetime_to_fast_parameter(
         .and_local_timezone(fixed_offset)
         .single()
         .ok_or_else(|| datetime_conversion_error(parameter_index, "DATETIMEOFFSET(7)"))?;
+    let valid_year = 1..=9_999;
+    if !valid_year.contains(&datetime.naive_local().year())
+        || !valid_year.contains(&datetime.naive_utc().year())
+    {
+        return Err(create_parameter_conversion_error(
+            parameter_index,
+            "DATETIMEOFFSET(7)",
+            "datetime_out_of_range",
+            "Datetime offset local and UTC values must be between year 1 and 9999",
+        ));
+    }
 
     Ok(FastParameter::new(FastParameterValue::DateTimeOffset(
         datetime,
