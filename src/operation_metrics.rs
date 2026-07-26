@@ -160,17 +160,19 @@ impl OperationMetric {
     }
 
     fn snapshot(&self) -> OperationMetricSnapshot {
-        let outcomes = std::array::from_fn(|index| self.outcomes[index].load(Ordering::Acquire));
         let mut completed = 0_u64;
-        for value in outcomes {
-            completed = match completed.checked_add(value) {
-                Some(total) => total,
-                None => {
-                    self.saturated.store(true, Ordering::Release);
-                    u64::MAX
-                }
-            };
-        }
+        // Public saturation projection order: succeeded, errors, timed_out,
+        // cancelled, outcome_unknown.
+        let outcomes = std::array::from_fn(|index| {
+            let raw_outcome = self.outcomes[index].load(Ordering::Acquire);
+            let remaining = u64::MAX - completed;
+            let exported_outcome = raw_outcome.min(remaining);
+            if exported_outcome != raw_outcome {
+                self.saturated.store(true, Ordering::Release);
+            }
+            completed += exported_outcome;
+            exported_outcome
+        });
 
         let raw_started = self.started.load(Ordering::Acquire);
         let started = raw_started.max(completed);
@@ -509,6 +511,56 @@ mod tests {
         metric.duration_sum_micros.store(0, Ordering::Relaxed);
         metric.raw_buckets[0].store(0, Ordering::Relaxed);
         assert!(registry.snapshot().operations[index].saturated);
+    }
+
+    #[test]
+    fn snapshot_reconciles_multiple_outcomes_into_one_saturated_total() {
+        let registry = OperationMetricsRegistry::new();
+        let index = metric_index(OperationName::Query).unwrap();
+        let metric = &registry.operations[index];
+        metric.started.store(u64::MAX, Ordering::Relaxed);
+        metric.outcomes[0].store(u64::MAX - 2, Ordering::Relaxed);
+        metric.outcomes[1].store(3, Ordering::Relaxed);
+        metric.outcomes[2].store(1, Ordering::Relaxed);
+
+        let query = &registry.snapshot().operations[index];
+        assert_eq!(query.outcomes, [u64::MAX - 2, 2, 0, 0, 0]);
+        assert_eq!(query.completed, u64::MAX);
+        assert_eq!(
+            u128::from(query.completed),
+            query.outcomes.into_iter().map(u128::from).sum::<u128>()
+        );
+        assert_eq!(
+            u128::from(query.started),
+            u128::from(query.completed) + u128::from(query.in_flight)
+        );
+        assert!(query.saturated);
+
+        metric.started.store(18, Ordering::Relaxed);
+        for (outcome, value) in metric.outcomes.iter().zip([7, 5, 3, 2, 1]) {
+            outcome.store(value, Ordering::Relaxed);
+        }
+        let unsaturated_values = &registry.snapshot().operations[index];
+        assert_eq!(unsaturated_values.outcomes, [7, 5, 3, 2, 1]);
+        assert_eq!(unsaturated_values.completed, 18);
+        assert_eq!(unsaturated_values.in_flight, 0);
+        assert!(unsaturated_values.saturated);
+    }
+
+    #[test]
+    fn snapshot_keeps_exact_capacity_outcomes_unsaturated() {
+        let registry = OperationMetricsRegistry::new();
+        let index = metric_index(OperationName::Query).unwrap();
+        let metric = &registry.operations[index];
+        metric.started.store(u64::MAX, Ordering::Relaxed);
+        metric.outcomes[0].store(u64::MAX - 2, Ordering::Relaxed);
+        metric.outcomes[1].store(2, Ordering::Relaxed);
+
+        let query = &registry.snapshot().operations[index];
+        assert_eq!(query.outcomes, [u64::MAX - 2, 2, 0, 0, 0]);
+        assert_eq!(query.completed, u64::MAX);
+        assert_eq!(query.in_flight, 0);
+        assert!(!query.saturated);
     }
 
     #[test]
