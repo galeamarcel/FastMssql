@@ -68,11 +68,50 @@ async def test_every_typed_null_variant(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("value", [False, True])
 async def test_bool_parameter(owner_connection: Connection, value: bool) -> None:
-    result = await owner_connection.query(
-        "SELECT CAST(@P1 AS BIT) AS value", [value]
-    )
-    returned = result.fetchone()["value"]
-    assert returned is value
+    row = (
+        await owner_connection.query(
+            """
+            SELECT
+                @P1 AS value,
+                CONVERT(
+                    VARCHAR(128),
+                    SQL_VARIANT_PROPERTY(@P1, 'BaseType')
+                ) AS base_type,
+                CONVERT(
+                    INT,
+                    SQL_VARIANT_PROPERTY(@P1, 'Precision')
+                ) AS precision_value,
+                CONVERT(
+                    INT,
+                    SQL_VARIANT_PROPERTY(@P1, 'MaxLength')
+                ) AS max_length
+            """,
+            [value],
+        )
+    ).fetchone()
+    assert row is not None
+    assert row["base_type"] == "bit"
+    assert row["precision_value"] == 1
+    assert row["max_length"] == 1
+    assert row["value"] is value
+
+    integer_row = (
+        await owner_connection.query(
+            """
+            SELECT
+                @P1 AS value,
+                CONVERT(
+                    VARCHAR(128),
+                    SQL_VARIANT_PROPERTY(@P1, 'BaseType')
+                ) AS base_type
+            """,
+            [int(value)],
+        )
+    ).fetchone()
+    assert integer_row is not None
+    assert integer_row["base_type"] == "bigint"
+    assert type(integer_row["value"]) is int
+    assert integer_row["value"] == int(value)
 
 
 @case("PARAM-004")
