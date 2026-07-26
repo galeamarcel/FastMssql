@@ -24,6 +24,7 @@ use crate::lifecycle::{
     ConnectionLifecycle, ForceRequested, ForcedShutdownParticipant, LifecycleFailure,
     TransactionPermit, run_force_aware,
 };
+use crate::operation_metrics::{OperationMetricsRegistry, observe_operation};
 use crate::parameter_conversion::{convert_parameters_to_fast, params_as_sql_refs};
 use crate::pool_config::PyPoolConfig;
 use crate::pool_manager::{
@@ -573,6 +574,7 @@ pub struct Transaction {
     azure_credential: Option<Arc<PyAzureCredential>>,
     pool_source: Option<SharedPoolSource>,
     timeout_config: PyTimeoutConfig,
+    operation_metrics: Option<Arc<OperationMetricsRegistry>>,
 }
 
 #[pymethods]
@@ -659,6 +661,7 @@ impl Transaction {
             azure_credential: azure_credential.map(Arc::new),
             pool_source: None,
             timeout_config: timeout_config.unwrap_or_else(PyTimeoutConfig::explicit_default),
+            operation_metrics: None,
         })
     }
 
@@ -677,68 +680,79 @@ impl Transaction {
     ) -> PyResult<Bound<'p, PyAny>> {
         let fast_parameters = convert_parameters_to_fast(parameters, py)?;
         let handles = self.clone_handles();
+        let operation_metrics = self.operation_metrics.clone();
 
         future_into_py(py, async move {
-            let mut cancellation_guard =
-                TransactionCancellationGuard::new(Arc::clone(&handles.session));
-            let admitted_by_current_call = handles.ensure_connected(OperationName::Query).await?;
+            observe_operation(operation_metrics, OperationName::Query, async move {
+                let mut cancellation_guard =
+                    TransactionCancellationGuard::new(Arc::clone(&handles.session));
+                let admitted_by_current_call =
+                    handles.ensure_connected(OperationName::Query).await?;
 
-            let execution_result = {
-                let mut session = handles.session.lock().await;
-                let (previous_state, epoch, deadline) = Self::begin_data_operation(
-                    &mut session,
-                    OperationName::Query,
-                    &handles.timeout_config,
-                    admitted_by_current_call,
-                )?;
-                cancellation_guard.arm(epoch);
-                let force_receiver = session.force_receiver();
-                let operation = run_with_optional_force(force_receiver, async {
-                    match session.conn.as_mut() {
-                        Some(conn_ref) => {
-                            let tiberius_params = params_as_sql_refs(&fast_parameters);
-                            run_until(
-                                deadline,
-                                catch_driver_panic(async {
-                                    conn_ref
-                                        .query(&query, &tiberius_params)
-                                        .await
-                                        .map_err(|e| create_sql_error(e, "Query execution failed"))?
-                                        .into_first_result()
-                                        .await
-                                        .map_err(|e| create_sql_error(e, "Failed to get results"))
-                                }),
-                            )
-                            .await
-                        }
-                        None => Ok(Ok(Err(PyRuntimeError::new_err(
-                            "Connection is not established",
-                        )))),
-                    }
-                })
-                .await;
-                match operation {
-                    Ok(operation) => Self::finish_data_operation(
+                let execution_result = {
+                    let mut session = handles.session.lock().await;
+                    let (previous_state, epoch, deadline) = Self::begin_data_operation(
                         &mut session,
-                        previous_state,
                         OperationName::Query,
-                        operation,
-                    ),
-                    Err(ForceRequested) => {
-                        let failure = session
-                            .forced_failure(OperationName::Query, true)
-                            .ok_or_else(|| {
-                                PyRuntimeError::new_err("forced query lost its lifecycle permit")
-                            })?;
-                        session.retire_connection(Some(failure));
-                        session.transition_to(TransactionState::Failed);
-                        Err(failure.into_pyerr())
+                        &handles.timeout_config,
+                        admitted_by_current_call,
+                    )?;
+                    cancellation_guard.arm(epoch);
+                    let force_receiver = session.force_receiver();
+                    let operation = run_with_optional_force(force_receiver, async {
+                        match session.conn.as_mut() {
+                            Some(conn_ref) => {
+                                let tiberius_params = params_as_sql_refs(&fast_parameters);
+                                run_until(
+                                    deadline,
+                                    catch_driver_panic(async {
+                                        conn_ref
+                                            .query(&query, &tiberius_params)
+                                            .await
+                                            .map_err(|e| {
+                                                create_sql_error(e, "Query execution failed")
+                                            })?
+                                            .into_first_result()
+                                            .await
+                                            .map_err(|e| {
+                                                create_sql_error(e, "Failed to get results")
+                                            })
+                                    }),
+                                )
+                                .await
+                            }
+                            None => Ok(Ok(Err(PyRuntimeError::new_err(
+                                "Connection is not established",
+                            )))),
+                        }
+                    })
+                    .await;
+                    match operation {
+                        Ok(operation) => Self::finish_data_operation(
+                            &mut session,
+                            previous_state,
+                            OperationName::Query,
+                            operation,
+                        ),
+                        Err(ForceRequested) => {
+                            let failure = session
+                                .forced_failure(OperationName::Query, true)
+                                .ok_or_else(|| {
+                                    PyRuntimeError::new_err(
+                                        "forced query lost its lifecycle permit",
+                                    )
+                                })?;
+                            session.retire_connection(Some(failure));
+                            session.transition_to(TransactionState::Failed);
+                            Err(failure.into_pyerr())
+                        }
                     }
-                }
-            };
-            cancellation_guard.disarm();
+                };
+                cancellation_guard.disarm();
 
-            wrap_query_stream(execution_result?)
+                wrap_query_stream(execution_result?)
+            })
+            .await
         })
     }
 
@@ -746,70 +760,78 @@ impl Transaction {
     #[pyo3(signature = (query))]
     pub fn simple_query<'p>(&self, py: Python<'p>, query: String) -> PyResult<Bound<'p, PyAny>> {
         let handles = self.clone_handles();
+        let operation_metrics = self.operation_metrics.clone();
 
         future_into_py(py, async move {
-            let mut cancellation_guard =
-                TransactionCancellationGuard::new(Arc::clone(&handles.session));
-            let admitted_by_current_call =
-                handles.ensure_connected(OperationName::SimpleQuery).await?;
+            observe_operation(operation_metrics, OperationName::SimpleQuery, async move {
+                let mut cancellation_guard =
+                    TransactionCancellationGuard::new(Arc::clone(&handles.session));
+                let admitted_by_current_call =
+                    handles.ensure_connected(OperationName::SimpleQuery).await?;
 
-            let execution_result = {
-                let mut session = handles.session.lock().await;
-                let (previous_state, epoch, deadline) = Self::begin_data_operation(
-                    &mut session,
-                    OperationName::SimpleQuery,
-                    &handles.timeout_config,
-                    admitted_by_current_call,
-                )?;
-                cancellation_guard.arm(epoch);
-                let force_receiver = session.force_receiver();
-                let operation = run_with_optional_force(force_receiver, async {
-                    match session.conn.as_mut() {
-                        Some(conn_ref) => {
-                            run_until(
-                                deadline,
-                                catch_driver_panic(async {
-                                    conn_ref
-                                        .simple_query(&query)
-                                        .await
-                                        .map_err(|e| create_sql_error(e, "Query execution failed"))?
-                                        .into_first_result()
-                                        .await
-                                        .map_err(|e| create_sql_error(e, "Failed to get results"))
-                                }),
-                            )
-                            .await
-                        }
-                        None => Ok(Ok(Err(PyRuntimeError::new_err(
-                            "Connection is not established",
-                        )))),
-                    }
-                })
-                .await;
-                match operation {
-                    Ok(operation) => Self::finish_data_operation(
+                let execution_result = {
+                    let mut session = handles.session.lock().await;
+                    let (previous_state, epoch, deadline) = Self::begin_data_operation(
                         &mut session,
-                        previous_state,
                         OperationName::SimpleQuery,
-                        operation,
-                    ),
-                    Err(ForceRequested) => {
-                        let failure = session
-                            .forced_failure(OperationName::SimpleQuery, true)
-                            .ok_or_else(|| {
-                                PyRuntimeError::new_err(
-                                    "forced simple query lost its lifecycle permit",
+                        &handles.timeout_config,
+                        admitted_by_current_call,
+                    )?;
+                    cancellation_guard.arm(epoch);
+                    let force_receiver = session.force_receiver();
+                    let operation = run_with_optional_force(force_receiver, async {
+                        match session.conn.as_mut() {
+                            Some(conn_ref) => {
+                                run_until(
+                                    deadline,
+                                    catch_driver_panic(async {
+                                        conn_ref
+                                            .simple_query(&query)
+                                            .await
+                                            .map_err(|e| {
+                                                create_sql_error(e, "Query execution failed")
+                                            })?
+                                            .into_first_result()
+                                            .await
+                                            .map_err(|e| {
+                                                create_sql_error(e, "Failed to get results")
+                                            })
+                                    }),
                                 )
-                            })?;
-                        session.retire_connection(Some(failure));
-                        session.transition_to(TransactionState::Failed);
-                        Err(failure.into_pyerr())
+                                .await
+                            }
+                            None => Ok(Ok(Err(PyRuntimeError::new_err(
+                                "Connection is not established",
+                            )))),
+                        }
+                    })
+                    .await;
+                    match operation {
+                        Ok(operation) => Self::finish_data_operation(
+                            &mut session,
+                            previous_state,
+                            OperationName::SimpleQuery,
+                            operation,
+                        ),
+                        Err(ForceRequested) => {
+                            let failure = session
+                                .forced_failure(OperationName::SimpleQuery, true)
+                                .ok_or_else(|| {
+                                    PyRuntimeError::new_err(
+                                        "forced simple query lost its lifecycle permit",
+                                    )
+                                })?;
+                            session.retire_connection(Some(failure));
+                            session.transition_to(TransactionState::Failed);
+                            Err(failure.into_pyerr())
+                        }
                     }
-                }
-            };
-            cancellation_guard.disarm();
+                };
+                cancellation_guard.disarm();
 
-            wrap_query_stream(execution_result?)
+                wrap_query_stream(execution_result?)
+            })
+            .await
         })
     }
 
@@ -823,78 +845,87 @@ impl Transaction {
     ) -> PyResult<Bound<'p, PyAny>> {
         let fast_parameters = convert_parameters_to_fast(parameters, py)?;
         let handles = self.clone_handles();
+        let operation_metrics = self.operation_metrics.clone();
 
         future_into_py(py, async move {
-            let mut cancellation_guard =
-                TransactionCancellationGuard::new(Arc::clone(&handles.session));
-            let admitted_by_current_call = handles.ensure_connected(OperationName::Execute).await?;
+            observe_operation(operation_metrics, OperationName::Execute, async move {
+                let mut cancellation_guard =
+                    TransactionCancellationGuard::new(Arc::clone(&handles.session));
+                let admitted_by_current_call =
+                    handles.ensure_connected(OperationName::Execute).await?;
 
-            let affected = {
-                let mut session = handles.session.lock().await;
-                let (previous_state, epoch, deadline) = Self::begin_data_operation(
-                    &mut session,
-                    OperationName::Execute,
-                    &handles.timeout_config,
-                    admitted_by_current_call,
-                )?;
-                cancellation_guard.arm(epoch);
-                let force_receiver = session.force_receiver();
-                let operation = run_with_optional_force(force_receiver, async {
-                    match session.conn.as_mut() {
-                        Some(conn_ref) => {
-                            run_until(
-                                deadline,
-                                catch_driver_panic(async {
-                                    if fast_parameters.is_empty() && requires_direct_batch(&command)
-                                    {
-                                        execute_unparameterized_command(
-                                            conn_ref,
-                                            &command,
-                                            "Command execution failed",
-                                        )
-                                        .await
-                                    } else {
-                                        let tiberius_params = params_as_sql_refs(&fast_parameters);
-                                        conn_ref
-                                            .execute(&command, &tiberius_params)
-                                            .await
-                                            .map(|result| result.total())
-                                            .map_err(|e| {
-                                                create_sql_error(e, "Command execution failed")
-                                            })
-                                    }
-                                }),
-                            )
-                            .await
-                        }
-                        None => Ok(Ok(Err(PyRuntimeError::new_err(
-                            "Connection is not established",
-                        )))),
-                    }
-                })
-                .await;
-                match operation {
-                    Ok(operation) => Self::finish_data_operation(
+                let affected = {
+                    let mut session = handles.session.lock().await;
+                    let (previous_state, epoch, deadline) = Self::begin_data_operation(
                         &mut session,
-                        previous_state,
                         OperationName::Execute,
-                        operation,
-                    ),
-                    Err(ForceRequested) => {
-                        let failure = session
-                            .forced_failure(OperationName::Execute, true)
-                            .ok_or_else(|| {
-                                PyRuntimeError::new_err("forced execute lost its lifecycle permit")
-                            })?;
-                        session.retire_connection(Some(failure));
-                        session.transition_to(TransactionState::Failed);
-                        Err(failure.into_pyerr())
+                        &handles.timeout_config,
+                        admitted_by_current_call,
+                    )?;
+                    cancellation_guard.arm(epoch);
+                    let force_receiver = session.force_receiver();
+                    let operation = run_with_optional_force(force_receiver, async {
+                        match session.conn.as_mut() {
+                            Some(conn_ref) => {
+                                run_until(
+                                    deadline,
+                                    catch_driver_panic(async {
+                                        if fast_parameters.is_empty()
+                                            && requires_direct_batch(&command)
+                                        {
+                                            execute_unparameterized_command(
+                                                conn_ref,
+                                                &command,
+                                                "Command execution failed",
+                                            )
+                                            .await
+                                        } else {
+                                            let tiberius_params =
+                                                params_as_sql_refs(&fast_parameters);
+                                            conn_ref
+                                                .execute(&command, &tiberius_params)
+                                                .await
+                                                .map(|result| result.total())
+                                                .map_err(|e| {
+                                                    create_sql_error(e, "Command execution failed")
+                                                })
+                                        }
+                                    }),
+                                )
+                                .await
+                            }
+                            None => Ok(Ok(Err(PyRuntimeError::new_err(
+                                "Connection is not established",
+                            )))),
+                        }
+                    })
+                    .await;
+                    match operation {
+                        Ok(operation) => Self::finish_data_operation(
+                            &mut session,
+                            previous_state,
+                            OperationName::Execute,
+                            operation,
+                        ),
+                        Err(ForceRequested) => {
+                            let failure = session
+                                .forced_failure(OperationName::Execute, true)
+                                .ok_or_else(|| {
+                                    PyRuntimeError::new_err(
+                                        "forced execute lost its lifecycle permit",
+                                    )
+                                })?;
+                            session.retire_connection(Some(failure));
+                            session.transition_to(TransactionState::Failed);
+                            Err(failure.into_pyerr())
+                        }
                     }
-                }
-            };
-            cancellation_guard.disarm();
+                };
+                cancellation_guard.disarm();
 
-            affected
+                affected
+            })
+            .await
         })
     }
 
@@ -907,70 +938,74 @@ impl Transaction {
     ) -> PyResult<Bound<'p, PyAny>> {
         let batch_commands = parse_batch_items(commands, py)?;
         let handles = self.clone_handles();
+        let operation_metrics = self.operation_metrics.clone();
 
         future_into_py(py, async move {
-            let mut cancellation_guard =
-                TransactionCancellationGuard::new(Arc::clone(&handles.session));
-            let admitted_by_current_call = handles
-                .ensure_connected(OperationName::ExecuteBatch)
-                .await?;
+            observe_operation(operation_metrics, OperationName::ExecuteBatch, async move {
+                let mut cancellation_guard =
+                    TransactionCancellationGuard::new(Arc::clone(&handles.session));
+                let admitted_by_current_call = handles
+                    .ensure_connected(OperationName::ExecuteBatch)
+                    .await?;
 
-            let all_results = {
-                let mut session = handles.session.lock().await;
-                let (previous_state, epoch, deadline) = Self::begin_data_operation(
-                    &mut session,
-                    OperationName::ExecuteBatch,
-                    &handles.timeout_config,
-                    admitted_by_current_call,
-                )?;
-                cancellation_guard.arm(epoch);
-                let force_receiver = session.force_receiver();
-                let operation = run_with_optional_force(force_receiver, async {
-                    match session.conn.as_mut() {
-                        Some(conn_ref) => {
-                            run_until(
-                                deadline,
-                                catch_driver_panic(execute_batch_on_connection(
-                                    conn_ref,
-                                    batch_commands,
-                                )),
-                            )
-                            .await
-                        }
-                        None => Ok(Ok(Err(PyRuntimeError::new_err(
-                            "Connection is not established",
-                        )))),
-                    }
-                })
-                .await;
-                match operation {
-                    Ok(operation) => Self::finish_data_operation(
+                let all_results = {
+                    let mut session = handles.session.lock().await;
+                    let (previous_state, epoch, deadline) = Self::begin_data_operation(
                         &mut session,
-                        previous_state,
                         OperationName::ExecuteBatch,
-                        operation,
-                    ),
-                    Err(ForceRequested) => {
-                        let failure = session
-                            .forced_failure(OperationName::ExecuteBatch, true)
-                            .ok_or_else(|| {
-                                PyRuntimeError::new_err(
-                                    "forced execute_batch lost its lifecycle permit",
+                        &handles.timeout_config,
+                        admitted_by_current_call,
+                    )?;
+                    cancellation_guard.arm(epoch);
+                    let force_receiver = session.force_receiver();
+                    let operation = run_with_optional_force(force_receiver, async {
+                        match session.conn.as_mut() {
+                            Some(conn_ref) => {
+                                run_until(
+                                    deadline,
+                                    catch_driver_panic(execute_batch_on_connection(
+                                        conn_ref,
+                                        batch_commands,
+                                    )),
                                 )
-                            })?;
-                        session.retire_connection(Some(failure));
-                        session.transition_to(TransactionState::Failed);
-                        Err(failure.into_pyerr())
+                                .await
+                            }
+                            None => Ok(Ok(Err(PyRuntimeError::new_err(
+                                "Connection is not established",
+                            )))),
+                        }
+                    })
+                    .await;
+                    match operation {
+                        Ok(operation) => Self::finish_data_operation(
+                            &mut session,
+                            previous_state,
+                            OperationName::ExecuteBatch,
+                            operation,
+                        ),
+                        Err(ForceRequested) => {
+                            let failure = session
+                                .forced_failure(OperationName::ExecuteBatch, true)
+                                .ok_or_else(|| {
+                                    PyRuntimeError::new_err(
+                                        "forced execute_batch lost its lifecycle permit",
+                                    )
+                                })?;
+                            session.retire_connection(Some(failure));
+                            session.transition_to(TransactionState::Failed);
+                            Err(failure.into_pyerr())
+                        }
                     }
-                }
-            };
-            cancellation_guard.disarm();
-            let all_results = all_results?;
+                };
+                cancellation_guard.disarm();
+                let all_results = all_results?;
 
-            Python::attach(|py| {
-                let py_list = PyList::new(py, all_results)?;
-                Ok(py_list.into_any().unbind())
+                Python::attach(|py| {
+                    let py_list = PyList::new(py, all_results)?;
+                    Ok(py_list.into_any().unbind())
+                })
             })
+            .await
         })
     }
 
@@ -983,88 +1018,97 @@ impl Transaction {
     ) -> PyResult<Bound<'p, PyAny>> {
         let batch_queries = parse_batch_items(queries, py)?;
         let handles = self.clone_handles();
+        let operation_metrics = self.operation_metrics.clone();
 
         future_into_py(py, async move {
-            let mut cancellation_guard =
-                TransactionCancellationGuard::new(Arc::clone(&handles.session));
-            let admitted_by_current_call =
-                handles.ensure_connected(OperationName::QueryBatch).await?;
+            observe_operation(operation_metrics, OperationName::QueryBatch, async move {
+                let mut cancellation_guard =
+                    TransactionCancellationGuard::new(Arc::clone(&handles.session));
+                let admitted_by_current_call =
+                    handles.ensure_connected(OperationName::QueryBatch).await?;
 
-            let all_results = {
-                let mut session = handles.session.lock().await;
-                let (previous_state, epoch, deadline) = Self::begin_data_operation(
-                    &mut session,
-                    OperationName::QueryBatch,
-                    &handles.timeout_config,
-                    admitted_by_current_call,
-                )?;
-                cancellation_guard.arm(epoch);
-                let force_receiver = session.force_receiver();
-                let operation = run_with_optional_force(force_receiver, async {
-                    match session.conn.as_mut() {
-                        Some(conn_ref) => {
-                            run_until(
-                                deadline,
-                                catch_driver_panic(query_batch_on_connection(
-                                    conn_ref,
-                                    batch_queries,
-                                )),
-                            )
-                            .await
-                        }
-                        None => Ok(Ok(Err(PyRuntimeError::new_err(
-                            "Connection is not established",
-                        )))),
-                    }
-                })
-                .await;
-                match operation {
-                    Ok(operation) => Self::finish_data_operation(
+                let all_results = {
+                    let mut session = handles.session.lock().await;
+                    let (previous_state, epoch, deadline) = Self::begin_data_operation(
                         &mut session,
-                        previous_state,
                         OperationName::QueryBatch,
-                        operation,
-                    ),
-                    Err(ForceRequested) => {
-                        let failure = session
-                            .forced_failure(OperationName::QueryBatch, true)
-                            .ok_or_else(|| {
+                        &handles.timeout_config,
+                        admitted_by_current_call,
+                    )?;
+                    cancellation_guard.arm(epoch);
+                    let force_receiver = session.force_receiver();
+                    let operation = run_with_optional_force(force_receiver, async {
+                        match session.conn.as_mut() {
+                            Some(conn_ref) => {
+                                run_until(
+                                    deadline,
+                                    catch_driver_panic(query_batch_on_connection(
+                                        conn_ref,
+                                        batch_queries,
+                                    )),
+                                )
+                                .await
+                            }
+                            None => Ok(Ok(Err(PyRuntimeError::new_err(
+                                "Connection is not established",
+                            )))),
+                        }
+                    })
+                    .await;
+                    match operation {
+                        Ok(operation) => Self::finish_data_operation(
+                            &mut session,
+                            previous_state,
+                            OperationName::QueryBatch,
+                            operation,
+                        ),
+                        Err(ForceRequested) => {
+                            let failure = session
+                                .forced_failure(OperationName::QueryBatch, true)
+                                .ok_or_else(|| {
                                 PyRuntimeError::new_err(
                                     "forced query_batch lost its lifecycle permit",
                                 )
                             })?;
-                        session.retire_connection(Some(failure));
-                        session.transition_to(TransactionState::Failed);
-                        Err(failure.into_pyerr())
+                            session.retire_connection(Some(failure));
+                            session.transition_to(TransactionState::Failed);
+                            Err(failure.into_pyerr())
+                        }
                     }
-                }
-            };
-            cancellation_guard.disarm();
-            let all_results = all_results?;
+                };
+                cancellation_guard.disarm();
+                let all_results = all_results?;
 
-            Python::attach(|py| -> PyResult<Py<PyAny>> {
-                let mut py_results = Vec::with_capacity(all_results.len());
-                for result in all_results {
-                    let py_result = wrap_query_stream(result)?;
-                    py_results.push(py_result.into_any());
-                }
-                let py_list = PyList::new(py, py_results)?;
-                Ok(py_list.into_any().unbind())
+                Python::attach(|py| -> PyResult<Py<PyAny>> {
+                    let mut py_results = Vec::with_capacity(all_results.len());
+                    for result in all_results {
+                        let py_result = wrap_query_stream(result)?;
+                        py_results.push(py_result.into_any());
+                    }
+                    let py_list = PyList::new(py, py_results)?;
+                    Ok(py_list.into_any().unbind())
+                })
             })
+            .await
         })
     }
 
     pub fn begin<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let handles = self.clone_handles();
+        let operation_metrics = self.operation_metrics.clone();
 
         future_into_py(py, async move {
-            let admitted_by_current_call = handles.ensure_connected(OperationName::Begin).await?;
-            Self::execute_transaction_command(
-                &handles.session,
-                TransactionCommand::Begin,
-                &handles.timeout_config,
-                admitted_by_current_call,
-            )
+            observe_operation(operation_metrics, OperationName::Begin, async move {
+                let admitted_by_current_call =
+                    handles.ensure_connected(OperationName::Begin).await?;
+                Self::execute_transaction_command(
+                    &handles.session,
+                    TransactionCommand::Begin,
+                    &handles.timeout_config,
+                    admitted_by_current_call,
+                )
+                .await
+            })
             .await
         })
     }
@@ -1072,13 +1116,17 @@ impl Transaction {
     pub fn commit<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let session = Arc::clone(&self.session);
         let timeout_config = self.timeout_config.clone();
+        let operation_metrics = self.operation_metrics.clone();
         future_into_py(py, async move {
-            Self::execute_transaction_command(
-                &session,
-                TransactionCommand::Commit,
-                &timeout_config,
-                false,
-            )
+            observe_operation(operation_metrics, OperationName::Commit, async move {
+                Self::execute_transaction_command(
+                    &session,
+                    TransactionCommand::Commit,
+                    &timeout_config,
+                    false,
+                )
+                .await
+            })
             .await
         })
     }
@@ -1086,13 +1134,17 @@ impl Transaction {
     pub fn rollback<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let session = Arc::clone(&self.session);
         let timeout_config = self.timeout_config.clone();
+        let operation_metrics = self.operation_metrics.clone();
         future_into_py(py, async move {
-            Self::execute_transaction_command(
-                &session,
-                TransactionCommand::Rollback,
-                &timeout_config,
-                false,
-            )
+            observe_operation(operation_metrics, OperationName::Rollback, async move {
+                Self::execute_transaction_command(
+                    &session,
+                    TransactionCommand::Rollback,
+                    &timeout_config,
+                    false,
+                )
+                .await
+            })
             .await
         })
     }
@@ -1101,105 +1153,110 @@ impl Transaction {
     pub fn close<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let session = Arc::clone(&self.session);
         let timeout_config = self.timeout_config.clone();
+        let operation_metrics = self.operation_metrics.clone();
 
         future_into_py(py, async move {
-            let mut cancellation_guard = TransactionCancellationGuard::new(Arc::clone(&session));
-            let mut session = session.lock().await;
-            if session.lifecycle_failure.is_none() {
-                session.authorize_settlement(OperationName::Close, false)?;
-            }
-            let previous_state = session.state;
-            let force_receiver = session.force_receiver();
-            let mut conn = session.conn.take();
-            let epoch = session.enter_in_flight(TransactionState::Closing);
-            cancellation_guard.arm(epoch);
-            let mut close_result: PyResult<()> = Ok(());
+            observe_operation(operation_metrics, OperationName::Close, async move {
+                let mut cancellation_guard =
+                    TransactionCancellationGuard::new(Arc::clone(&session));
+                let mut session = session.lock().await;
+                if session.lifecycle_failure.is_none() {
+                    session.authorize_settlement(OperationName::Close, false)?;
+                }
+                let previous_state = session.state;
+                let force_receiver = session.force_receiver();
+                let mut conn = session.conn.take();
+                let epoch = session.enter_in_flight(TransactionState::Closing);
+                cancellation_guard.arm(epoch);
+                let mut close_result: PyResult<()> = Ok(());
 
-            if let Some(conn_ref) = conn.as_mut() {
-                if previous_state == TransactionState::Active {
-                    conn_ref.begin_operation();
-                    let deadline =
-                        deadline_from(TimeoutPhase::Rollback, timeout_config.rollback_timeout);
-                    let rollback = run_with_optional_force(
-                        force_receiver,
-                        run_until(
-                            deadline,
-                            catch_driver_panic(async {
-                                conn_ref
-                                    .simple_query("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION")
-                                    .await
-                                    .map_err(|error| {
-                                        create_sql_error(error, "Failed to close transaction")
-                                    })?
-                                    .into_results()
-                                    .await
-                                    .map_err(|error| {
-                                        create_sql_error(error, "Failed to close transaction")
-                                    })?;
-                                Ok(())
-                            }),
-                        ),
-                    )
-                    .await;
+                if let Some(conn_ref) = conn.as_mut() {
+                    if previous_state == TransactionState::Active {
+                        conn_ref.begin_operation();
+                        let deadline =
+                            deadline_from(TimeoutPhase::Rollback, timeout_config.rollback_timeout);
+                        let rollback = run_with_optional_force(
+                            force_receiver,
+                            run_until(
+                                deadline,
+                                catch_driver_panic(async {
+                                    conn_ref
+                                        .simple_query("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION")
+                                        .await
+                                        .map_err(|error| {
+                                            create_sql_error(error, "Failed to close transaction")
+                                        })?
+                                        .into_results()
+                                        .await
+                                        .map_err(|error| {
+                                            create_sql_error(error, "Failed to close transaction")
+                                        })?;
+                                    Ok(())
+                                }),
+                            ),
+                        )
+                        .await;
 
-                    match rollback {
-                        Err(ForceRequested) => {
-                            conn_ref.mark_unusable();
-                            let failure = session
-                                .forced_failure(OperationName::Close, false)
-                                .ok_or_else(|| {
+                        match rollback {
+                            Err(ForceRequested) => {
+                                conn_ref.mark_unusable();
+                                let failure = session
+                                    .forced_failure(OperationName::Close, false)
+                                    .ok_or_else(|| {
                                     PyRuntimeError::new_err(
                                         "forced transaction close lost its lifecycle permit",
                                     )
                                 })?;
-                            session.lifecycle_failure = Some(failure);
-                            close_result = Err(failure.into_pyerr());
+                                session.lifecycle_failure = Some(failure);
+                                close_result = Err(failure.into_pyerr());
+                            }
+                            Ok(Err(elapsed)) => {
+                                conn_ref.mark_unusable();
+                                close_result = Err(transaction_timeout_error(
+                                    elapsed,
+                                    OperationName::Close,
+                                    false,
+                                ));
+                            }
+                            Ok(Ok(Err(driver_panic))) => {
+                                conn_ref.mark_unusable();
+                                close_result = Err(driver_panic);
+                            }
+                            Ok(Ok(Ok(result @ Ok(())))) => {
+                                conn_ref.finish_operation(&result);
+                            }
+                            Ok(Ok(Ok(Err(error)))) => {
+                                conn_ref.mark_unusable();
+                                close_result = Err(error);
+                            }
                         }
-                        Ok(Err(elapsed)) => {
-                            conn_ref.mark_unusable();
-                            close_result = Err(transaction_timeout_error(
-                                elapsed,
-                                OperationName::Close,
-                                false,
-                            ));
-                        }
-                        Ok(Ok(Err(driver_panic))) => {
-                            conn_ref.mark_unusable();
-                            close_result = Err(driver_panic);
-                        }
-                        Ok(Ok(Ok(result @ Ok(())))) => {
-                            conn_ref.finish_operation(&result);
-                        }
-                        Ok(Ok(Ok(Err(error)))) => {
-                            conn_ref.mark_unusable();
-                            close_result = Err(error);
-                        }
+                    } else if matches!(
+                        previous_state,
+                        TransactionState::Idle
+                            | TransactionState::Committed
+                            | TransactionState::RolledBack
+                    ) {
+                        let clean_result: PyResult<()> = Ok(());
+                        conn_ref.finish_operation(&clean_result);
+                    } else {
+                        conn_ref.mark_unusable();
                     }
-                } else if matches!(
-                    previous_state,
-                    TransactionState::Idle
-                        | TransactionState::Committed
-                        | TransactionState::RolledBack
-                ) {
-                    let clean_result: PyResult<()> = Ok(());
-                    conn_ref.finish_operation(&clean_result);
-                } else {
-                    conn_ref.mark_unusable();
                 }
-            }
 
-            // Dropping a direct socket guarantees server-side rollback. Dropping
-            // a pooled lease returns only a fully consumed response; an
-            // in-flight/cancelled lease is marked Broken and bb8 retires it.
-            drop(conn);
-            session.lifecycle_permit.take();
-            if session.lifecycle_failure.is_some() {
-                session.transition_to(TransactionState::Failed);
-            } else {
-                session.transition_to(TransactionState::Idle);
-            }
-            cancellation_guard.disarm();
-            close_result
+                // Dropping a direct socket guarantees server-side rollback. Dropping
+                // a pooled lease returns only a fully consumed response; an
+                // in-flight/cancelled lease is marked Broken and bb8 retires it.
+                drop(conn);
+                session.lifecycle_permit.take();
+                if session.lifecycle_failure.is_some() {
+                    session.transition_to(TransactionState::Failed);
+                } else {
+                    session.transition_to(TransactionState::Idle);
+                }
+                cancellation_guard.disarm();
+                close_result
+            })
+            .await
         })
     }
 
@@ -1219,6 +1276,7 @@ impl Transaction {
         timeout_config: PyTimeoutConfig,
         lifecycle: Arc<ConnectionLifecycle>,
         azure_credential: Option<Arc<PyAzureCredential>>,
+        operation_metrics: Option<Arc<OperationMetricsRegistry>>,
     ) -> Self {
         Self {
             session: Arc::new(AsyncMutex::new(TransactionSession::default())),
@@ -1232,6 +1290,7 @@ impl Transaction {
                 lifecycle,
             }),
             timeout_config,
+            operation_metrics,
         }
     }
 

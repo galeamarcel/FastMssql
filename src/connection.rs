@@ -623,6 +623,7 @@ impl PyConnection {
             self.timeout_config.clone(),
             Arc::clone(&self.lifecycle),
             self.azure_credential.clone(),
+            self.operation_metrics.clone(),
         )
     }
 
@@ -791,6 +792,7 @@ impl PyConnection {
             handles.timeout_config,
             handles.lifecycle,
             handles.azure_credential,
+            self.operation_metrics.clone(),
             py,
             queries,
         )
@@ -811,6 +813,7 @@ impl PyConnection {
             handles.timeout_config,
             handles.lifecycle,
             handles.azure_credential,
+            self.operation_metrics.clone(),
             py,
             table_name,
             columns,
@@ -829,6 +832,7 @@ impl PyConnection {
             handles.timeout_config,
             handles.lifecycle,
             handles.azure_credential,
+            self.operation_metrics.clone(),
             py,
             commands,
         )
