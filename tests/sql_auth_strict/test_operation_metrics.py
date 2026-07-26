@@ -186,7 +186,7 @@ async def test_disabled_operation_metrics_remain_zero_across_work(
         enabled=False,
         max_size=1,
     )
-    query_task: asyncio.Task | None = None
+    query_task: asyncio.Future | None = None
     try:
         before = await connection.operation_stats()
         assert_operation_stats(before, enabled=False)
@@ -195,7 +195,7 @@ async def test_disabled_operation_metrics_remain_zero_across_work(
             await connection.query("SELECT * FROM dbo.strict_opmet_disabled_missing")
         assert captured.value.code == 208
 
-        query_task = asyncio.create_task(
+        query_task = asyncio.ensure_future(
             connection.query(
                 f"""
                 /* {cancellation_token} */
@@ -596,11 +596,11 @@ async def test_server_confirmed_cancellation_is_counted_and_retires(
         enabled=True,
         max_size=1,
     )
-    query_task: asyncio.Task | None = None
+    query_task: asyncio.Future | None = None
     try:
         original_connection_id = await physical_connection_id(connection)
         before = await connection.operation_stats()
-        query_task = asyncio.create_task(
+        query_task = asyncio.ensure_future(
             connection.query(
                 f"""
                 /* {token} */
