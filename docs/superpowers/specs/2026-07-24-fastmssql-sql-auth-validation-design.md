@@ -266,6 +266,28 @@ evidence reference.
   reverts before the operation completes and does not unnecessarily retire the
   physical session.
 
+### OBS — pool observability
+
+- `OBS-001`: exact public key/type schema, zero disconnected snapshot and all
+  arithmetic invariants.
+- `OBS-002`: direct checkout and physical creation counters increase after
+  successful SQL and remain bounded by `max_size`.
+- `OBS-003`: pool saturation exposes a server-gated pending checkout, then a
+  waited completion and positive accumulated wait time.
+- `OBS-004`: acquire timeout increments `get_timed_out` exactly once and pool
+  recovery remains successful.
+- `OBS-005`: cancelled pooled work increments
+  `connections_closed_broken` and replaces the physical session.
+- `OBS-006`: a killed idle session with checkout validation enabled increments
+  `connections_closed_invalid` before a healthy replacement is returned.
+- `OBS-007`: maximum-lifetime retirement increments only its exact close
+  category.
+- `OBS-008`: idle reaping increments only its exact close category.
+- `OBS-009`: concurrent scraping during 10,000 bounded SQL operations
+  preserves invariants, event-loop progress and post-load health.
+- `OBS-010`: SQL, parameters, application/database/login identifiers and
+  credentials are absent from pool statistics and evidence.
+
 ### SQL — query and command execution
 
 - `SQL-001`: parameterized single-row SELECT.

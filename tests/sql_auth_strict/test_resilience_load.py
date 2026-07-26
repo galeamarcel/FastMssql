@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import math
 import subprocess
 import time
 import tracemalloc
@@ -31,6 +32,25 @@ from sql_auth_strict.helpers import (
 pytestmark = [pytest.mark.sql_auth_strict, pytest.mark.integration]
 
 CONTAINER = "fastmssql-sql-auth-dev"
+POOL_STATS_KEYS = {
+    "connected",
+    "connections",
+    "idle_connections",
+    "active_connections",
+    "max_size",
+    "min_idle",
+    "get_started",
+    "get_direct",
+    "get_waited",
+    "get_timed_out",
+    "pending_gets",
+    "get_wait_time_seconds",
+    "connections_created",
+    "connections_closed_broken",
+    "connections_closed_invalid",
+    "connections_closed_max_lifetime",
+    "connections_closed_idle_timeout",
+}
 
 
 def _connection(
@@ -57,6 +77,29 @@ def _connection(
         ),
         application_name=application_name,
     )
+
+
+def _assert_pool_metric_invariants(stats: dict) -> None:
+    assert set(stats) == POOL_STATS_KEYS
+    assert stats["connected"] is True
+    assert stats["active_connections"] == (
+        stats["connections"] - stats["idle_connections"]
+    )
+    assert 0 <= stats["idle_connections"] <= stats["connections"]
+    assert stats["connections"] <= stats["max_size"]
+    assert stats["get_started"] == (
+        stats["get_direct"]
+        + stats["get_waited"]
+        + stats["get_timed_out"]
+        + stats["pending_gets"]
+    )
+    assert all(
+        stats[key] >= 0
+        for key in POOL_STATS_KEYS
+        - {"connected", "min_idle", "get_wait_time_seconds"}
+    )
+    assert math.isfinite(stats["get_wait_time_seconds"])
+    assert stats["get_wait_time_seconds"] >= 0.0
 
 
 def _docker_command(*arguments: str) -> list[str]:
@@ -845,4 +888,143 @@ async def test_thousand_readiness_probes_remain_pool_bounded(
     else:
         raise AssertionError(
             f"readiness load left {remaining} SQL application session(s)"
+        )
+
+
+@case("OBS-009")
+@pytest.mark.load
+@pytest.mark.asyncio
+@pytest.mark.timeout(90)
+async def test_pool_metrics_remain_consistent_during_ten_thousand_queries(
+    sql_auth_config: SqlAuthConfig,
+    sa_connection: Connection,
+    unique_sql_name: Callable[[str], str],
+    record_load_metric,
+) -> None:
+    operation_count = 10_000
+    worker_count = 100
+    max_size = 20
+    application_name = unique_sql_name("strict_pool_observability_load")
+    connection = _connection(
+        sql_auth_config,
+        max_size=max_size,
+        min_idle=max_size,
+        application_name=application_name,
+    )
+    stop = asyncio.Event()
+    scraper: asyncio.Task | None = None
+    ticker: asyncio.Task | None = None
+
+    async def worker(worker_id: int) -> list[int]:
+        values: list[int] = []
+        for value in range(worker_id, operation_count, worker_count):
+            values.append(
+                await scalar(
+                    connection,
+                    "SELECT @P1 AS value",
+                    [value],
+                )
+            )
+        return values
+
+    async def scrape() -> tuple[int, int]:
+        samples = 0
+        max_pending = 0
+        while not stop.is_set():
+            stats = await connection.pool_stats()
+            _assert_pool_metric_invariants(stats)
+            samples += 1
+            max_pending = max(max_pending, stats["pending_gets"])
+            await asyncio.sleep(0)
+        return samples, max_pending
+
+    async def tick() -> int:
+        ticks = 0
+        while not stop.is_set():
+            ticks += 1
+            await asyncio.sleep(0)
+        return ticks
+
+    try:
+        assert await connection.connect() is True
+        before = await connection.pool_stats()
+        _assert_pool_metric_invariants(before)
+
+        scraper = asyncio.create_task(scrape())
+        ticker = asyncio.create_task(tick())
+        started = time.monotonic()
+        worker_results = await asyncio.wait_for(
+            asyncio.gather(
+                *(worker(worker_id) for worker_id in range(worker_count))
+            ),
+            timeout=75.0,
+        )
+        elapsed = time.monotonic() - started
+        stop.set()
+        try:
+            samples, max_pending = await scraper
+        finally:
+            scraper = None
+        try:
+            ticks = await ticker
+        finally:
+            ticker = None
+
+        values = sorted(
+            value for worker_values in worker_results for value in worker_values
+        )
+        assert values == list(range(operation_count))
+        final = await connection.pool_stats()
+        _assert_pool_metric_invariants(final)
+        assert (
+            final["get_started"] - before["get_started"]
+            == operation_count
+        )
+        assert (
+            final["get_direct"]
+            - before["get_direct"]
+            + final["get_waited"]
+            - before["get_waited"]
+            == operation_count
+        )
+        assert final["get_timed_out"] == before["get_timed_out"]
+        assert final["pending_gets"] == 0
+        assert final["active_connections"] == 0
+        assert final["connections"] <= max_size
+        assert samples > 0
+        assert ticks > 10
+        assert await scalar(connection, "SELECT 321") == 321
+        record_load_metric(
+            "OBS-009",
+            elapsed_seconds=elapsed,
+            operation_count=operation_count,
+            worker_count=worker_count,
+            pool_max_size=max_size,
+            scrape_samples=samples,
+            event_loop_ticks=ticks,
+            max_pending_gets=max_pending,
+            physical_connections=final["connections"],
+            queries_per_second=operation_count / elapsed,
+        )
+    finally:
+        stop.set()
+        try:
+            for task in (scraper, ticker):
+                if task is not None:
+                    await task
+        finally:
+            assert await connection.disconnect() is True
+
+    deadline = time.monotonic() + 4.0
+    while time.monotonic() < deadline:
+        remaining = await _application_session_count(
+            sa_connection,
+            application_name,
+        )
+        if remaining == 0:
+            break
+        await asyncio.sleep(0.02)
+    else:
+        raise AssertionError(
+            f"observability load left {remaining} SQL application session(s)"
         )

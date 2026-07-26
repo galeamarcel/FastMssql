@@ -245,9 +245,11 @@ class Connection:
         """
         ...
 
-    def pool_stats(self) -> Coroutine[Any, Any, Dict[str, int | bool | None]]:
+    def pool_stats(
+        self,
+    ) -> Coroutine[Any, Any, Dict[str, int | float | bool | None]]:
         """
-        Get connection pool statistics.
+        Get the current connection-pool statistics without performing SQL.
 
         Returns a dictionary with the following keys:
         - connected (bool): Whether this object owns a pool handle
@@ -256,6 +258,20 @@ class Connection:
         - active_connections (int): Number of connections currently in use
         - max_size (int): Maximum pool size
         - min_idle (int | None): Minimum idle connections to maintain
+        - get_started (int): Checkout attempts started
+        - get_direct (int): Checkouts completed without waiting
+        - get_waited (int): Checkouts completed after waiting
+        - get_timed_out (int): Checkouts that reached the acquire timeout
+        - pending_gets (int): Currently outstanding checkouts
+        - get_wait_time_seconds (float): Cumulative checkout wait seconds
+        - connections_created (int): Physical connections created
+        - connections_closed_broken (int): Broken connections retired
+        - connections_closed_invalid (int): Validation failures retired
+        - connections_closed_max_lifetime (int): Lifetime retirements
+        - connections_closed_idle_timeout (int): Idle-timeout retirements
+
+        Checkout counters include connect/ping readiness acquisitions.
+        Retirement-event counters are not mutually exclusive.
         """
         ...
 

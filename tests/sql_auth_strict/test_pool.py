@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+import math
 import time
 
 from fastmssql import (
@@ -22,6 +23,13 @@ from sql_auth_strict.helpers import quote_identifier, scalar
 
 
 pytestmark = [pytest.mark.sql_auth_strict, pytest.mark.integration]
+
+POOL_RETIREMENT_EVENT_KEYS = {
+    "connections_closed_broken",
+    "connections_closed_invalid",
+    "connections_closed_max_lifetime",
+    "connections_closed_idle_timeout",
+}
 
 
 def _connection(
@@ -65,6 +73,26 @@ def _assert_pool_invariants(stats: dict) -> None:
         stats["connections"] - stats["idle_connections"]
     )
     assert stats["connections"] <= stats["max_size"]
+    assert stats["get_started"] == (
+        stats["get_direct"]
+        + stats["get_waited"]
+        + stats["get_timed_out"]
+        + stats["pending_gets"]
+    )
+    assert all(
+        stats[key] >= 0
+        for key in {
+            "get_started",
+            "get_direct",
+            "get_waited",
+            "get_timed_out",
+            "pending_gets",
+            "connections_created",
+            *POOL_RETIREMENT_EVENT_KEYS,
+        }
+    )
+    assert math.isfinite(stats["get_wait_time_seconds"])
+    assert stats["get_wait_time_seconds"] >= 0.0
 
 
 async def _wait_for_active(
@@ -95,6 +123,43 @@ async def _wait_for_connection_count(
     raise AssertionError(
         f"expected {expected} managed connection(s), observed {stats}"
     )
+
+
+async def _wait_for_counter(
+    connection: Connection,
+    key: str,
+    expected: int,
+    *,
+    timeout: float = 2.0,
+) -> dict:
+    deadline = time.monotonic() + timeout
+    last: dict = {}
+    while time.monotonic() < deadline:
+        last = await connection.pool_stats()
+        _assert_pool_invariants(last)
+        observed = last[key]
+        if observed == expected:
+            return last
+        if observed > expected:
+            raise AssertionError(
+                f"pool metric {key} exceeded {expected}: {observed}"
+            )
+        await asyncio.sleep(0.01)
+    raise AssertionError(
+        f"expected pool metric {key}={expected}, observed {last.get(key)!r}"
+    )
+
+
+async def _cancel_unfinished_task(
+    task: asyncio.Task | None,
+) -> None:
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 async def _application_sessions(
@@ -564,9 +629,11 @@ async def test_resources_return_after_query_error(
     assert await connection.disconnect() is True
 
 
-@case("POOL-012")
+@case("POOL-012", "OBS-005")
 @pytest.mark.asyncio
+@pytest.mark.timeout(10)
 async def test_resources_return_after_task_cancellation(
+    sa_connection: Connection,
     sql_auth_config: SqlAuthConfig,
 ) -> None:
     connection = _connection(
@@ -574,26 +641,65 @@ async def test_resources_return_after_task_cancellation(
         PoolConfig(
             max_size=1,
             min_idle=0,
+            max_lifetime_secs=None,
+            idle_timeout_secs=None,
             connection_timeout_secs=2,
+            test_on_check_out=False,
             retry_connection=False,
         ),
     )
-    task = asyncio.create_task(
-        scalar(
-            connection,
-            "WAITFOR DELAY '00:00:05'; SELECT 1",
+    task: asyncio.Task | None = None
+    try:
+        first_session = int(await scalar(connection, "SELECT @@SPID"))
+        first_connection_id = await _server_connection_id(
+            sa_connection,
+            first_session,
         )
-    )
-    await _wait_for_active(connection, 1)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    await _wait_for_active(connection, 0)
-    assert await scalar(connection, "SELECT 2") == 2
-    assert await connection.disconnect() is True
+        before = await connection.pool_stats()
+        _assert_pool_invariants(before)
+
+        task = asyncio.create_task(
+            scalar(
+                connection,
+                "WAITFOR DELAY '00:00:05'; SELECT 1",
+            )
+        )
+        await _wait_for_active_request(sa_connection, first_session)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        after_cancel = await _wait_for_counter(
+            connection,
+            "connections_closed_broken",
+            before["connections_closed_broken"] + 1,
+        )
+        assert all(
+            after_cancel[key] == before[key]
+            for key in POOL_RETIREMENT_EVENT_KEYS
+            - {"connections_closed_broken"}
+        )
+
+        second_session = int(await scalar(connection, "SELECT @@SPID"))
+        second_connection_id = await _server_connection_id(
+            sa_connection,
+            second_session,
+        )
+        # SQL Server may immediately reuse the smallint SPID after the
+        # cancelled connection closes. connection_id is the physical identity.
+        assert second_connection_id != first_connection_id
+        recovered = await connection.pool_stats()
+        _assert_pool_invariants(recovered)
+        assert (
+            recovered["connections_created"]
+            == before["connections_created"] + 1
+        )
+    finally:
+        await _cancel_unfinished_task(task)
+        assert await connection.disconnect() is True
 
 
-@case("POOL-013")
+@case("POOL-013", "OBS-008")
 @pytest.mark.asyncio
 @pytest.mark.timeout(45)
 async def test_idle_timeout_retires_connection(
@@ -610,17 +716,31 @@ async def test_idle_timeout_retires_connection(
             retry_connection=False,
         ),
     )
-    assert await scalar(connection, "SELECT 1") == 1
-    before = await connection.pool_stats()
-    assert before["connections"] == 1
-    after = await _wait_for_connection_count(
-        connection, 0, timeout=35.0
-    )
-    assert after["idle_connections"] == 0
-    assert await connection.disconnect() is True
+    try:
+        assert await scalar(connection, "SELECT 1") == 1
+        before = await connection.pool_stats()
+        _assert_pool_invariants(before)
+        assert before["connections"] == 1
+
+        after = await _wait_for_connection_count(
+            connection, 0, timeout=35.0
+        )
+        _assert_pool_invariants(after)
+        assert after["idle_connections"] == 0
+        assert (
+            after["connections_closed_idle_timeout"]
+            == before["connections_closed_idle_timeout"] + 1
+        )
+        assert all(
+            after[key] == before[key]
+            for key in POOL_RETIREMENT_EVENT_KEYS
+            - {"connections_closed_idle_timeout"}
+        )
+    finally:
+        assert await connection.disconnect() is True
 
 
-@case("POOL-014")
+@case("POOL-014", "OBS-007")
 @pytest.mark.asyncio
 async def test_max_lifetime_retires_connection(
     sa_connection: Connection,
@@ -640,41 +760,60 @@ async def test_max_lifetime_retires_connection(
         ),
         application_name=application_name,
     )
-    first_query = asyncio.create_task(
-        scalar(
-            connection,
-            "WAITFOR DELAY '00:00:01.100'; SELECT @@SPID",
+    first_query: asyncio.Task | None = None
+    second_query: asyncio.Task | None = None
+    try:
+        before = await connection.pool_stats()
+        first_query = asyncio.create_task(
+            scalar(
+                connection,
+                "WAITFOR DELAY '00:00:01.100'; SELECT @@SPID",
+            )
         )
-    )
-    await _wait_for_active(connection, 1)
-    first_sessions = await _application_sessions(
-        sa_connection, application_name
-    )
-    assert len(first_sessions) == 1
-    first_session = next(iter(first_sessions))
-    first_connection_id = await _server_connection_id(
-        sa_connection, first_session
-    )
-    assert await first_query == first_session
+        await _wait_for_active(connection, 1)
+        first_sessions = await _application_sessions(
+            sa_connection, application_name
+        )
+        assert len(first_sessions) == 1
+        first_session = next(iter(first_sessions))
+        first_connection_id = await _server_connection_id(
+            sa_connection, first_session
+        )
+        assert await first_query == first_session
 
-    second_query = asyncio.create_task(
-        scalar(
-            connection,
-            "WAITFOR DELAY '00:00:00.100'; SELECT @@SPID",
+        second_query = asyncio.create_task(
+            scalar(
+                connection,
+                "WAITFOR DELAY '00:00:00.100'; SELECT @@SPID",
+            )
         )
-    )
-    await _wait_for_active(connection, 1)
-    second_sessions = await _application_sessions(
-        sa_connection, application_name
-    )
-    assert len(second_sessions) == 1
-    second_session = next(iter(second_sessions))
-    second_connection_id = await _server_connection_id(
-        sa_connection, second_session
-    )
-    assert await second_query == second_session
-    assert second_connection_id != first_connection_id
-    assert await connection.disconnect() is True
+        await _wait_for_active(connection, 1)
+        second_sessions = await _application_sessions(
+            sa_connection, application_name
+        )
+        assert len(second_sessions) == 1
+        second_session = next(iter(second_sessions))
+        second_connection_id = await _server_connection_id(
+            sa_connection, second_session
+        )
+        assert await second_query == second_session
+        assert second_connection_id != first_connection_id
+
+        after = await connection.pool_stats()
+        _assert_pool_invariants(after)
+        assert (
+            after["connections_closed_max_lifetime"]
+            == before["connections_closed_max_lifetime"] + 1
+        )
+        assert all(
+            after[key] == before[key]
+            for key in POOL_RETIREMENT_EVENT_KEYS
+            - {"connections_closed_max_lifetime"}
+        )
+    finally:
+        for task in (first_query, second_query):
+            await _cancel_unfinished_task(task)
+        assert await connection.disconnect() is True
 
 
 @case("POOL-015")

@@ -38,6 +38,65 @@ struct ConnectionHandles {
     azure_credential: Option<Arc<PyAzureCredential>>,
 }
 
+fn reconcile_checkout_counts(
+    get_started: u64,
+    get_direct: u64,
+    get_waited: u64,
+    get_timed_out: u64,
+) -> (u64, u64) {
+    let completed = get_direct
+        .saturating_add(get_waited)
+        .saturating_add(get_timed_out);
+    let reconciled_started = get_started.max(completed);
+    (reconciled_started, reconciled_started - completed)
+}
+
+#[derive(Debug, Default)]
+struct PoolStatisticsSnapshot {
+    connected: bool,
+    connections: u32,
+    idle_connections: u32,
+    get_started: u64,
+    get_direct: u64,
+    get_waited: u64,
+    get_timed_out: u64,
+    pending_gets: u64,
+    get_wait_time_seconds: f64,
+    connections_created: u64,
+    connections_closed_broken: u64,
+    connections_closed_invalid: u64,
+    connections_closed_max_lifetime: u64,
+    connections_closed_idle_timeout: u64,
+}
+
+impl PoolStatisticsSnapshot {
+    fn from_state(state: bb8::State) -> Self {
+        let statistics = state.statistics;
+        let (get_started, pending_gets) = reconcile_checkout_counts(
+            statistics.get_started,
+            statistics.get_direct,
+            statistics.get_waited,
+            statistics.get_timed_out,
+        );
+        Self {
+            connected: true,
+            connections: state.connections,
+            idle_connections: state.idle_connections,
+            get_started,
+            get_direct: statistics.get_direct,
+            get_waited: statistics.get_waited,
+            get_timed_out: statistics.get_timed_out,
+            pending_gets,
+            get_wait_time_seconds: statistics.get_wait_time.as_secs_f64(),
+            connections_created: statistics.connections_created,
+            connections_closed_broken: statistics.connections_closed_broken,
+            connections_closed_invalid: statistics.connections_closed_invalid,
+            connections_closed_max_lifetime: statistics.connections_closed_max_lifetime,
+            connections_closed_idle_timeout: statistics.connections_closed_idle_timeout,
+        }
+    }
+}
+
 impl ConnectionHandles {
     fn ensure_connected(
         &self,
@@ -458,27 +517,51 @@ impl PyConnection {
         let min_idle = self.pool_config.min_idle;
 
         future_into_py(py, async move {
-            let (is_connected, connections, idle_connections) = {
+            let snapshot = {
                 let pool_guard = pool.read().await;
                 if let Some(pool_ref) = pool_guard.as_ref() {
-                    let state = pool_ref.state();
-                    (true, state.connections, state.idle_connections)
+                    PoolStatisticsSnapshot::from_state(pool_ref.state())
                 } else {
-                    (false, 0u32, 0u32)
+                    PoolStatisticsSnapshot::default()
                 }
             };
 
             Python::try_attach(|py| {
                 let dict = pyo3::types::PyDict::new(py);
-                dict.set_item("connected", is_connected)?;
-                dict.set_item("connections", connections)?;
-                dict.set_item("idle_connections", idle_connections)?;
+                dict.set_item("connected", snapshot.connected)?;
+                dict.set_item("connections", snapshot.connections)?;
+                dict.set_item("idle_connections", snapshot.idle_connections)?;
                 dict.set_item(
                     "active_connections",
-                    connections.saturating_sub(idle_connections),
+                    snapshot
+                        .connections
+                        .saturating_sub(snapshot.idle_connections),
                 )?;
                 dict.set_item("max_size", max_size)?;
                 dict.set_item("min_idle", min_idle)?;
+                dict.set_item("get_started", snapshot.get_started)?;
+                dict.set_item("get_direct", snapshot.get_direct)?;
+                dict.set_item("get_waited", snapshot.get_waited)?;
+                dict.set_item("get_timed_out", snapshot.get_timed_out)?;
+                dict.set_item("pending_gets", snapshot.pending_gets)?;
+                dict.set_item("get_wait_time_seconds", snapshot.get_wait_time_seconds)?;
+                dict.set_item("connections_created", snapshot.connections_created)?;
+                dict.set_item(
+                    "connections_closed_broken",
+                    snapshot.connections_closed_broken,
+                )?;
+                dict.set_item(
+                    "connections_closed_invalid",
+                    snapshot.connections_closed_invalid,
+                )?;
+                dict.set_item(
+                    "connections_closed_max_lifetime",
+                    snapshot.connections_closed_max_lifetime,
+                )?;
+                dict.set_item(
+                    "connections_closed_idle_timeout",
+                    snapshot.connections_closed_idle_timeout,
+                )?;
                 Ok(dict.unbind())
             })
             .ok_or_else(|| {
@@ -676,5 +759,28 @@ impl PyConnection {
             py,
             commands,
         )
+    }
+}
+
+#[cfg(test)]
+mod pool_observability_tests {
+    use super::reconcile_checkout_counts;
+
+    #[test]
+    fn checkout_counts_preserve_normal_pending_work() {
+        assert_eq!(reconcile_checkout_counts(10, 4, 3, 1), (10, 2));
+    }
+
+    #[test]
+    fn checkout_counts_reconcile_transient_relaxed_load_order() {
+        assert_eq!(reconcile_checkout_counts(2, 2, 1, 0), (3, 0));
+    }
+
+    #[test]
+    fn checkout_counts_do_not_overflow_completed_sum() {
+        assert_eq!(
+            reconcile_checkout_counts(u64::MAX, u64::MAX, 1, 1),
+            (u64::MAX, 0)
+        );
     }
 }
