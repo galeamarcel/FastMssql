@@ -22,6 +22,7 @@ from .fastmssql import (
     Parameters,
     PoolConfig,
     LifecycleConfig,
+    OperationMetricsConfig,
     OperationTimeoutError,
     ProtocolError,
     QueryStream,
@@ -123,6 +124,10 @@ class Connection:
         """
         return await self._conn.pool_stats()
 
+    async def operation_stats(self):
+        """Return fixed connection-lifetime operation metrics without SQL."""
+        return await self._conn.operation_stats()
+
     def transaction(self):
         """Create a transaction backed by this connection's shared pool."""
         return Transaction._from_rust(self._conn.transaction())
@@ -136,6 +141,11 @@ class Connection:
     def lifecycle_config(self):
         """Return an isolated copy of the effective lifecycle policy."""
         return self._conn.lifecycle_config
+
+    @property
+    def operation_metrics_config(self):
+        """Return an isolated copy of the operation-metrics policy."""
+        return self._conn.operation_metrics_config
 
     @property
     def lifecycle_state(self):
@@ -299,6 +309,7 @@ __all__ = [
     "Parameters",
     "PoolConfig",
     "LifecycleConfig",
+    "OperationMetricsConfig",
     "OperationTimeoutError",
     "ProtocolError",
     "QueryStream",

@@ -1,6 +1,6 @@
 """Type stubs for FastMSSQL wrapper classes."""
 
-from typing import Any, Coroutine, Dict, List, Optional, Tuple, StrEnum
+from typing import Any, Coroutine, Dict, List, Literal, Optional, StrEnum, Tuple, TypedDict
 from .fastmssql import (
     AzureCredential,
     AzureCredentialType,
@@ -25,6 +25,49 @@ from .fastmssql import (
     TimeoutConfig,
     TypedNull,
 )
+
+class _OperationStatsEntry(TypedDict):
+    started: int
+    completed: int
+    in_flight: int
+    succeeded: int
+    errors: int
+    timed_out: int
+    cancelled: int
+    outcome_unknown: int
+    duration_seconds_sum: float
+    duration_seconds_min: Optional[float]
+    duration_seconds_max: Optional[float]
+    duration_seconds_buckets: List[int]
+    saturated: bool
+
+class _OperationStatsByName(TypedDict):
+    connect: _OperationStatsEntry
+    ping: _OperationStatsEntry
+    query: _OperationStatsEntry
+    simple_query: _OperationStatsEntry
+    execute: _OperationStatsEntry
+    query_batch: _OperationStatsEntry
+    execute_batch: _OperationStatsEntry
+    bulk_insert: _OperationStatsEntry
+    begin: _OperationStatsEntry
+    commit: _OperationStatsEntry
+    rollback: _OperationStatsEntry
+    close: _OperationStatsEntry
+    disconnect: _OperationStatsEntry
+
+class _OperationStatsSnapshot(TypedDict):
+    schema_version: Literal[1]
+    enabled: bool
+    bucket_bounds_seconds: List[float]
+    operations: _OperationStatsByName
+
+class OperationMetricsConfig:
+    """Default-off policy for fixed, connection-lifetime operation metrics."""
+
+    enabled: bool
+
+    def __init__(self, enabled: bool = False) -> None: ...
 
 class ApplicationIntent(StrEnum):
     """SQL Server application intent constants."""
@@ -73,6 +116,7 @@ class Connection:
         application_name: Optional[str] = None,
         timeout_config: Optional[TimeoutConfig] = None,
         lifecycle_config: Optional[LifecycleConfig] = None,
+        operation_metrics_config: Optional[OperationMetricsConfig] = None,
     ) -> None:
         """
         Initialize a new SQL Server connection.
@@ -110,6 +154,11 @@ class Connection:
     @property
     def lifecycle_config(self) -> LifecycleConfig:
         """Return an isolated copy of the effective lifecycle policy."""
+        ...
+
+    @property
+    def operation_metrics_config(self) -> OperationMetricsConfig:
+        """Return an isolated copy of the operation-metrics policy."""
         ...
 
     @property
@@ -275,6 +324,12 @@ class Connection:
         """
         ...
 
+    def operation_stats(
+        self,
+    ) -> Coroutine[Any, Any, _OperationStatsSnapshot]:
+        """Return fixed connection-lifetime operation metrics without SQL."""
+        ...
+
     def transaction(self) -> Transaction:
         """Create a transaction backed by this connection's shared pool."""
         ...
@@ -413,6 +468,7 @@ __all__ = [
     "Parameters",
     "OperationTimeoutError",
     "LifecycleConfig",
+    "OperationMetricsConfig",
     "PoolConfig",
     "ProtocolError",
     "QueryStream",

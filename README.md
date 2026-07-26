@@ -126,6 +126,79 @@ server/database/login/application identifiers or arbitrary labels. The method
 describes shared-pool operations only; direct `execute_batch()` and direct
 `Transaction(...)` sockets are intentionally excluded.
 
+### Operation duration and outcome metrics
+
+Operation metrics are opt-in and belong to one logical `Connection` for its
+entire connection lifetime:
+
+```python
+from fastmssql import Connection, OperationMetricsConfig
+
+metrics = OperationMetricsConfig(enabled=True)
+connection = Connection(
+    "Server=localhost;Database=app;User Id=myuser;Password=mypass",
+    operation_metrics_config=metrics,
+)
+
+await connection.connect()
+await connection.query("SELECT @P1", [42])
+
+stats = await connection.operation_stats()
+query = stats["operations"]["query"]
+print(query["succeeded"], query["timed_out"])
+```
+
+Metrics are disabled by default. A disabled connection allocates no metrics
+registry and its normal operations perform no metrics clock read or atomic
+update. `operation_stats()` remains available and returns the fixed schema
+with `enabled=False` and zero values.
+
+The registry has exactly 13 operation series:
+
+```text
+connect, ping, query, simple_query, execute, query_batch, execute_batch,
+bulk_insert, begin, commit, rollback, close, disconnect
+```
+
+Each completed call increments exactly one mutually exclusive outcome.
+Classification priority is `succeeded`, then `outcome_unknown` for
+`CommitOutcomeUnknown`, then `timed_out` for the typed operation/shutdown
+timeout exceptions, then `errors` for every other returned exception.
+`cancelled` is used only when a started Rust future is dropped without
+returning a result. Causes are not double-counted.
+
+Durations cover the end-to-end Rust async body: lazy connection creation, pool
+acquisition, SQL Server I/O, response consumption, and Rust-side result
+construction. They do not include Python task-queue time before the Rust future
+is first polled. The histogram has 17 fixed finite bounds from 100 microseconds
+through 30 seconds; cumulative counts are returned in
+`duration_seconds_buckets`. `completed` is the implicit positive-infinity
+(`+Inf`) bucket, so calls longer than 30 seconds still complete without
+incrementing a larger finite bucket.
+
+Snapshots are fresh dictionaries and lists. During concurrent updates they
+are weakly consistent but always preserve their documented arithmetic
+invariants; after writers quiesce they are exact. Counters and duration sums
+saturate at `u64::MAX` instead of wrapping, and the affected operation keeps
+`saturated=True` permanently.
+
+The registry survives `disconnect()` and later reconnect generations.
+Transactions created by `connection.transaction()` aggregate into the owner's
+same registry; the compatibility constructor `Transaction(...)` is excluded.
+There is no reset API or runtime enable/disable toggle, avoiding ambiguous
+epochs for operations already in flight.
+
+This is a pull-only source: FastMssql installs no exporter, callback,
+background task, SQL label, or global telemetry provider. Snapshots contain no
+SQL, parameters, credentials, connection strings, or application-defined
+labels. Applications may copy the fixed values into their own monitoring
+stack.
+
+Operation metrics do not change framework execution models. FastAPI and other
+ASGI applications retain a persistent event loop. Flask `async def` under
+WSGI still creates a loop per request; use an ASGI adapter when persistent-loop
+behavior is required.
+
 ## Explicit Connection Management
 
 `query()`, `execute()`, and the other data methods still initialize the pool
