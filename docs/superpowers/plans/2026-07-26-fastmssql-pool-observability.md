@@ -668,7 +668,7 @@ after_cancel["connections_closed_broken"] \
 ```
 
 Then prove a new query succeeds on a different physical `connection_id` and
-that no other close-reason counter changed.
+that no other retirement-event counter changed.
 
 - [ ] **Step 2: Add killed-idle validation as `OBS-006`**
 
@@ -1208,7 +1208,7 @@ Add concise prose for:
 - current-pool epoch/reset semantics;
 - arithmetic invariant;
 - cumulative, not average, wait time;
-- close-reason categories;
+- retirement-event categories, including their documented overlap;
 - pull-only behavior and privacy;
 - direct-socket exclusions.
 
@@ -1384,7 +1384,8 @@ no call to bb8 Statistics::pending_gets()
 no unchecked checkout-counter subtraction
 exact 17-key schema in Rust/wrapper/stubs/docs/tests
 disconnected/reconnected zero epoch
-all close reasons map exactly to bb8 fields
+all retirement events map exactly to bb8 fields and are not treated as an
+exclusive partition
 no direct-socket misreporting
 no labels, SQL, parameters or identifiers
 no test weakening/skip/xfail
