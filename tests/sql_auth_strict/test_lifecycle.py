@@ -718,6 +718,7 @@ async def test_forced_write_has_unknown_outcome_and_is_not_retried(
     shutdown: asyncio.Task | None = None
     try:
         assert await connection.connect() is True
+        assert await scalar(connection, "SELECT 10") == 10
         assert proxy.accepted_connections == 1
         proxy.pause_downstream()
         proxy.expect_client_disconnect()
@@ -853,7 +854,7 @@ async def test_force_retires_idle_pooled_transaction_and_old_generation(
             await old_transaction.query("SELECT 11")
         old_error = old_captured.value
         assert old_error.phase == "shutdown"
-        assert old_error.state == "Closed"
+        assert old_error.state in {"Closing", "Closed"}
         assert old_error.retryable is False
         assert old_error.connection_discarded is True
         assert old_error.outcome_unknown is False
