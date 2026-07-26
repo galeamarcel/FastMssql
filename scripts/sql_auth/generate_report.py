@@ -26,6 +26,9 @@ STATUS_PRIORITY = {
     "FAIL": 3,
     "ERROR": 4,
 }
+LANE_DISPLAY_NAMES = {
+    "upstream": "original-local-regression",
+}
 SECRET_NAME = re.compile(r"(?:PASSWORD|TOKEN|SECRET)", re.IGNORECASE)
 INLINE_SECRET = re.compile(
     r"(?i)\b(password|pwd|token|secret)\s*=\s*([^;\s|]+)"
@@ -153,7 +156,7 @@ def load_lanes(artifact_dir: Path, secrets: tuple[str, ...]) -> list[dict]:
         )
         lanes.append(
             {
-                "name": name,
+                "name": LANE_DISPLAY_NAMES.get(name, name),
                 "exit_code": exit_code,
                 "command": command,
                 "junit": _junit_summary(artifact_dir / f"{name}.xml"),

@@ -26,15 +26,28 @@ fi
 
 mkdir -p "${artifact_dir}"
 
+display_lane_name() {
+  case "$1" in
+    upstream)
+      printf '%s' "original-local-regression"
+      ;;
+    *)
+      printf '%s' "$1"
+      ;;
+  esac
+}
+
 record() {
   local name="$1"
+  local display_name
+  display_name="$(display_lane_name "${name}")"
   shift
   local log_path="${artifact_dir}/${name}.log"
   local exit_path="${artifact_dir}/${name}.exitcode"
   local command_path="${artifact_dir}/${name}.command"
   local code
 
-  echo "[sql-auth] ${name}: $*"
+  echo "[sql-auth] ${display_name}: $*"
   printf '%q ' "$@" >"${command_path}"
   printf '\n' >>"${command_path}"
   "$@" >"${log_path}" 2>&1
@@ -42,9 +55,9 @@ record() {
   printf '%s\n' "${code}" >"${exit_path}"
   if [[ "${code}" -ne 0 ]]; then
     required_failures=$((required_failures + 1))
-    echo "[sql-auth] ${name}: FAILED (${code}); see ${log_path}" >&2
+    echo "[sql-auth] ${display_name}: FAILED (${code}); see ${log_path}" >&2
   else
-    echo "[sql-auth] ${name}: passed"
+    echo "[sql-auth] ${display_name}: passed"
   fi
 }
 
