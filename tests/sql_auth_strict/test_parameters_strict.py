@@ -518,6 +518,29 @@ async def test_naive_datetime_and_aware_datetimeoffset_parameters(
         assert error.value.retryable is False
         assert "internal tzinfo secret" not in str(error.value)
 
+    range_message = (
+        "Datetime offset local and UTC values must be between year 1 and 9999"
+    )
+    utc_out_of_range = [
+        datetime.min.replace(
+            tzinfo=timezone(timedelta(hours=14)),
+        ),
+        datetime.max.replace(
+            tzinfo=timezone(-timedelta(hours=14)),
+        ),
+    ]
+    for value in utc_out_of_range:
+        with pytest.raises(
+            ConversionError, match=rf"^{re.escape(range_message)}$"
+        ) as error:
+            await owner_connection.query("SELECT @P1", [value])
+
+        assert error.value.message == range_message
+        assert error.value.parameter_index == 0
+        assert error.value.sql_type == "DATETIMEOFFSET(7)"
+        assert error.value.reason == "datetime_out_of_range"
+        assert error.value.retryable is False
+
 
 @case("PARAM-013")
 @pytest.mark.asyncio
