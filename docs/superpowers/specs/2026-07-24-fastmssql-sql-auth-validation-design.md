@@ -634,6 +634,8 @@ violated. No marketing claim is declared proven from a single emulated host.
 - `LIFE-013`: direct execute_batch and nested contexts use one lifecycle.
 - `LIFE-014`: 100 generations and 2,000 operations leave no stale work.
 - `LIFE-015`: ASGI lifecycle is persistent; Flask/WSGI remains per-loop.
+- `LIFE-016`: cancelling an in-flight transaction close retires its lease,
+  releases the lifecycle barrier exactly once and permits graceful shutdown.
 
 ## 7. Error handling and defect workflow
 

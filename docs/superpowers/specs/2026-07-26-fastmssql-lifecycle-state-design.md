@@ -762,6 +762,14 @@ Corrections made during self-review:
    to preserve a reviewable lifecycle boundary.
 10. Direct `Transaction(...)` remains outside connection scope, while the
     direct socket used internally by `Connection.execute_batch()` is included.
+11. A second audit found that cancelling `Transaction.close()` while its
+    rollback response was pending dropped the local socket/lease but left the
+    generation-scoped transaction permit inside `TransactionSession`. The
+    close phase is therefore an epoch-checked in-flight state: cancellation
+    must retire the transport, release the permit exactly once, mark the
+    transaction failed and preserve Python `CancelledError`. A later
+    `disconnect()` must drain gracefully instead of waiting for the grace
+    deadline and entering force cleanup.
 
 No unresolved contradiction or placeholder remains. The repository does not
 contain a `VERSION.md`; therefore this documentation-only candidate cannot
@@ -783,9 +791,11 @@ The candidate is complete only when:
 8. unconfirmed COMMIT remains `CommitOutcomeUnknown`;
 9. old transactions cannot attach to a new generation;
 10. explicit and lazy reconnect compatibility remains green;
-11. public configuration, state, errors, signatures and stubs agree;
-12. all real SQL-auth, framework, stress, upstream, Rust, wheel, quality,
+11. cancelling an in-flight `Transaction.close()` releases its lifecycle
+    permit without requiring a second explicit close;
+12. public configuration, state, errors, signatures and stubs agree;
+13. all real SQL-auth, framework, stress, upstream, Rust, wheel, quality,
     security and hosted cross-platform gates pass at exact recorded SHAs;
-13. the live production-readiness audit and upstream PR roadmap contain
+14. the live production-readiness audit and upstream PR roadmap contain
     measured evidence and remaining limitations;
-14. all branches and pushes exist only on Marcel Galea's fork.
+15. all branches and pushes exist only on Marcel Galea's fork.
