@@ -1,4 +1,5 @@
 use crate::deadline::{DeadlineElapsed, OperationName};
+use crate::lifecycle_config::ConnectionLifecycleState;
 use crate::type_mapping;
 use ahash::AHashMap as HashMap;
 use pyo3::exceptions::{PyException, PyRuntimeError};
@@ -6,11 +7,22 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3::{create_exception, exceptions::PyValueError};
 use std::sync::Arc;
+use std::time::Duration;
 use tiberius::{ColumnType, Row, error::Error as TError};
 
 create_exception!(crate::fastmssql, SqlError, PyException);
 create_exception!(crate::fastmssql, SqlConnectionError, PyException);
 create_exception!(crate::fastmssql, OperationTimeoutError, SqlConnectionError);
+create_exception!(
+    crate::fastmssql,
+    ConnectionLifecycleError,
+    SqlConnectionError
+);
+create_exception!(
+    crate::fastmssql,
+    ShutdownTimeoutError,
+    ConnectionLifecycleError
+);
 create_exception!(crate::fastmssql, CommitOutcomeUnknown, PyException);
 create_exception!(crate::fastmssql, TlsError, PyException);
 create_exception!(crate::fastmssql, ProtocolError, PyException);
@@ -24,6 +36,93 @@ pub(crate) struct TimeoutErrorMetadata {
     pub(crate) retryable: bool,
     pub(crate) connection_discarded: bool,
     pub(crate) outcome_unknown: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LifecycleErrorMetadata {
+    pub(crate) operation: OperationName,
+    pub(crate) state: ConnectionLifecycleState,
+    pub(crate) generation: u64,
+    pub(crate) retryable: bool,
+    pub(crate) connection_discarded: bool,
+    pub(crate) outcome_unknown: bool,
+    pub(crate) forced: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ShutdownTimeoutMetadata {
+    pub(crate) generation: u64,
+    pub(crate) shutdown_timeout: Duration,
+    pub(crate) force_timeout: Duration,
+    pub(crate) active_operations_at_timeout: usize,
+    pub(crate) active_transactions_at_timeout: usize,
+    pub(crate) force_completed: bool,
+}
+
+pub(crate) fn create_lifecycle_error(metadata: LifecycleErrorMetadata) -> PyResult<PyErr> {
+    let message = if metadata.forced {
+        format!(
+            "{} was interrupted by forced connection shutdown in generation {}",
+            metadata.operation.as_str(),
+            metadata.generation
+        )
+    } else {
+        format!(
+            "{} was rejected while connection generation {} was {}",
+            metadata.operation.as_str(),
+            metadata.generation,
+            metadata.state.as_str()
+        )
+    };
+    Python::attach(|py| {
+        let error = ConnectionLifecycleError::new_err(message.clone());
+        let value = error.value(py);
+        value.setattr("message", message)?;
+        value.setattr("operation", metadata.operation.as_str())?;
+        value.setattr("phase", "shutdown")?;
+        value.setattr("state", metadata.state.as_str())?;
+        value.setattr("generation", metadata.generation)?;
+        value.setattr("retryable", metadata.retryable)?;
+        value.setattr("connection_discarded", metadata.connection_discarded)?;
+        value.setattr("outcome_unknown", metadata.outcome_unknown)?;
+        value.setattr("forced", metadata.forced)?;
+        Ok(error)
+    })
+}
+
+pub(crate) fn create_shutdown_timeout_error(metadata: ShutdownTimeoutMetadata) -> PyResult<PyErr> {
+    let shutdown_seconds = metadata.shutdown_timeout.as_secs_f64();
+    let force_seconds = metadata.force_timeout.as_secs_f64();
+    let message = format!(
+        "disconnect exceeded the {:.6} second graceful shutdown budget; \
+         forced retirement completed={}",
+        shutdown_seconds, metadata.force_completed
+    );
+    Python::attach(|py| {
+        let error = ShutdownTimeoutError::new_err(message.clone());
+        let value = error.value(py);
+        value.setattr("message", message)?;
+        value.setattr("operation", OperationName::Disconnect.as_str())?;
+        value.setattr("phase", "shutdown")?;
+        value.setattr("state", ConnectionLifecycleState::Closed.as_str())?;
+        value.setattr("generation", metadata.generation)?;
+        value.setattr("retryable", false)?;
+        value.setattr("connection_discarded", true)?;
+        value.setattr("outcome_unknown", false)?;
+        value.setattr("forced", true)?;
+        value.setattr("shutdown_timeout_seconds", shutdown_seconds)?;
+        value.setattr("force_timeout_seconds", force_seconds)?;
+        value.setattr(
+            "active_operations_at_timeout",
+            metadata.active_operations_at_timeout,
+        )?;
+        value.setattr(
+            "active_transactions_at_timeout",
+            metadata.active_transactions_at_timeout,
+        )?;
+        value.setattr("force_completed", metadata.force_completed)?;
+        Ok(error)
+    })
 }
 
 pub(crate) fn create_operation_timeout_error(
