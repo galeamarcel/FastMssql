@@ -114,7 +114,8 @@ def test_hosted_gate_builds_extension_and_checks_configuration_contracts() -> No
     assert (
         "-m pytest --noconftest "
         "tests/test_pool_config_default_contract.py "
-        "tests/test_timeout_config_contract.py -q"
+        "tests/test_timeout_config_contract.py "
+        "tests/test_lifecycle_contract.py -q"
         in normalized_workflow
     )
     assert (
