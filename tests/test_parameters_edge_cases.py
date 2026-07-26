@@ -27,20 +27,20 @@ class TestParameterEdgeCases:
         """Test Parameter with empty string."""
         param = Parameter("", "VARCHAR")
         assert param.value == ""
-        assert param.sql_type == "VARCHAR"
+        assert param.sql_type == "VARCHAR(8000)"
 
     def test_parameter_with_zero_values(self):
         """Test Parameter with various zero values."""
         test_cases = [
-            (0, "INT"),
-            (0.0, "FLOAT"),
-            (False, "BIT"),
+            (0, "INT", "INT"),
+            (0.0, "FLOAT", "FLOAT(53)"),
+            (False, "BIT", "BIT"),
         ]
 
-        for value, sql_type in test_cases:
+        for value, sql_type, canonical_type in test_cases:
             param = Parameter(value, sql_type)
             assert param.value == value
-            assert param.sql_type == sql_type
+            assert param.sql_type == canonical_type
 
     def test_parameter_with_large_values(self):
         """Test Parameter with large values."""
@@ -68,6 +68,179 @@ class TestParameterEdgeCases:
         for unicode_str in unicode_strings:
             param = Parameter(unicode_str, "NVARCHAR")
             assert param.value == unicode_str
+            assert param.sql_type == "NVARCHAR(4000)"
+
+
+class TestParameterSqlTypeGrammar:
+    """The SQL declaration surface is closed, canonical and non-executable."""
+
+    @pytest.mark.parametrize(
+        ("declaration", "canonical"),
+        [
+            (" bit ", "BIT"),
+            ("tinyint", "TINYINT"),
+            ("smallint", "SMALLINT"),
+            ("int", "INT"),
+            ("bigint", "BIGINT"),
+            ("real", "REAL"),
+            ("float", "FLOAT(53)"),
+            ("float(1)", "FLOAT(1)"),
+            ("FLOAT ( 53 )", "FLOAT(53)"),
+            ("decimal(1,0)", "DECIMAL(1,0)"),
+            ("DECIMAL ( 38 , 38 )", "DECIMAL(38,38)"),
+            ("numeric(19,4)", "NUMERIC(19,4)"),
+            ("char(1)", "CHAR(1)"),
+            ("char(8000)", "CHAR(8000)"),
+            ("varchar", "VARCHAR(8000)"),
+            ("varchar(1)", "VARCHAR(1)"),
+            ("varchar(8000)", "VARCHAR(8000)"),
+            ("varchar(max)", "VARCHAR(MAX)"),
+            ("nchar(1)", "NCHAR(1)"),
+            ("nchar(4000)", "NCHAR(4000)"),
+            ("nvarchar", "NVARCHAR(4000)"),
+            ("nvarchar(4000)", "NVARCHAR(4000)"),
+            ("nvarchar(MAX)", "NVARCHAR(MAX)"),
+            ("binary(1)", "BINARY(1)"),
+            ("binary(8000)", "BINARY(8000)"),
+            ("varbinary", "VARBINARY(8000)"),
+            ("varbinary(8000)", "VARBINARY(8000)"),
+            ("varbinary(max)", "VARBINARY(MAX)"),
+            ("uniqueidentifier", "UNIQUEIDENTIFIER"),
+            ("date", "DATE"),
+            ("time", "TIME(7)"),
+            ("time(0)", "TIME(0)"),
+            ("time(7)", "TIME(7)"),
+            ("datetime", "DATETIME"),
+            ("smalldatetime", "SMALLDATETIME"),
+            ("datetime2", "DATETIME2(7)"),
+            ("datetime2(0)", "DATETIME2(0)"),
+            ("datetime2(7)", "DATETIME2(7)"),
+            ("datetimeoffset", "DATETIMEOFFSET(7)"),
+            ("datetimeoffset(0)", "DATETIMEOFFSET(0)"),
+            ("datetimeoffset(7)", "DATETIMEOFFSET(7)"),
+            ("xml", "XML"),
+        ],
+    )
+    def test_closed_grammar_accepts_only_supported_declarations(
+        self, declaration, canonical
+    ):
+        assert Parameter(None, declaration).sql_type == canonical
+
+    @pytest.mark.parametrize(
+        "declaration",
+        [
+            "",
+            " ",
+            "INT;",
+            "INT -- comment",
+            "INT/*comment*/",
+            "[INT]",
+            "dbo.INT",
+            "'INT'",
+            '"INT"',
+            "INT COLLATE SQL_Latin1_General_CP1_CI_AS",
+            "INT OUTPUT",
+            "VARCHAR(10); SELECT 1",
+            "VARCHAR((10))",
+            "VARCHAR(10 + 1)",
+            "VARCHAR(-1)",
+            "VARCHAR(0)",
+            "VARCHAR(8001)",
+            "VARCHAR(MAX, 1)",
+            "NVARCHAR(4001)",
+            "CHAR",
+            "CHAR(MAX)",
+            "NCHAR",
+            "NCHAR(MAX)",
+            "BINARY",
+            "BINARY(MAX)",
+            "VARBINARY(8001)",
+            "FLOAT(0)",
+            "FLOAT(54)",
+            "FLOAT(MAX)",
+            "DECIMAL",
+            "DECIMAL(18)",
+            "DECIMAL(0,0)",
+            "DECIMAL(39,0)",
+            "DECIMAL(10,11)",
+            "DECIMAL(10,-1)",
+            "NUMERIC(18,2,1)",
+            "TIME(-1)",
+            "TIME(8)",
+            "DATETIME(3)",
+            "SMALLDATETIME(0)",
+            "DATETIME2(8)",
+            "DATETIMEOFFSET(8)",
+            "MONEY",
+            "SMALLMONEY",
+            "TEXT",
+            "NTEXT",
+            "IMAGE",
+            "SQL_VARIANT",
+            "GEOGRAPHY",
+            "GEOMETRY",
+            "HIERARCHYID",
+            "ROWVERSION",
+            "TABLE",
+        ],
+    )
+    def test_closed_grammar_rejects_malformed_or_unsupported_declarations(
+        self, declaration
+    ):
+        with pytest.raises(ValueError):
+            Parameter(None, declaration)
+
+    @pytest.mark.parametrize(
+        "factory",
+        [
+            lambda: Parameter(None, "FLOAT(24)", precision=25),
+            lambda: Parameter(None, "DECIMAL(9,2)", precision=10),
+            lambda: Parameter(None, "DECIMAL(9,2)", scale=3),
+            lambda: Parameter(None, "VARCHAR(10)", length=11),
+            lambda: Parameter(None, "VARCHAR(MAX)", length=8000),
+            lambda: Parameter(None, "INT", precision=10),
+            lambda: Parameter(None, "INT", scale=0),
+            lambda: Parameter(None, "INT", length=4),
+            lambda: Parameter(None, "DATE", scale=0),
+            lambda: Parameter(None, "XML", length="MAX"),
+        ],
+    )
+    def test_conflicting_or_inapplicable_metadata_is_rejected(self, factory):
+        with pytest.raises(ValueError):
+            factory()
+
+    def test_keyword_metadata_can_complete_declarations(self):
+        decimal = Parameter(
+            None,
+            "DECIMAL",
+            precision=19,
+            scale=4,
+        )
+        varchar = Parameter(None, "VARCHAR", length=32)
+        binary = Parameter(None, "BINARY", length=16)
+        time = Parameter(None, "TIME", scale=3)
+
+        assert decimal.sql_type == "DECIMAL(19,4)"
+        assert varchar.sql_type == "VARCHAR(32)"
+        assert binary.sql_type == "BINARY(16)"
+        assert time.sql_type == "TIME(3)"
+
+    @pytest.mark.parametrize(
+        "direction",
+        ["", "IN", "INPUT OUTPUT", "INOUT", "RETURN", "SIDEWAYS", 1],
+    )
+    def test_invalid_directions_are_rejected(self, direction):
+        with pytest.raises((TypeError, ValueError)):
+            Parameter(None, "INT", direction=direction)
+
+    def test_invalid_declaration_error_does_not_echo_attacker_text(self):
+        secret = "TypeGrammarSecret_MustNotLeak_2026"
+        declaration = f"INT); SELECT '{secret}' --"
+
+        with pytest.raises(ValueError) as error:
+            Parameter(None, declaration)
+
+        assert secret not in str(error.value)
 
 
 class TestParametersEdgeCases:

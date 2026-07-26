@@ -251,7 +251,7 @@ def test_report_generator_preserves_not_run_and_redacts(
     matrix = matrix_output.read_text(encoding="utf-8")
     report = report_output.read_text(encoding="utf-8")
     assert (
-        sum(line.startswith("| `") for line in matrix.splitlines()) == 337
+        sum(line.startswith("| `") for line in matrix.splitlines()) == 346
     )
     assert "| `ENV-001` | PASS |" in matrix
     assert "| `AUTH-001` | FAIL |" in matrix
@@ -319,10 +319,10 @@ def test_report_generator_can_require_complete_evidence(
     )
 
     assert completed.returncode == 1
-    assert "missing evidence for 337 case(s)" in completed.stderr
+    assert "missing evidence for 346 case(s)" in completed.stderr
     assert matrix_output.is_file()
     assert report_output.is_file()
-    assert "| NOT RUN | 337 |" in report_output.read_text(encoding="utf-8")
+    assert "| NOT RUN | 346 |" in report_output.read_text(encoding="utf-8")
 
 
 def test_config_redacts_password(monkeypatch) -> None:
@@ -333,13 +333,13 @@ def test_config_redacts_password(monkeypatch) -> None:
     assert "NeverPrintMe_2026!" not in repr(config)
 
 
-def test_approved_spec_contains_337_unique_case_ids() -> None:
+def test_approved_spec_contains_346_unique_case_ids() -> None:
     spec = ROOT / (
         "docs/superpowers/specs/"
         "2026-07-24-fastmssql-sql-auth-validation-design.md"
     )
     ids = spec_case_ids(spec)
-    assert len(ids) == 337
+    assert len(ids) == 346
 
 
 def test_framework_contract_is_wired_into_runner_and_report() -> None:
@@ -549,7 +549,10 @@ def test_resilience_and_load_cases_are_routed_to_their_runner_lanes() -> None:
                 "pytest.mark.resilience"
                 if case_id.startswith("RES-")
                 else "pytest.mark.load"
-                if case_id.startswith("LOAD-") or case_id == "OPMET-011"
+                if (
+                    case_id.startswith("LOAD-")
+                    or case_id in {"OPMET-011", "PARAM-033"}
+                )
                 else ""
             )
             if expected_marker and expected_marker not in decorators:

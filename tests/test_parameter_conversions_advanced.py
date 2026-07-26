@@ -7,12 +7,18 @@ and boundary conditions to ensure proper type conversion between Python and SQL 
 
 import datetime
 from decimal import Decimal
+from uuid import UUID
 
 import pytest
 from conftest import Config
 
 try:
-    from fastmssql import Connection, TypedNull
+    from fastmssql import (
+        Connection,
+        ConversionError,
+        Parameter,
+        TypedNull,
+    )
 except ImportError:
     pytest.fail("fastmssql not available - run 'maturin develop' first")
 
@@ -426,6 +432,7 @@ async def test_parameter_type_explicit_casting(test_config: Config):
     except Exception as e:
         pytest.fail(f"Database not available: {e}")
 
+
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_parameter_typed_null(test_config: Config):
@@ -442,10 +449,10 @@ async def test_parameter_typed_null(test_config: Config):
             for typ in [
                 (TypedNull.GUID, "uniqueidentifier"),
                 (TypedNull.TIME, "time"),
-                (TypedNull.DATE, "date"), 
+                (TypedNull.DATE, "date"),
                 (TypedNull.DATETIME2, "datetime2"),
                 (TypedNull.DATETIMEOFFSET, "datetimeoffset"),
-            ]:  
+            ]:
                 # Test 1: ms-sql casting
                 err = None
                 try:
@@ -471,13 +478,138 @@ async def test_parameter_typed_null(test_config: Config):
                     res = await conn.query("EXECUTE test_sproc @P1", [None])
                 except Exception as e:
                     err = str(e)
-                assert err is not None and f"tinyint is incompatible with {typ[1]}" in err
+                assert (
+                    err is not None and f"tinyint is incompatible with {typ[1]}" in err
+                )
 
                 # This works as normal None is a 'Typed null'
                 res = await conn.query("EXECUTE test_sproc @P1", [typ[0]])
-                assert res[0]['status'] == 5
+                assert res[0]["status"] == 5
 
             await conn.simple_query("DROP PROCEDURE IF EXISTS test_sproc")
 
     except Exception as e:
         pytest.fail(f"Database not available: {e}")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_explicit_parameter_value_validation_is_exact_and_redacted(
+    test_config: Config,
+):
+    """Every explicit family rejects the wrong kind, range or length locally."""
+    secret = "TypedConversionSecret_MustNotLeak_2026"
+    invalid = [
+        (1, "BIT", "BIT"),
+        (-1, "TINYINT", "TINYINT"),
+        (256, "TINYINT", "TINYINT"),
+        (-(2**15) - 1, "SMALLINT", "SMALLINT"),
+        (2**15, "SMALLINT", "SMALLINT"),
+        (-(2**31) - 1, "INT", "INT"),
+        (2**31, "INT", "INT"),
+        (-(2**63) - 1, "BIGINT", "BIGINT"),
+        (2**63, "BIGINT", "BIGINT"),
+        (float("nan"), "REAL", "REAL"),
+        (float("inf"), "FLOAT(53)", "FLOAT(53)"),
+        ("not-a-number", "DECIMAL(9,2)", "DECIMAL(9,2)"),
+        (Decimal("10000000"), "DECIMAL(8,2)", "DECIMAL(8,2)"),
+        (b"bytes", "CHAR(5)", "CHAR(5)"),
+        (secret, "VARCHAR(8)", "VARCHAR(8)"),
+        ("😀", "NVARCHAR(1)", "NVARCHAR(1)"),
+        ("text", "BINARY(4)", "BINARY(4)"),
+        (b"12345", "VARBINARY(4)", "VARBINARY(4)"),
+        ("not-a-uuid", "UNIQUEIDENTIFIER", "UNIQUEIDENTIFIER"),
+        (
+            datetime.datetime(2026, 7, 26, 12, 0),
+            "DATE",
+            "DATE",
+        ),
+        (
+            datetime.time(12, 0, tzinfo=datetime.timezone.utc),
+            "TIME(7)",
+            "TIME(7)",
+        ),
+        (
+            datetime.datetime(
+                2026,
+                7,
+                26,
+                12,
+                0,
+                tzinfo=datetime.timezone.utc,
+            ),
+            "DATETIME",
+            "DATETIME",
+        ),
+        (
+            datetime.datetime(
+                2026,
+                7,
+                26,
+                12,
+                0,
+                tzinfo=datetime.timezone.utc,
+            ),
+            "DATETIME2(7)",
+            "DATETIME2(7)",
+        ),
+        (
+            datetime.datetime(2026, 7, 26, 12, 0),
+            "DATETIMEOFFSET(7)",
+            "DATETIMEOFFSET(7)",
+        ),
+        (b"<root/>", "XML", "XML"),
+    ]
+
+    async with Connection(test_config.connection_string) as conn:
+        for value, declaration, canonical in invalid:
+            with pytest.raises(ConversionError) as error:
+                await conn.query(
+                    "SELECT @P1 AS value",
+                    [Parameter(value, declaration)],
+                )
+
+            assert error.value.parameter_index == 0
+            assert error.value.sql_type == canonical
+            assert isinstance(error.value.reason, str)
+            assert error.value.reason
+            assert error.value.retryable is False
+            assert secret not in str(error.value)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_explicit_parameter_valid_boundary_values_round_trip(
+    test_config: Config,
+):
+    """Valid exact-width boundaries and identity strings reach SQL unchanged."""
+    integer_cases = [
+        (False, "BIT", False),
+        (0, "TINYINT", 0),
+        (255, "TINYINT", 255),
+        (-(2**15), "SMALLINT", -(2**15)),
+        (2**15 - 1, "SMALLINT", 2**15 - 1),
+        (-(2**31), "INT", -(2**31)),
+        (2**31 - 1, "INT", 2**31 - 1),
+        (-(2**63), "BIGINT", -(2**63)),
+        (2**63 - 1, "BIGINT", 2**63 - 1),
+    ]
+    uuid_value = UUID("12345678-1234-5678-9234-567812345678")
+
+    async with Connection(test_config.connection_string) as conn:
+        for value, declaration, expected in integer_cases:
+            row = (
+                await conn.query(
+                    "SELECT @P1 AS value",
+                    [Parameter(value, declaration)],
+                )
+            ).fetchone()
+            assert row["value"] == expected
+
+        uuid_row = (
+            await conn.query(
+                "SELECT @P1 AS value",
+                [Parameter(str(uuid_value), "UNIQUEIDENTIFIER")],
+            )
+        ).fetchone()
+        assert uuid_row["value"] == uuid_value

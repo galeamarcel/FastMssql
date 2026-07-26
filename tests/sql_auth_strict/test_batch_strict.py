@@ -6,6 +6,8 @@ from datetime import date, datetime
 
 from fastmssql import (
     Connection,
+    Parameter,
+    Parameters,
     PoolConfig,
     SqlError,
     SslConfig,
@@ -48,9 +50,7 @@ async def _wait_for_request(
         if (count > 0) is present:
             return
         await asyncio.sleep(0.02)
-    raise AssertionError(
-        f"request token {token!r} did not reach present={present}"
-    )
+    raise AssertionError(f"request token {token!r} did not reach present={present}")
 
 
 def _isolated_connection(config: SqlAuthConfig) -> Connection:
@@ -108,6 +108,21 @@ async def test_parameterized_mixed_query_batch(
                 ["mixed", 22],
             ),
             ("SELECT CAST(33 AS INT) AS value", None),
+            (
+                """
+                SELECT
+                    @P1 AS value,
+                    CONVERT(
+                        VARCHAR(128),
+                        SQL_VARIANT_PROPERTY(@P1, 'BaseType')
+                    ) AS base_type
+                """,
+                [Parameter(44, "INT")],
+            ),
+            (
+                "SELECT @P1 AS value",
+                Parameters(Parameter("typed", "VARCHAR(10)")),
+            ),
         ]
     )
     assert results[0].fetchone().to_dict() == {"value": 11}
@@ -116,6 +131,11 @@ async def test_parameterized_mixed_query_batch(
         "integer_value": 22,
     }
     assert results[2].fetchone().to_dict() == {"value": 33}
+    assert results[3].fetchone().to_dict() == {
+        "value": 44,
+        "base_type": "int",
+    }
+    assert results[4].fetchone().to_dict() == {"value": "typed"}
 
 
 @case("BATCH-003")
@@ -126,13 +146,11 @@ async def test_query_batch_order_and_independent_results(
     results = await owner_connection.query_batch(
         [
             (
-                "SELECT value FROM (VALUES (1), (2)) AS source(value) "
-                "ORDER BY value",
+                "SELECT value FROM (VALUES (1), (2)) AS source(value) ORDER BY value",
                 None,
             ),
             (
-                "SELECT value FROM (VALUES (10), (20)) AS source(value) "
-                "ORDER BY value",
+                "SELECT value FROM (VALUES (10), (20)) AS source(value) ORDER BY value",
                 None,
             ),
         ]
@@ -183,7 +201,22 @@ async def test_empty_single_and_multiple_command_batches(
             (f"INSERT INTO {table} VALUES (@P1, @P2)", [3, 30]),
         ]
     ) == [1, 1]
-    assert await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}") == 3
+    assert await owner_connection.execute_batch(
+        [
+            (
+                f"INSERT INTO {table} VALUES (@P1, @P2)",
+                [Parameter(4, "INT"), Parameter(40, "INT")],
+            ),
+            (
+                f"INSERT INTO {table} VALUES (@P1, @P2)",
+                Parameters(
+                    Parameter(5, "INT"),
+                    Parameter(50, "INT"),
+                ),
+            ),
+        ]
+    ) == [1, 1]
+    assert await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}") == 5
 
 
 @case("BATCH-006")
@@ -206,9 +239,7 @@ async def test_command_batch_row_count_order(
         ]
     )
     assert counts == [2, 1, 0]
-    rows = await owner_connection.query(
-        f"SELECT id, value FROM {table} ORDER BY id"
-    )
+    rows = await owner_connection.query(f"SELECT id, value FROM {table} ORDER BY id")
     assert [row.to_dict() for row in rows.rows()] == [
         {"id": 1, "value": 11},
         {"id": 2, "value": 20},
@@ -276,9 +307,7 @@ async def test_basic_bulk_insert_and_persisted_rows(
         [[1, "one"], [2, "two"], [3, "three"]],
     )
     assert affected == 3
-    rows = await owner_connection.query(
-        f"SELECT id, value FROM {table} ORDER BY id"
-    )
+    rows = await owner_connection.query(f"SELECT id, value FROM {table} ORDER BY id")
     assert [row.to_dict() for row in rows.rows()] == [
         {"id": 1, "value": "one"},
         {"id": 2, "value": "two"},
@@ -447,9 +476,9 @@ async def test_bulk_multiple_chunks(
         f"CREATE TABLE {table} (id INT PRIMARY KEY, value INT NOT NULL)"
     )
     rows = [[index, index * 2] for index in range(1201)]
-    assert await owner_connection.bulk_insert(
-        raw_table, ["id", "value"], rows
-    ) == len(rows)
+    assert await owner_connection.bulk_insert(raw_table, ["id", "value"], rows) == len(
+        rows
+    )
     aggregates = (
         await owner_connection.query(
             f"""
@@ -482,9 +511,7 @@ async def test_bulk_wide_table(
         [row_index * 1000 + column_index for column_index in range(100)]
         for row_index in range(21)
     ]
-    assert await owner_connection.bulk_insert(
-        raw_table, columns, rows
-    ) == len(rows)
+    assert await owner_connection.bulk_insert(raw_table, columns, rows) == len(rows)
     selected = (
         await owner_connection.query(
             f"""
@@ -560,9 +587,7 @@ async def test_bulk_malformed_and_malicious_identifiers(
     with pytest.raises(ValueError, match="At least one column"):
         await owner_connection.bulk_insert(raw_guard, [], [])
     with pytest.raises(ValueError, match="null byte"):
-        await owner_connection.bulk_insert(
-            f"{raw_guard}\x00suffix", ["id"], [[1]]
-        )
+        await owner_connection.bulk_insert(f"{raw_guard}\x00suffix", ["id"], [[1]])
     malicious = f"missing]; DROP TABLE {guard}; --"
     with pytest.raises(SqlError):
         await owner_connection.bulk_insert(malicious, ["id"], [[1]])
@@ -582,18 +607,10 @@ async def test_bulk_row_width_mismatch(
     await owner_connection.execute(
         f"CREATE TABLE {table} (id INT PRIMARY KEY, value INT)"
     )
-    with pytest.raises(
-        ValueError, match="Row has 1 values but 2 columns specified"
-    ):
-        await owner_connection.bulk_insert(
-            raw_table, ["id", "value"], [[1], [2, 20]]
-        )
-    with pytest.raises(
-        ValueError, match="Row has 3 values but 2 columns specified"
-    ):
-        await owner_connection.bulk_insert(
-            raw_table, ["id", "value"], [[1, 10, 100]]
-        )
+    with pytest.raises(ValueError, match="Row has 1 values but 2 columns specified"):
+        await owner_connection.bulk_insert(raw_table, ["id", "value"], [[1], [2, 20]])
+    with pytest.raises(ValueError, match="Row has 3 values but 2 columns specified"):
+        await owner_connection.bulk_insert(raw_table, ["id", "value"], [[1, 10, 100]])
     assert await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}") == 0
 
 
@@ -648,9 +665,7 @@ async def test_bulk_identity_default_computed_and_trigger_interactions(
         )
         """
     )
-    await owner_connection.execute(
-        f"CREATE TABLE {audit} (inserted_id INT NOT NULL)"
-    )
+    await owner_connection.execute(f"CREATE TABLE {audit} (inserted_id INT NOT NULL)")
     await owner_connection.simple_query(
         f"""
         CREATE TRIGGER {trigger}
@@ -705,17 +720,14 @@ async def test_batch_and_bulk_cancellation_cleanup(
     raw_batch_table = unique_sql_name("strict_cancel_batch")
     batch_table = quote_identifier(raw_batch_table)
     cleanup_registry.add(f"DROP TABLE IF EXISTS {batch_table}")
-    await owner_connection.execute(
-        f"CREATE TABLE {batch_table} (id INT PRIMARY KEY)"
-    )
+    await owner_connection.execute(f"CREATE TABLE {batch_table} (id INT PRIMARY KEY)")
     batch_token = unique_sql_name("strict_batch_wait")
     batch_task = asyncio.ensure_future(
         owner_connection.execute_batch(
             [
                 (f"INSERT INTO {batch_table} VALUES (1)", None),
                 (
-                    "WAITFOR DELAY '00:00:05'; "
-                    f"SELECT 1; -- {batch_token}",
+                    f"WAITFOR DELAY '00:00:05'; SELECT 1; -- {batch_token}",
                     None,
                 ),
                 (f"INSERT INTO {batch_table} VALUES (2)", None),
@@ -727,10 +739,7 @@ async def test_batch_and_bulk_cancellation_cleanup(
     with pytest.raises(asyncio.CancelledError):
         await batch_task
     await _wait_for_request(sa_connection, batch_token, present=False)
-    assert (
-        await scalar(owner_connection, f"SELECT COUNT(*) FROM {batch_table}")
-        == 0
-    )
+    assert await scalar(owner_connection, f"SELECT COUNT(*) FROM {batch_table}") == 0
 
     raw_bulk_table = unique_sql_name("strict_cancel_bulk")
     raw_trigger = unique_sql_name("strict_cancel_bulk_trigger")
@@ -738,9 +747,7 @@ async def test_batch_and_bulk_cancellation_cleanup(
     trigger = quote_identifier(raw_trigger)
     cleanup_registry.add(f"DROP TABLE IF EXISTS {bulk_table}")
     cleanup_registry.add(f"DROP TRIGGER IF EXISTS {trigger}")
-    await owner_connection.execute(
-        f"CREATE TABLE {bulk_table} (id INT PRIMARY KEY)"
-    )
+    await owner_connection.execute(f"CREATE TABLE {bulk_table} (id INT PRIMARY KEY)")
     await owner_connection.simple_query(
         f"""
         CREATE TRIGGER {trigger}
@@ -759,21 +766,14 @@ async def test_batch_and_bulk_cancellation_cleanup(
         bulk_task = asyncio.ensure_future(
             bulk_connection.bulk_insert(raw_bulk_table, ["id"], [[1]])
         )
-        await _wait_for_request(
-            sa_connection, raw_bulk_table, present=True
-        )
+        await _wait_for_request(sa_connection, raw_bulk_table, present=True)
         bulk_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await bulk_task
         assert (
-            await asyncio.wait_for(
-                scalar(bulk_connection, "SELECT 1"), timeout=3.0
-            )
+            await asyncio.wait_for(scalar(bulk_connection, "SELECT 1"), timeout=3.0)
             == 1
         )
-        assert (
-            await scalar(owner_connection, f"SELECT COUNT(*) FROM {bulk_table}")
-            == 0
-        )
+        assert await scalar(owner_connection, f"SELECT COUNT(*) FROM {bulk_table}") == 0
     finally:
         await bulk_connection.disconnect()

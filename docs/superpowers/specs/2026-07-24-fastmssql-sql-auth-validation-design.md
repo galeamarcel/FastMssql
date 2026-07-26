@@ -381,8 +381,25 @@ evidence reference.
 - `PARAM-022`: 2,100-parameter SQL Server boundary.
 - `PARAM-023`: parameterized SQL-injection payload remains data.
 - `PARAM-024`: conversion error class and message are stable and redacted.
+- `PARAM-025`: every supported explicit scalar declaration and typed null
+  reports the intended effective SQL Server type.
+- `PARAM-026`: explicit precision, scale and maximum length are preserved,
+  with deterministic rounding and local overflow rejection.
+- `PARAM-027`: ANSI collation, Unicode UTF-16 code-unit lengths and binary
+  byte lengths are enforced without truncation.
+- `PARAM-028`: the closed SQL type parser rejects malformed, injected and
+  unsupported declarations before network I/O.
+- `PARAM-029`: typed iterable expansion preserves the declared type for every
+  expanded child.
+- `PARAM-030`: descriptor fields, non-input direction rejection, plain-list
+  descriptors and `Parameters` compatibility are deterministic.
 - `PARAM-031`: `Parameter.__repr__` is metadata-only, never invokes the
   wrapped value's `__repr__`, and redacts scalar and expanded values.
+- `PARAM-032`: connection, transaction and batch paths use the same typed
+  parameter conversion.
+- `PARAM-033`: 1,000 concurrent typed operations preserve values and
+  effective types without exceeding configured pool or SQL Server session
+  bounds.
 
 ### TYPE — SQL-to-Python values
 

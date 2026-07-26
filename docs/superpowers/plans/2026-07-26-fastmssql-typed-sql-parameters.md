@@ -591,6 +591,7 @@ test/typed-parameter-descriptor
 - Modify: `tests/sql_auth_strict/test_transactions_strict.py`
 - Modify: `tests/sql_auth_strict/test_batch_strict.py`
 - Modify: `tests/sql_auth_strict/test_resilience_load.py`
+- Modify: `tests/sql_auth_strict/test_matrix_contract.py`
 
 **Implementation files:**
 
@@ -622,7 +623,13 @@ Add every case ID and its exact description to the SQL-auth design in the
 same commit as its one owning test node.
 
 Use one helper query returning `BaseType`, `Precision`, `Scale` and
-`MaxLength` through `SQL_VARIANT_PROPERTY`.
+`MaxLength` through `SQL_VARIANT_PROPERTY` for SQL-variant-compatible
+limited scalar types. SQL Server rejects `XML`, `(N)VARCHAR(MAX)` and
+`VARBINARY(MAX)` as `sql_variant` operands, so prove those declarations with
+typed semantic operations: XML methods on `ISNULL(@P1, CAST(... AS XML))`
+and over-limit `DATALENGTH(ISNULL(...))` fallbacks for `MAX`. This preserves
+wire-type evidence without relying on a server-side `CAST` that could hide
+incorrect parameter metadata.
 
 Coverage must include:
 
