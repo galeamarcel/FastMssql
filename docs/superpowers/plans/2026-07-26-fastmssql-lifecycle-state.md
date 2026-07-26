@@ -2831,6 +2831,7 @@ Report that `VERSION.md` is absent, so no version-ledger entry changed.
 
 - Modify:
   `docs/superpowers/specs/2026-07-24-fastmssql-sql-auth-validation-design.md`
+- Modify: `tests/sql_auth_strict/test_matrix_contract.py`
 - Modify: `tests/sql_auth_strict/test_lifecycle.py`
 - Modify: `src/transaction.rs`
 - Regenerate: `docs/SQL_AUTH_TEST_MATRIX.md`
@@ -2848,9 +2849,10 @@ Report that `VERSION.md` is absent, so no version-ledger entry changed.
 
 Create `test/lifecycle-close-cancellation` from the current
 `feat/lifecycle-state` candidate. Add `LIFE-016` to the strict registry and a
-real SQL-auth test using `DownstreamGateProxy`: pause the rollback response,
-cancel `Transaction.close()`, confirm the client socket is retired, and call
-`Connection.disconnect()` without a compensating second `close()`.
+real SQL-auth test using `DownstreamGateProxy`; update the exact matrix count
+from 310 to 311. Pause the rollback response, cancel `Transaction.close()`,
+confirm the client socket is retired, and call `Connection.disconnect()`
+without a compensating second `close()`.
 
 Expected before the fix: `disconnect()` reaches its graceful deadline because
 the cancelled close left `TransactionPermit` in `TransactionSession`, then
