@@ -1758,6 +1758,32 @@ mod cancellation_retirement_tests {
     }
 
     #[test]
+    fn cancelled_close_releases_transaction_permit_exactly_once() {
+        let lifecycle = ConnectionLifecycle::new();
+        let session = Arc::new(AsyncMutex::new(TransactionSession::default()));
+        let participant = Arc::new(TransactionShutdownParticipant {
+            session: Arc::downgrade(&session),
+        });
+        let permit = lifecycle
+            .admit_transaction(participant)
+            .expect("Open must admit a transaction");
+        assert_eq!(lifecycle.counts(0), Some((0, 1)));
+
+        let mut session = session
+            .try_lock()
+            .expect("new transaction session must be unlocked");
+        session.state = TransactionState::Active;
+        session.lifecycle_permit = Some(permit);
+        let close_epoch = session.enter_in_flight(TransactionState::Closing);
+        session.retire_cancelled_operation(close_epoch);
+        session.retire_cancelled_operation(close_epoch);
+
+        assert_eq!(session.state, TransactionState::Failed);
+        assert!(session.lifecycle_permit.is_none());
+        assert_eq!(lifecycle.counts(0), Some((0, 0)));
+    }
+
+    #[test]
     fn forced_idle_participant_is_terminal_and_preserves_lifecycle_error() {
         Python::initialize();
         tokio::runtime::Builder::new_current_thread()
