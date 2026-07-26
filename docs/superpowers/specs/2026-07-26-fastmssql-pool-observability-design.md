@@ -20,7 +20,7 @@ FastMssql's existing `Connection.pool_stats()` API.
 
 This is the first independently reviewable observability candidate. It covers
 pool gauges, checkout pressure, wait time, timeouts, physical connection
-creation and bb8's four close-reason counters without adding a dependency,
+creation and bb8's four retirement-event counters without adding a dependency,
 callback, logging side effect or SQL hot-path allocation.
 
 Operation-duration histograms, outcome counters, trace context and an
@@ -182,6 +182,14 @@ All new integer counters are monotonic within one concrete bb8 pool instance.
 - `connections_closed_idle_timeout`: connections reaped after the configured
   idle timeout.
 
+The four `connections_closed_*` counters are historical event categories, not
+an exclusive partition of physical connection closures. In bb8 0.9.1,
+checkout validation records `connections_closed_invalid` before it marks the
+lease invalid. Dropping that lease still invokes the manager's `has_broken`;
+if the transport is also unsafe, the same physical connection additionally
+increments `connections_closed_broken`. Therefore consumers must not sum these
+four values to derive a total number of uniquely closed connections.
+
 `connections_closed_broken` intentionally exposes the safe bb8 reason
 category, not SQL text or a high-cardinality application-specific cause.
 Finer driver outcome reasons belong to the future operation-metrics candidate.
@@ -253,7 +261,9 @@ sleep is proof that a waiter reached bb8.
 - cancellation/fatal protocol paths continue to retire the lease and
   eventually increment `connections_closed_broken`;
 - checkout validation failure continues to retry according to bb8 and
-  increments `connections_closed_invalid`;
+  increments `connections_closed_invalid`; when the failed transport is also
+  marked unsafe by FastMssql's cancellation-safe manager, the same retirement
+  also increments `connections_closed_broken`;
 - reaper closures increment only their exact lifetime/idle categories;
 - observer reads never suppress, replace or retry the underlying error.
 
@@ -309,7 +319,9 @@ The strict specification gains ten IDs:
 - `OBS-005`: cancelled/fatally broken pooled work increments
   `connections_closed_broken` and replaces the physical session.
 - `OBS-006`: a killed idle session with checkout validation enabled increments
-  `connections_closed_invalid` before a healthy replacement is returned.
+  both the validation-event (`connections_closed_invalid`) and unsafe-transport
+  (`connections_closed_broken`) counters before a healthy replacement is
+  returned, demonstrating that retirement categories may overlap.
 - `OBS-007`: the existing maximum-lifetime scenario increments only the
   max-lifetime close category.
 - `OBS-008`: the existing idle-reaper scenario increments only the idle-timeout
