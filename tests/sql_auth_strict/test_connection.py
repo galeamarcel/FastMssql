@@ -356,7 +356,13 @@ async def test_explicit_connect_is_idempotent(
     assert await connection.connect() is True
     first_stats = await connection.pool_stats()
     assert await connection.connect() is True
-    assert await connection.pool_stats() == first_stats
+    second_stats = await connection.pool_stats()
+    assert second_stats["get_started"] == first_stats["get_started"] + 1
+    assert second_stats["get_direct"] == first_stats["get_direct"] + 1
+    assert all(
+        second_stats[key] == first_stats[key]
+        for key in POOL_STATS_KEYS - {"get_started", "get_direct"}
+    )
     assert await connection.disconnect() is True
 
 
