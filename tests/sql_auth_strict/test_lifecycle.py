@@ -1156,3 +1156,85 @@ async def test_one_hundred_generations_run_two_thousand_operations(
     assert completed_values == list(range(2_000))
     assert len(completed_values) == 2_000
     await wait_for_zero_sessions(sa_connection, application_name)
+
+
+@case("LIFE-016")
+@pytest.mark.asyncio
+async def test_cancelled_transaction_close_releases_lifecycle_permit(
+    sql_auth_config: SqlAuthConfig,
+    sa_connection: Connection,
+    unique_sql_name: Callable[[str], str],
+    cleanup_registry: CleanupRegistry,
+) -> None:
+    _, ConnectionLifecycleState, _, _ = lifecycle_api()
+    application_name = unique_sql_name(
+        "strict_lifecycle_cancel_close"
+    )
+    table = await create_table(
+        cleanup_registry,
+        unique_sql_name,
+        "strict_lifecycle_cancel_close_rows",
+        "id INT NOT NULL PRIMARY KEY",
+    )
+    proxy = DownstreamGateProxy(
+        sql_auth_config.host,
+        sql_auth_config.port,
+    )
+    await proxy.start()
+    connection = lifecycle_connection(
+        sql_auth_config,
+        application_name=application_name,
+        max_size=1,
+        shutdown_timeout=0.2,
+        force_timeout=1.0,
+        host=proxy.host,
+        port=proxy.port,
+    )
+    transaction = connection.transaction()
+    close_task: asyncio.Task | None = None
+    try:
+        await transaction.begin()
+        await transaction.execute(
+            f"INSERT INTO {table} (id) VALUES (@P1)",
+            [16],
+        )
+
+        proxy.pause_downstream()
+        proxy.expect_client_disconnect()
+        close_task = asyncio.create_task(transaction.close())
+        await proxy.wait_until_downstream_held()
+        assert close_task.done() is False
+
+        close_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+        close_task = None
+        proxy.resume_downstream()
+
+        async def cancelled_close_was_rolled_back() -> bool:
+            return (
+                await scalar(
+                    sa_connection,
+                    f"SELECT COUNT(*) FROM {table} WHERE id = @P1",
+                    [16],
+                )
+                == 0
+            )
+
+        await wait_until(cancelled_close_was_rolled_back, timeout=5.0)
+        assert transaction.is_connected() is False
+
+        # No compensating transaction.close() is allowed before disconnect:
+        # cancellation cleanup itself must drop the lifecycle permit.
+        assert await connection.disconnect() is True
+        assert (
+            connection.lifecycle_state
+            == ConnectionLifecycleState.CLOSED
+        )
+        await wait_for_zero_sessions(sa_connection, application_name)
+    finally:
+        proxy.resume_downstream()
+        await cancel_and_wait(close_task)
+        await transaction.close()
+        await connection.disconnect()
+        await proxy.close()
