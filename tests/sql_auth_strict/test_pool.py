@@ -24,7 +24,7 @@ from sql_auth_strict.helpers import quote_identifier, scalar
 
 pytestmark = [pytest.mark.sql_auth_strict, pytest.mark.integration]
 
-POOL_CLOSE_REASON_KEYS = {
+POOL_RETIREMENT_EVENT_KEYS = {
     "connections_closed_broken",
     "connections_closed_invalid",
     "connections_closed_max_lifetime",
@@ -88,7 +88,7 @@ def _assert_pool_invariants(stats: dict) -> None:
             "get_timed_out",
             "pending_gets",
             "connections_created",
-            *POOL_CLOSE_REASON_KEYS,
+            *POOL_RETIREMENT_EVENT_KEYS,
         }
     )
     assert math.isfinite(stats["get_wait_time_seconds"])
@@ -676,7 +676,7 @@ async def test_resources_return_after_task_cancellation(
         )
         assert all(
             after_cancel[key] == before[key]
-            for key in POOL_CLOSE_REASON_KEYS
+            for key in POOL_RETIREMENT_EVENT_KEYS
             - {"connections_closed_broken"}
         )
 
@@ -732,7 +732,7 @@ async def test_idle_timeout_retires_connection(
         )
         assert all(
             after[key] == before[key]
-            for key in POOL_CLOSE_REASON_KEYS
+            for key in POOL_RETIREMENT_EVENT_KEYS
             - {"connections_closed_idle_timeout"}
         )
     finally:
@@ -806,7 +806,7 @@ async def test_max_lifetime_retires_connection(
         )
         assert all(
             after[key] == before[key]
-            for key in POOL_CLOSE_REASON_KEYS
+            for key in POOL_RETIREMENT_EVENT_KEYS
             - {"connections_closed_max_lifetime"}
         )
     finally:
