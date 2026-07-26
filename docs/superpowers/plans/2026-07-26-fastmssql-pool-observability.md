@@ -668,7 +668,9 @@ after_cancel["connections_closed_broken"] \
 ```
 
 Then prove a new query succeeds on a different physical `connection_id` and
-that no other retirement-event counter changed.
+that no other retirement-event counter changed. Do not require a different
+`@@SPID`: SQL Server can immediately reuse the smallint session ID after the
+cancelled physical connection closes.
 
 - [ ] **Step 2: Add killed-idle validation as `OBS-006`**
 
