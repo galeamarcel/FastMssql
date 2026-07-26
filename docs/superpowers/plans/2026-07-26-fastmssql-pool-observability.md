@@ -568,6 +568,26 @@ Also check:
 3. after `disconnect()`, all new counters return to zero;
 4. reconnect starts a fresh epoch and succeeds.
 
+- [ ] **Step 2a: Preserve `CONN-011` pool idempotence semantics**
+
+The second default `connect(validate=True)` reuses the concrete pool but
+intentionally runs one new readiness checkout. Replace the obsolete
+whole-dictionary equality with:
+
+```python
+second_stats = await connection.pool_stats()
+assert second_stats["get_started"] == first_stats["get_started"] + 1
+assert second_stats["get_direct"] == first_stats["get_direct"] + 1
+assert all(
+    second_stats[key] == first_stats[key]
+    for key in POOL_STATS_KEYS - {"get_started", "get_direct"}
+)
+```
+
+This is not a relaxation: it preserves equality for every gauge,
+configuration value, wait/timeout counter, connection counter and retirement
+event while proving the documented readiness checkout exactly.
+
 - [ ] **Step 3: Add `OBS-002` direct-checkout accounting**
 
 Use `max_size=1`, `min_idle=1`, no lifetime/idle reaper, checkout validation
