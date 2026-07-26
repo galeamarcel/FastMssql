@@ -50,9 +50,10 @@ La data redactării:
 - `upstream/master`: `e45f301` — versiunea `v0.7.7`;
 - branch audit: `test/sql-auth-validation`;
 - snapshotul tehnic anterior acestui update documentar este
-  `776f9033975f8727fba57f51effb81c8fafd9acb`;
-- feature-ul deadline-urilor este `822ab2a`, iar evidența generată este
-  `eec7e83`; statusul auditat este `ec6161b`;
+  `d9df1f9943f218a6fcd12aada2cd52c4d32967b6`;
+- feature-ul lifecycle final este `6c5cbff`, arborele tehnic final este
+  `fd79495`, iar rapoartele SQL-auth au fost regenerate pe merge-ul
+  `d9df1f9`;
 - unicul PR upstream deschis este draftul
   [#121 — Improve transactions behavior and safety](https://github.com/Rivendael/FastMssql/pull/121);
 - PR-ul #121 modifică masiv tranzacțiile și timeouturile, deci orice PR care
@@ -96,7 +97,8 @@ PR-uri cu decizie API
     ├── PR-05 connection endpoint error context
     ├── PR-12 TLS secure-by-default și sursă unică
     ├── PR-21 PoolConfig default consistency
-    └── PR-22 operation timeout/deadline safety
+    ├── PR-22 operation timeout/deadline safety
+    └── PR-23 graceful connection lifecycle
 
 PR-uri care cer hardening sau separare
     ├── PR-06 pooled cancellation and disposition
@@ -2358,6 +2360,124 @@ rezultatele și URL-urile hosted. Nu executa `git push` pentru branchul upstream
 Galea. Starea curentă confirmată este: zero PR-uri upstream pentru
 `galeamarcel:feat/operation-timeouts`.
 
+### Task 22: PR-23 — Graceful connection lifecycle
+
+**Status:** `VERIFIED_FORK / requires fresh upstream rebase`. Implementat și
+verificat pe fork; nu există branch curat upstream și publicarea nu este
+aprobată.
+
+```text
+fork feature branch          feat/lifecycle-state
+fork feature SHA             6c5cbffa8cf2f5ec8e695db627d5f425fcbd4154
+technical source SHA         fd79495c2d6f811377ec5b5f35948e18019ac89d
+fork RED branches            test/lifecycle-state
+                             test/lifecycle-close-cancellation
+fork final RED SHAs          4609de7, 7d2fa6b
+technical merge SHA          d9df1f9943f218a6fcd12aada2cd52c4d32967b6
+future clean branch          feat/upstream-lifecycle-state
+future title                 feat: add graceful connection lifecycle
+case IDs                     LIFE-001 through LIFE-016
+current upstream PR state    none
+publication                  forbidden until a new explicit user approval
+```
+
+**Suprafața publică verificată:**
+
+- `LifecycleConfig(shutdown_timeout_secs=30.0, force_timeout_secs=5.0)`;
+- `ConnectionLifecycleState.OPEN`, `.CLOSING` și `.CLOSED`;
+- proprietățile read-only `Connection.lifecycle_config` și
+  `Connection.lifecycle_state`;
+- `ConnectionLifecycleError(SqlConnectionError)` cu metadata structurată;
+- `ShutdownTimeoutError(ConnectionLifecycleError)` cu bugete, counturile de
+  la grace timeout și rezultatul force cleanup.
+
+**Scope și safety:**
+
+- admission generation-aware pe toate căile SQL ale unui `Connection`;
+- permit de tranzacție pentru durata completă a lease-ului pooled;
+- `Open -> Closing -> Closed`, cu o generație nouă după reconnect;
+- un singur supervisor detached pentru apelurile `disconnect()` concurente;
+- anularea waiterului inițiator nu abandonează shutdown-ul;
+- grace și force au bugete distincte și portabile;
+- force retrage transportul și nu retrimite SQL;
+- un write forțat rămâne incert, iar COMMIT neconfirmat păstrează
+  `CommitOutcomeUnknown`;
+- anularea `Transaction.close()` retrage lease-ul și eliberează permitul exact
+  o dată.
+
+**Reproduceri păstrate:**
+
+1. baseline-ul întorcea din `disconnect()` în `0,000` secunde în timp ce un
+   query SQL Server continua aproximativ `2,012` secunde;
+2. înainte de `00696df`, anularea rollbackului din `Transaction.close()`
+   lăsa `TransactionPermit` în sesiune, iar următorul `disconnect()` ridica
+   `ShutdownTimeoutError` după grace timeout deși socketul fusese retras.
+
+**Dovada locală și hosted:**
+
+```text
+matrice SQL-auth                         311/311 PASS
+strict / async / framework              321/321 + 16/16 + 30/30 PASS
+resilience / load                         6/6 + 9/9 PASS
+upstream aplicabil                      921/921 PASS
+FastMssql Rust                            40/40 PASS
+wheel contracts                           18/18 PASS
+100 generații / operații                 100 / 2.000 PASS
+stress                     10.000:100, 99.999:100, 99.999:200 PASS
+post-test sessions                         0
+```
+
+[Run-ul #30185323201](https://github.com/galeamarcel/FastMssql/actions/runs/30185323201)
+este verde pentru raw Cargo, `40/40` Rust, wheel și `18/18` contracte pe
+[Ubuntu](https://github.com/galeamarcel/FastMssql/actions/runs/30185323201/job/89748818322),
+[macOS](https://github.com/galeamarcel/FastMssql/actions/runs/30185323201/job/89748818324)
+și
+[Windows](https://github.com/galeamarcel/FastMssql/actions/runs/30185323201/job/89748818296).
+[RustSec #30185327671](https://github.com/galeamarcel/FastMssql/actions/runs/30185327671)
+este verde la același feature SHA. SQL-auth real este verificat local pe
+containerul MSSQL aprobat; repository-ul nu are runner hosted SQL Server.
+
+**Exclus din PR-23:**
+
+- backpressure/limită de waiters și observability/OpenTelemetry;
+- TDS `ATTENTION`/`DONE_ATTN` și same-socket reuse;
+- lifecycle pentru constructorul direct `Transaction(...)`;
+- streaming, result sets/RPC, typed parameters, bulk nativ;
+- deployment multiprocess, SQLAlchemy, versiune, release ori publicare;
+- orice modificare Tiberius care nu este strict necesară reproducerii
+  proaspete pe upstream.
+
+- [ ] **Step 1: Rebase și audit upstream proaspăt**
+
+Actualizează referința fetch-only, inspectează ultimul `upstream/master` și
+PR-urile lifecycle/transaction apărute între timp. Creează candidatul numai
+din acel upstream, nu din istoricul cumulativ al forkului.
+
+- [ ] **Step 2: Reproduce RED independent**
+
+Reaplică întâi contractul public minim, falsul shutdown cu request server-side
+vizibil și anularea close cu proxy. Confirmă că defectele încă există înainte
+de a porta implementarea.
+
+- [ ] **Step 3: Extrage diff-ul minim reviewable**
+
+Păstrează mașina de stare, permiturile, supervisorul cancellation-safe,
+force retirement, API-ul/stuburile și testele strict necesare. Separă orice
+conflict cu schimbări upstream și nu importa remedieri cumulative fără
+legătură.
+
+- [ ] **Step 4: Reexecută gate-urile**
+
+Rulează LIFE-001–LIFE-016 pe SQL-auth real, Rust, format, Clippy, wheel,
+matricea strictă, framework, resilience/load și regresia upstream. Gate-urile
+hosted Linux/macOS/Windows și RustSec trebuie să fie verzi la același SHA.
+
+- [ ] **Step 5: Prezintă candidatul și cere aprobare separată**
+
+Prezintă branchul curat, comparația cu upstream, RED/GREEN, impactul API și
+toate URL-urile. Nu executa push către repository-ul original și nu crea PR
+fără o aprobare nouă, explicită, a lui Marcel Galea.
+
 ### PyO3 build/test separation — VERIFIED_FORK
 
 **Status:** `VERIFIED_FORK`. Implementat și verificat pe fork; publicarea
@@ -2465,8 +2585,8 @@ fork, testată live și auditată.
 | Native bulk | TDS bulk copy | subset de coloane, streaming input, atomicity contract |
 | Named instances | SQL Browser Tokio | instanță reală fără port explicit |
 | Operation timeouts | PR-22, connect/acquire/operation/transaction/rollback | `VERIFIED_FORK`; rebase curat, RED proaspăt, comparație cu #121, gate pe trei sisteme și aprobare separată înainte de upstream |
-| Observability | pool metrics și OpenTelemetry | fără SQL/parametri sensibili implicit |
-| Graceful shutdown | Open/Closing/Closed | lease-uri active și deadline testate |
+| Observability | pool metrics și OpenTelemetry | următorul candidat; fără SQL/parametri sensibili implicit |
+| Graceful shutdown | PR-23, Open/Closing/Closed generation-aware | `VERIFIED_FORK`; RED proaspăt, rebase curat și aprobare separată înainte de upstream |
 | SQLAlchemy | dialect async | pool ownership și transaction semantics clare |
 | Azure identity | credential callback standardizat | expirare fail-closed și fără fallback lent accidental |
 | TDS 8 | `Encrypt=Strict` | necesită suport la nivel Tiberius/TDS |

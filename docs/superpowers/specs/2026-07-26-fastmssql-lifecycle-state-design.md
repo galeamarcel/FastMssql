@@ -555,7 +555,7 @@ verify deterministic per-loop creation and cleanup, not true-async throughput.
 
 ## Strict SQL-auth cases
 
-The approved strict specification gains fifteen unique IDs:
+The approved strict specification gains sixteen unique IDs:
 
 - `LIFE-001`: public config/state/error exports, defaults, signatures, stubs,
   copy isolation and portable validation.
@@ -588,8 +588,11 @@ The approved strict specification gains fifteen unique IDs:
   sessions.
 - `LIFE-015`: FastAPI/ASGI and Flask-through-ASGI use persistent lifecycle
   shutdown; Flask/WSGI is reported as functional per-loop compatibility.
+- `LIFE-016`: cancelling an in-flight `Transaction.close()` retires the
+  transport, rolls back server-side and releases the generation-scoped
+  transaction permit without a compensating second close.
 
-The strict matrix grows from 295 to 310 unique case IDs. Existing IDs and
+The strict matrix grows from 295 to 311 unique case IDs. Existing IDs and
 assertions are not renumbered or weakened.
 
 ## Deterministic test mechanics
@@ -628,9 +631,9 @@ expensive lane by 100 lifecycle rounds.
 Before the candidate can be marked remediated:
 
 - focused pure/static lifecycle contracts pass;
-- all fifteen `LIFE-*` cases pass against real Docker SQL Server with SQL
+- all sixteen `LIFE-*` cases pass against real Docker SQL Server with SQL
   authentication;
-- all 310 strict specification IDs have passing evidence;
+- all 311 strict specification IDs have passing evidence;
 - every existing strict test remains green;
 - true-async, framework, resilience and load lanes pass;
 - the existing 99,999-transaction bounded-load evidence remains green;
