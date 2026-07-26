@@ -187,10 +187,11 @@ def test_compiled_types_preserve_timeout_config_position() -> None:
 
     assert [
         (parameter.name, parameter.default)
-        for parameter in connection_parameters[-2:]
+        for parameter in connection_parameters[-3:]
     ] == [
         ("timeout_config", None),
         ("lifecycle_config", None),
+        ("operation_metrics_config", None),
     ]
     assert (
         transaction_parameters[-1].name,

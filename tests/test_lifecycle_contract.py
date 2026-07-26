@@ -89,11 +89,16 @@ def test_lifecycle_state_and_errors_are_public_and_typed() -> None:
     assert issubclass(shutdown_error, lifecycle_error)
 
 
-def test_compiled_connection_appends_lifecycle_config() -> None:
+def test_compiled_connection_preserves_lifecycle_before_additive_config() -> None:
     core = importlib.import_module("fastmssql.fastmssql")
     parameters = tuple(inspect.signature(core.Connection).parameters.values())
-    assert parameters[-1].name == "lifecycle_config"
-    assert parameters[-1].default is None
+    assert [
+        (parameter.name, parameter.default)
+        for parameter in parameters[-2:]
+    ] == [
+        ("lifecycle_config", None),
+        ("operation_metrics_config", None),
+    ]
 
 
 def test_lifecycle_stubs_and_readme_match_runtime_contract() -> None:
