@@ -2823,6 +2823,75 @@ no upstream lifecycle PR
 
 Report that `VERSION.md` is absent, so no version-ledger entry changed.
 
+---
+
+### Task 14: Make transaction close cancellation-safe
+
+**Files:**
+
+- Modify:
+  `docs/superpowers/specs/2026-07-24-fastmssql-sql-auth-validation-design.md`
+- Modify: `tests/sql_auth_strict/test_lifecycle.py`
+- Modify: `src/transaction.rs`
+- Regenerate: `docs/SQL_AUTH_TEST_MATRIX.md`
+- Regenerate: `docs/SQL_AUTH_TEST_REPORT.md`
+
+**Interfaces:**
+
+- Consumes: a pooled transaction whose `close()` rollback request has reached
+  SQL Server but whose response is withheld.
+- Produces: Python `CancelledError`, fail-closed transport retirement,
+  epoch-checked `Failed` state, one lifecycle-permit release and a subsequent
+  graceful `Connection.disconnect()`.
+
+- [ ] **Step 1: Preserve the second-audit finding on a focused RED branch**
+
+Create `test/lifecycle-close-cancellation` from the current
+`feat/lifecycle-state` candidate. Add `LIFE-016` to the strict registry and a
+real SQL-auth test using `DownstreamGateProxy`: pause the rollback response,
+cancel `Transaction.close()`, confirm the client socket is retired, and call
+`Connection.disconnect()` without a compensating second `close()`.
+
+Expected before the fix: `disconnect()` reaches its graceful deadline because
+the cancelled close left `TransactionPermit` in `TransactionSession`, then
+raises `ShutdownTimeoutError`.
+
+- [ ] **Step 2: Commit and merge the unchanged RED reproduction**
+
+Run the focused test and preserve the exact failure. Commit only the registry
+and test, push only to `origin`, then merge that commit into
+`feat/lifecycle-state`. Do not weaken the assertion in GREEN.
+
+- [ ] **Step 3: Make close an epoch-checked in-flight phase**
+
+Treat `TransactionState::Closing` as in-flight for cancellation cleanup.
+`Transaction.close()` must arm `TransactionCancellationGuard` immediately
+after taking the connection and entering `Closing`, then disarm only after the
+connection/lease and lifecycle permit have reached their terminal state.
+Cancellation cleanup must be idempotent and generation-aware through the
+existing `TransactionPermit` RAII drop.
+
+- [ ] **Step 4: Verify focused, complete and hosted gates again**
+
+Run:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test --locked
+uv run maturin develop --release
+uv run pytest tests/test_lifecycle_contract.py -q
+uv run pytest \
+  tests/sql_auth_strict/test_lifecycle.py \
+  -k cancelled_transaction_close -vv
+scripts/sql_auth/run_all.sh
+```
+
+Repeat the exact isolated-wheel check, the 10,000 and 99,999 transaction
+profiles, and the Linux/macOS/Windows plus RustSec hosted workflows on the new
+feature SHA. Evidence from a superseded SHA is retained only as history and is
+not cited as the final verdict.
+
 ## Plan self-review record
 
 The plan was checked against every section of the approved design.
@@ -2845,8 +2914,9 @@ The plan was checked against every section of the approved design.
 | 100-generation stress | Tasks 5, 10 |
 | Existing 99,999 load gate | Task 11 |
 | Cross-platform hosted gates | Task 13 |
+| Cancellation-safe transaction close | Task 14 |
 | Live audit/roadmap evidence | Task 12 |
-| Fork-only publication | Tasks 1, 4, 11, 12, 13 |
+| Fork-only publication | Tasks 1, 4, 11, 12, 13, 14 |
 
 ### Type consistency
 
