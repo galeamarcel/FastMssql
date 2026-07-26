@@ -63,6 +63,7 @@ def lifecycle_connection(
             max_lifetime_secs=None,
             idle_timeout_secs=None,
             connection_timeout_secs=3,
+            test_on_check_out=False,
             retry_connection=False,
         ),
         lifecycle_config=LifecycleConfig(
