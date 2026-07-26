@@ -2,6 +2,7 @@ import ast
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -19,6 +20,11 @@ from sql_auth_strict.operation_metrics_assertions import (
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def _write_executable(path: Path, source: str) -> None:
+    path.write_text(source, encoding="utf-8")
+    path.chmod(0o755)
 
 
 def test_sql_auth_repository_contract_files_exist() -> None:
@@ -62,6 +68,84 @@ def test_full_runner_contract() -> None:
         "tests/sql_auth_strict",
     ):
         assert f"--ignore={ignored}" in source
+
+
+def test_full_runner_uses_original_local_regression_display_name(
+    tmp_path: Path,
+) -> None:
+    sandbox = tmp_path / "repo"
+    scripts = sandbox / "scripts" / "sql_auth"
+    scripts.mkdir(parents=True)
+    runner = scripts / "run_all.sh"
+    shutil.copy2(ROOT / "scripts/sql_auth/run_all.sh", runner)
+
+    (sandbox / ".env.sql-auth.local").write_text(
+        "\n".join(
+            (
+                "FASTMSSQL_SQL_AUTH_CONTAINER=fastmssql-sql-auth-dev",
+                "FASTMSSQL_SQL_AUTH_HOST=127.0.0.1",
+                "FASTMSSQL_SQL_AUTH_PORT=14333",
+                "FASTMSSQL_SQL_AUTH_OWNER_USER=test_owner",
+                "FASTMSSQL_SQL_AUTH_OWNER_PASSWORD=test_only_password",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _write_executable(
+        scripts / "provision.sh",
+        "#!/usr/bin/env bash\nexit 0\n",
+    )
+
+    fake_bin = sandbox / "fake-bin"
+    fake_bin.mkdir()
+    for name in ("uv", "cargo", "docker"):
+        _write_executable(
+            fake_bin / name,
+            "#!/usr/bin/env bash\nexit 0\n",
+        )
+
+    environment = os.environ.copy()
+    environment["PATH"] = (
+        f"{fake_bin}{os.pathsep}{environment.get('PATH', '')}"
+    )
+    completed = subprocess.run(
+        [str(runner)],
+        cwd=sandbox,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert (
+        "[sql-auth] original-local-regression: passed" in completed.stdout
+    )
+    assert "[sql-auth] upstream:" not in completed.stdout
+
+    artifacts = sandbox / ".artifacts" / "sql-auth"
+    assert (artifacts / "upstream.exitcode").read_text(
+        encoding="utf-8"
+    ) == "0\n"
+    assert (artifacts / "upstream.log").is_file()
+    command = (artifacts / "upstream.command").read_text(
+        encoding="utf-8"
+    )
+    assert "uv run pytest -n 1 tests" in command
+    assert "--ignore=tests/sql_auth_strict" in command
+    for forbidden in (
+        "git ",
+        "gh ",
+        "curl ",
+        "http://",
+        "https://",
+        "Rivendael/FastMssql",
+    ):
+        assert forbidden not in command
+    assert not (
+        artifacts / "original-local-regression.exitcode"
+    ).exists()
 
 
 def test_report_generator_preserves_not_run_and_redacts(
@@ -181,7 +265,8 @@ def test_report_generator_preserves_not_run_and_redacts(
     assert "Azure" in report
     assert "Windows authentication" in report
     assert "strict" in report
-    assert "upstream" in report
+    assert "| original-local-regression | 0 | 3 | 0 | 0 | 1 |" in report
+    assert "| upstream |" not in report
     assert "FastAPI/native ASGI" in report
     assert "Flask/WSGI" in report
     assert "Flask via WsgiToAsgi" in report
