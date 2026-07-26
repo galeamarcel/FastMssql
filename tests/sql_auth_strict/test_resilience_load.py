@@ -8,6 +8,7 @@ import time
 import tracemalloc
 from collections.abc import AsyncIterator, Callable
 
+import fastmssql
 from fastmssql import (
     Connection,
     PoolConfig,
@@ -22,10 +23,16 @@ import pytest_asyncio
 
 from sql_auth_strict.cases import case
 from sql_auth_strict.config import SqlAuthConfig
+from sql_auth_strict.framework_apps import wait_for_session_count
 from sql_auth_strict.helpers import (
     assert_dedicated_container,
     quote_identifier,
     scalar,
+)
+from sql_auth_strict.operation_metrics_assertions import (
+    OUTCOME_KEYS,
+    assert_operation_stats,
+    operation_delta,
 )
 
 
@@ -1028,3 +1035,170 @@ async def test_pool_metrics_remain_consistent_during_ten_thousand_queries(
         raise AssertionError(
             f"observability load left {remaining} SQL application session(s)"
         )
+
+
+@case("OPMET-011")
+@pytest.mark.load
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_operation_metrics_survive_ten_thousand_queries_and_scrapes(
+    sql_auth_config: SqlAuthConfig,
+    sa_connection: Connection,
+    unique_sql_name: Callable[[str], str],
+    record_load_metric,
+) -> None:
+    operation_count = 10_000
+    worker_count = 100
+    max_size = 20
+    application_name = unique_sql_name("strict_opmet_load")
+    metrics_type = getattr(fastmssql, "OperationMetricsConfig")
+    connection = Connection(
+        server=sql_auth_config.host,
+        port=sql_auth_config.port,
+        database=sql_auth_config.database,
+        username=sql_auth_config.owner_user,
+        password=sql_auth_config.owner_password,
+        application_name=application_name,
+        ssl_config=SslConfig.development(),
+        pool_config=PoolConfig(
+            max_size=max_size,
+            min_idle=0,
+            max_lifetime_secs=None,
+            idle_timeout_secs=None,
+            connection_timeout_secs=3,
+            test_on_check_out=False,
+            retry_connection=False,
+        ),
+        operation_metrics_config=metrics_type(enabled=True),
+    )
+    stop = asyncio.Event()
+    scraper: asyncio.Task | None = None
+    ticker: asyncio.Task | None = None
+
+    async def worker(worker_id: int) -> list[int]:
+        values: list[int] = []
+        for value in range(worker_id, operation_count, worker_count):
+            values.append(
+                await scalar(
+                    connection,
+                    """
+                    IF @P1 < 100
+                        WAITFOR DELAY '00:00:00.050';
+                    SELECT @P1;
+                    """,
+                    [value],
+                )
+            )
+        return values
+
+    async def scrape() -> tuple[int, int, int]:
+        samples = 0
+        maximum_in_flight = 0
+        maximum_connections = 0
+        while not stop.is_set():
+            operation_stats = await connection.operation_stats()
+            assert_operation_stats(operation_stats, enabled=True)
+            pool_stats = await connection.pool_stats()
+            samples += 1
+            maximum_in_flight = max(
+                maximum_in_flight,
+                operation_stats["operations"]["query"]["in_flight"],
+            )
+            maximum_connections = max(
+                maximum_connections,
+                pool_stats["connections"],
+            )
+            await asyncio.sleep(0)
+        return samples, maximum_in_flight, maximum_connections
+
+    async def tick() -> int:
+        ticks = 0
+        while not stop.is_set():
+            ticks += 1
+            await asyncio.sleep(0)
+        return ticks
+
+    try:
+        assert await connection.connect() is True
+        assert await scalar(connection, "SELECT -1") == -1
+        before = await connection.operation_stats()
+        scraper = asyncio.create_task(scrape())
+        ticker = asyncio.create_task(tick())
+        started = time.monotonic()
+        try:
+            worker_results = await asyncio.wait_for(
+                asyncio.gather(
+                    *(
+                        worker(worker_id)
+                        for worker_id in range(worker_count)
+                    )
+                ),
+                timeout=90.0,
+            )
+        finally:
+            stop.set()
+            assert scraper is not None
+            assert ticker is not None
+            samples, maximum_in_flight, maximum_connections = await scraper
+            scraper = None
+            ticks = await ticker
+            ticker = None
+        elapsed = time.monotonic() - started
+
+        values = sorted(
+            value
+            for worker_values in worker_results
+            for value in worker_values
+        )
+        assert values == list(range(operation_count))
+        final = await connection.operation_stats()
+        assert_operation_stats(final, enabled=True)
+        delta = operation_delta(before, final, "query")
+        assert delta["started"] == delta["completed"] == operation_count
+        assert delta["succeeded"] == operation_count
+        assert all(
+            delta[key] == 0
+            for key in (
+                "errors",
+                "timed_out",
+                "cancelled",
+                "outcome_unknown",
+            )
+        )
+        assert final["operations"]["query"]["in_flight"] == 0
+        assert samples > 0
+        assert maximum_in_flight > 0
+        assert maximum_in_flight <= worker_count
+        assert maximum_connections <= max_size
+        assert ticks > 10
+        assert await scalar(connection, "SELECT 11") == 11
+        record_load_metric(
+            "OPMET-011",
+            elapsed_seconds=elapsed,
+            operation_count=operation_count,
+            worker_count=worker_count,
+            pool_max_size=max_size,
+            scrape_samples=samples,
+            event_loop_ticks=ticks,
+            maximum_in_flight=maximum_in_flight,
+            maximum_connections=maximum_connections,
+            queries_per_second=operation_count / elapsed,
+            query_histogram=final["operations"]["query"][
+                "duration_seconds_buckets"
+            ],
+            exact_outcomes={
+                key: delta[key] for key in OUTCOME_KEYS
+            },
+        )
+    finally:
+        stop.set()
+        for task in (scraper, ticker):
+            if task is not None:
+                await task
+        await connection.disconnect()
+
+    await wait_for_session_count(
+        sa_connection,
+        application_name,
+        expected=0,
+    )

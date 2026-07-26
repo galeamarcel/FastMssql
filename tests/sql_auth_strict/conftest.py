@@ -214,7 +214,10 @@ def sql_auth_config() -> SqlAuthConfig:
 @pytest.fixture
 def record_framework_metric():
     def record(case_id: str, **values: object) -> None:
-        if not case_id.startswith("FRAME-"):
+        if not (
+            case_id.startswith("FRAME-")
+            or case_id in {"OPMET-014", "OPMET-015", "OPMET-016"}
+        ):
             raise ValueError(f"not a framework case ID: {case_id}")
         json.dumps(values)
         existing = _FRAMEWORK_METRICS.setdefault(case_id, {})
@@ -233,7 +236,8 @@ def record_framework_metric():
 def record_load_metric():
     def record(case_id: str, **values: object) -> None:
         if not (
-            case_id.startswith("LOAD-") or case_id == "OBS-009"
+            case_id.startswith("LOAD-")
+            or case_id in {"OBS-009", "OPMET-011"}
         ):
             raise ValueError(f"not a load case ID: {case_id}")
         json.dumps(values)
