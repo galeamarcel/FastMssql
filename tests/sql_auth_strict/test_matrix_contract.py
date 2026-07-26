@@ -12,6 +12,10 @@ from sql_auth_strict.cases import (
 )
 from sql_auth_strict.config import SqlAuthConfig
 from sql_auth_strict.conftest import redact_message
+from sql_auth_strict.operation_metrics_assertions import (
+    BUCKET_BOUNDS_SECONDS,
+    OPERATION_NAMES,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -163,7 +167,7 @@ def test_report_generator_preserves_not_run_and_redacts(
     matrix = matrix_output.read_text(encoding="utf-8")
     report = report_output.read_text(encoding="utf-8")
     assert (
-        sum(line.startswith("| `") for line in matrix.splitlines()) == 321
+        sum(line.startswith("| `") for line in matrix.splitlines()) == 337
     )
     assert "| `ENV-001` | PASS |" in matrix
     assert "| `AUTH-001` | FAIL |" in matrix
@@ -230,10 +234,10 @@ def test_report_generator_can_require_complete_evidence(
     )
 
     assert completed.returncode == 1
-    assert "missing evidence for 321 case(s)" in completed.stderr
+    assert "missing evidence for 337 case(s)" in completed.stderr
     assert matrix_output.is_file()
     assert report_output.is_file()
-    assert "| NOT RUN | 321 |" in report_output.read_text(encoding="utf-8")
+    assert "| NOT RUN | 337 |" in report_output.read_text(encoding="utf-8")
 
 
 def test_config_redacts_password(monkeypatch) -> None:
@@ -244,13 +248,13 @@ def test_config_redacts_password(monkeypatch) -> None:
     assert "NeverPrintMe_2026!" not in repr(config)
 
 
-def test_approved_spec_contains_321_unique_case_ids() -> None:
+def test_approved_spec_contains_337_unique_case_ids() -> None:
     spec = ROOT / (
         "docs/superpowers/specs/"
         "2026-07-24-fastmssql-sql-auth-validation-design.md"
     )
     ids = spec_case_ids(spec)
-    assert len(ids) == 321
+    assert len(ids) == 337
 
 
 def test_framework_contract_is_wired_into_runner_and_report() -> None:
@@ -326,6 +330,84 @@ def test_extended_transaction_stress_harness_is_bounded_and_opt_in() -> None:
     assert "--profiles" in completed.stdout
 
 
+def test_operation_metrics_stress_harness_is_bounded_and_opt_in() -> None:
+    python_runner = ROOT / "scripts/sql_auth/operation_metrics_stress.py"
+    shell_runner = (
+        ROOT / "scripts/sql_auth/run_operation_metrics_stress.sh"
+    )
+    assert python_runner.is_file()
+    assert shell_runner.is_file()
+    assert shell_runner.stat().st_mode & 0o111
+
+    source = python_runner.read_text(encoding="utf-8")
+    assert "99_999" in source
+    assert "DEFAULT_WORKERS = 200" in source
+    assert "DEFAULT_POOL_SIZE = 100" in source
+    assert "REQUIRED_PAIRS = 3" in source
+    assert "DEFAULT_MAXIMUM_MEDIAN_DEGRADATION = 0.15" in source
+    assert "asyncio.TaskGroup" in source
+    assert "from statistics import median" in source
+    assert "operation_stats_scrapes_during_timing" in source
+    assert "operations must be between 1 and 99,999" in source
+    assert "workers must be between 1 and 500" in source
+    assert "source SHA must be exactly 40 lowercase hexadecimal" in source
+
+    tree = ast.parse(source, filename=str(python_runner))
+    literals = {
+        node.targets[0].id: ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id
+        in {"OPERATION_NAMES", "BUCKET_BOUNDS_SECONDS", "PAIR_MODE_ORDER"}
+    }
+    assert tuple(literals["OPERATION_NAMES"]) == OPERATION_NAMES
+    assert tuple(literals["BUCKET_BOUNDS_SECONDS"]) == BUCKET_BOUNDS_SECONDS
+    assert tuple(
+        tuple(pair) for pair in literals["PAIR_MODE_ORDER"]
+    ) == (
+        (False, True),
+        (True, False),
+        (False, True),
+    )
+
+    shell_source = shell_runner.read_text(encoding="utf-8")
+    for token in (
+        ".env.sql-auth.local",
+        "--operations 99999",
+        "--workers 200",
+        "--pool-size 100",
+        "--pairs 3",
+        "--maximum-median-degradation 0.15",
+        "--source-sha",
+        "operation-metrics-stress.json",
+    ):
+        assert token in shell_source
+    runner = (ROOT / "scripts/sql_auth/run_all.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "run_operation_metrics_stress.sh" not in runner
+
+    completed = subprocess.run(
+        [sys.executable, str(python_runner), "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    for option in (
+        "--operations",
+        "--workers",
+        "--pool-size",
+        "--pairs",
+        "--maximum-median-degradation",
+        "--source-sha",
+        "--metrics-output",
+    ):
+        assert option in completed.stdout
+
+
 def test_result_messages_redact_every_nonempty_password() -> None:
     assert redact_message(
         "owner=OwnerSecret readonly=ReadonlySecret",
@@ -382,13 +464,68 @@ def test_resilience_and_load_cases_are_routed_to_their_runner_lanes() -> None:
                 "pytest.mark.resilience"
                 if case_id.startswith("RES-")
                 else "pytest.mark.load"
-                if case_id.startswith("LOAD-")
+                if case_id.startswith("LOAD-") or case_id == "OPMET-011"
                 else ""
             )
             if expected_marker and expected_marker not in decorators:
                 incorrectly_routed[case_id] = node.name
 
     assert incorrectly_routed == {}
+
+
+def test_operation_metric_cases_are_routed_to_exact_runner_lanes() -> None:
+    framework_path = (
+        ROOT / "tests/sql_auth_strict/test_framework_integration.py"
+    )
+    framework_source = framework_path.read_text(encoding="utf-8")
+    framework_tree = ast.parse(
+        framework_source,
+        filename=str(framework_path),
+    )
+    assert "pytest.mark.framework" in framework_source
+    framework_cases = {
+        argument.value
+        for node in framework_tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        for decorator in node.decorator_list
+        if isinstance(decorator, ast.Call)
+        and isinstance(decorator.func, ast.Name)
+        and decorator.func.id == "case"
+        for argument in decorator.args
+        if isinstance(argument, ast.Constant)
+        and isinstance(argument.value, str)
+        and argument.value.startswith("OPMET-")
+    }
+    assert framework_cases == {"OPMET-014", "OPMET-015", "OPMET-016"}
+
+    load_path = ROOT / "tests/sql_auth_strict/test_resilience_load.py"
+    load_tree = ast.parse(
+        load_path.read_text(encoding="utf-8"),
+        filename=str(load_path),
+    )
+    load_functions = {
+        argument.value: {
+            ast.unparse(item)
+            for item in node.decorator_list
+        }
+        for node in load_tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        for decorator in node.decorator_list
+        if isinstance(decorator, ast.Call)
+        and isinstance(decorator.func, ast.Name)
+        and decorator.func.id == "case"
+        for argument in decorator.args
+        if isinstance(argument, ast.Constant)
+        and argument.value == "OPMET-011"
+    }
+    assert load_functions == {
+        "OPMET-011": {
+            "case('OPMET-011')",
+            "pytest.mark.load",
+            "pytest.mark.asyncio",
+            "pytest.mark.timeout(120)",
+        }
+    }
 
 
 def test_strict_tests_do_not_swallow_failures() -> None:

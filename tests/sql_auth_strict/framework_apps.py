@@ -47,6 +47,7 @@ class FrameworkState:
         pool_config: PoolConfig | None = None,
         timeout_config=None,
         lifecycle_config=None,
+        operation_metrics_config=None,
     ) -> FrameworkState:
         if not IDENTIFIER.fullmatch(application_name):
             raise ValueError(
@@ -57,6 +58,10 @@ class FrameworkState:
             connection_kwargs["timeout_config"] = timeout_config
         if lifecycle_config is not None:
             connection_kwargs["lifecycle_config"] = lifecycle_config
+        if operation_metrics_config is not None:
+            connection_kwargs["operation_metrics_config"] = (
+                operation_metrics_config
+            )
         connection = Connection(
             server=config.host,
             port=config.port,

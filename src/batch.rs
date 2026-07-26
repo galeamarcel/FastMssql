@@ -7,6 +7,7 @@ use crate::helpers::{
     requires_direct_batch,
 };
 use crate::lifecycle::ConnectionLifecycle;
+use crate::operation_metrics::{OperationMetricsRegistry, observe_operation};
 use crate::parameter_conversion::{
     FastParameter, MAX_USER_QUERY_PARAMETERS, TypedNull, convert_parameters_to_fast,
     params_as_sql_refs, python_to_fast_parameter,
@@ -209,104 +210,108 @@ pub fn execute_batch<'p>(
     timeout_config: PyTimeoutConfig,
     lifecycle: Arc<ConnectionLifecycle>,
     azure_credential: Option<Arc<PyAzureCredential>>,
+    operation_metrics: Option<Arc<OperationMetricsRegistry>>,
     py: Python<'p>,
     commands: &Bound<'p, PyList>,
 ) -> PyResult<Bound<'p, PyAny>> {
     let batch_commands = parse_batch_items(commands, py)?;
 
     future_into_py(py, async move {
-        let permit = lifecycle.admit_operation(OperationName::ExecuteBatch, true)?;
-        permit
-            .run(async move {
-                // ── Safety: dedicated connection, not a pooled one ─────────────────────────
-                //
-                // execute_batch wraps all commands in a single BEGIN / COMMIT transaction.
-                // If the caller's coroutine is cancelled (e.g. asyncio.Task.cancel()) while
-                // the transaction is open, the Rust future is dropped.  With a *pooled*
-                // connection the guard would silently return the connection to the pool with
-                // an open BEGIN TRANSACTION, corrupting the state seen by the next caller.
-                //
-                // By using a *dedicated* TCP connection instead:
-                //   • If the future is dropped, the TCP socket is closed by the OS.
-                //   • SQL Server detects the broken connection and automatically rolls back.
-                //   • The shared pool is never touched, so no poisoning is possible.
-                //
-                // The cost (one extra TCP + TDS handshake per batch call) is acceptable
-                // because batch operations are inherently heavy and latency-tolerant.
-                // ───────────────────────────────────────────────────────────────────────────
+        observe_operation(operation_metrics, OperationName::ExecuteBatch, async move {
+            let permit = lifecycle.admit_operation(OperationName::ExecuteBatch, true)?;
+            permit
+                .run(async move {
+                    // ── Safety: dedicated connection, not a pooled one ─────────────────────────
+                    //
+                    // execute_batch wraps all commands in a single BEGIN / COMMIT transaction.
+                    // If the caller's coroutine is cancelled (e.g. asyncio.Task.cancel()) while
+                    // the transaction is open, the Rust future is dropped.  With a *pooled*
+                    // connection the guard would silently return the connection to the pool with
+                    // an open BEGIN TRANSACTION, corrupting the state seen by the next caller.
+                    //
+                    // By using a *dedicated* TCP connection instead:
+                    //   • If the future is dropped, the TCP socket is closed by the OS.
+                    //   • SQL Server detects the broken connection and automatically rolls back.
+                    //   • The shared pool is never touched, so no poisoning is possible.
+                    //
+                    // The cost (one extra TCP + TDS handshake per batch call) is acceptable
+                    // because batch operations are inherently heavy and latency-tolerant.
+                    // ───────────────────────────────────────────────────────────────────────────
 
-                let mut conn = connect_client_with_timeout(
-                    &config,
-                    azure_credential.as_ref(),
-                    timeout_config.connect_timeout,
-                    OperationName::ExecuteBatch,
-                )
-                .await?;
+                    let mut conn = connect_client_with_timeout(
+                        &config,
+                        azure_credential.as_ref(),
+                        timeout_config.connect_timeout,
+                        OperationName::ExecuteBatch,
+                    )
+                    .await?;
 
-                let deadline =
-                    deadline_from(TimeoutPhase::Operation, timeout_config.operation_timeout);
-                let mut transaction_started = false;
-                let operation = run_until(
-                    deadline,
-                    catch_driver_panic(async {
-                        consume_simple_command(
-                            &mut conn,
-                            "BEGIN TRANSACTION",
-                            "Failed to start transaction",
-                        )
-                        .await?;
-                        transaction_started = true;
-
-                        let all_results =
-                            execute_batch_on_connection(&mut conn, batch_commands).await?;
-
-                        consume_simple_command(
-                            &mut conn,
-                            "COMMIT TRANSACTION",
-                            "Failed to commit batch transaction",
-                        )
-                        .await?;
-                        transaction_started = false;
-                        Ok::<Vec<u64>, PyErr>(all_results)
-                    }),
-                )
-                .await;
-
-                let all_results = match operation {
-                    Err(elapsed) => {
-                        return Err(operation_timeout_error(
-                            elapsed,
-                            OperationName::ExecuteBatch,
-                            true,
-                        ));
-                    }
-                    Ok(Err(driver_panic)) => return Err(driver_panic),
-                    Ok(Ok(Ok(results))) => results,
-                    Ok(Ok(Err(primary))) => {
-                        if transaction_started
-                            && let Err(cleanup) = rollback_after_failure(
+                    let deadline =
+                        deadline_from(TimeoutPhase::Operation, timeout_config.operation_timeout);
+                    let mut transaction_started = false;
+                    let operation = run_until(
+                        deadline,
+                        catch_driver_panic(async {
+                            consume_simple_command(
                                 &mut conn,
-                                &timeout_config,
-                                OperationName::ExecuteBatch,
-                                "Failed to roll back batch transaction",
+                                "BEGIN TRANSACTION",
+                                "Failed to start transaction",
                             )
-                            .await
-                        {
-                            return Err(attach_cleanup_cause(primary, cleanup));
+                            .await?;
+                            transaction_started = true;
+
+                            let all_results =
+                                execute_batch_on_connection(&mut conn, batch_commands).await?;
+
+                            consume_simple_command(
+                                &mut conn,
+                                "COMMIT TRANSACTION",
+                                "Failed to commit batch transaction",
+                            )
+                            .await?;
+                            transaction_started = false;
+                            Ok::<Vec<u64>, PyErr>(all_results)
+                        }),
+                    )
+                    .await;
+
+                    let all_results = match operation {
+                        Err(elapsed) => {
+                            return Err(operation_timeout_error(
+                                elapsed,
+                                OperationName::ExecuteBatch,
+                                true,
+                            ));
                         }
-                        return Err(primary);
-                    }
-                };
+                        Ok(Err(driver_panic)) => return Err(driver_panic),
+                        Ok(Ok(Ok(results))) => results,
+                        Ok(Ok(Err(primary))) => {
+                            if transaction_started
+                                && let Err(cleanup) = rollback_after_failure(
+                                    &mut conn,
+                                    &timeout_config,
+                                    OperationName::ExecuteBatch,
+                                    "Failed to roll back batch transaction",
+                                )
+                                .await
+                            {
+                                return Err(attach_cleanup_cause(primary, cleanup));
+                            }
+                            return Err(primary);
+                        }
+                    };
 
-                // conn drops here — TCP connection closed cleanly.
-                // On future cancellation the OS closes the socket; SQL Server rolls back.
+                    // conn drops here — TCP connection closed cleanly.
+                    // On future cancellation the OS closes the socket; SQL Server rolls back.
 
-                Python::attach(|py| {
-                    let py_list = PyList::new(py, all_results)?;
-                    Ok(py_list.into_any().unbind())
+                    Python::attach(|py| {
+                        let py_list = PyList::new(py, all_results)?;
+                        Ok(py_list.into_any().unbind())
+                    })
                 })
-            })
-            .await
+                .await
+        })
+        .await
     })
 }
 
@@ -318,6 +323,7 @@ pub fn query_batch<'p>(
     timeout_config: PyTimeoutConfig,
     lifecycle: Arc<ConnectionLifecycle>,
     azure_credential: Option<Arc<PyAzureCredential>>,
+    operation_metrics: Option<Arc<OperationMetricsRegistry>>,
     py: Python<'p>,
     queries: &Bound<'p, PyList>,
 ) -> PyResult<Bound<'p, PyAny>> {
@@ -331,63 +337,69 @@ pub fn query_batch<'p>(
     let pool_config = pool_config.clone();
 
     future_into_py(py, async move {
-        let permit = lifecycle.admit_operation(OperationName::QueryBatch, true)?;
-        permit
-            .run(async move {
-                let pool_ref = ensure_pool_initialized_with_auth(
-                    pool,
-                    config,
-                    &pool_config,
-                    &timeout_config,
-                    azure_credential,
-                    OperationName::QueryBatch,
-                )
-                .await?;
-
-                let pooled = pool_ref.get().await.map_err(|error| {
-                    map_pool_checkout_error(
-                        error,
+        observe_operation(operation_metrics, OperationName::QueryBatch, async move {
+            let permit = lifecycle.admit_operation(OperationName::QueryBatch, true)?;
+            permit
+                .run(async move {
+                    let pool_ref = ensure_pool_initialized_with_auth(
+                        pool,
+                        config,
+                        &pool_config,
+                        &timeout_config,
+                        azure_credential,
                         OperationName::QueryBatch,
-                        timeout_config.acquire_timeout,
                     )
-                })?;
-                let mut conn = PooledOperationGuard::new(pooled);
+                    .await?;
 
-                let deadline =
-                    deadline_from(TimeoutPhase::Operation, timeout_config.operation_timeout);
-                let operation = run_until(
-                    deadline,
-                    catch_driver_panic(query_batch_on_connection(&mut conn, batch_queries)),
-                )
-                .await;
-                let all_results = match operation {
-                    Err(elapsed) => {
-                        return Err(operation_timeout_error(
-                            elapsed,
+                    let pooled = pool_ref.get().await.map_err(|error| {
+                        map_pool_checkout_error(
+                            error,
                             OperationName::QueryBatch,
-                            true,
-                        ));
-                    }
-                    Ok(Ok(result)) => {
-                        conn.complete_with_result_and_retirement(&result, retire_after_operation);
-                        result?
-                    }
-                    Ok(Err(driver_panic)) => return Err(driver_panic),
-                };
+                            timeout_config.acquire_timeout,
+                        )
+                    })?;
+                    let mut conn = PooledOperationGuard::new(pooled);
 
-                Python::attach(|py| -> PyResult<Py<PyAny>> {
-                    let mut py_results = Vec::with_capacity(all_results.len());
-                    for result in all_results {
-                        let query_stream =
-                            crate::types::PyQueryStream::from_tiberius_rows(result, py)?;
-                        let py_result = Py::new(py, query_stream)?;
-                        py_results.push(py_result.into_any());
-                    }
-                    let py_list = PyList::new(py, py_results)?;
-                    Ok(py_list.into_any().unbind())
+                    let deadline =
+                        deadline_from(TimeoutPhase::Operation, timeout_config.operation_timeout);
+                    let operation = run_until(
+                        deadline,
+                        catch_driver_panic(query_batch_on_connection(&mut conn, batch_queries)),
+                    )
+                    .await;
+                    let all_results = match operation {
+                        Err(elapsed) => {
+                            return Err(operation_timeout_error(
+                                elapsed,
+                                OperationName::QueryBatch,
+                                true,
+                            ));
+                        }
+                        Ok(Ok(result)) => {
+                            conn.complete_with_result_and_retirement(
+                                &result,
+                                retire_after_operation,
+                            );
+                            result?
+                        }
+                        Ok(Err(driver_panic)) => return Err(driver_panic),
+                    };
+
+                    Python::attach(|py| -> PyResult<Py<PyAny>> {
+                        let mut py_results = Vec::with_capacity(all_results.len());
+                        for result in all_results {
+                            let query_stream =
+                                crate::types::PyQueryStream::from_tiberius_rows(result, py)?;
+                            let py_result = Py::new(py, query_stream)?;
+                            py_results.push(py_result.into_any());
+                        }
+                        let py_list = PyList::new(py, py_results)?;
+                        Ok(py_list.into_any().unbind())
+                    })
                 })
-            })
-            .await
+                .await
+        })
+        .await
     })
 }
 
@@ -491,6 +503,7 @@ pub fn bulk_insert<'p>(
     timeout_config: PyTimeoutConfig,
     lifecycle: Arc<ConnectionLifecycle>,
     azure_credential: Option<Arc<PyAzureCredential>>,
+    operation_metrics: Option<Arc<OperationMetricsRegistry>>,
     py: Python<'p>,
     table_name: String,
     columns: Vec<String>,
@@ -559,141 +572,145 @@ pub fn bulk_insert<'p>(
         .join(", ");
 
     future_into_py(py, async move {
-        let permit = lifecycle.admit_operation(OperationName::BulkInsert, true)?;
-        permit
-            .run(async move {
-                let pool_ref = ensure_pool_initialized_with_auth(
-                    pool,
-                    config,
-                    &pool_config,
-                    &timeout_config,
-                    azure_credential,
-                    OperationName::BulkInsert,
-                )
-                .await?;
-
-                let pooled = pool_ref.get().await.map_err(|error| {
-                    map_pool_checkout_error(
-                        error,
+        observe_operation(operation_metrics, OperationName::BulkInsert, async move {
+            let permit = lifecycle.admit_operation(OperationName::BulkInsert, true)?;
+            permit
+                .run(async move {
+                    let pool_ref = ensure_pool_initialized_with_auth(
+                        pool,
+                        config,
+                        &pool_config,
+                        &timeout_config,
+                        azure_credential,
                         OperationName::BulkInsert,
-                        timeout_config.acquire_timeout,
                     )
-                })?;
-                let mut conn = PooledOperationGuard::new(pooled);
+                    .await?;
 
-                let deadline =
-                    deadline_from(TimeoutPhase::Operation, timeout_config.operation_timeout);
-                let mut transaction_started = false;
-                let operation = run_until(
-                    deadline,
-                    catch_driver_panic(async {
-                        consume_simple_command(
-                            &mut conn,
-                            "BEGIN TRANSACTION",
-                            "Failed to start bulk transaction",
+                    let pooled = pool_ref.get().await.map_err(|error| {
+                        map_pool_checkout_error(
+                            error,
+                            OperationName::BulkInsert,
+                            timeout_config.acquire_timeout,
                         )
-                        .await?;
-                        transaction_started = true;
+                    })?;
+                    let mut conn = PooledOperationGuard::new(pooled);
 
-                        let mut total_affected = 0u64;
+                    let deadline =
+                        deadline_from(TimeoutPhase::Operation, timeout_config.operation_timeout);
+                    let mut transaction_started = false;
+                    let operation = run_until(
+                        deadline,
+                        catch_driver_panic(async {
+                            consume_simple_command(
+                                &mut conn,
+                                "BEGIN TRANSACTION",
+                                "Failed to start bulk transaction",
+                            )
+                            .await?;
+                            transaction_started = true;
 
-                        // Drain chunks via into_iter: each Vec<FastParameter> is moved
-                        // out and freed before the next request.
-                        for chunk in chunks {
-                            let row_count_in_batch = chunk.len() / col_count;
-                            let mut sql =
-                                String::with_capacity(100 + row_count_in_batch * (col_count * 5));
-                            sql.push_str("INSERT INTO ");
-                            sql.push_str(&quoted_table);
-                            sql.push_str(" (");
-                            sql.push_str(&columns_sql);
-                            sql.push_str(") VALUES ");
+                            let mut total_affected = 0u64;
 
-                            for row in 0..row_count_in_batch {
-                                if row > 0 {
-                                    sql.push(',');
-                                }
-                                sql.push('(');
-                                for column in 1..=col_count {
-                                    if column > 1 {
+                            // Drain chunks via into_iter: each Vec<FastParameter> is moved
+                            // out and freed before the next request.
+                            for chunk in chunks {
+                                let row_count_in_batch = chunk.len() / col_count;
+                                let mut sql = String::with_capacity(
+                                    100 + row_count_in_batch * (col_count * 5),
+                                );
+                                sql.push_str("INSERT INTO ");
+                                sql.push_str(&quoted_table);
+                                sql.push_str(" (");
+                                sql.push_str(&columns_sql);
+                                sql.push_str(") VALUES ");
+
+                                for row in 0..row_count_in_batch {
+                                    if row > 0 {
                                         sql.push(',');
                                     }
-                                    sql.push('@');
-                                    sql.push('P');
-                                    let parameter_number = (row * col_count) + column;
-                                    let _ = write!(sql, "{}", parameter_number);
+                                    sql.push('(');
+                                    for column in 1..=col_count {
+                                        if column > 1 {
+                                            sql.push(',');
+                                        }
+                                        sql.push('@');
+                                        sql.push('P');
+                                        let parameter_number = (row * col_count) + column;
+                                        let _ = write!(sql, "{}", parameter_number);
+                                    }
+                                    sql.push(')');
                                 }
-                                sql.push(')');
+
+                                let mut params: SmallVec<[&dyn tiberius::ToSql; 128]> =
+                                    SmallVec::with_capacity(chunk.len());
+                                for parameter in &chunk {
+                                    params.push(parameter as &dyn tiberius::ToSql);
+                                }
+
+                                let result = conn.execute(sql, &params).await.map_err(|error| {
+                                    create_sql_error(error, "Batch execution failed")
+                                })?;
+                                total_affected += result.rows_affected().iter().sum::<u64>();
                             }
 
-                            let mut params: SmallVec<[&dyn tiberius::ToSql; 128]> =
-                                SmallVec::with_capacity(chunk.len());
-                            for parameter in &chunk {
-                                params.push(parameter as &dyn tiberius::ToSql);
-                            }
-
-                            let result = conn.execute(sql, &params).await.map_err(|error| {
-                                create_sql_error(error, "Batch execution failed")
-                            })?;
-                            total_affected += result.rows_affected().iter().sum::<u64>();
-                        }
-
-                        consume_simple_command(
-                            &mut conn,
-                            "COMMIT TRANSACTION",
-                            "Failed to commit bulk transaction",
-                        )
-                        .await?;
-                        transaction_started = false;
-                        Ok::<u64, PyErr>(total_affected)
-                    }),
-                )
-                .await;
-
-                let total_affected = match operation {
-                    Err(elapsed) => {
-                        return Err(operation_timeout_error(
-                            elapsed,
-                            OperationName::BulkInsert,
-                            true,
-                        ));
-                    }
-                    Ok(Err(driver_panic)) => return Err(driver_panic),
-                    Ok(Ok(Ok(total))) => {
-                        conn.complete();
-                        total
-                    }
-                    Ok(Ok(Err(primary))) => {
-                        conn.observe_error(&primary);
-                        let result = if transaction_started {
-                            rollback_after_failure(
+                            consume_simple_command(
                                 &mut conn,
-                                &timeout_config,
-                                OperationName::BulkInsert,
-                                "Failed to roll back bulk transaction",
+                                "COMMIT TRANSACTION",
+                                "Failed to commit bulk transaction",
                             )
-                            .await
-                        } else {
-                            Ok(())
-                        };
-                        match result {
-                            Ok(()) => {
-                                conn.complete();
-                                return Err(primary);
-                            }
-                            Err(cleanup) => {
-                                return Err(attach_cleanup_cause(primary, cleanup));
+                            .await?;
+                            transaction_started = false;
+                            Ok::<u64, PyErr>(total_affected)
+                        }),
+                    )
+                    .await;
+
+                    let total_affected = match operation {
+                        Err(elapsed) => {
+                            return Err(operation_timeout_error(
+                                elapsed,
+                                OperationName::BulkInsert,
+                                true,
+                            ));
+                        }
+                        Ok(Err(driver_panic)) => return Err(driver_panic),
+                        Ok(Ok(Ok(total))) => {
+                            conn.complete();
+                            total
+                        }
+                        Ok(Ok(Err(primary))) => {
+                            conn.observe_error(&primary);
+                            let result = if transaction_started {
+                                rollback_after_failure(
+                                    &mut conn,
+                                    &timeout_config,
+                                    OperationName::BulkInsert,
+                                    "Failed to roll back bulk transaction",
+                                )
+                                .await
+                            } else {
+                                Ok(())
+                            };
+                            match result {
+                                Ok(()) => {
+                                    conn.complete();
+                                    return Err(primary);
+                                }
+                                Err(cleanup) => {
+                                    return Err(attach_cleanup_cause(primary, cleanup));
+                                }
                             }
                         }
-                    }
-                };
+                    };
 
-                Python::attach(|py| {
-                    let res = total_affected.into_pyobject(py)?;
-                    Ok(res.into_any().unbind())
+                    Python::attach(|py| {
+                        let res = total_affected.into_pyobject(py)?;
+                        Ok(res.into_any().unbind())
+                    })
                 })
-            })
-            .await
+                .await
+        })
+        .await
     })
 }
 

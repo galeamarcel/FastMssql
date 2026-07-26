@@ -352,7 +352,17 @@ async def test_first_query_initializes_connection_lazily(
 async def test_explicit_connect_is_idempotent(
     sql_auth_config: SqlAuthConfig,
 ) -> None:
-    connection = _individual_connection(sql_auth_config)
+    connection = _individual_connection(
+        sql_auth_config,
+        pool_config=PoolConfig(
+            max_size=2,
+            min_idle=0,
+            max_lifetime_secs=None,
+            idle_timeout_secs=None,
+            connection_timeout_secs=2,
+            retry_connection=False,
+        ),
+    )
     assert await connection.connect() is True
     first_stats = await connection.pool_stats()
     assert await connection.connect() is True

@@ -35,6 +35,12 @@ from sql_auth_strict.framework_apps import (
     wait_for_session_count,
 )
 from sql_auth_strict.helpers import event_loop_ticks, quote_identifier, scalar
+from sql_auth_strict.operation_metrics_assertions import (
+    OUTCOME_KEYS,
+    assert_operation_stats,
+    operation_delta,
+    zero_outcomes,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -1520,4 +1526,288 @@ async def test_framework_lifecycle_shutdown_modes(
         sa_connection,
         flask_wsgi_state.application_name,
         expected=0,
+    )
+
+
+def _assert_framework_query_successes(
+    before: dict[str, object],
+    after: dict[str, object],
+    expected: int,
+) -> None:
+    delta = operation_delta(before, after, "query")
+    assert delta["started"] == delta["completed"] == expected
+    assert {key: delta[key] for key in OUTCOME_KEYS} == zero_outcomes(
+        succeeded=expected
+    )
+    assert after["operations"]["query"]["in_flight"] == 0
+
+
+@case("OPMET-014")
+@pytest.mark.asyncio
+async def test_fastapi_operation_metrics_are_exact_under_concurrency(
+    sql_auth_config,
+    sa_connection,
+    unique_sql_name,
+    record_framework_metric,
+) -> None:
+    request_count = 100
+    worker_count = 20
+    max_size = 8
+    metrics_type = getattr(fastmssql, "OperationMetricsConfig")
+    state = FrameworkState.create(
+        sql_auth_config,
+        application_name=unique_sql_name("strict_opmet_fastapi"),
+        max_size=max_size,
+        operation_metrics_config=metrics_type(enabled=True),
+    )
+    app = create_fastapi_app(state, "[unused_opmet_table]")
+    after_requests: dict[str, object] | None = None
+
+    async with LifespanManager(app):
+        before = await state.connection.operation_stats()
+        stop = asyncio.Event()
+        ticker_task = asyncio.create_task(
+            event_loop_ticks(stop, interval=0.0)
+        )
+        pool_task = asyncio.create_task(
+            _sample_framework_pool(state.connection, stop)
+        )
+
+        async def worker(worker_id: int) -> list[int]:
+            values: list[int] = []
+            async with asgi_client(app) as client:
+                for value in range(worker_id, request_count, worker_count):
+                    response = await client.get(
+                        f"/wait/{value}?profile=none"
+                    )
+                    assert response.status_code == 200
+                    values.append(int(response.json()["value"]))
+            return values
+
+        started = time.monotonic()
+        try:
+            worker_results = await asyncio.gather(
+                *(worker(worker_id) for worker_id in range(worker_count))
+            )
+        finally:
+            stop.set()
+            ticks = await ticker_task
+            maximum_connections = await pool_task
+        elapsed = time.monotonic() - started
+        assert sorted(
+            value
+            for worker_values in worker_results
+            for value in worker_values
+        ) == list(range(request_count))
+        after_requests = await state.connection.operation_stats()
+        assert_operation_stats(after_requests, enabled=True)
+        _assert_framework_query_successes(
+            before,
+            after_requests,
+            request_count,
+        )
+        assert len(ticks) > 10
+        assert maximum_connections <= max_size
+
+    assert after_requests is not None
+    after_shutdown = await state.connection.operation_stats()
+    disconnect_delta = operation_delta(
+        after_requests,
+        after_shutdown,
+        "disconnect",
+    )
+    assert disconnect_delta["started"] == disconnect_delta["completed"] == 1
+    assert {
+        key: disconnect_delta[key] for key in OUTCOME_KEYS
+    } == zero_outcomes(succeeded=1)
+    await wait_for_session_count(
+        sa_connection,
+        state.application_name,
+        expected=0,
+    )
+    record_framework_metric(
+        "OPMET-014",
+        request_count=request_count,
+        worker_count=worker_count,
+        pool_max_size=max_size,
+        maximum_connections=maximum_connections,
+        event_loop_ticks=len(ticks),
+        elapsed_seconds=elapsed,
+        exact_query_delta=True,
+    )
+
+
+@case("OPMET-015")
+@pytest.mark.asyncio
+async def test_flask_wsgi_operation_metrics_preserve_loop_limits(
+    sql_auth_config,
+    sa_connection,
+    unique_sql_name,
+    record_framework_metric,
+) -> None:
+    request_count = 40
+    worker_count = 10
+    metrics_type = getattr(fastmssql, "OperationMetricsConfig")
+    state = FrameworkState.create(
+        sql_auth_config,
+        application_name=unique_sql_name("strict_opmet_flask_wsgi"),
+        max_size=10,
+        operation_metrics_config=metrics_type(enabled=True),
+    )
+    app = create_flask_app(state)
+    disconnected = False
+    try:
+        before = await state.connection.operation_stats()
+        first = await flask_request(app, "/loop")
+        second = await flask_request(app, "/loop")
+
+        async def worker(worker_id: int) -> list[int]:
+            values: list[int] = []
+            for value in range(worker_id, request_count, worker_count):
+                response = await flask_request(app, f"/value/{value}")
+                assert response.status_code == 200
+                values.append(int(response.get_json()["value"]))
+            return values
+
+        worker_results = await asyncio.gather(
+            *(worker(worker_id) for worker_id in range(worker_count))
+        )
+        after_requests = await state.connection.operation_stats()
+        assert first.status_code == second.status_code == 200
+        assert first.get_json()["sql_value"] == 15
+        assert second.get_json()["sql_value"] == 15
+        assert len(state.loops) == 2
+        assert state.loops[0] is not state.loops[1]
+        assert sorted(
+            value
+            for worker_values in worker_results
+            for value in worker_values
+        ) == list(range(request_count))
+        assert_operation_stats(after_requests, enabled=True)
+        _assert_framework_query_successes(
+            before,
+            after_requests,
+            request_count + 2,
+        )
+
+        assert await state.connection.disconnect() is True
+        disconnected = True
+        after_shutdown = await state.connection.operation_stats()
+        disconnect_delta = operation_delta(
+            after_requests,
+            after_shutdown,
+            "disconnect",
+        )
+        assert disconnect_delta["started"] == disconnect_delta["completed"] == 1
+        assert {
+            key: disconnect_delta[key] for key in OUTCOME_KEYS
+        } == zero_outcomes(succeeded=1)
+    finally:
+        if not disconnected:
+            await state.connection.disconnect()
+    await wait_for_session_count(
+        sa_connection,
+        state.application_name,
+        expected=0,
+    )
+    record_framework_metric(
+        "OPMET-015",
+        execution_model="WSGI per-request event loop",
+        query_count=request_count + 2,
+        worker_count=worker_count,
+        distinct_request_loops=True,
+    )
+
+
+@case("OPMET-016")
+@pytest.mark.asyncio
+async def test_flask_asgi_operation_metrics_use_persistent_loop(
+    sql_auth_config,
+    sa_connection,
+    unique_sql_name,
+    record_framework_metric,
+) -> None:
+    request_count = 40
+    worker_count = 10
+    metrics_type = getattr(fastmssql, "OperationMetricsConfig")
+    state = FrameworkState.create(
+        sql_auth_config,
+        application_name=unique_sql_name("strict_opmet_flask_asgi"),
+        max_size=10,
+        operation_metrics_config=metrics_type(enabled=True),
+    )
+    after_requests: dict[str, object] | None = None
+
+    async with adapted_flask_lifespan(state) as adapted_app:
+        before = await state.connection.operation_stats()
+        stop = asyncio.Event()
+        ticker_task = asyncio.create_task(
+            event_loop_ticks(stop, interval=0.0)
+        )
+
+        async def worker(worker_id: int) -> list[int]:
+            values: list[int] = []
+            async with asgi_client(adapted_app) as client:
+                for value in range(worker_id, request_count, worker_count):
+                    response = await client.get(f"/value/{value}")
+                    assert response.status_code == 200
+                    values.append(int(response.json()["value"]))
+            return values
+
+        try:
+            async with asgi_client(adapted_app) as client:
+                first = await client.get("/loop")
+                second = await client.get("/loop")
+                worker_results = await asyncio.gather(
+                    *(
+                        worker(worker_id)
+                        for worker_id in range(worker_count)
+                    )
+                )
+        finally:
+            stop.set()
+            ticks = await ticker_task
+
+        assert first.status_code == second.status_code == 200
+        assert first.json()["sql_value"] == 15
+        assert second.json()["sql_value"] == 15
+        assert len(state.loops) == 2
+        assert state.loops[0] is state.loops[1]
+        assert sorted(
+            value
+            for worker_values in worker_results
+            for value in worker_values
+        ) == list(range(request_count))
+        after_requests = await state.connection.operation_stats()
+        assert_operation_stats(after_requests, enabled=True)
+        _assert_framework_query_successes(
+            before,
+            after_requests,
+            request_count + 2,
+        )
+        assert len(ticks) > 10
+
+    assert after_requests is not None
+    after_shutdown = await state.connection.operation_stats()
+    disconnect_delta = operation_delta(
+        after_requests,
+        after_shutdown,
+        "disconnect",
+    )
+    assert disconnect_delta["started"] == disconnect_delta["completed"] == 1
+    assert {
+        key: disconnect_delta[key] for key in OUTCOME_KEYS
+    } == zero_outcomes(succeeded=1)
+    await wait_for_session_count(
+        sa_connection,
+        state.application_name,
+        expected=0,
+    )
+    record_framework_metric(
+        "OPMET-016",
+        execution_model="persistent ASGI loop around Flask/WSGI",
+        query_count=request_count + 2,
+        worker_count=worker_count,
+        event_loop_ticks=len(ticks),
+        persistent_loop=True,
     )
