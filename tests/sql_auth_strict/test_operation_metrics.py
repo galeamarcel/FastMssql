@@ -335,9 +335,18 @@ async def test_errors_are_classified_and_preflight_is_excluded(
         )
 
         before_preflight = await connection.operation_stats()
-        with pytest.raises(Exception):
+        with pytest.raises(
+            ValueError,
+            match="^Unsupported type: object$",
+        ):
             connection.query("SELECT @P1", [object()])
-        with pytest.raises(Exception):
+        with pytest.raises(
+            ValueError,
+            match=(
+                "^Batch item 0 parameter validation failed: "
+                "ValueError: Unsupported type: object$"
+            ),
+        ):
             connection.execute_batch([("SELECT @P1", [object()])])
         after_preflight = await connection.operation_stats()
         assert (
