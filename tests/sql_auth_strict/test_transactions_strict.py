@@ -12,6 +12,11 @@ import pytest
 from sql_auth_strict.cases import case
 from sql_auth_strict.config import SqlAuthConfig
 from sql_auth_strict.helpers import CleanupRegistry, quote_identifier, scalar
+from sql_auth_strict.operation_metrics_assertions import (
+    OUTCOME_KEYS,
+    operation_delta,
+    zero_outcomes,
+)
 from sql_auth_strict.tcp_fault_proxy import DownstreamGateProxy
 
 
@@ -112,7 +117,13 @@ def _pooled_transaction_connection(
     application_name: str | None = None,
     server: str | None = None,
     port: int | None = None,
+    operation_metrics_config=None,
 ) -> Connection:
+    connection_kwargs = {}
+    if operation_metrics_config is not None:
+        connection_kwargs["operation_metrics_config"] = (
+            operation_metrics_config
+        )
     return Connection(
         server=server or config.host,
         port=port or config.port,
@@ -130,6 +141,7 @@ def _pooled_transaction_connection(
             test_on_check_out=False,
             retry_connection=False,
         ),
+        **connection_kwargs,
     )
 
 
@@ -789,7 +801,7 @@ async def test_cancelled_transaction_lease_is_retired_and_waiter_recovers(
         await connection.disconnect()
 
 
-@case("TX-028")
+@case("TX-028", "OPMET-013")
 @pytest.mark.asyncio
 async def test_pooled_commit_ack_loss_is_typed_and_retires_connection(
     sa_connection: Connection,
@@ -808,12 +820,14 @@ async def test_pooled_commit_ack_loss_is_typed_and_retires_connection(
         sql_auth_config.port,
     )
     await proxy.start()
+    metrics_type = getattr(fastmssql, "OperationMetricsConfig")
     connection = _pooled_transaction_connection(
         sql_auth_config,
         max_size=1,
         application_name=unique_sql_name("strict_commit_unknown_pool_app"),
         server=proxy.host,
         port=proxy.port,
+        operation_metrics_config=metrics_type(enabled=True),
     )
     committing = connection.transaction()
     waiting = connection.transaction()
@@ -845,6 +859,7 @@ async def test_pooled_commit_ack_loss_is_typed_and_retires_connection(
         await asyncio.sleep(0.05)
         assert waiting_begin.done() is False
 
+        before_commit = await connection.operation_stats()
         proxy.pause_downstream()
         commit_task = asyncio.create_task(committing.commit())
         await _wait_for_row_count(sa_connection, table, 1)
@@ -860,6 +875,12 @@ async def test_pooled_commit_ack_loss_is_typed_and_retires_connection(
         assert error.retryable is False
         assert error.connection_discarded is True
         assert error.__cause__ is not None
+        after_commit = await connection.operation_stats()
+        delta = operation_delta(before_commit, after_commit, "commit")
+        assert delta["started"] == delta["completed"] == 1
+        assert {
+            key: delta[key] for key in OUTCOME_KEYS
+        } == zero_outcomes(outcome_unknown=1)
         assert await scalar(
             sa_connection,
             f"SELECT COUNT(*) FROM {table} WHERE id = 1",
