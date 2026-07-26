@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from decimal import Decimal
 import math
 import re
@@ -21,6 +21,21 @@ from sql_auth_strict.helpers import CleanupRegistry, quote_identifier, scalar
 
 
 pytestmark = [pytest.mark.sql_auth_strict, pytest.mark.integration]
+
+
+class _DateDependentTimezone(tzinfo):
+    def utcoffset(self, value: datetime | None) -> timedelta | None:
+        if value is None:
+            return None
+        return timedelta(hours=3, minutes=30)
+
+    def dst(self, value: datetime | None) -> timedelta:
+        del value
+        return timedelta(0)
+
+    def tzname(self, value: datetime | None) -> str:
+        del value
+        return "DateDependent/+03:30"
 
 
 @case("PARAM-001")
@@ -376,13 +391,14 @@ async def test_naive_datetime_and_aware_datetimeoffset_parameters(
     assert naive_row["base_type"] == "datetime2"
     assert naive_row["scale_value"] == 7
 
-    offsets = [
-        timedelta(hours=2, minutes=30),
-        -timedelta(hours=5, minutes=45),
-        timedelta(hours=14),
-        -timedelta(hours=14),
+    timezones = [
+        _DateDependentTimezone(),
+        timezone(timedelta(hours=2, minutes=30)),
+        timezone(-timedelta(hours=5, minutes=45)),
+        timezone(timedelta(hours=14)),
+        timezone(-timedelta(hours=14)),
     ]
-    for offset in offsets:
+    for zone in timezones:
         aware = datetime(
             2024,
             2,
@@ -391,7 +407,7 @@ async def test_naive_datetime_and_aware_datetimeoffset_parameters(
             34,
             56,
             123456,
-            tzinfo=timezone(offset),
+            tzinfo=zone,
         )
         row = (
             await owner_connection.query(
@@ -435,7 +451,7 @@ async def test_naive_datetime_and_aware_datetimeoffset_parameters(
             "Datetime offset must be between -14:00 and +14:00",
         ),
     ]
-    for tzinfo, reason, message in invalid_cases:
+    for invalid_zone, reason, message in invalid_cases:
         value = datetime(
             2024,
             2,
@@ -444,7 +460,7 @@ async def test_naive_datetime_and_aware_datetimeoffset_parameters(
             34,
             56,
             123456,
-            tzinfo=tzinfo,
+            tzinfo=invalid_zone,
         )
         with pytest.raises(ConversionError, match=rf"^{re.escape(message)}$") as error:
             await owner_connection.query("SELECT @P1", [value])
