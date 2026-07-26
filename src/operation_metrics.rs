@@ -518,10 +518,8 @@ mod tests {
         let metric = &registry.operations[index];
         metric.started.store(u64::MAX, Ordering::Relaxed);
         metric.outcomes[0].store(u64::MAX - 2, Ordering::Relaxed);
-        metric.outcomes[1].store(2, Ordering::Relaxed);
+        metric.outcomes[1].store(3, Ordering::Relaxed);
         metric.outcomes[2].store(1, Ordering::Relaxed);
-        metric.outcomes[3].store(1, Ordering::Relaxed);
-        metric.outcomes[4].store(1, Ordering::Relaxed);
 
         let query = &registry.snapshot().operations[index];
         assert_eq!(query.outcomes, [u64::MAX - 2, 2, 0, 0, 0]);
@@ -545,6 +543,22 @@ mod tests {
         assert_eq!(unsaturated_values.completed, 18);
         assert_eq!(unsaturated_values.in_flight, 0);
         assert!(unsaturated_values.saturated);
+    }
+
+    #[test]
+    fn snapshot_keeps_exact_capacity_outcomes_unsaturated() {
+        let registry = OperationMetricsRegistry::new();
+        let index = metric_index(OperationName::Query).unwrap();
+        let metric = &registry.operations[index];
+        metric.started.store(u64::MAX, Ordering::Relaxed);
+        metric.outcomes[0].store(u64::MAX - 2, Ordering::Relaxed);
+        metric.outcomes[1].store(2, Ordering::Relaxed);
+
+        let query = &registry.snapshot().operations[index];
+        assert_eq!(query.outcomes, [u64::MAX - 2, 2, 0, 0, 0]);
+        assert_eq!(query.completed, u64::MAX);
+        assert_eq!(query.in_flight, 0);
+        assert!(!query.saturated);
     }
 
     #[test]
