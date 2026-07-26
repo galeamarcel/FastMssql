@@ -66,6 +66,12 @@ class _FailingTimezone(tzinfo):
         return "Failing"
 
 
+class _FailingUUID(UUID):
+    @property
+    def bytes(self) -> bytes:
+        raise RuntimeError("internal UUID secret")
+
+
 @case("PARAM-001")
 @pytest.mark.asyncio
 async def test_none_with_inferable_sql_type(owner_connection: Connection) -> None:
@@ -607,6 +613,22 @@ async def test_time_parameter_uses_time_7_and_rejects_offsets(
 async def test_uuid_parameter_is_symmetric_and_uses_uniqueidentifier(
     owner_connection: Connection,
 ) -> None:
+    conversion_message = "UUID parameter conversion failed"
+    with pytest.raises(
+        ConversionError,
+        match=rf"^{re.escape(conversion_message)}$",
+    ) as error:
+        await owner_connection.query(
+            "SELECT @P1",
+            [_FailingUUID("12345678-1234-5678-9234-567812345678")],
+        )
+    assert error.value.message == conversion_message
+    assert error.value.parameter_index == 0
+    assert error.value.sql_type == "UNIQUEIDENTIFIER"
+    assert error.value.reason == "invalid_uuid"
+    assert error.value.retryable is False
+    assert "internal UUID secret" not in str(error.value)
+
     value = UUID("12345678-1234-5678-9234-567812345678")
     row = (
         await owner_connection.query(
