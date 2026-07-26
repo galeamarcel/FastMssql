@@ -539,12 +539,16 @@ uv run pytest \
 Expected:
 
 ```text
-matrix contract passes with 310 unique IDs
-lifecycle contract fails because LifecycleConfig is not exported
+the registry/report assertions pass with 310 unique IDs
+the source-attachment assertion remains RED for LIFE-001..015 until Tasks 3-5
+the lifecycle contract fails because LifecycleConfig is not exported
 ```
 
-If the failure occurs before that missing API assertion, fix only the test
-fixture or registry wiring; do not add implementation on the RED branch.
+At this intermediate commit, the full matrix file is intentionally not green:
+the specification IDs exist before their test-source markers. After Tasks 3-5
+attach every LIFE marker, rerun the complete matrix and require it to pass.
+If any other failure occurs, fix only the test fixture or registry wiring; do
+not add implementation on the RED branch.
 
 - [ ] **Step 6: Commit the public RED contract**
 
@@ -1341,13 +1345,22 @@ async def test_framework_lifecycle_shutdown_modes(
         await client_context.__aexit__(None, None, None)
 ```
 
-Repeat the same request/shutdown ordering with
-`adapted_flask_lifespan(state)` and its returned WsgiToAsgi app. For plain
-WSGI, use two calls to `flask_request(app, "/loop")`, assert their `loop_id`
-values differ, explicitly await `state.connection.disconnect()` after each
-request so the shared wrapper lazily opens a fresh generation on the next
-transient loop, and assert only functional SQL correctness plus zero final
-sessions.
+For `adapted_flask_lifespan(state)`, account for the verified asgiref execution
+model: `WsgiToAsgi` dispatches WSGI calls through a thread-sensitive serialized
+lane. Two simultaneous HTTP requests therefore cannot prove that a late
+request reaches FastMssql while the first WSGI request is active. Instead,
+start one visible admitted SQL operation on the same application-scoped
+connection, begin lifespan shutdown, then issue `/timeout/99` through the
+returned WsgiToAsgi app. This keeps the WSGI thread available and proves that
+the late HTTP request reaches the driver and receives the typed `Closing`
+payload. Record this serialization limitation; do not claim native-ASGI
+inter-request parallelism for Flask.
+
+For plain WSGI, use two calls to `flask_request(app, "/loop")`, assert their
+`loop_id` values differ, explicitly await `state.connection.disconnect()`
+after each request so the shared wrapper lazily opens a fresh generation on
+the next transient loop, and assert only functional SQL correctness plus zero
+final sessions.
 
 - [ ] **Step 4: Run and record RED**
 
