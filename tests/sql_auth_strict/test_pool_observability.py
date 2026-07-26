@@ -45,7 +45,7 @@ POOL_INTEGER_KEYS = POOL_STATS_KEYS - {
     "min_idle",
     "get_wait_time_seconds",
 }
-POOL_CLOSE_REASON_KEYS = {
+POOL_RETIREMENT_EVENT_KEYS = {
     "connections_closed_broken",
     "connections_closed_invalid",
     "connections_closed_max_lifetime",
@@ -406,10 +406,14 @@ async def test_checkout_validation_counts_killed_idle_connection_as_invalid(
             == before["connections_closed_invalid"] + 1
         )
         assert after["connections_created"] == before["connections_created"] + 1
-        assert after["connections_closed_broken"] == before["connections_closed_broken"]
+        assert (
+            after["connections_closed_broken"]
+            == before["connections_closed_broken"] + 1
+        )
         assert all(
             after[key] == before[key]
-            for key in POOL_CLOSE_REASON_KEYS - {"connections_closed_invalid"}
+            for key in POOL_RETIREMENT_EVENT_KEYS
+            - {"connections_closed_invalid", "connections_closed_broken"}
         )
     finally:
         assert await connection.disconnect() is True
