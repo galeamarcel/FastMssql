@@ -1,12 +1,12 @@
 use crate::py_parameters::Parameters;
 use crate::type_mapping;
 use crate::types::create_parameter_conversion_error;
-use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{
-    PyBool, PyByteArray, PyByteArrayMethods, PyBytes, PyFloat, PyInt, PyList, PyMemoryView,
-    PyString, PyTime, PyTuple,
+    PyBool, PyByteArray, PyByteArrayMethods, PyBytes, PyDateTime, PyFloat, PyInt, PyList,
+    PyMemoryView, PyString, PyTime, PyTuple,
 };
 use smallvec::SmallVec;
 
@@ -31,6 +31,7 @@ pub(crate) enum FastParameterValue {
     Date(NaiveDate),
     Time(NaiveTime),
     DateTime(NaiveDateTime),
+    DateTimeOffset(DateTime<FixedOffset>),
 }
 
 impl FastParameter {
@@ -52,6 +53,7 @@ impl tiberius::ToSql for FastParameter {
             FastParameterValue::Date(d) => d.to_sql(),
             FastParameterValue::Time(t) => t.to_sql(),
             FastParameterValue::DateTime(dt) => dt.to_sql(),
+            FastParameterValue::DateTimeOffset(dt) => dt.to_sql(),
         }
     }
 }
@@ -111,13 +113,8 @@ fn python_to_fast_parameter_at(
     if let Ok(py_time) = obj.cast::<PyTime>() {
         return time_to_fast_parameter(py_time, parameter_index);
     }
-    if let Ok(py_dt) = obj.extract::<NaiveDateTime>() {
-        return Ok(FastParameter::new(FastParameterValue::DateTime(py_dt)));
-    }
-    if let Ok(py_dt) = obj.extract::<DateTime<FixedOffset>>() {
-        return Ok(FastParameter::new(FastParameterValue::DateTime(
-            py_dt.naive_local(),
-        )));
+    if let Ok(py_datetime) = obj.cast::<PyDateTime>() {
+        return datetime_to_fast_parameter(py_datetime, parameter_index);
     }
     if let Ok(py_date) = obj.extract::<NaiveDate>() {
         return Ok(FastParameter::new(FastParameterValue::Date(py_date)));
@@ -168,6 +165,96 @@ fn time_to_fast_parameter(
     })?;
 
     Ok(FastParameter::new(FastParameterValue::Time(time)))
+}
+
+fn datetime_to_fast_parameter(
+    py_datetime: &Bound<PyDateTime>,
+    parameter_index: usize,
+) -> PyResult<FastParameter> {
+    let offset = py_datetime
+        .call_method0("utcoffset")
+        .map_err(|_| datetime_conversion_error(parameter_index, "DATETIMEOFFSET(7)"))?;
+
+    if offset.is_none() {
+        let datetime = python_datetime_components(py_datetime, parameter_index, "DATETIME2(7)")?;
+        return Ok(FastParameter::new(FastParameterValue::DateTime(datetime)));
+    }
+
+    let offset = offset
+        .extract::<Duration>()
+        .map_err(|_| datetime_conversion_error(parameter_index, "DATETIMEOFFSET(7)"))?;
+    let offset_microseconds = offset
+        .num_microseconds()
+        .ok_or_else(|| datetime_conversion_error(parameter_index, "DATETIMEOFFSET(7)"))?;
+    const MICROSECONDS_PER_MINUTE: i64 = 60 * 1_000_000;
+    if offset_microseconds % MICROSECONDS_PER_MINUTE != 0 {
+        return Err(create_parameter_conversion_error(
+            parameter_index,
+            "DATETIMEOFFSET(7)",
+            "offset_not_whole_minute",
+            "Datetime offset must be a whole number of minutes",
+        ));
+    }
+    let offset_minutes = offset_microseconds / MICROSECONDS_PER_MINUTE;
+    if !(-14 * 60..=14 * 60).contains(&offset_minutes) {
+        return Err(create_parameter_conversion_error(
+            parameter_index,
+            "DATETIMEOFFSET(7)",
+            "offset_out_of_range",
+            "Datetime offset must be between -14:00 and +14:00",
+        ));
+    }
+    let offset_seconds = i32::try_from(offset_minutes * 60)
+        .map_err(|_| datetime_conversion_error(parameter_index, "DATETIMEOFFSET(7)"))?;
+    let fixed_offset = FixedOffset::east_opt(offset_seconds)
+        .ok_or_else(|| datetime_conversion_error(parameter_index, "DATETIMEOFFSET(7)"))?;
+    let local_datetime =
+        python_datetime_components(py_datetime, parameter_index, "DATETIMEOFFSET(7)")?;
+    let datetime = local_datetime
+        .and_local_timezone(fixed_offset)
+        .single()
+        .ok_or_else(|| datetime_conversion_error(parameter_index, "DATETIMEOFFSET(7)"))?;
+
+    Ok(FastParameter::new(FastParameterValue::DateTimeOffset(
+        datetime,
+    )))
+}
+
+fn python_datetime_components(
+    py_datetime: &Bound<PyDateTime>,
+    parameter_index: usize,
+    sql_type: &'static str,
+) -> PyResult<NaiveDateTime> {
+    let extract = |name: &'static str| {
+        py_datetime
+            .getattr(name)
+            .and_then(|value| value.extract::<u32>())
+            .map_err(|_| datetime_conversion_error(parameter_index, sql_type))
+    };
+    let year = extract("year")?;
+    let month = extract("month")?;
+    let day = extract("day")?;
+    let hour = extract("hour")?;
+    let minute = extract("minute")?;
+    let second = extract("second")?;
+    let microsecond = extract("microsecond")?;
+
+    NaiveDate::from_ymd_opt(
+        i32::try_from(year).map_err(|_| datetime_conversion_error(parameter_index, sql_type))?,
+        month,
+        day,
+    )
+    .and_then(|date| date.and_hms_micro_opt(hour, minute, second, microsecond))
+    .ok_or_else(|| datetime_conversion_error(parameter_index, sql_type))
+}
+
+fn datetime_conversion_error(parameter_index: usize, sql_type: &'static str) -> PyErr {
+    create_parameter_conversion_error(
+        parameter_index,
+        sql_type,
+        "invalid_datetime",
+        "Datetime parameter conversion failed",
+    )
 }
 
 fn is_decimal_instance(obj: &Bound<PyAny>) -> PyResult<bool> {
