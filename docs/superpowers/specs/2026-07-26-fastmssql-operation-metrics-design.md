@@ -533,6 +533,15 @@ exported_started = max(raw_started, completed)
 in_flight = exported_started - completed
 ```
 
+The five exported outcomes are themselves reconciled into the same saturating
+sum. In fixed schema order, each outcome contributes at most the remaining
+capacity below `u64::MAX`; `completed` is the exact sum of those exported
+contributions. Raw values are unchanged while their mathematical sum fits.
+If projection discards any count, `saturated` becomes permanently true. This
+preserves the public outcome equality even after multiple independent outcome
+counters have saturated. The detailed amendment is
+`2026-07-26-fastmssql-operation-metrics-saturation-coherence-design.md`.
+
 Finite bucket values are cumulatively summed with saturation, made
 non-decreasing and clamped to `completed`. If `completed == 0`, public
 duration sum is `0.0`, min/max are `None` and every bucket is zero, even if a
