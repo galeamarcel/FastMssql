@@ -29,25 +29,20 @@ impl Parameter {
         }
     }
 
-    fn __repr__(&self, py: Python) -> String {
-        let value_bound = self.value.bind(py);
-        let value_repr = match value_bound.repr() {
-            Ok(repr) => repr.to_string(),
-            Err(_) => "<error>".to_string(),
-        };
+    fn __repr__(&self) -> String {
+        let sql_type = self.sql_type.as_ref().map_or_else(
+            || "None".to_owned(),
+            |value| {
+                let escaped: String = value.chars().flat_map(char::escape_default).collect();
+                format!("'{escaped}'")
+            },
+        );
+        let expanded = if self.is_expanded { "True" } else { "False" };
 
-        // Check if this is an expanded parameter (iterable)
-        if self.is_expanded {
-            match &self.sql_type {
-                Some(sql_type) => format!("Parameter(IN_values={}, type={})", value_repr, sql_type),
-                None => format!("Parameter(IN_values={})", value_repr),
-            }
-        } else {
-            match &self.sql_type {
-                Some(sql_type) => format!("Parameter(value={}, type={})", value_repr, sql_type),
-                None => format!("Parameter(value={})", value_repr),
-            }
-        }
+        format!(
+            "Parameter(sql_type={sql_type}, direction='INPUT', \
+             expanded={expanded}, value=<redacted>)"
+        )
     }
 }
 
