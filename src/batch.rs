@@ -9,8 +9,8 @@ use crate::helpers::{
 use crate::lifecycle::ConnectionLifecycle;
 use crate::operation_metrics::{OperationMetricsRegistry, observe_operation};
 use crate::parameter_conversion::{
-    FastParameter, MAX_USER_QUERY_PARAMETERS, TypedNull, convert_parameters_to_fast,
-    params_as_sql_refs, python_to_fast_parameter,
+    FastParameter, FastParameterValue, MAX_USER_QUERY_PARAMETERS, TypedNull,
+    convert_parameters_to_fast, params_as_sql_refs, python_to_fast_parameter,
 };
 use crate::pool_config::PyPoolConfig;
 use crate::pool_manager::{
@@ -473,23 +473,27 @@ fn fix_bulk_null_types(flat_data: &mut [FastParameter], col_count: usize) {
         // Infer the null type from the first non-null value in this column.
         let null_type = (0..row_count)
             .map(|row| &flat_data[row * col_count + col])
-            .find_map(|p| match p {
-                FastParameter::String(_) => Some(TypedNull::String),
-                FastParameter::I64(_) => Some(TypedNull::I64),
-                FastParameter::F64(_) => Some(TypedNull::F64),
-                FastParameter::Bool(_) => Some(TypedNull::Bit),
-                FastParameter::Bytes(_) => Some(TypedNull::Binary),
-                FastParameter::Date(_) => Some(TypedNull::Date),
-                FastParameter::DateTime(_) => Some(TypedNull::DateTime),
-                FastParameter::Null(_) => None,
+            .find_map(|parameter| match &parameter.value {
+                FastParameterValue::String(_) => Some(TypedNull::String),
+                FastParameterValue::I64(_) => Some(TypedNull::I64),
+                FastParameterValue::F64(_) => Some(TypedNull::F64),
+                FastParameterValue::Bool(_) => Some(TypedNull::Bit),
+                FastParameterValue::Bytes(_) => Some(TypedNull::Binary),
+                FastParameterValue::Numeric(_) => Some(TypedNull::Numeric),
+                FastParameterValue::Date(_) => Some(TypedNull::Date),
+                FastParameterValue::DateTime(_) => Some(TypedNull::DateTime),
+                FastParameterValue::Null(_) => None,
             })
             .unwrap_or(TypedNull::String); // all-null column → nvarchar null is safe
 
         // Patch every untyped Null in this column.
         for row in 0..row_count {
             let idx = row * col_count + col;
-            if matches!(&flat_data[idx], FastParameter::Null(TypedNull::U8)) {
-                flat_data[idx] = FastParameter::Null(null_type.clone());
+            if matches!(
+                &flat_data[idx].value,
+                FastParameterValue::Null(TypedNull::U8)
+            ) {
+                flat_data[idx].value = FastParameterValue::Null(null_type.clone());
             }
         }
     }

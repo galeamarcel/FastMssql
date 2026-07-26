@@ -1,11 +1,12 @@
 use crate::py_parameters::Parameters;
 use crate::type_mapping;
+use crate::types::create_parameter_conversion_error;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{
     PyBool, PyByteArray, PyByteArrayMethods, PyBytes, PyFloat, PyInt, PyList, PyMemoryView,
-    PyString,
+    PyString, PyTuple,
 };
 use smallvec::SmallVec;
 
@@ -14,90 +15,312 @@ use smallvec::SmallVec;
 pub(crate) const MAX_USER_QUERY_PARAMETERS: usize = 2_098;
 
 #[derive(Debug, Clone)]
-pub enum FastParameter {
+pub struct FastParameter {
+    pub(crate) value: FastParameterValue,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum FastParameterValue {
     Null(TypedNull),
     Bool(bool),
     I64(i64),
     F64(f64),
     String(String),
     Bytes(Vec<u8>),
+    Numeric(tiberius::numeric::Numeric),
     Date(NaiveDate),
     DateTime(NaiveDateTime),
 }
 
+impl FastParameter {
+    fn new(value: FastParameterValue) -> Self {
+        Self { value }
+    }
+}
+
 impl tiberius::ToSql for FastParameter {
     fn to_sql(&self) -> tiberius::ColumnData<'_> {
-        match self {
-            FastParameter::Null(t) => t.to_sql(),
-            FastParameter::Bool(b) => b.to_sql(),
-            FastParameter::I64(i) => i.to_sql(),
-            FastParameter::F64(f) => f.to_sql(),
-            FastParameter::String(s) => s.to_sql(),
-            FastParameter::Bytes(b) => b.to_sql(),
-            FastParameter::Date(d) => d.to_sql(),
-            FastParameter::DateTime(dt) => dt.to_sql(),
+        match &self.value {
+            FastParameterValue::Null(t) => t.to_sql(),
+            FastParameterValue::Bool(b) => b.to_sql(),
+            FastParameterValue::I64(i) => i.to_sql(),
+            FastParameterValue::F64(f) => f.to_sql(),
+            FastParameterValue::String(s) => s.to_sql(),
+            FastParameterValue::Bytes(b) => b.to_sql(),
+            FastParameterValue::Numeric(n) => n.to_sql(),
+            FastParameterValue::Date(d) => d.to_sql(),
+            FastParameterValue::DateTime(dt) => dt.to_sql(),
         }
     }
 }
 
 pub fn python_to_fast_parameter(obj: &Bound<PyAny>) -> PyResult<FastParameter> {
+    python_to_fast_parameter_at(obj, 0)
+}
+
+fn python_to_fast_parameter_at(
+    obj: &Bound<PyAny>,
+    parameter_index: usize,
+) -> PyResult<FastParameter> {
     if obj.is_none() {
-        return Ok(FastParameter::Null(TypedNull::U8));
+        return Ok(FastParameter::new(FastParameterValue::Null(TypedNull::U8)));
     }
 
     // Typed nulls
     if let Ok(tn) = obj.extract::<TypedNull>() {
-        return Ok(FastParameter::Null(tn));
+        return Ok(FastParameter::new(FastParameterValue::Null(tn)));
     }
 
     // Python bool is a subclass of int, so it must be detected first.
     if let Ok(py_b) = obj.cast::<PyBool>() {
-        return Ok(FastParameter::Bool(py_b.is_true()));
+        return Ok(FastParameter::new(FastParameterValue::Bool(py_b.is_true())));
     }
     if let Ok(py_i) = obj.cast::<PyInt>() {
         return py_i
             .extract::<i64>()
-            .map(FastParameter::I64)
+            .map(|value| FastParameter::new(FastParameterValue::I64(value)))
             .map_err(|_| PyValueError::new_err("Int too large"));
     }
     if let Ok(py_s) = obj.cast::<PyString>() {
         let s = py_s
             .to_str()
             .map_err(|_| PyValueError::new_err("String parameter contains invalid UTF-8"))?;
-        return Ok(FastParameter::String(s.to_owned()));
+        return Ok(FastParameter::new(FastParameterValue::String(s.to_owned())));
     }
     if let Ok(py_f) = obj.cast::<PyFloat>() {
-        return Ok(FastParameter::F64(py_f.value()));
+        return Ok(FastParameter::new(FastParameterValue::F64(py_f.value())));
     }
     if let Ok(py_by) = obj.cast::<PyBytes>() {
-        return Ok(FastParameter::Bytes(py_by.as_bytes().to_vec()));
+        return Ok(FastParameter::new(FastParameterValue::Bytes(
+            py_by.as_bytes().to_vec(),
+        )));
     }
     if let Ok(py_by) = obj.cast::<PyByteArray>() {
-        return Ok(FastParameter::Bytes(py_by.to_vec()));
+        return Ok(FastParameter::new(FastParameterValue::Bytes(
+            py_by.to_vec(),
+        )));
     }
     if obj.is_instance_of::<PyMemoryView>() {
         let py_by = PyByteArray::from(obj)?;
-        return Ok(FastParameter::Bytes(py_by.to_vec()));
+        return Ok(FastParameter::new(FastParameterValue::Bytes(
+            py_by.to_vec(),
+        )));
     }
     if let Ok(py_dt) = obj.extract::<NaiveDateTime>() {
-        return Ok(FastParameter::DateTime(py_dt));
+        return Ok(FastParameter::new(FastParameterValue::DateTime(py_dt)));
     }
     if let Ok(py_dt) = obj.extract::<DateTime<FixedOffset>>() {
-        return Ok(FastParameter::DateTime(py_dt.naive_local()));
+        return Ok(FastParameter::new(FastParameterValue::DateTime(
+            py_dt.naive_local(),
+        )));
     }
     if let Ok(py_date) = obj.extract::<NaiveDate>() {
-        return Ok(FastParameter::Date(py_date));
+        return Ok(FastParameter::new(FastParameterValue::Date(py_date)));
+    }
+    if is_decimal_instance(obj)? {
+        return decimal_to_fast_parameter(obj, parameter_index);
     }
 
     // Fallback for custom types
     if let Ok(i) = obj.extract::<i64>() {
-        Ok(FastParameter::I64(i))
+        Ok(FastParameter::new(FastParameterValue::I64(i)))
     } else {
         Err(PyValueError::new_err(format!(
             "Unsupported type: {}",
             obj.get_type().name()?
         )))
     }
+}
+
+fn is_decimal_instance(obj: &Bound<PyAny>) -> PyResult<bool> {
+    obj.is_instance(type_mapping::get_decimal_class(obj.py())?)
+}
+
+#[derive(Clone, Copy)]
+enum DecimalConversionFailure {
+    NonFinite,
+    PrecisionOverflow,
+    Invalid,
+}
+
+impl DecimalConversionFailure {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::NonFinite => "non_finite",
+            Self::PrecisionOverflow => "precision_overflow",
+            Self::Invalid => "invalid_decimal",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::NonFinite => "Decimal parameter must be finite",
+            Self::PrecisionOverflow => "Decimal parameter exceeds SQL Server NUMERIC precision 38",
+            Self::Invalid => "Decimal parameter conversion failed",
+        }
+    }
+}
+
+fn decimal_conversion_error(parameter_index: usize, failure: DecimalConversionFailure) -> PyErr {
+    create_parameter_conversion_error(
+        parameter_index,
+        "NUMERIC",
+        failure.reason(),
+        failure.message(),
+    )
+}
+
+fn decimal_to_fast_parameter(
+    obj: &Bound<PyAny>,
+    parameter_index: usize,
+) -> PyResult<FastParameter> {
+    let decimal_class = type_mapping::get_decimal_class(obj.py()).map_err(|_| {
+        decimal_conversion_error(parameter_index, DecimalConversionFailure::Invalid)
+    })?;
+
+    let is_finite = decimal_class
+        .getattr("is_finite")
+        .and_then(|method| method.call1((obj,)))
+        .and_then(|result| result.extract::<bool>())
+        .map_err(|_| {
+            decimal_conversion_error(parameter_index, DecimalConversionFailure::Invalid)
+        })?;
+    if !is_finite {
+        return Err(decimal_conversion_error(
+            parameter_index,
+            DecimalConversionFailure::NonFinite,
+        ));
+    }
+
+    let components = decimal_class
+        .getattr("as_tuple")
+        .and_then(|method| method.call1((obj,)))
+        .map_err(|_| {
+            decimal_conversion_error(parameter_index, DecimalConversionFailure::Invalid)
+        })?;
+    let sign = components
+        .getattr("sign")
+        .and_then(|value| value.extract::<u8>())
+        .map_err(|_| {
+            decimal_conversion_error(parameter_index, DecimalConversionFailure::Invalid)
+        })?;
+    if sign > 1 {
+        return Err(decimal_conversion_error(
+            parameter_index,
+            DecimalConversionFailure::Invalid,
+        ));
+    }
+
+    let digits_object = components.getattr("digits").map_err(|_| {
+        decimal_conversion_error(parameter_index, DecimalConversionFailure::Invalid)
+    })?;
+    let digits = digits_object.cast::<PyTuple>().map_err(|_| {
+        decimal_conversion_error(parameter_index, DecimalConversionFailure::Invalid)
+    })?;
+    let coefficient_digits = digits.len().max(1);
+    if coefficient_digits > 38 {
+        return Err(decimal_conversion_error(
+            parameter_index,
+            DecimalConversionFailure::PrecisionOverflow,
+        ));
+    }
+
+    let mut coefficient = 0_i128;
+    for digit in digits.iter() {
+        let digit = digit.extract::<u8>().map_err(|_| {
+            decimal_conversion_error(parameter_index, DecimalConversionFailure::Invalid)
+        })?;
+        if digit > 9 {
+            return Err(decimal_conversion_error(
+                parameter_index,
+                DecimalConversionFailure::Invalid,
+            ));
+        }
+        coefficient = coefficient
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(i128::from(digit)))
+            .ok_or_else(|| {
+                decimal_conversion_error(
+                    parameter_index,
+                    DecimalConversionFailure::PrecisionOverflow,
+                )
+            })?;
+    }
+
+    let exponent = components
+        .getattr("exponent")
+        .and_then(|value| value.extract::<i64>())
+        .map_err(|_| {
+            decimal_conversion_error(parameter_index, DecimalConversionFailure::PrecisionOverflow)
+        })?;
+
+    let scale = if exponent > 0 {
+        if coefficient != 0 {
+            let exponent = usize::try_from(exponent).map_err(|_| {
+                decimal_conversion_error(
+                    parameter_index,
+                    DecimalConversionFailure::PrecisionOverflow,
+                )
+            })?;
+            if exponent > 38_usize.saturating_sub(coefficient_digits) {
+                return Err(decimal_conversion_error(
+                    parameter_index,
+                    DecimalConversionFailure::PrecisionOverflow,
+                ));
+            }
+            for _ in 0..exponent {
+                coefficient = coefficient.checked_mul(10).ok_or_else(|| {
+                    decimal_conversion_error(
+                        parameter_index,
+                        DecimalConversionFailure::PrecisionOverflow,
+                    )
+                })?;
+            }
+        }
+        0
+    } else {
+        let scale = exponent.checked_neg().ok_or_else(|| {
+            decimal_conversion_error(parameter_index, DecimalConversionFailure::PrecisionOverflow)
+        })?;
+        u8::try_from(scale)
+            .ok()
+            .filter(|scale| *scale <= 38)
+            .ok_or_else(|| {
+                decimal_conversion_error(
+                    parameter_index,
+                    DecimalConversionFailure::PrecisionOverflow,
+                )
+            })?
+    };
+
+    let precision = if coefficient == 0 {
+        1_usize
+    } else {
+        coefficient_digits
+            + usize::try_from(exponent.max(0)).map_err(|_| {
+                decimal_conversion_error(
+                    parameter_index,
+                    DecimalConversionFailure::PrecisionOverflow,
+                )
+            })?
+    }
+    .max(usize::from(scale));
+    if precision > 38 {
+        return Err(decimal_conversion_error(
+            parameter_index,
+            DecimalConversionFailure::PrecisionOverflow,
+        ));
+    }
+
+    if sign == 1 {
+        coefficient = coefficient.checked_neg().ok_or_else(|| {
+            decimal_conversion_error(parameter_index, DecimalConversionFailure::PrecisionOverflow)
+        })?;
+    }
+
+    Ok(FastParameter::new(FastParameterValue::Numeric(
+        tiberius::numeric::Numeric::new_with_scale(coefficient, scale),
+    )))
 }
 
 /// Convert a `&[FastParameter]` into a `SmallVec` of `&dyn tiberius::ToSql` fat-pointer
@@ -158,9 +381,11 @@ fn python_params_to_fast_parameters(
         if type_mapping::is_expandable_iterable(&param)? {
             // Calculate remaining budget and pass it to prevent unbounded generator expansion
             let remaining = MAX_USER_QUERY_PARAMETERS.saturating_sub(result.len());
-            expand_iterable_to_fast_params(&param, &mut result, remaining)?;
+            let parameter_index = result.len();
+            expand_iterable_to_fast_params(&param, &mut result, remaining, parameter_index)?;
         } else {
-            result.push(python_to_fast_parameter(&param)?);
+            let parameter_index = result.len();
+            result.push(python_to_fast_parameter_at(&param, parameter_index)?);
         }
     }
 
@@ -184,6 +409,7 @@ fn expand_iterable_to_fast_params<T>(
     iterable: &Bound<PyAny>,
     result: &mut T,
     mut remaining: usize,
+    mut parameter_index: usize,
 ) -> PyResult<()>
 where
     T: Extend<FastParameter>,
@@ -198,9 +424,10 @@ where
                     "Parameter expansion exceeded FastMssql limit of 2,098 user parameters per query",
                 ));
             }
-            let param = python_to_fast_parameter(&item)?;
+            let param = python_to_fast_parameter_at(&item, parameter_index)?;
             result.extend(std::iter::once(param));
             remaining -= 1;
+            parameter_index += 1;
         }
         return Ok(());
     }
@@ -212,9 +439,10 @@ where
                     "Parameter expansion exceeded FastMssql limit of 2,098 user parameters per query",
                 ));
             }
-            let param = python_to_fast_parameter(&item)?;
+            let param = python_to_fast_parameter_at(&item, parameter_index)?;
             result.extend(std::iter::once(param));
             remaining -= 1;
+            parameter_index += 1;
         }
         return Ok(());
     }
@@ -234,8 +462,9 @@ where
                         "Parameter expansion exceeded FastMssql limit of 2,098 user parameters per query",
                     ));
                 }
-                batch.push(python_to_fast_parameter(&item)?);
+                batch.push(python_to_fast_parameter_at(&item, parameter_index)?);
                 remaining -= 1;
+                parameter_index += 1;
 
                 // Batch extend every 16 items to reduce extend() call overhead
                 if batch.len() == 16 {

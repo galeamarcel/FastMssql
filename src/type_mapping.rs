@@ -16,7 +16,7 @@ static DECIMAL_CLASS: OnceLock<Option<Py<PyAny>>> = OnceLock::new();
 /// Return a `Bound` reference to `decimal.Decimal`, initializing the cache on
 /// the very first call and simply re-binding on every subsequent call.
 #[inline]
-fn get_decimal_class(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
+pub(crate) fn get_decimal_class(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
     let cls = DECIMAL_CLASS
         .get_or_init(|| {
             py.import("decimal")

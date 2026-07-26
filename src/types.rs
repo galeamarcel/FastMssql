@@ -275,6 +275,26 @@ pub fn create_protocol_error(message: impl Into<String>) -> PyErr {
     })
 }
 
+pub(crate) fn create_parameter_conversion_error(
+    parameter_index: usize,
+    sql_type: &str,
+    reason: &str,
+    message: &str,
+) -> PyErr {
+    Python::attach(|py| {
+        let error = ConversionError::new_err(message.to_owned());
+        {
+            let value = error.value(py);
+            let _ = value.setattr("message", message);
+            let _ = value.setattr("parameter_index", parameter_index);
+            let _ = value.setattr("sql_type", sql_type);
+            let _ = value.setattr("reason", reason);
+            let _ = value.setattr("retryable", false);
+        }
+        error
+    })
+}
+
 #[cfg(test)]
 mod error_classification_tests {
     use super::is_tls_io_failure;
