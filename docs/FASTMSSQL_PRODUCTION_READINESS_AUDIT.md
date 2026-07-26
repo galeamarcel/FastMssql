@@ -3,20 +3,22 @@
 Data auditului: 24 iulie 2026  
 Fork auditat: `https://github.com/galeamarcel/FastMssql.git`  
 Branch: `test/sql-auth-validation`  
-Commit tehnic: `d9df1f9943f218a6fcd12aada2cd52c4d32967b6`
+Commit tehnic: `5936cb5d6c6f1e7fd55e4d70fb28143cdbc7fd7a`
 
 Ultima actualizare live: 26 iulie 2026
-Ultimul fix verificat: `feat/lifecycle-state` la `6c5cbff`, inclusiv
-reproducerile RED `4609de7` și `7d2fa6b` pentru lifecycle și anularea
-`Transaction.close()`
-Ultimul harness tranzacțional de load verificat: `6c5cbff`
+Ultimul fix verificat: `feat/observability-metrics` la `8971066`, inclusiv
+contractul RED final `1d530a6` pentru schema și contabilitatea metricilor
+pool-ului
+Ultimul harness tranzacțional de load verificat: `8971066`, atât cu
+tranzacții directe persistente, cât și cu leasing prin pool
 Ultimul contract de readiness load verificat: LOAD-009 în `d891db8`
-Ultimul merge tehnic verificat: `test/sql-auth-validation` la `d9df1f9`
+Ultimul contract de observability load verificat: OBS-009 la `5936cb5`
+Ultimul merge tehnic verificat: `test/sql-auth-validation` la `5936cb5`
 Ultimul gate hosted verificat: `rust-unit-tests.yml`, rularea
-[#30185323201](https://github.com/galeamarcel/FastMssql/actions/runs/30185323201)
-verde pe Linux, macOS și Windows la feature SHA `6c5cbff`
+[#30188491054](https://github.com/galeamarcel/FastMssql/actions/runs/30188491054)
+verde pe Linux, macOS și Windows la feature SHA `8971066`
 Ultimul gate dependency-security verificat: rularea
-[#30185327671](https://github.com/galeamarcel/FastMssql/actions/runs/30185327671)
+[#30188798876](https://github.com/galeamarcel/FastMssql/actions/runs/30188798876)
 verde la același feature SHA
 
 ## Concluzie
@@ -60,10 +62,19 @@ fail-closed transporturile la expirarea bugetului. Anularea primului waiter
 sau a unui `Transaction.close()` nu mai poate pierde supervisorul ori permitul
 de tranzacție.
 
-Toate defectele P0 de corectitudine identificate de acest audit și candidatul
-P1 de graceful lifecycle sunt închise pe fork. Aceasta nu declară încă
-biblioteca complet enterprise production-ready: observabilitatea,
-backpressure-ul explicit, streamingul cu memorie limitată, tipurile lipsă,
+`Connection.pool_stats()` oferă acum o fotografie privacy-safe cu exact 17
+chei pentru capacitate, checkout direct/așteptat/expirat, wait time, cereri
+pending, conexiuni create și evenimentele de retragere bb8. Snapshotul nu
+execută SQL, nu adaugă contoare proprii pe calea operațiilor și își resetează
+epoca la disconnect/reconnect. OBS-001–OBS-010 includ saturație reală,
+timeout, anulare, `KILL`, lifetime/idle reaping și 10.000 de operații cu
+scraping concurent.
+
+Toate defectele P0 de corectitudine identificate de acest audit, graceful
+lifecycle și fundația de observabilitate a pool-ului sunt închise pe fork.
+Aceasta nu declară încă biblioteca complet enterprise production-ready:
+backpressure-ul explicit, metricile de durată/rezultat per operație,
+tracing/OpenTelemetry, streamingul cu memorie limitată, tipurile lipsă,
 multiple result sets/RPC și gate-urile de packaging prin servere reale rămân
 cerințe P1/P2.
 
@@ -1504,9 +1515,9 @@ MSSQL hosted.
 
 Limitele rămase sunt explicite:
 
-- nu există încă limită separată pentru numărul waiterilor sau telemetry;
-- metricile bb8 complete, tracing și OpenTelemetry aparțin candidatului
-  `feat/observability`;
+- nu există încă limită separată pentru numărul waiterilor;
+- metricile bb8 sunt închise de candidatul documentat în secțiunea următoare;
+  duration/outcome telemetry, tracing și OpenTelemetry rămân separate;
 - nu există TDS `ATTENTION`/`DONE_ATTN`; force retrage transportul, nu îl
   reutilizează;
 - obiectele construite direct prin `Transaction(...)` rămân în afara
@@ -1517,6 +1528,161 @@ Limitele rămase sunt explicite:
 
 Nu s-a creat niciun branch sau PR upstream. `origin` este
 `galeamarcel/FastMssql`, iar push URL-ul `upstream` rămâne `DISABLED`.
+
+## Metrici de observabilitate pentru pool — implementate și verificate
+
+Statusul candidatului este `VERIFIED_FORK`. `Connection.pool_stats()` păstrează
+cele șase valori existente și adaugă un adaptor read-only peste statisticile
+deja întreținute de bb8. Implementarea nu adaugă dependențe, callbackuri,
+exporter, SQL pe calea de scrape sau contoare FastMssql pe calea normală a
+operațiilor.
+
+Istoricul TDD este separat și publicat numai pe fork:
+
+- `docs/observability-metrics-design`
+  - `48ec147d912fdec92a90d951c452c0182600af4d` — designul, planul și
+    corecția contabilizării checkoutului de readiness;
+- `test/observability-metrics`
+  - `1d530a66a16ff43f262cd5dab934ce3788a66304` — contractul RED final,
+    inclusiv apelul repetat `connect(validate=True)`;
+- `feat/observability-metrics`
+  - `74c062b` — implementarea adaptorului;
+  - `8971066580eac093d170c7bcdac18dabf086f340` — feature-ul final
+    verificat local și hosted;
+- `test/sql-auth-validation`
+  - `5936cb5d6c6f1e7fd55e4d70fb28143cdbc7fd7a` — merge-ul tehnic exact,
+    reverificat integral pe SQL-auth real.
+
+Schema publică are exact 17 chei stabile:
+
+```text
+connected
+connections
+idle_connections
+active_connections
+max_size
+min_idle
+get_started
+get_direct
+get_waited
+get_timed_out
+pending_gets
+get_wait_time_seconds
+connections_created
+connections_closed_broken
+connections_closed_invalid
+connections_closed_max_lifetime
+connections_closed_idle_timeout
+```
+
+Snapshotul descrie numai epoca pool-ului curent. În starea disconnected toate
+valorile sunt zero/false, iar disconnect/reconnect pornește o epocă nouă.
+`get_started` este reconciliat cu suma checkouturilor finalizate citind
+atomicele relaxate bb8 astfel încât `pending_gets` să nu poată face underflow
+sau overflow într-un scrape concurent. Un al doilea
+`connect(validate=True)` reutilizează pool-ul, dar execută intenționat încă un
+checkout de readiness, deci crește exact `get_started` și `get_direct`.
+
+Contoarele de retragere sunt evenimente bb8, nu o partiție de conexiuni fizice
+unice. De exemplu, o validare eșuată poate înregistra `invalid`, iar același
+obiect poate fi apoi observat `broken` la drop. Din acest motiv aceste valori
+pot crește împreună și nu trebuie însumate pentru a calcula un număr de
+închideri unice. În reproducerile cu `KILL` și anulare, înlocuirea fizică este
+demonstrată prin `sys.dm_exec_connections.connection_id`, nu prin SPID,
+deoarece SQL Server poate reutiliza imediat un SPID mic.
+
+OBS-001–OBS-010 sunt deterministe și acoperă:
+
+1. schema, tipurile și ciclul disconnected/reconnect;
+2. checkout direct și conexiune fizică nouă;
+3. saturație server-gated, `pending_gets` live și checkout așteptat;
+4. acquire timeout exact o dată și recuperare;
+5. anulare, conexiune broken și capacitate recuperată;
+6. checkout validation după `KILL`, inclusiv evenimentele invalid/broken;
+7. retragere prin max lifetime;
+8. retragere prin idle timeout;
+9. 10.000 de operații parametrizate cu scraping concurent;
+10. absența SQL-ului, parametrilor, identificatorilor și credențialelor.
+
+Rezultatul OBS-009 măsurat pe merge-ul tehnic exact este:
+
+```text
+operații parametrizate                    10.000
+workers / pool max                         100 / 20
+conexiuni fizice maxime                         20
+elapsed                                  1,347 s
+throughput                            7.423,30 qps
+snapshoturi concurente                      9.216
+event-loop ticks                           36.715
+pending_gets maxim                            100
+smoke după load                              PASS
+sesiuni aplicație după teardown                 0
+```
+
+Acesta este un test al driverului și al invariantelor adaptorului pe
+containerul local MSSQL, nu un benchmark universal SQL Server.
+
+Self-review-ul a repetat separat cele trei profile tranzacționale prin două
+strategii. Calea `persistent` păstrează o conexiune directă per worker și nu
+pretinde că `pool_size` o limitează:
+
+```text
+persistent 10.000:100       3.651,84 tx/s, 100 conexiuni, 0 rămase
+persistent 99.999:100       3.996,74 tx/s, 100 conexiuni, 0 rămase
+persistent 99.999:200       3.666,48 tx/s, 200 conexiuni, 0 rămase
+```
+
+Calea enterprise recomandată folosește leasing printr-un pool cu
+`max_size=100`; chiar la concurență 200 limita fizică a rămas 100:
+
+```text
+pooled 10.000:100           3.495,59 tx/s, max 100 conexiuni, 0 rămase
+pooled 99.999:100           3.641,50 tx/s, max 100 conexiuni, 0 rămase
+pooled 99.999:200           3.631,09 tx/s, max 100 conexiuni, 0 rămase
+```
+
+Fiecare profil a avut numărul exact de COMMIT/ROLLBACK și smoke query PASS.
+
+Dovada finală locală pe arborele tehnic exact:
+
+```text
+FastMssql Rust                              43/43 PASS
+contract static pool observability            2/2 PASS
+matrice SQL-auth                            321/321 PASS
+strict / async / framework        326/326 + 16/16 + 30/30 PASS
+resilience / load                     6/6 + 10/10 PASS
+regresie upstream                         923/923 PASS
+ABI3 cp311 wheel instalat                    20/20 PASS
+cargo fmt / Clippy -D warnings                   PASS
+Ruff / compileall / RustSec                      PASS
+failures / errors / skips / not-run       0 / 0 / 0 / 0
+```
+
+[Run-ul hosted #30188491054](https://github.com/galeamarcel/FastMssql/actions/runs/30188491054)
+a verificat exact feature SHA `8971066580eac093d170c7bcdac18dabf086f340`:
+raw Cargo, `43/43` teste Rust, build ABI3, instalarea wheel-ului și contractele
+publice au trecut independent pe Ubuntu, macOS și Windows.
+[RustSec #30188798876](https://github.com/galeamarcel/FastMssql/actions/runs/30188798876)
+a scanat 219 dependențe la același SHA și a trecut cu vulnerabilități și
+warnings respinse.
+
+Limitele curente sunt explicite:
+
+- statisticile descriu numai pool-ul curent; conexiunile directe construite
+  prin `Transaction(...)` nu sunt agregate;
+- snapshotul nu oferă histograme sau metrici de durată/rezultat per operație;
+- nu există tracing, OpenTelemetry, exporter ori etichete configurabile;
+- nu există încă o limită publică separată pentru numărul waiterilor;
+- SQL-auth real este dovadă locală Docker; workflow-ul hosted nu rulează MSSQL;
+- nu s-au schimbat dependențele, lockfile-ul, versiunea sau release metadata.
+
+Următorul candidat independent este observabilitatea duratei și rezultatului
+operațiilor. Acesta trebuie proiectat separat de tracing/OpenTelemetry și de
+adaptorul bb8 deja verificat.
+
+Nu s-a creat niciun branch și niciun PR upstream pentru observability.
+`origin` rămâne `galeamarcel/FastMssql`, iar push URL-ul `upstream` este
+`DISABLED`.
 
 ## Corecții și nuanțări față de primul audit
 
@@ -1693,12 +1859,19 @@ nedeterministe după intrarea în `Committing`; conexiunea a fost deja eliminat�
   `workers * pool.max_size` rămân cerințe operaționale/observability
   separate; nu invalidează corectitudinea lifecycle-ului verificat.
 
-### Observabilitate — următorul candidat
+### Observabilitate pool — `VERIFIED_FORK`
 
-- Metricile bb8 complete: timp de așteptare, checkout direct/așteptat,
-  timeouturi, conexiuni create/eliminate și motivul eliminării.
-- Metrici de durată și tracing/OpenTelemetry, fără logarea implicită a SQL-ului
-  sau parametrilor sensibili.
+- `8971066`, integrat tehnic în `5936cb5`, extinde aditiv `pool_stats()` la
+  exact 17 chei cu wait time, checkout direct/așteptat/expirat, pending,
+  conexiuni create și evenimentele de retragere bb8.
+- OBS-001–OBS-010 verifică saturație, timeout, anulare, `KILL`, lifetime,
+  idle reaping, epoca pool-ului, privacy și 10.000 de operații cu scraping
+  concurent.
+- Contoarele de retragere sunt evenimente care se pot suprapune; nu reprezintă
+  un total de conexiuni fizice unice.
+- Metricile de durată/rezultat per operație sunt următorul candidat
+  independent. Tracing/OpenTelemetry și exporterul rămân un scope separat,
+  fără SQL sau parametri sensibili implicit.
 
 ### Rezultate și streaming
 
@@ -1947,12 +2120,14 @@ funcție ar necesita lucru la nivelul driverului TDS:
     retragere fail-closed și gate Linux/macOS/Windows finalizate și verificate**
 14. `feat/lifecycle-state` — **Open/Closing/Closed, drain generation-aware,
     force bounded și close cancellation-safe finalizate și verificate**
-15. `feat/observability` — **următorul candidat**
-16. `feat/typed-parameters`
-17. `feat/resultsets-streaming`
-18. `feat/batch-bulk`
-19. `fix/named-instance`
-20. `test/production-framework-matrix`
+15. `feat/observability-metrics` — **cele 17 metrici bb8 privacy-safe,
+    saturația și loadul cu scrape concurent finalizate și verificate hosted**
+16. `feat/operation-outcome-observability` — **următorul candidat**
+17. `feat/typed-parameters`
+18. `feat/resultsets-streaming`
+19. `feat/batch-bulk`
+20. `fix/named-instance`
+21. `test/production-framework-matrix`
 
 Orice remediere FastMssql va fi făcută numai pe forkul
 `galeamarcel/FastMssql`.
@@ -1986,6 +2161,8 @@ upstream fără aprobarea explicită a proprietarului forkului.
 - [x] lifecycle-ul `Open | Closing | Closed` așteaptă operațiile și
   tranzacțiile admise, coalescează shutdown-ul concurent și retrage bounded
   transporturile la expirarea grace timeoutului;
+- [x] `pool_stats()` expune exact 17 chei privacy-safe, menține invarianta
+  checkouturilor sub scraping concurent și își resetează epoca la reconnect;
 - [x] răspunsul pierdut după COMMIT produce `CommitOutcomeUnknown`, fără
   rollback sau retry automat;
 - [x] numărul sesiunilor tranzacționale nu depășește `pool.max_size`, inclusiv
@@ -2002,40 +2179,43 @@ upstream fără aprobarea explicită a proprietarului forkului.
 - Fork: `https://github.com/galeamarcel/FastMssql.git`
 - Branch cumulativ: `test/sql-auth-validation`
 - HEAD tehnic verificat:
-  `d9df1f9943f218a6fcd12aada2cd52c4d32967b6`
+  `5936cb5d6c6f1e7fd55e4d70fb28143cdbc7fd7a`
 - `origin` indică forkul; `upstream` permite numai fetch, cu push
   `DISABLED`.
-- Feature-ul lifecycle final este `6c5cbff`; arborele său tehnic este
-  `fd79495`, iar raportul regenerat pe merge păstrează `d9df1f9` în antet.
-- La acest source tree: FastMssql Rust `40/40`, contractele instalate
-  PoolConfig + TimeoutConfig + Lifecycle `18/18`, strict `321/321`,
-  true-async `16/16`, framework `30/30`, resilience `6/6`, load `9/9`,
-  upstream `921/921` și exact `311/311` ID-uri din specificație, toate PASS.
-- Stress-ul final: profilele `10.000:100`, `99.999:100` și `99.999:200`,
-  fiecare cu numărul exact de COMMIT/ROLLBACK, smoke PASS și zero sesiuni
-  după teardown.
-- Hosted la `6c5cbff`: Linux/macOS/Windows
-  [#30185323201](https://github.com/galeamarcel/FastMssql/actions/runs/30185323201)
+- Feature-ul observability final este
+  `8971066580eac093d170c7bcdac18dabf086f340`; designul final este
+  `48ec147d912fdec92a90d951c452c0182600af4d`, iar contractul RED final este
+  `1d530a66a16ff43f262cd5dab934ce3788a66304`.
+- La acest source tree: FastMssql Rust `43/43`, contractul static observability
+  `2/2`, strict `326/326`, true-async `16/16`, framework `30/30`,
+  resilience `6/6`, load `10/10`, upstream `923/923` și exact `321/321`
+  ID-uri din specificație, toate PASS.
+- OBS-009: 10.000 operații, 100 workers, pool 20, exact 20 conexiuni fizice,
+  maximum 100 waiteri pending, 9.216 snapshoturi, 36.715 event-loop ticks,
+  `7.423,30 qps`, smoke PASS și zero sesiuni după teardown.
+- Stress-ul final a repetat profilele `10.000:100`, `99.999:100` și
+  `99.999:200` atât persistent, cât și pooled. Fiecare a avut numărul exact
+  de COMMIT/ROLLBACK, smoke PASS și zero sesiuni după teardown; pool-ul cu
+  `max_size=100` a rămas la maximum 100 conexiuni inclusiv la concurență 200.
+- Hosted la feature SHA exact `8971066`: Linux/macOS/Windows
+  [#30188491054](https://github.com/galeamarcel/FastMssql/actions/runs/30188491054)
   și RustSec
-  [#30185327671](https://github.com/galeamarcel/FastMssql/actions/runs/30185327671)
+  [#30188798876](https://github.com/galeamarcel/FastMssql/actions/runs/30188798876)
   sunt verzi.
 - Run-ul Windows RED
   [#30178680707](https://github.com/galeamarcel/FastMssql/actions/runs/30178680707)
   rămâne vizibil și este legat de reproducerea `2d8e526` și fixul `822ab2a`.
-- Nu există PR upstream pentru lifecycle sau operation timeouts.
+- Nu există PR upstream pentru observability, lifecycle sau operation
+  timeouts.
 - Wheel-ul `cp311-abi3` a fost construit, instalat și importat dintr-un
-  virtualenv curat. `cargo fmt`, Clippy cu `-D warnings`, Ruff și `compileall`
-  au trecut; `cargo audit` a scanat 219 dependențe cu zero findings.
+  virtualenv curat, iar cele 20 de contracte instalate au trecut. `cargo fmt`,
+  Clippy cu `-D warnings`, Ruff și `compileall` au trecut; `cargo audit` a
+  scanat 219 dependențe cu zero findings.
 - SQL-auth real a fost executat local pe containerul MSSQL aprobat; workflow-ul
   găzduit nu are un runner SQL Server și validează Rust/wheel/contracts.
-- Gate-ul hosted precedent, pentru candidatul PoolConfig,
-  [#30172198247](https://github.com/galeamarcel/FastMssql/actions/runs/30172198247)
-  a trecut separat pe Ubuntu, macOS și Windows: raw Cargo, `14/14` teste Rust,
-  wheel instalat și contract Python izolat. Gate-ul
-  [RustSec #30172198251](https://github.com/galeamarcel/FastMssql/actions/runs/30172198251)
-  a trecut cu zero vulnerabilități și zero warnings.
-- Ramura tehnică locală și `origin/test/sql-auth-validation` sunt în paritate
-  `0/0`; nu există niciun push și niciun PR către upstream.
+- Toate modificările tehnice și documentare au fost publicate exclusiv pe
+  fork. Paritatea exactă cu `origin/test/sql-auth-validation` se verifică după
+  merge-ul acestui status; nu există niciun push și niciun PR către upstream.
 
 Starea de mai sus este rezultatul arborelui tehnic exact înaintea acestui
 update documentar. Branchurile validate au fost integrate numai în fork; nu
