@@ -155,6 +155,8 @@ Coroutine[Any, Any, Dict[str, int | float | bool | None]]
   `OBS-008`.
 - `tests/sql_auth_strict/test_resilience_load.py` — `OBS-009`, 10,000 bounded
   parameterized queries with concurrent scraping.
+- `tests/sql_auth_strict/conftest.py` — allow the load-metrics recorder's
+  otherwise `LOAD-*`-only namespace to accept exactly `OBS-009`.
 - `tests/sql_auth_strict/test_matrix_contract.py` — authoritative count
   `311 -> 321`.
 - `tests/test_pyo3_build_contract.py` — hosted installed-wheel command includes
@@ -372,7 +374,7 @@ INTEGER_METRICS = POOL_STATS_KEYS - {
 }
 
 
-def disconnected_stats() -> dict[str, object]:
+async def _disconnected_stats() -> dict[str, object]:
     connection = fastmssql.Connection(
         server="127.0.0.1",
         port=1,
@@ -389,11 +391,11 @@ def disconnected_stats() -> dict[str, object]:
             retry_connection=False,
         ),
     )
-    return asyncio.run(connection.pool_stats())
+    return await connection.pool_stats()
 
 
 def test_disconnected_pool_stats_exact_schema_types_and_zero_epoch() -> None:
-    stats = disconnected_stats()
+    stats = asyncio.run(_disconnected_stats())
     assert set(stats) == POOL_STATS_KEYS
     assert stats["connected"] is False
     assert stats["max_size"] == 2
@@ -757,10 +759,24 @@ artifacts do not contain the explicit sentinels.
 **Files:**
 
 - Modify: `tests/sql_auth_strict/test_resilience_load.py`
+- Modify: `tests/sql_auth_strict/conftest.py`
 
 **Produces:** `OBS-009`.
 
-- [ ] **Step 1: Add a load-only case with bounded task count**
+- [ ] **Step 1: Permit exactly one observability ID in load evidence**
+
+The existing recorder intentionally rejects non-`LOAD-*` keys. Preserve that
+boundary while allowing this one approved cross-category load case:
+
+```python
+if not (case_id.startswith("LOAD-") or case_id == "OBS-009"):
+    raise ValueError(f"not a load case ID: {case_id}")
+```
+
+Do not permit a general `OBS-*` prefix and do not invent `LOAD-010`; the
+strict matrix remains 321 IDs.
+
+- [ ] **Step 2: Add a load-only case with bounded task count**
 
 Add:
 
@@ -795,7 +811,7 @@ async def worker(worker_id: int) -> list[int]:
 This bounds Python task count at 100 rather than allocating 10,000 concurrent
 tasks.
 
-- [ ] **Step 2: Scrape and tick concurrently**
+- [ ] **Step 3: Scrape and tick concurrently**
 
 Start two bounded background tasks:
 
@@ -822,7 +838,7 @@ async def tick() -> int:
 Await all workers with a 75-second bound. In `finally`, set the stop event and
 await both observers so assertion failures cannot be lost.
 
-- [ ] **Step 3: Assert exact accounting and health**
+- [ ] **Step 4: Assert exact accounting and health**
 
 Flatten and sort worker results, then assert:
 
@@ -848,7 +864,7 @@ connections and counter deltas under metric ID `OBS-009`.
 Disconnect in `finally`, poll `sys.dm_exec_sessions` by unique application
 name, and require zero leaked sessions.
 
-- [ ] **Step 4: Complete source-registry coverage**
+- [ ] **Step 5: Complete source-registry coverage**
 
 Run:
 
@@ -957,6 +973,7 @@ git add \
 git commit -m "test: define pool observability contract"
 
 git add \
+  tests/sql_auth_strict/conftest.py \
   tests/sql_auth_strict/test_connection.py \
   tests/sql_auth_strict/test_pool.py \
   tests/sql_auth_strict/test_pool_observability.py \
