@@ -14,6 +14,8 @@ use crate::helpers::{
     catch_driver_panic, execute_unparameterized_command, requires_connection_retirement,
     requires_direct_batch, wrap_query_stream,
 };
+use crate::lifecycle::ConnectionLifecycle;
+use crate::lifecycle_config::{ConnectionLifecycleState, PyLifecycleConfig};
 use crate::parameter_conversion::{FastParameter, convert_parameters_to_fast, params_as_sql_refs};
 use crate::pool_config::PyPoolConfig;
 use crate::pool_manager::{
@@ -32,6 +34,7 @@ struct ConnectionHandles {
     config: Arc<Config>,
     pool_config: PyPoolConfig,
     timeout_config: PyTimeoutConfig,
+    lifecycle: Arc<ConnectionLifecycle>,
     azure_credential: Option<Arc<PyAzureCredential>>,
 }
 
@@ -57,6 +60,8 @@ pub struct PyConnection {
     config: Arc<Config>,
     pool_config: PyPoolConfig,
     timeout_config: PyTimeoutConfig,
+    lifecycle: Arc<ConnectionLifecycle>,
+    lifecycle_config: PyLifecycleConfig,
     _ssl_config: Option<PySslConfig>,
     azure_credential: Option<Arc<PyAzureCredential>>,
 }
@@ -84,6 +89,7 @@ impl PyConnection {
             config: Arc::clone(&self.config),
             pool_config: self.pool_config.clone(),
             timeout_config: self.timeout_config.clone(),
+            lifecycle: Arc::clone(&self.lifecycle),
             azure_credential: self.azure_credential.clone(),
         }
     }
@@ -256,7 +262,7 @@ impl PyConnection {
 #[pymethods]
 impl PyConnection {
     #[new]
-    #[pyo3(signature = (connection_string = None, pool_config = None, ssl_config = None, azure_credential = None, server = None, database = None, username = None, password = None, application_intent = None, port = None, instance_name = None, application_name = None, timeout_config = None))]
+    #[pyo3(signature = (connection_string = None, pool_config = None, ssl_config = None, azure_credential = None, server = None, database = None, username = None, password = None, application_intent = None, port = None, instance_name = None, application_name = None, timeout_config = None, lifecycle_config = None))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         connection_string: Option<String>,
@@ -272,6 +278,7 @@ impl PyConnection {
         instance_name: Option<String>,
         application_name: Option<String>,
         timeout_config: Option<PyTimeoutConfig>,
+        lifecycle_config: Option<PyLifecycleConfig>,
     ) -> PyResult<Self> {
         let config = if let Some(conn_str) = connection_string {
             config_from_ado_string(&conn_str, ssl_config.as_ref())?
@@ -341,6 +348,8 @@ impl PyConnection {
             config: Arc::new(config),
             pool_config: effective_pool_config,
             timeout_config: effective_timeout,
+            lifecycle: ConnectionLifecycle::new(),
+            lifecycle_config: lifecycle_config.unwrap_or_default(),
             _ssl_config: ssl_config,
             azure_credential: azure_credential.map(Arc::new),
         })
@@ -357,16 +366,23 @@ impl PyConnection {
         let handles = self.clone_handles();
 
         future_into_py(py, async move {
-            let pool_ref = handles.ensure_connected(OperationName::Query).await?;
-            let execution_result = Self::execute_query_async_gil_free(
-                &pool_ref,
-                &handles.timeout_config,
-                OperationName::Query,
-                &query,
-                &fast_parameters,
-            )
-            .await?;
-            wrap_query_stream(execution_result)
+            let permit = handles
+                .lifecycle
+                .admit_operation(OperationName::Query, true)?;
+            permit
+                .run(async move {
+                    let pool_ref = handles.ensure_connected(OperationName::Query).await?;
+                    let execution_result = Self::execute_query_async_gil_free(
+                        &pool_ref,
+                        &handles.timeout_config,
+                        OperationName::Query,
+                        &query,
+                        &fast_parameters,
+                    )
+                    .await?;
+                    wrap_query_stream(execution_result)
+                })
+                .await
         })
     }
 
@@ -375,15 +391,22 @@ impl PyConnection {
         let handles = self.clone_handles();
 
         future_into_py(py, async move {
-            let pool_ref = handles.ensure_connected(OperationName::SimpleQuery).await?;
-            let execution_result = Self::execute_simple_query_async_gil_free(
-                &pool_ref,
-                &handles.timeout_config,
-                OperationName::SimpleQuery,
-                &query,
-            )
-            .await?;
-            wrap_query_stream(execution_result)
+            let permit = handles
+                .lifecycle
+                .admit_operation(OperationName::SimpleQuery, true)?;
+            permit
+                .run(async move {
+                    let pool_ref = handles.ensure_connected(OperationName::SimpleQuery).await?;
+                    let execution_result = Self::execute_simple_query_async_gil_free(
+                        &pool_ref,
+                        &handles.timeout_config,
+                        OperationName::SimpleQuery,
+                        &query,
+                    )
+                    .await?;
+                    wrap_query_stream(execution_result)
+                })
+                .await
         })
     }
 
@@ -398,16 +421,22 @@ impl PyConnection {
         let handles = self.clone_handles();
 
         future_into_py(py, async move {
-            let pool_ref = handles.ensure_connected(OperationName::Execute).await?;
-            let affected_count = Self::execute_command_async_gil_free(
-                &pool_ref,
-                &handles.timeout_config,
-                OperationName::Execute,
-                &query,
-                &fast_parameters,
-            )
-            .await?;
-            Ok(affected_count)
+            let permit = handles
+                .lifecycle
+                .admit_operation(OperationName::Execute, true)?;
+            permit
+                .run(async move {
+                    let pool_ref = handles.ensure_connected(OperationName::Execute).await?;
+                    Self::execute_command_async_gil_free(
+                        &pool_ref,
+                        &handles.timeout_config,
+                        OperationName::Execute,
+                        &query,
+                        &fast_parameters,
+                    )
+                    .await
+                })
+                .await
         })
     }
 
@@ -466,6 +495,7 @@ impl PyConnection {
             Arc::clone(&self.config),
             self.pool_config.clone(),
             self.timeout_config.clone(),
+            Arc::clone(&self.lifecycle),
             self.azure_credential.clone(),
         )
     }
@@ -475,17 +505,40 @@ impl PyConnection {
         self.timeout_config.clone()
     }
 
+    #[getter]
+    pub fn lifecycle_config(&self) -> PyLifecycleConfig {
+        self.lifecycle_config.clone()
+    }
+
+    #[getter]
+    pub fn lifecycle_state(&self) -> ConnectionLifecycleState {
+        self.lifecycle.state()
+    }
+
     pub fn __aenter__<'p>(slf: Bound<'p, Self>, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let handles = slf.borrow().clone_handles();
         let slf_clone = slf.clone().unbind();
 
         future_into_py(py, async move {
-            let pool = handles.ensure_connected(OperationName::Connect).await?;
-            Self::validate_pool_readiness(&pool, &handles.timeout_config, OperationName::Connect)
-                .await?;
-            Python::try_attach(|py| Ok(slf_clone.clone_ref(py))).ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err("Failed to attach Python runtime thread")
-            })?
+            let permit = handles
+                .lifecycle
+                .admit_operation(OperationName::Connect, false)?;
+            permit
+                .run(async move {
+                    let pool = handles.ensure_connected(OperationName::Connect).await?;
+                    Self::validate_pool_readiness(
+                        &pool,
+                        &handles.timeout_config,
+                        OperationName::Connect,
+                    )
+                    .await?;
+                    Python::try_attach(|py| Ok(slf_clone.clone_ref(py))).ok_or_else(|| {
+                        pyo3::exceptions::PyRuntimeError::new_err(
+                            "Failed to attach Python runtime thread",
+                        )
+                    })?
+                })
+                .await
         })
     }
 
@@ -497,8 +550,10 @@ impl PyConnection {
         _traceback: Option<Bound<PyAny>>,
     ) -> PyResult<Bound<'p, PyAny>> {
         let pool = Arc::clone(&self.pool);
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let lifecycle_config = self.lifecycle_config.clone();
         future_into_py(py, async move {
-            *pool.write().await = None;
+            lifecycle.shutdown(pool, lifecycle_config).await?;
             Ok(())
         })
     }
@@ -511,16 +566,23 @@ impl PyConnection {
     pub fn connect<'p>(&self, py: Python<'p>, validate: bool) -> PyResult<Bound<'p, PyAny>> {
         let handles = self.clone_handles();
         future_into_py(py, async move {
-            let pool = handles.ensure_connected(OperationName::Connect).await?;
-            if validate {
-                Self::validate_pool_readiness(
-                    &pool,
-                    &handles.timeout_config,
-                    OperationName::Connect,
-                )
-                .await?;
-            }
-            Ok(true)
+            let permit = handles
+                .lifecycle
+                .admit_operation(OperationName::Connect, false)?;
+            permit
+                .run(async move {
+                    let pool = handles.ensure_connected(OperationName::Connect).await?;
+                    if validate {
+                        Self::validate_pool_readiness(
+                            &pool,
+                            &handles.timeout_config,
+                            OperationName::Connect,
+                        )
+                        .await?;
+                    }
+                    Ok(true)
+                })
+                .await
         })
     }
 
@@ -532,20 +594,30 @@ impl PyConnection {
     pub fn ping<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let handles = self.clone_handles();
         future_into_py(py, async move {
-            let pool = handles.ensure_connected(OperationName::Ping).await?;
-            Self::validate_pool_readiness(&pool, &handles.timeout_config, OperationName::Ping)
-                .await?;
-            Ok(true)
+            let permit = handles
+                .lifecycle
+                .admit_operation(OperationName::Ping, false)?;
+            permit
+                .run(async move {
+                    let pool = handles.ensure_connected(OperationName::Ping).await?;
+                    Self::validate_pool_readiness(
+                        &pool,
+                        &handles.timeout_config,
+                        OperationName::Ping,
+                    )
+                    .await?;
+                    Ok(true)
+                })
+                .await
         })
     }
 
     pub fn disconnect<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let pool = Arc::clone(&self.pool);
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let lifecycle_config = self.lifecycle_config.clone();
         future_into_py(py, async move {
-            let mut pool_guard = pool.write().await;
-            let had_pool = pool_guard.is_some();
-            *pool_guard = None; // Explicit drops go here safely
-            Ok(had_pool)
+            lifecycle.shutdown(pool, lifecycle_config).await
         })
     }
 
@@ -561,6 +633,7 @@ impl PyConnection {
             handles.config,
             handles.pool_config,
             handles.timeout_config,
+            handles.lifecycle,
             handles.azure_credential,
             py,
             queries,
@@ -580,6 +653,7 @@ impl PyConnection {
             handles.config,
             handles.pool_config,
             handles.timeout_config,
+            handles.lifecycle,
             handles.azure_credential,
             py,
             table_name,
@@ -597,6 +671,7 @@ impl PyConnection {
         execute_batch(
             handles.config,
             handles.timeout_config,
+            handles.lifecycle,
             handles.azure_credential,
             py,
             commands,
