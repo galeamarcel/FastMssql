@@ -176,12 +176,26 @@ def test_timeout_error_is_structured_connection_error() -> None:
     assert issubclass(timeout_error, fastmssql.SqlConnectionError)
 
 
-def test_compiled_connection_types_append_timeout_config() -> None:
+def test_compiled_types_preserve_timeout_config_position() -> None:
     core = importlib.import_module("fastmssql.fastmssql")
-    for public_type in (core.Connection, core.Transaction):
-        parameters = tuple(inspect.signature(public_type).parameters.values())
-        assert parameters[-1].name == "timeout_config"
-        assert parameters[-1].default is None
+    connection_parameters = tuple(
+        inspect.signature(core.Connection).parameters.values()
+    )
+    transaction_parameters = tuple(
+        inspect.signature(core.Transaction).parameters.values()
+    )
+
+    assert [
+        (parameter.name, parameter.default)
+        for parameter in connection_parameters[-2:]
+    ] == [
+        ("timeout_config", None),
+        ("lifecycle_config", None),
+    ]
+    assert (
+        transaction_parameters[-1].name,
+        transaction_parameters[-1].default,
+    ) == ("timeout_config", None)
 
 
 def test_timeout_stubs_and_readme_match_runtime_contract() -> None:
