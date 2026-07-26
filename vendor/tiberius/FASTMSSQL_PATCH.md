@@ -4,7 +4,7 @@ This directory is the minimal build source subset of the published `tiberius`
 crate version `0.12.3`, whose registry source records upstream commit
 `c34fab2e14c52ab74519d073d7a7b65bd023fc1a`.
 
-FastMssql temporarily carries two narrowly scoped patch sets.
+FastMssql temporarily carries three narrowly scoped patch sets.
 
 The TLS dependency migration includes:
 
@@ -32,6 +32,14 @@ The connection-pool safety patch adds protocol-level session reset support:
   COMMITTED`, because
   [MS-TDS section 2.2.3.1.2](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-tds/ce398f9a-7d47-4ede-8f36-9dd6fc21ca43)
   explicitly excludes transaction isolation level from `RESETCONNECTION`.
+
+The SQL numeric compatibility patch:
+
+- accepts SQL Server's complete scale range from 0 through 38;
+- derives precision as the maximum of coefficient digits, scale, and one;
+- avoids overstating sub-unit and zero values such as `1E-38` as precision
+  39;
+- covers the `DECIMAL(38,38)` wire payload and real SQL Server decoding path.
 
 No Tiberius fork has been created or published by the FastMssql fork owner.
 The path dependency keeps the reviewed source inside the FastMssql repository

@@ -28,11 +28,9 @@ impl Numeric {
     /// Creates a new Numeric value.
     ///
     /// # Panic
-    /// It will panic if the scale exceed 37.
+    /// It will panic if the scale exceeds SQL Server's maximum of 38.
     pub fn new_with_scale(value: i128, scale: u8) -> Self {
-        // scale cannot exceed 37 since a
-        // max precision of 38 is possible here.
-        assert!(scale < 38);
+        assert!(scale <= 38);
 
         Numeric { value, scale }
     }
@@ -67,19 +65,15 @@ impl Numeric {
 
     /// The precision of the `Number` as a number of digits.
     pub fn precision(self) -> u8 {
-        let mut result = 0;
-        let mut n = self.int_part();
+        let mut coefficient_digits = 0;
+        let mut coefficient = self.value;
 
-        while n != 0 {
-            n /= 10;
-            result += 1;
+        while coefficient != 0 {
+            coefficient /= 10;
+            coefficient_digits += 1;
         }
 
-        if result == 0 {
-            1 + self.scale()
-        } else {
-            result + self.scale()
-        }
+        coefficient_digits.max(self.scale()).max(1)
     }
 
     pub(crate) fn len(self) -> u8 {
