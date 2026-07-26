@@ -98,6 +98,11 @@ and contains only fixed low-cardinality scalar values:
 - `connections_closed_max_lifetime`: connections retired at maximum lifetime.
 - `connections_closed_idle_timeout`: connections retired by idle timeout.
 
+Checkout counters include every shared-pool acquisition, including readiness
+checks. Repeating `connect(validate=True)` reuses the same pool but counts one
+new readiness checkout; `ping()` also counts a checkout.
+`connect(validate=False)` and `pool_stats()` do not acquire a connection.
+
 The four `connections_closed_*` values are bb8 retirement-event counters, not
 mutually exclusive close reasons. For example, a failed checkout validation
 can increment both `connections_closed_invalid` and

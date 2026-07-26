@@ -872,6 +872,7 @@ class Connection:
         - connections_closed_max_lifetime (int): Lifetime retirements
         - connections_closed_idle_timeout (int): Idle-timeout retirements
 
+        Checkout counters include connect/ping readiness acquisitions.
         Retirement-event counters are not mutually exclusive.
         """
         ...

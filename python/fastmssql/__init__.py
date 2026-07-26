@@ -114,6 +114,8 @@ class Connection:
         - connections_closed_max_lifetime (int): lifetime retirements
         - connections_closed_idle_timeout (int): idle-timeout retirements
 
+        Checkout counters include readiness acquisitions made by
+        ``connect(validate=True)`` and ``ping()``.
         Retirement-event counters are not mutually exclusive. A failed
         validation can also retire the same transport as broken.
 
