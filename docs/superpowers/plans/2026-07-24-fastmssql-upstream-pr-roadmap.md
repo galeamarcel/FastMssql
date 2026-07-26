@@ -50,10 +50,10 @@ La data redactării:
 - `upstream/master`: `e45f301` — versiunea `v0.7.7`;
 - branch audit: `test/sql-auth-validation`;
 - snapshotul tehnic anterior acestui update documentar este
-  `d9df1f9943f218a6fcd12aada2cd52c4d32967b6`;
-- feature-ul lifecycle final este `6c5cbff`, arborele tehnic final este
-  `fd79495`, iar rapoartele SQL-auth au fost regenerate pe merge-ul
-  `d9df1f9`;
+  `5936cb5d6c6f1e7fd55e4d70fb28143cdbc7fd7a`;
+- feature-ul pool observability final este `8971066`, RED-ul final este
+  `1d530a6`, iar rapoartele SQL-auth au fost regenerate pe merge-ul tehnic
+  `5936cb5`;
 - unicul PR upstream deschis este draftul
   [#121 — Improve transactions behavior and safety](https://github.com/Rivendael/FastMssql/pull/121);
 - PR-ul #121 modifică masiv tranzacțiile și timeouturile, deci orice PR care
@@ -98,7 +98,8 @@ PR-uri cu decizie API
     ├── PR-12 TLS secure-by-default și sursă unică
     ├── PR-21 PoolConfig default consistency
     ├── PR-22 operation timeout/deadline safety
-    └── PR-23 graceful connection lifecycle
+    ├── PR-23 graceful connection lifecycle
+    └── PR-24 additive pool observability metrics
 
 PR-uri care cer hardening sau separare
     ├── PR-06 pooled cancellation and disposition
@@ -2478,6 +2479,115 @@ Prezintă branchul curat, comparația cu upstream, RED/GREEN, impactul API și
 toate URL-urile. Nu executa push către repository-ul original și nu crea PR
 fără o aprobare nouă, explicită, a lui Marcel Galea.
 
+### Task 23: PR-24 — Metrici aditive de observabilitate pentru pool
+
+**Status:** `VERIFIED_FORK / requires fresh upstream rebase`. Implementat și
+verificat pe fork; nu există branch curat upstream și publicarea nu este
+aprobată.
+
+```text
+fork design branch          docs/observability-metrics-design
+fork design SHA             48ec147d912fdec92a90d951c452c0182600af4d
+fork RED branch             test/observability-metrics
+fork final RED SHA          1d530a66a16ff43f262cd5dab934ce3788a66304
+fork feature branch         feat/observability-metrics
+fork feature SHA            8971066580eac093d170c7bcdac18dabf086f340
+technical merge SHA         5936cb5d6c6f1e7fd55e4d70fb28143cdbc7fd7a
+future clean branch         feat/upstream-pool-observability
+future title                feat: expose pool observability metrics
+case IDs                    OBS-001 through OBS-010
+current upstream PR state   none
+publication                 forbidden until a new explicit user approval
+```
+
+**Scope reviewable:**
+
+- migrare aditivă a API-ului existent `Connection.pool_stats()`, de la 6 la
+  exact 17 chei;
+- adaptor dependency-free peste contoarele deja întreținute de bb8;
+- checkout direct/așteptat/expirat, wait time, pending, conexiuni create și
+  evenimente de retragere;
+- snapshot read-only pentru epoca pool-ului curent, resetat la reconnect;
+- reconciliation saturating pentru citirea atomicelor relaxate concurente;
+- API, wrapper, ambele stuburi și README sincronizate;
+- contract RED, teste reale SQL-auth și test de 10.000 operații cu scraping
+  concurent.
+
+**Semantica de păstrat:**
+
+- cele șase valori publice anterioare rămân neschimbate semantic;
+- `connect(validate=True)` repetat numără câte un checkout real de readiness;
+- `pending_gets` nu folosește getterul bb8 care poate observa temporar o sumă
+  inconsistentă și nu poate face underflow;
+- contoarele `broken` și `invalid` sunt evenimente care se pot suprapune și nu
+  se însumează pentru conexiuni închise unice;
+- înlocuirea fizică după `KILL`/anulare este identificată prin
+  `sys.dm_exec_connections.connection_id`, nu prin SPID;
+- snapshotul nu conține SQL, parametri, identificatori, credențiale, labels
+  sau date application-specific.
+
+**Dovada locală și hosted:**
+
+```text
+FastMssql Rust                              43/43 PASS
+matrice SQL-auth                            321/321 PASS
+strict / async / framework        326/326 + 16/16 + 30/30 PASS
+resilience / load                     6/6 + 10/10 PASS
+upstream aplicabil                      923/923 PASS
+OBS-001–OBS-010                            10/10 PASS
+ABI3 installed-wheel contracts             20/20 PASS
+OBS-009             10.000 ops, 100 workers, pool 20, 0 sessions
+stress persistent       10.000:100, 99.999:100, 99.999:200 PASS
+stress pooled max 100   10.000:100, 99.999:100, 99.999:200 PASS
+```
+
+[Run-ul #30188491054](https://github.com/galeamarcel/FastMssql/actions/runs/30188491054)
+este verde la feature SHA exact pe Ubuntu, macOS și Windows pentru raw Cargo,
+`43/43` Rust, wheel ABI3 instalat și contractele publice.
+[RustSec #30188798876](https://github.com/galeamarcel/FastMssql/actions/runs/30188798876)
+este verde la același SHA. SQL-auth real este verificat local pe containerul
+MSSQL aprobat; hosted CI nu pretinde un server MSSQL.
+
+**Exclus din PR-24:**
+
+- histograme și metrici de durată/rezultat per operație;
+- tracing, OpenTelemetry, exporter și integrarea cu un vendor;
+- SQL, parametri, identificatori sau labels high-cardinality;
+- conexiuni directe din `Transaction(...)`;
+- limită publică separată pentru numărul waiterilor/backpressure;
+- schimbări bb8/Tiberius, dependențe, lockfile, versiune sau release;
+- streaming, RPC/result sets, typed parameters și bulk.
+
+- [ ] **Step 1: Rebase și audit upstream proaspăt**
+
+Actualizează referința fetch-only și caută schimbări sau PR-uri noi în
+`pool_stats`, bb8 și API-ul de observability. Creează candidatul numai din
+ultimul `upstream/master`, nu din istoricul cumulativ.
+
+- [ ] **Step 2: Reproduce RED independent**
+
+Aplică întâi contractul exact de 17 chei și OBS-001–OBS-010 fără
+implementare. Confirmă lipsa contoarelor pe upstream și păstrează testele
+fără skip, retry sau excepții înghițite.
+
+- [ ] **Step 3: Extrage diff-ul minim reviewable**
+
+Portează numai adaptorul bb8, reconciliation, API/stuburi/README și testele
+necesare. Nu combina operation histograms sau OpenTelemetry.
+
+- [ ] **Step 4: Reexecută toate gate-urile**
+
+Rulează OBS-001–OBS-010 pe SQL-auth real, testul de 10.000 operații cu scrape
+concurent, Rust, format, Clippy, wheel izolat, matricea completă și regresia
+upstream. Gate-urile Linux/macOS/Windows și RustSec trebuie să fie verzi pe
+același SHA.
+
+- [ ] **Step 5: Prezintă candidatul și cere aprobare separată**
+
+Prezintă diff-ul curat, RED/GREEN, migrarea aditivă a schemei, limitele de
+privacy/performance și URL-urile hosted. Nu executa push către repository-ul
+original și nu crea PR fără o aprobare nouă, explicită, a lui Marcel Galea.
+
 ### PyO3 build/test separation — VERIFIED_FORK
 
 **Status:** `VERIFIED_FORK`. Implementat și verificat pe fork; publicarea
@@ -2585,7 +2695,8 @@ fork, testată live și auditată.
 | Native bulk | TDS bulk copy | subset de coloane, streaming input, atomicity contract |
 | Named instances | SQL Browser Tokio | instanță reală fără port explicit |
 | Operation timeouts | PR-22, connect/acquire/operation/transaction/rollback | `VERIFIED_FORK`; rebase curat, RED proaspăt, comparație cu #121, gate pe trei sisteme și aprobare separată înainte de upstream |
-| Observability | pool metrics și OpenTelemetry | următorul candidat; fără SQL/parametri sensibili implicit |
+| Pool observability | PR-24, migrare aditivă `pool_stats()` peste contoarele bb8 | `VERIFIED_FORK`; dependency-free, RED + SQL-auth real + installed-wheel Linux/macOS/Windows, fără PR upstream |
+| Operation observability | durată și rezultat per operație | următorul candidat; separat de tracing/OpenTelemetry și fără SQL/parametri sensibili implicit |
 | Graceful shutdown | PR-23, Open/Closing/Closed generation-aware | `VERIFIED_FORK`; RED proaspăt, rebase curat și aprobare separată înainte de upstream |
 | SQLAlchemy | dialect async | pool ownership și transaction semantics clare |
 | Azure identity | credential callback standardizat | expirare fail-closed și fără fallback lent accidental |
