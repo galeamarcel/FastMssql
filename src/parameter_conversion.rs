@@ -32,6 +32,7 @@ pub(crate) enum FastParameterValue {
     Time(NaiveTime),
     DateTime(NaiveDateTime),
     DateTimeOffset(DateTime<FixedOffset>),
+    Uuid(uuid::Uuid),
 }
 
 impl FastParameter {
@@ -54,6 +55,7 @@ impl tiberius::ToSql for FastParameter {
             FastParameterValue::Time(t) => t.to_sql(),
             FastParameterValue::DateTime(dt) => dt.to_sql(),
             FastParameterValue::DateTimeOffset(dt) => dt.to_sql(),
+            FastParameterValue::Uuid(uuid) => uuid.to_sql(),
         }
     }
 }
@@ -109,6 +111,9 @@ fn python_to_fast_parameter_at(
         return Ok(FastParameter::new(FastParameterValue::Bytes(
             py_by.to_vec(),
         )));
+    }
+    if is_uuid_instance(obj)? {
+        return uuid_to_fast_parameter(obj, parameter_index);
     }
     if let Ok(py_time) = obj.cast::<PyTime>() {
         return time_to_fast_parameter(py_time, parameter_index);
@@ -266,6 +271,31 @@ fn datetime_conversion_error(parameter_index: usize, sql_type: &'static str) -> 
         "invalid_datetime",
         "Datetime parameter conversion failed",
     )
+}
+
+fn is_uuid_instance(obj: &Bound<PyAny>) -> PyResult<bool> {
+    obj.is_instance(type_mapping::get_uuid_class(obj.py())?)
+}
+
+fn uuid_conversion_error(parameter_index: usize) -> PyErr {
+    create_parameter_conversion_error(
+        parameter_index,
+        "UNIQUEIDENTIFIER",
+        "invalid_uuid",
+        "UUID parameter conversion failed",
+    )
+}
+
+fn uuid_to_fast_parameter(obj: &Bound<PyAny>, parameter_index: usize) -> PyResult<FastParameter> {
+    let bytes_object = obj
+        .getattr("bytes")
+        .map_err(|_| uuid_conversion_error(parameter_index))?;
+    let bytes = bytes_object
+        .cast_into::<PyBytes>()
+        .map_err(|_| uuid_conversion_error(parameter_index))?;
+    let uuid = uuid::Uuid::from_slice(bytes.as_bytes())
+        .map_err(|_| uuid_conversion_error(parameter_index))?;
+    Ok(FastParameter::new(FastParameterValue::Uuid(uuid)))
 }
 
 fn is_decimal_instance(obj: &Bound<PyAny>) -> PyResult<bool> {

@@ -484,6 +484,7 @@ fn fix_bulk_null_types(flat_data: &mut [FastParameter], col_count: usize) {
                 FastParameterValue::Time(_) => Some(TypedNull::Time),
                 FastParameterValue::DateTime(_) => Some(TypedNull::DateTime),
                 FastParameterValue::DateTimeOffset(_) => Some(TypedNull::DateTimeOffset),
+                FastParameterValue::Uuid(_) => Some(TypedNull::Guid),
                 FastParameterValue::Null(_) => None,
             })
             .unwrap_or(TypedNull::String); // all-null column → nvarchar null is safe

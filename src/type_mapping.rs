@@ -2,7 +2,7 @@ use std::sync::OnceLock;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::types::{
-    PyByteArray, PyBytes, PyFrozenSet, PyList, PyMemoryView, PySet, PyString, PyTuple,
+    PyByteArray, PyBytes, PyDict, PyFrozenSet, PyList, PyMemoryView, PySet, PyString, PyTuple,
 };
 use pyo3::{IntoPyObjectExt, Py, PyAny, prelude::*};
 use tiberius::{ColumnType, Row};
@@ -12,6 +12,7 @@ use crate::types::ConversionError;
 /// Cached handle to `decimal.Decimal` — imported once, reused for every row.
 /// Stored as `Option` to allow initialization via `get_or_init()` with fallible closure.
 static DECIMAL_CLASS: OnceLock<Option<Py<PyAny>>> = OnceLock::new();
+static UUID_CLASS: OnceLock<Option<Py<PyAny>>> = OnceLock::new();
 
 /// Return a `Bound` reference to `decimal.Decimal`, initializing the cache on
 /// the very first call and simply re-binding on every subsequent call.
@@ -26,6 +27,21 @@ pub(crate) fn get_decimal_class(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
         })
         .as_ref()
         .ok_or_else(|| PyValueError::new_err("Failed to initialize decimal.Decimal"))?;
+    Ok(cls.bind(py))
+}
+
+/// Return the canonical `uuid.UUID` class, cached after its first import.
+#[inline]
+pub(crate) fn get_uuid_class(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
+    let cls = UUID_CLASS
+        .get_or_init(|| {
+            py.import("uuid")
+                .and_then(|module| module.getattr("UUID"))
+                .map(|uuid| uuid.unbind())
+                .ok()
+        })
+        .as_ref()
+        .ok_or_else(|| PyValueError::new_err("Failed to initialize uuid.UUID"))?;
     Ok(cls.bind(py))
 }
 
@@ -246,9 +262,9 @@ fn handle_datetimeoffset(row: &Row, index: usize, py: Python) -> PyResult<Py<PyA
 fn handle_uuid(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
     match row.try_get::<uuid::Uuid, usize>(index) {
         Ok(Some(val)) => {
-            let mut buf = uuid::Uuid::encode_buffer();
-            let uuid_str = val.hyphenated().encode_lower(&mut buf);
-            Ok(uuid_str.into_pyobject(py)?.into_any().unbind())
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("bytes", PyBytes::new(py, val.as_bytes()))?;
+            Ok(get_uuid_class(py)?.call((), Some(&kwargs))?.unbind())
         }
         Ok(None) => Ok(py.None()),
         Err(_) => Err(PyValueError::new_err(format!(
