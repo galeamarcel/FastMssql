@@ -11,6 +11,8 @@ mod connection;
 mod connection_config;
 mod deadline;
 mod helpers;
+mod lifecycle;
+mod lifecycle_config;
 mod parameter_conversion;
 mod pool_config;
 mod pool_manager;
@@ -23,14 +25,16 @@ mod types;
 
 pub use azure_auth::{AzureCredentialType, PyAzureCredential};
 pub use connection::PyConnection;
+pub use lifecycle_config::{ConnectionLifecycleState, PyLifecycleConfig};
 pub use pool_config::PyPoolConfig;
 pub use py_parameters::{Parameter, Parameters};
 pub use ssl_config::{EncryptionLevel, PySslConfig};
 pub use timeout_config::PyTimeoutConfig;
 pub use transaction::Transaction;
 pub use types::{
-    CommitOutcomeUnknown, ConversionError, OperationTimeoutError, ProtocolError, PyFastRow,
-    PyQueryStream, SqlConnectionError, SqlError, TlsError,
+    CommitOutcomeUnknown, ConnectionLifecycleError, ConversionError, OperationTimeoutError,
+    ProtocolError, PyFastRow, PyQueryStream, ShutdownTimeoutError, SqlConnectionError, SqlError,
+    TlsError,
 };
 
 use crate::parameter_conversion::TypedNull;
@@ -76,6 +80,8 @@ fn fastmssql(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Parameters>()?;
     m.add_class::<PyPoolConfig>()?;
     m.add_class::<PyTimeoutConfig>()?;
+    m.add_class::<PyLifecycleConfig>()?;
+    m.add_class::<ConnectionLifecycleState>()?;
     m.add_class::<PySslConfig>()?;
     m.add_class::<EncryptionLevel>()?;
     m.add_class::<PyAzureCredential>()?;
@@ -89,6 +95,14 @@ fn fastmssql(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add(
             "OperationTimeoutError",
             py.get_type::<OperationTimeoutError>(),
+        )?;
+        m.add(
+            "ConnectionLifecycleError",
+            py.get_type::<ConnectionLifecycleError>(),
+        )?;
+        m.add(
+            "ShutdownTimeoutError",
+            py.get_type::<ShutdownTimeoutError>(),
         )?;
         m.add(
             "CommitOutcomeUnknown",

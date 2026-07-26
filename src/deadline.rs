@@ -37,6 +37,7 @@ pub(crate) enum OperationName {
     Commit,
     Rollback,
     Close,
+    Disconnect,
     // Reserved for a future public transaction factory that performs I/O.
     // Connection.transaction() is currently synchronous and cannot time out.
     #[allow(dead_code)]
@@ -58,6 +59,7 @@ impl OperationName {
             Self::Commit => "commit",
             Self::Rollback => "rollback",
             Self::Close => "close",
+            Self::Disconnect => "disconnect",
             Self::Transaction => "transaction",
         }
     }
@@ -166,6 +168,7 @@ mod tests {
             (OperationName::Commit, "commit"),
             (OperationName::Rollback, "rollback"),
             (OperationName::Close, "close"),
+            (OperationName::Disconnect, "disconnect"),
             (OperationName::Transaction, "transaction"),
         ];
         for (operation, expected) in operations {

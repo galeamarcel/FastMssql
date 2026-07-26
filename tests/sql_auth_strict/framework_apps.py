@@ -46,6 +46,7 @@ class FrameworkState:
         min_idle: int = 0,
         pool_config: PoolConfig | None = None,
         timeout_config=None,
+        lifecycle_config=None,
     ) -> FrameworkState:
         if not IDENTIFIER.fullmatch(application_name):
             raise ValueError(
@@ -54,6 +55,8 @@ class FrameworkState:
         connection_kwargs = {}
         if timeout_config is not None:
             connection_kwargs["timeout_config"] = timeout_config
+        if lifecycle_config is not None:
+            connection_kwargs["lifecycle_config"] = lifecycle_config
         connection = Connection(
             server=config.host,
             port=config.port,
@@ -152,6 +155,23 @@ async def wait_for_session_count(
     )
 
 
+async def wait_for_lifecycle_state(
+    connection: Connection,
+    expected,
+    *,
+    timeout: float = 3.0,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if connection.lifecycle_state == expected:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(
+        f"expected lifecycle state {expected}, "
+        f"observed {connection.lifecycle_state}"
+    )
+
+
 async def wait_for_sql_request(
     observer: Connection,
     token: str,
@@ -172,7 +192,22 @@ async def wait_for_sql_request(
     )
 
 
-def _timeout_payload(error: BaseException) -> dict[str, object]:
+def _connection_error_payload(
+    error: BaseException,
+) -> dict[str, object]:
+    lifecycle_type = getattr(
+        fastmssql,
+        "ConnectionLifecycleError",
+        None,
+    )
+    if lifecycle_type is not None and isinstance(error, lifecycle_type):
+        return {
+            "type": type(error).__name__,
+            "operation": getattr(error, "operation", None),
+            "state": getattr(error, "state", None),
+            "forced": getattr(error, "forced", None),
+        }
+
     timeout_type = getattr(fastmssql, "OperationTimeoutError", None)
     if timeout_type is None or not isinstance(error, timeout_type):
         raise error
@@ -268,7 +303,7 @@ def create_fastapi_app(
             )
         except fastmssql.SqlConnectionError as error:
             return JSONResponse(
-                _timeout_payload(error),
+                _connection_error_payload(error),
                 status_code=504,
             )
 
@@ -400,7 +435,7 @@ def create_flask_app(state: FrameworkState) -> Flask:
                 )
             )
         except fastmssql.SqlConnectionError as error:
-            return jsonify(_timeout_payload(error)), 504
+            return jsonify(_connection_error_payload(error)), 504
 
     @app.get("/sql-error")
     async def sql_error():

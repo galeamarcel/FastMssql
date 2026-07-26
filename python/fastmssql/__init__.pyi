@@ -5,18 +5,22 @@ from .fastmssql import (
     AzureCredential,
     AzureCredentialType,
     CommitOutcomeUnknown,
+    ConnectionLifecycleError,
+    ConnectionLifecycleState,
     ConversionError,
     EncryptionLevel,
     FastRow,
     Parameter,
     Parameters,
     OperationTimeoutError,
+    LifecycleConfig,
     PoolConfig,
     ProtocolError,
     QueryStream,
     SqlConnectionError,
     SqlError,
     SslConfig,
+    ShutdownTimeoutError,
     TlsError,
     TimeoutConfig,
     TypedNull,
@@ -68,6 +72,7 @@ class Connection:
         instance_name: Optional[str] = None,
         application_name: Optional[str] = None,
         timeout_config: Optional[TimeoutConfig] = None,
+        lifecycle_config: Optional[LifecycleConfig] = None,
     ) -> None:
         """
         Initialize a new SQL Server connection.
@@ -100,6 +105,16 @@ class Connection:
     @property
     def timeout_config(self) -> TimeoutConfig:
         """Return an isolated copy of the effective timeout policy."""
+        ...
+
+    @property
+    def lifecycle_config(self) -> LifecycleConfig:
+        """Return an isolated copy of the effective lifecycle policy."""
+        ...
+
+    @property
+    def lifecycle_state(self) -> ConnectionLifecycleState:
+        """Return Open, Closing, or Closed without network I/O."""
         ...
 
     def connect(
@@ -374,17 +389,21 @@ __all__ = [
     "CommitOutcomeUnknown",
     "ConversionError",
     "Connection",
+    "ConnectionLifecycleError",
+    "ConnectionLifecycleState",
     "EncryptionLevel",
     "FastRow",
     "Parameter",
     "Parameters",
     "OperationTimeoutError",
+    "LifecycleConfig",
     "PoolConfig",
     "ProtocolError",
     "QueryStream",
     "SqlConnectionError",
     "SqlError",
     "SslConfig",
+    "ShutdownTimeoutError",
     "TlsError",
     "TimeoutConfig",
     "Transaction",

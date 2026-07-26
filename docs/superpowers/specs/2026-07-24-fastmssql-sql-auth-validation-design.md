@@ -616,6 +616,27 @@ violated. No marketing claim is declared proven from a single emulated host.
 - `TIME-010`: FastAPI and Flask-through-ASGI preserve typed errors and recover
   after 1,000 bounded operations.
 
+### LIFE — connection lifecycle and graceful shutdown
+
+- `LIFE-001`: public config/state/error exports, defaults, signatures, stubs,
+  copy isolation and portable validation.
+- `LIFE-002`: initial Open, pool-independent state and graceful transitions.
+- `LIFE-003`: disconnect waits for admitted SQL and leaves zero sessions.
+- `LIFE-004`: Closing rejects new SQL and Closed permits a new generation.
+- `LIFE-005`: concurrent/cancelled shutdown waiters share one supervisor.
+- `LIFE-006`: admitted pool waiters remain inside the drain barrier.
+- `LIFE-007`: an active pooled transaction may commit while Closing.
+- `LIFE-008`: rollback/close release the transaction permit exactly once.
+- `LIFE-009`: grace expiry force-retires a query and allows recovery.
+- `LIFE-010`: forced writes/batches are uncertain and never retried.
+- `LIFE-011`: force rolls back and revokes an idle pooled transaction.
+- `LIFE-012`: forced unconfirmed COMMIT remains CommitOutcomeUnknown.
+- `LIFE-013`: direct execute_batch and nested contexts use one lifecycle.
+- `LIFE-014`: 100 generations and 2,000 operations leave no stale work.
+- `LIFE-015`: ASGI lifecycle is persistent; Flask/WSGI remains per-loop.
+- `LIFE-016`: cancelling an in-flight transaction close retires its lease,
+  releases the lifecycle barrier exactly once and permits graceful shutdown.
+
 ## 7. Error handling and defect workflow
 
 When a strict test fails:

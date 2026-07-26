@@ -108,6 +108,25 @@ class TimeoutConfig:
         rollback_timeout_secs: Optional[float] = 30.0,
     ) -> None: ...
 
+class LifecycleConfig:
+    """Bounded graceful-shutdown and forced-retirement policy."""
+
+    shutdown_timeout_secs: float
+    force_timeout_secs: float
+
+    def __init__(
+        self,
+        shutdown_timeout_secs: float = 30.0,
+        force_timeout_secs: float = 5.0,
+    ) -> None: ...
+
+class ConnectionLifecycleState(StrEnum):
+    """Connection admission lifecycle state."""
+
+    OPEN: str
+    CLOSING: str
+    CLOSED: str
+
 class EncryptionLevel(StrEnum):
     """SQL Server encryption level constants."""
 
@@ -173,6 +192,30 @@ class OperationTimeoutError(SqlConnectionError):
     retryable: bool
     connection_discarded: bool
     outcome_unknown: bool
+    ...
+
+class ConnectionLifecycleError(SqlConnectionError):
+    """Work was rejected or interrupted by connection shutdown."""
+
+    message: str
+    operation: str
+    phase: str
+    state: str
+    generation: int
+    retryable: bool
+    connection_discarded: bool
+    outcome_unknown: bool
+    forced: bool
+    ...
+
+class ShutdownTimeoutError(ConnectionLifecycleError):
+    """Graceful shutdown expired and forced retirement was attempted."""
+
+    shutdown_timeout_seconds: float
+    force_timeout_seconds: float
+    active_operations_at_timeout: int
+    active_transactions_at_timeout: int
+    force_completed: bool
     ...
 
 class CommitOutcomeUnknown(Exception):
@@ -635,6 +678,7 @@ class Connection:
         instance_name: Optional[str] = None,
         application_name: Optional[str] = None,
         timeout_config: Optional[TimeoutConfig] = None,
+        lifecycle_config: Optional[LifecycleConfig] = None,
     ) -> None:
         """
         Initialize a new SQL Server connection.
@@ -663,6 +707,16 @@ class Connection:
     @property
     def timeout_config(self) -> TimeoutConfig:
         """Return an isolated copy of the effective timeout policy."""
+        ...
+
+    @property
+    def lifecycle_config(self) -> LifecycleConfig:
+        """Return an isolated copy of the effective lifecycle policy."""
+        ...
+
+    @property
+    def lifecycle_state(self) -> ConnectionLifecycleState:
+        """Return Open, Closing, or Closed without network I/O."""
         ...
 
     def connect(
