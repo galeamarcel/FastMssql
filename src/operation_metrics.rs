@@ -160,17 +160,19 @@ impl OperationMetric {
     }
 
     fn snapshot(&self) -> OperationMetricSnapshot {
-        let outcomes = std::array::from_fn(|index| self.outcomes[index].load(Ordering::Acquire));
         let mut completed = 0_u64;
-        for value in outcomes {
-            completed = match completed.checked_add(value) {
-                Some(total) => total,
-                None => {
-                    self.saturated.store(true, Ordering::Release);
-                    u64::MAX
-                }
-            };
-        }
+        // Public saturation projection order: succeeded, errors, timed_out,
+        // cancelled, outcome_unknown.
+        let outcomes = std::array::from_fn(|index| {
+            let raw_outcome = self.outcomes[index].load(Ordering::Acquire);
+            let remaining = u64::MAX - completed;
+            let exported_outcome = raw_outcome.min(remaining);
+            if exported_outcome != raw_outcome {
+                self.saturated.store(true, Ordering::Release);
+            }
+            completed += exported_outcome;
+            exported_outcome
+        });
 
         let raw_started = self.started.load(Ordering::Acquire);
         let started = raw_started.max(completed);
