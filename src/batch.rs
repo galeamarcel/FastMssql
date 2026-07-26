@@ -481,6 +481,7 @@ fn fix_bulk_null_types(flat_data: &mut [FastParameter], col_count: usize) {
                 FastParameterValue::Bytes(_) => Some(TypedNull::Binary),
                 FastParameterValue::Numeric(_) => Some(TypedNull::Numeric),
                 FastParameterValue::Date(_) => Some(TypedNull::Date),
+                FastParameterValue::Time(_) => Some(TypedNull::Time),
                 FastParameterValue::DateTime(_) => Some(TypedNull::DateTime),
                 FastParameterValue::Null(_) => None,
             })

@@ -1,12 +1,12 @@
 use crate::py_parameters::Parameters;
 use crate::type_mapping;
 use crate::types::create_parameter_conversion_error;
-use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{
     PyBool, PyByteArray, PyByteArrayMethods, PyBytes, PyFloat, PyInt, PyList, PyMemoryView,
-    PyString, PyTuple,
+    PyString, PyTime, PyTuple,
 };
 use smallvec::SmallVec;
 
@@ -29,6 +29,7 @@ pub(crate) enum FastParameterValue {
     Bytes(Vec<u8>),
     Numeric(tiberius::numeric::Numeric),
     Date(NaiveDate),
+    Time(NaiveTime),
     DateTime(NaiveDateTime),
 }
 
@@ -49,6 +50,7 @@ impl tiberius::ToSql for FastParameter {
             FastParameterValue::Bytes(b) => b.to_sql(),
             FastParameterValue::Numeric(n) => n.to_sql(),
             FastParameterValue::Date(d) => d.to_sql(),
+            FastParameterValue::Time(t) => t.to_sql(),
             FastParameterValue::DateTime(dt) => dt.to_sql(),
         }
     }
@@ -106,6 +108,9 @@ fn python_to_fast_parameter_at(
             py_by.to_vec(),
         )));
     }
+    if let Ok(py_time) = obj.cast::<PyTime>() {
+        return time_to_fast_parameter(py_time, parameter_index);
+    }
     if let Ok(py_dt) = obj.extract::<NaiveDateTime>() {
         return Ok(FastParameter::new(FastParameterValue::DateTime(py_dt)));
     }
@@ -130,6 +135,39 @@ fn python_to_fast_parameter_at(
             obj.get_type().name()?
         )))
     }
+}
+
+fn time_to_fast_parameter(
+    py_time: &Bound<PyTime>,
+    parameter_index: usize,
+) -> PyResult<FastParameter> {
+    let offset = py_time.call_method0("utcoffset").map_err(|_| {
+        create_parameter_conversion_error(
+            parameter_index,
+            "TIME(7)",
+            "invalid_time",
+            "Time parameter conversion failed",
+        )
+    })?;
+    if !offset.is_none() {
+        return Err(create_parameter_conversion_error(
+            parameter_index,
+            "TIME(7)",
+            "timezone_not_supported",
+            "Aware time parameter is not supported because SQL Server TIME has no offset",
+        ));
+    }
+
+    let time = py_time.extract::<NaiveTime>().map_err(|_| {
+        create_parameter_conversion_error(
+            parameter_index,
+            "TIME(7)",
+            "invalid_time",
+            "Time parameter conversion failed",
+        )
+    })?;
+
+    Ok(FastParameter::new(FastParameterValue::Time(time)))
 }
 
 fn is_decimal_instance(obj: &Bound<PyAny>) -> PyResult<bool> {
