@@ -95,6 +95,23 @@ async def test_decimal_and_numeric_preserve_precision_and_scale(
             Decimal("99999999999999999999999999999999999999"),
             0,
         ),
+        (
+            "CAST(0.00000000000000000000000000000000000001 "
+            "AS DECIMAL(38,38))",
+            Decimal("1E-38"),
+            -38,
+        ),
+        (
+            "CAST(-0.00000000000000000000000000000000000001 "
+            "AS DECIMAL(38,38))",
+            Decimal("-1E-38"),
+            -38,
+        ),
+        (
+            "CAST(0 AS DECIMAL(38,38))",
+            Decimal("0E-38"),
+            -38,
+        ),
     ]
     for expression, expected, exponent in cases:
         value = await scalar(owner_connection, f"SELECT {expression}")

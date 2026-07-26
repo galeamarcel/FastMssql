@@ -332,6 +332,8 @@ mod bigdecimal_ {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
+    use bytes::{BufMut, BytesMut};
 
     #[test]
     fn numeric_eq() {
@@ -372,6 +374,35 @@ mod tests {
     fn calculates_precision_correctly() {
         let n = Numeric::new_with_scale(57705, 2);
         assert_eq!(5, n.precision());
+    }
+
+    #[test]
+    fn maximum_scale_is_valid_and_has_sql_server_precision() {
+        let smallest_positive = Numeric::new_with_scale(1, 38);
+        assert_eq!(38, smallest_positive.scale());
+        assert_eq!(38, smallest_positive.precision());
+
+        let zero = Numeric::new_with_scale(0, 38);
+        assert_eq!(38, zero.scale());
+        assert_eq!(38, zero.precision());
+    }
+
+    #[tokio::test]
+    async fn decodes_decimal_with_maximum_scale() {
+        let mut payload = BytesMut::with_capacity(18);
+        payload.put_u8(17);
+        payload.put_u8(1);
+        payload.put_u128_le(1);
+        let mut reader = payload.into_sql_read_bytes();
+
+        let decoded = Numeric::decode(&mut reader, 38)
+            .await
+            .expect("DECIMAL(38,38) payload must decode")
+            .expect("DECIMAL(38,38) payload must be non-null");
+
+        assert_eq!(1, decoded.value());
+        assert_eq!(38, decoded.scale());
+        assert_eq!(38, decoded.precision());
     }
 
     #[test]
