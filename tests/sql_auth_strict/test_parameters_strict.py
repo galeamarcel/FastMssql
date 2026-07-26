@@ -38,6 +38,34 @@ class _DateDependentTimezone(tzinfo):
         return "DateDependent/+03:30"
 
 
+class _SemanticallyNaiveTimezone(tzinfo):
+    def utcoffset(self, value: datetime | None) -> None:
+        del value
+        return None
+
+    def dst(self, value: datetime | None) -> None:
+        del value
+        return None
+
+    def tzname(self, value: datetime | None) -> None:
+        del value
+        return None
+
+
+class _FailingTimezone(tzinfo):
+    def utcoffset(self, value: datetime | None) -> timedelta:
+        del value
+        raise RuntimeError("internal tzinfo secret")
+
+    def dst(self, value: datetime | None) -> timedelta:
+        del value
+        return timedelta(0)
+
+    def tzname(self, value: datetime | None) -> str:
+        del value
+        return "Failing"
+
+
 @case("PARAM-001")
 @pytest.mark.asyncio
 async def test_none_with_inferable_sql_type(owner_connection: Connection) -> None:
@@ -366,30 +394,43 @@ async def test_date_parameter(owner_connection: Connection) -> None:
 async def test_naive_datetime_and_aware_datetimeoffset_parameters(
     owner_connection: Connection,
 ) -> None:
-    naive = datetime(2024, 2, 29, 23, 58, 57, 123456)
-    naive_row = (
-        await owner_connection.query(
-            """
-            SELECT
-                @P1 AS value,
-                CONVERT(
-                    VARCHAR(128),
-                    SQL_VARIANT_PROPERTY(@P1, 'BaseType')
-                ) AS base_type,
-                CONVERT(
-                    INT,
-                    SQL_VARIANT_PROPERTY(@P1, 'Scale')
-                ) AS scale_value
-            """,
-            [naive],
-        )
-    ).fetchone()
-    assert naive_row is not None
-    assert type(naive_row["value"]) is datetime
-    assert naive_row["value"] == naive
-    assert naive_row["value"].tzinfo is None
-    assert naive_row["base_type"] == "datetime2"
-    assert naive_row["scale_value"] == 7
+    naive_values = [
+        datetime(2024, 2, 29, 23, 58, 57, 123456),
+        datetime(
+            2024,
+            2,
+            29,
+            23,
+            58,
+            57,
+            123456,
+            tzinfo=_SemanticallyNaiveTimezone(),
+        ),
+    ]
+    for naive in naive_values:
+        naive_row = (
+            await owner_connection.query(
+                """
+                SELECT
+                    @P1 AS value,
+                    CONVERT(
+                        VARCHAR(128),
+                        SQL_VARIANT_PROPERTY(@P1, 'BaseType')
+                    ) AS base_type,
+                    CONVERT(
+                        INT,
+                        SQL_VARIANT_PROPERTY(@P1, 'Scale')
+                    ) AS scale_value
+                """,
+                [naive],
+            )
+        ).fetchone()
+        assert naive_row is not None
+        assert type(naive_row["value"]) is datetime
+        assert naive_row["value"] == naive.replace(tzinfo=None)
+        assert naive_row["value"].tzinfo is None
+        assert naive_row["base_type"] == "datetime2"
+        assert naive_row["scale_value"] == 7
 
     timezones = [
         _DateDependentTimezone(),
@@ -450,6 +491,11 @@ async def test_naive_datetime_and_aware_datetimeoffset_parameters(
             "offset_out_of_range",
             "Datetime offset must be between -14:00 and +14:00",
         ),
+        (
+            _FailingTimezone(),
+            "invalid_datetime",
+            "Datetime parameter conversion failed",
+        ),
     ]
     for invalid_zone, reason, message in invalid_cases:
         value = datetime(
@@ -470,6 +516,7 @@ async def test_naive_datetime_and_aware_datetimeoffset_parameters(
         assert error.value.sql_type == "DATETIMEOFFSET(7)"
         assert error.value.reason == reason
         assert error.value.retryable is False
+        assert "internal tzinfo secret" not in str(error.value)
 
 
 @case("PARAM-013")
