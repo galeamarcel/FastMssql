@@ -604,14 +604,35 @@ async def test_time_parameter_uses_time_7_and_rejects_offsets(
 
 @case("PARAM-014")
 @pytest.mark.asyncio
-async def test_uuid_currently_rejected_deterministically(
+async def test_uuid_parameter_is_symmetric_and_uses_uniqueidentifier(
     owner_connection: Connection,
 ) -> None:
-    with pytest.raises(ValueError, match="^Unsupported type: UUID$"):
+    value = UUID("12345678-1234-5678-9234-567812345678")
+    row = (
         await owner_connection.query(
-            "SELECT CAST(@P1 AS UNIQUEIDENTIFIER) AS value",
-            [UUID("12345678-1234-5678-9234-567812345678")],
+            """
+            SELECT
+                @P1 AS value,
+                CONVERT(
+                    VARCHAR(128),
+                    SQL_VARIANT_PROPERTY(@P1, 'BaseType')
+                ) AS base_type
+            """,
+            [value],
         )
+    ).fetchone()
+    assert row is not None
+    assert type(row["value"]) is UUID
+    assert row["value"] == value
+    assert row["base_type"] == "uniqueidentifier"
+
+    impostor_uuid = type(
+        "UUID",
+        (),
+        {"bytes": b"\x12\x34\x56\x78" * 4},
+    )()
+    with pytest.raises(ValueError, match="^Unsupported type: UUID$"):
+        await owner_connection.query("SELECT @P1", [impostor_uuid])
 
 
 @case("PARAM-015")

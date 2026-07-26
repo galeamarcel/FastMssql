@@ -4,6 +4,7 @@ from collections.abc import Callable
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 import math
+from uuid import UUID
 
 from fastmssql import Connection, ConversionError, ProtocolError
 import pytest
@@ -415,8 +416,8 @@ async def test_uniqueidentifier_mapping(owner_connection: Connection) -> None:
         )
         """,
     )
-    assert type(value) is str
-    assert value == "12345678-1234-5678-9234-567812345678"
+    assert type(value) is UUID
+    assert value == UUID("12345678-1234-5678-9234-567812345678")
     assert (
         await scalar(owner_connection, "SELECT CAST(NULL AS UNIQUEIDENTIFIER)")
         is None
