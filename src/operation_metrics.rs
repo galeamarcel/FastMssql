@@ -512,6 +512,42 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_reconciles_multiple_outcomes_into_one_saturated_total() {
+        let registry = OperationMetricsRegistry::new();
+        let index = metric_index(OperationName::Query).unwrap();
+        let metric = &registry.operations[index];
+        metric.started.store(u64::MAX, Ordering::Relaxed);
+        metric.outcomes[0].store(u64::MAX - 2, Ordering::Relaxed);
+        metric.outcomes[1].store(2, Ordering::Relaxed);
+        metric.outcomes[2].store(1, Ordering::Relaxed);
+        metric.outcomes[3].store(1, Ordering::Relaxed);
+        metric.outcomes[4].store(1, Ordering::Relaxed);
+
+        let query = &registry.snapshot().operations[index];
+        assert_eq!(query.outcomes, [u64::MAX - 2, 2, 0, 0, 0]);
+        assert_eq!(query.completed, u64::MAX);
+        assert_eq!(
+            u128::from(query.completed),
+            query.outcomes.into_iter().map(u128::from).sum::<u128>()
+        );
+        assert_eq!(
+            u128::from(query.started),
+            u128::from(query.completed) + u128::from(query.in_flight)
+        );
+        assert!(query.saturated);
+
+        metric.started.store(18, Ordering::Relaxed);
+        for (outcome, value) in metric.outcomes.iter().zip([7, 5, 3, 2, 1]) {
+            outcome.store(value, Ordering::Relaxed);
+        }
+        let unsaturated_values = &registry.snapshot().operations[index];
+        assert_eq!(unsaturated_values.outcomes, [7, 5, 3, 2, 1]);
+        assert_eq!(unsaturated_values.completed, 18);
+        assert_eq!(unsaturated_values.in_flight, 0);
+        assert!(unsaturated_values.saturated);
+    }
+
+    #[test]
     fn armed_guard_drop_records_exactly_one_cancellation() {
         let registry = Arc::new(OperationMetricsRegistry::new());
         let index = metric_index(OperationName::Query).unwrap();
