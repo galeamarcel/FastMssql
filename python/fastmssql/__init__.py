@@ -12,6 +12,8 @@ from .fastmssql import (
     AzureCredential,
     AzureCredentialType,
     CommitOutcomeUnknown,
+    ConnectionLifecycleError,
+    ConnectionLifecycleState,
     ConversionError,
     SqlConnectionError,
     EncryptionLevel,
@@ -19,11 +21,13 @@ from .fastmssql import (
     Parameter,
     Parameters,
     PoolConfig,
+    LifecycleConfig,
     OperationTimeoutError,
     ProtocolError,
     QueryStream,
     SqlError,
     SslConfig,
+    ShutdownTimeoutError,
     TlsError,
     TimeoutConfig,
     TypedNull,
@@ -67,7 +71,11 @@ class Connection:
         return await self._conn.ping()
 
     async def disconnect(self) -> bool:
-        """Drop this connection object's pool handle."""
+        """Drain and close this connection generation.
+
+        Raises ``ShutdownTimeoutError`` after bounded forced cleanup when
+        admitted work exceeds the graceful shutdown budget.
+        """
         return await self._conn.disconnect()
 
     async def is_connected(self) -> bool:
@@ -100,6 +108,16 @@ class Connection:
     def timeout_config(self):
         """Return an isolated copy of the effective timeout policy."""
         return self._conn.timeout_config
+
+    @property
+    def lifecycle_config(self):
+        """Return an isolated copy of the effective lifecycle policy."""
+        return self._conn.lifecycle_config
+
+    @property
+    def lifecycle_state(self):
+        """Return Open, Closing, or Closed without network I/O."""
+        return self._conn.lifecycle_state
 
 
 class Transaction:
@@ -248,6 +266,8 @@ __all__ = [
     "AzureCredentialType",
     "CommitOutcomeUnknown",
     "Connection",
+    "ConnectionLifecycleError",
+    "ConnectionLifecycleState",
     "ConversionError",
     "SqlConnectionError",
     "EncryptionLevel",
@@ -255,11 +275,13 @@ __all__ = [
     "Parameter",
     "Parameters",
     "PoolConfig",
+    "LifecycleConfig",
     "OperationTimeoutError",
     "ProtocolError",
     "QueryStream",
     "SqlError",
     "SslConfig",
+    "ShutdownTimeoutError",
     "TlsError",
     "TimeoutConfig",
     "Transaction",

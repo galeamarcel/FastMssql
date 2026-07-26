@@ -585,6 +585,69 @@ For a timeout while awaiting `COMMIT`, the top-level exception is always
 `CommitOutcomeUnknown`; its `__cause__` is the structured
 `OperationTimeoutError` whose phase is `operation` or `transaction`.
 
+### Graceful connection lifecycle
+
+Use `LifecycleConfig` to bound application shutdown without claiming that
+in-flight database work disappeared:
+
+```python
+import os
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastmssql import Connection, LifecycleConfig
+
+
+lifecycle = LifecycleConfig(
+    shutdown_timeout_secs=30.0,
+    force_timeout_secs=5.0,
+)
+connection = Connection(
+    server="sql.example.internal",
+    database="application",
+    username=os.environ["MSSQL_USER"],
+    password=os.environ["MSSQL_PASSWORD"],
+    lifecycle_config=lifecycle,
+)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    del app
+    await connection.connect()
+    try:
+        yield
+    finally:
+        await connection.disconnect()
+
+
+app = FastAPI(lifespan=lifespan)
+```
+
+Every connection has an explicit admission state:
+
+- `Open` accepts work. It does not mean that a pool exists or that SQL Server
+  is ready; use `ping()` for readiness.
+- `Closing` rejects new SQL with `ConnectionLifecycleError` while work already
+  admitted to that generation drains.
+- `Closed` owns no active pool and can lazily or explicitly reopen as a new
+  generation.
+
+`disconnect()` waits up to `shutdown_timeout_secs`. If work remains, it
+force-retires affected transports for at most `force_timeout_secs`, reaches
+`Closed`, and then raises `ShutdownTimeoutError`. A forced cleanup is never
+reported as a graceful success. Forced query, write, batch, or bulk outcomes
+are conservatively marked `outcome_unknown=True`; FastMssql never retries
+them. Reconcile uncertain writes with a unique business or idempotency key.
+An unconfirmed forced `COMMIT` remains `CommitOutcomeUnknown` and chains the
+structured lifecycle error as its cause.
+
+FastAPI/native ASGI and Flask through an ASGI adapter can own an
+application-scoped connection on a persistent event loop. Flask `async def`
+under plain WSGI remains functional compatibility only: WSGI may create a
+different event loop per request, so it is not a true-async concurrency or
+persistent-lifecycle deployment model.
+
 
 ### Transactions
 
