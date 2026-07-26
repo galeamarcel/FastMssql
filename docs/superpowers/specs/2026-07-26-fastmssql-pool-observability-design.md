@@ -162,11 +162,14 @@ pool implementation changes later.
 
 All new integer counters are monotonic within one concrete bb8 pool instance.
 
-- `get_started`: every checkout started, before waiting.
+- `get_started`: every checkout started, before waiting. The exported snapshot
+  is reconciled to at least the sum of the three completed-result counters
+  because bb8 reads its independent relaxed atomics separately.
 - `get_direct`: successful checkout without waiting for availability.
 - `get_waited`: successful checkout that waited for availability.
 - `get_timed_out`: checkout whose bb8 acquisition budget expired.
-- `pending_gets`: started minus direct, waited and timed-out completions.
+- `pending_gets`: reconciled started minus direct, waited and timed-out
+  completions.
 - `get_wait_time_seconds`: total time accumulated by waited or timed-out
   checkouts, converted from bb8's microsecond counter to seconds.
 - `connections_created`: physical connections successfully added to the pool.
@@ -202,8 +205,24 @@ callable during `Open`, `Closing` and `Closed` and does not create a pool,
 perform I/O or delay graceful shutdown beyond the existing short pool read.
 
 The snapshot is not a database transaction. Concurrent checkout/drop activity
-can progress immediately before or after capture, but each returned arithmetic
-relationship is derived from bb8's single `State`/`Statistics` value.
+can progress immediately before or after capture. bb8 constructs one
+`State::statistics` value by loading independent `Relaxed` atomics, so the
+loads are inexpensive but not one multi-counter atomic capture.
+
+FastMssql therefore does not call bb8's subtraction-based
+`Statistics::pending_gets()` directly. It derives:
+
+```text
+completed_gets = get_direct + get_waited + get_timed_out
+exported_get_started = max(bb8_get_started, completed_gets)
+pending_gets = exported_get_started - completed_gets
+```
+
+This reconciliation represents the logical fact that a completed checkout
+must already have started, prevents an impossible negative/wrapped pending
+value during a transient cross-atomic observation, and guarantees the public
+arithmetic contract without adding locks or driver-owned counters. It does not
+alter bb8 state.
 
 ## Required invariants
 
@@ -268,8 +287,9 @@ The only added work is when the caller explicitly invokes `pool_stats()`:
 
 1. read the existing pool handle;
 2. call `pool.state()`;
-3. convert one `Duration` to `f64` seconds;
-4. allocate the returned Python dictionary.
+3. reconcile the four checkout counters with bounded integer arithmetic;
+4. convert one `Duration` to `f64` seconds;
+5. allocate the returned Python dictionary.
 
 There is no background task, timer, ring buffer, callback, histogram or
 unbounded collection.
@@ -434,5 +454,12 @@ Corrections made during self-review:
    Compatibility language was corrected to identify the new exact key set as
    an intentional schema migration; the existing CONN-019 assertions are
    strengthened, not deleted or relaxed.
+10. bb8's `State` is not a multi-counter atomic snapshot: its statistics are
+    assembled from independent `Relaxed` loads. Direct use of
+    `Statistics::pending_gets()` was removed from the implementation contract;
+    completed counters are summed safely, exported `get_started` is reconciled
+    upward when needed, and `pending_gets` is derived without underflow. The
+    10,000-operation scrape test enforces the resulting invariant while writes
+    are active.
 
 No placeholder, unresolved API choice or hidden dependency remains.
