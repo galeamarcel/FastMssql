@@ -1839,6 +1839,104 @@ Toate branchurile, commiturile și push-urile acestui candidat există numai în
 `galeamarcel/FastMssql`. Nu s-a făcut push, PR sau release în repository-ul
 original, al cărui push URL local rămâne `DISABLED`.
 
+## Regresia originală locală — etichetă clarificată și verificată
+
+Statusul corecției este `VERIFIED_FORK`. Lane-ul care rulează suita moștenită
+de la proiectul original pe containerul MSSQL local nu mai este afișat public
+ca `upstream`, termen care putea sugera greșit o operație asupra altui
+repository. Numele vizibil este acum:
+
+```text
+original-local-regression
+```
+
+În textul românesc este folosit „regresia originală locală”.
+
+Schimbarea este limitată la cele două frontiere de prezentare:
+
+- `scripts/sql_auth/run_all.sh` mapează numai mesajele din consolă;
+- `scripts/sql_auth/generate_report.py` mapează numai celula `Lane` din
+  raport.
+
+Identificatorii interni istorici rămân intenționat compatibili:
+
+```text
+upstream.command
+upstream.exitcode
+upstream.log
+upstream.xml
+fastmssql_upstream_regression
+```
+
+Selecția pytest, excluderile Azure, `-n 1`, baza de date, JUnit-ul și
+agregarea exit-code-urilor nu s-au schimbat.
+
+Istoricul TDD, publicat exclusiv pe fork, este:
+
+- design și plan: `docs/original-local-regression-label-design` la
+  `d2d79d4f22d28be9653568999576907d92f9d7f5`;
+- contract RED: `test/original-local-regression-label` la
+  `e8aac7d44934c94e691e3c3a037731216c442c7f`;
+- fix cu RED în ancestry: `fix/original-local-regression-label` la
+  `40ed5fb86d7637c45d6fb89c43f8bbf5599d2eb7`;
+- merge tehnic al terminologiei:
+  `eaacc504be8582e99edab4fd05633458b8190984`;
+- arbore tehnic exact reverificat, care include și corecția test-only
+  lifecycle verificată în același gate:
+  `ecce84d3b1be65e591879f8dc2443a9058ddb581`;
+- matricea și raportul regenerate din artefactele acelui arbore:
+  `3f4c507f75b3f63821613ce611d769582a5af8f3`.
+
+Contractul RED a executat o copie reală a runnerului într-un sandbox local cu
+stuburi deterministe numai pentru procesele externe. A eșuat exact deoarece
+consola și raportul încă afișau `upstream`, păstrând în același timp
+artefactele interne și comanda pytest locală. După fix, cele două contracte
+focale au trecut `2/2`, întregul modul de contract al matricei a trecut
+`19/19`, iar Ruff, `compileall`, `bash -n` și `git diff --check` au fost
+verzi.
+
+Pe arborele tehnic exact `ecce84d3...`, gate-ul Docker/MSSQL complet a
+produs:
+
+```text
+FastMssql Rust                              54/54 PASS
+strict / async / framework        340/340 + 16/16 + 33/33 PASS
+resilience / load                     6/6 + 11/11 PASS
+regresia originală locală                  930/930 PASS
+matrice SQL-auth                            337/337 PASS
+failures / errors / skips / not-run       0 / 0 / 0 / 0
+```
+
+Creșterea strict de la 339 la 340 este contractul comportamental nou al
+runnerului; suita moștenită exclude `tests/sql_auth_strict`, deci rămâne
+930/930. Consola a afișat
+`[sql-auth] original-local-regression: passed`, raportul nu conține o celulă
+de lane `| upstream |`, iar `upstream.exitcode` a rămas `0` și
+`upstream.xml` a rămas prezent.
+
+Hashurile dovezilor sunt:
+
+```text
+SQL_AUTH_TEST_MATRIX.md  4cf85e413ceff6060e3aea7c15cd04678e3171d38116ab9f3ea85942b32ef75e
+SQL_AUTH_TEST_REPORT.md  b28fa96e9b768aaba4ddaad599869550a822f58c158b26f83dbfb6f95a57be47
+upstream.xml             48dc553954bb246fa268d0f28d4623e8530e447398949ad97071dd284ed4cc31
+```
+
+Raportul înscrie exact SHA-ul tehnic verificat și a trecut scanarea valorilor
+secrete din configurația SQL-auth și scanarea santinelei de privacy.
+
+[Rust unit tests #30214510722](https://github.com/galeamarcel/FastMssql/actions/runs/30214510722)
+a trecut raw Cargo, 54/54 teste Rust, buildul wheel-ului, instalarea lui și
+contractele Python pe Ubuntu, Windows și macOS.
+[Dependency security #30214510719](https://github.com/galeamarcel/FastMssql/actions/runs/30214510719)
+a trecut gate-ul RustSec care respinge atât vulnerabilitățile, cât și
+warningurile. Aceste workflow-uri hosted nu pretind un MSSQL real; dovada SQL
+Server este rularea Docker locală de mai sus.
+
+Nu s-a executat nicio operație asupra repository-ului original. `origin`
+indică exclusiv `galeamarcel/FastMssql`, iar push URL-ul remote-ului
+fetch-only pentru repository-ul original rămâne `DISABLED`.
+
 ## Corecții și nuanțări față de primul audit
 
 - Testul istoric cu 99.999 de operații a utilizat 100/200 de obiecte
@@ -2351,47 +2449,43 @@ upstream fără aprobarea explicită a proprietarului forkului.
 - Fork: `https://github.com/galeamarcel/FastMssql.git`
 - Branch cumulativ: `test/sql-auth-validation`
 - HEAD tehnic verificat:
-  `5936cb5d6c6f1e7fd55e4d70fb28143cdbc7fd7a`
-- `origin` indică forkul; `upstream` permite numai fetch, cu push
-  `DISABLED`.
-- Feature-ul observability final este
-  `8971066580eac093d170c7bcdac18dabf086f340`; designul final este
-  `48ec147d912fdec92a90d951c452c0182600af4d`, iar contractul RED final este
-  `1d530a66a16ff43f262cd5dab934ce3788a66304`.
-- La acest source tree: FastMssql Rust `43/43`, contractul static observability
-  `2/2`, strict `326/326`, true-async `16/16`, framework `30/30`,
-  resilience `6/6`, load `10/10`, upstream `923/923` și exact `321/321`
-  ID-uri din specificație, toate PASS.
-- OBS-009: 10.000 operații, 100 workers, pool 20, exact 20 conexiuni fizice,
-  maximum 100 waiteri pending, 9.216 snapshoturi, 36.715 event-loop ticks,
-  `7.423,30 qps`, smoke PASS și zero sesiuni după teardown.
-- Stress-ul final a repetat profilele `10.000:100`, `99.999:100` și
-  `99.999:200` atât persistent, cât și pooled. Fiecare a avut numărul exact
-  de COMMIT/ROLLBACK, smoke PASS și zero sesiuni după teardown; pool-ul cu
-  `max_size=100` a rămas la maximum 100 conexiuni inclusiv la concurență 200.
-- Hosted la feature SHA exact `8971066`: Linux/macOS/Windows
-  [#30188491054](https://github.com/galeamarcel/FastMssql/actions/runs/30188491054)
-  și RustSec
-  [#30188798876](https://github.com/galeamarcel/FastMssql/actions/runs/30188798876)
-  sunt verzi.
-- Run-ul Windows RED
-  [#30178680707](https://github.com/galeamarcel/FastMssql/actions/runs/30178680707)
-  rămâne vizibil și este legat de reproducerea `2d8e526` și fixul `822ab2a`.
-- Nu există PR upstream pentru observability, lifecycle sau operation
-  timeouts.
-- Wheel-ul `cp311-abi3` a fost construit, instalat și importat dintr-un
-  virtualenv curat, iar cele 20 de contracte instalate au trecut. `cargo fmt`,
-  Clippy cu `-D warnings`, Ruff și `compileall` au trecut; `cargo audit` a
-  scanat 219 dependențe cu zero findings.
-- SQL-auth real a fost executat local pe containerul MSSQL aprobat; workflow-ul
-  găzduit nu are un runner SQL Server și validează Rust/wheel/contracts.
-- Toate modificările tehnice și documentare au fost publicate exclusiv pe
-  fork. Paritatea exactă cu `origin/test/sql-auth-validation` se verifică după
-  merge-ul acestui status; nu există niciun push și niciun PR către upstream.
+  `ecce84d3b1be65e591879f8dc2443a9058ddb581`.
+- `origin` indică forkul; remote-ul repository-ului original permite numai
+  fetch și are push URL-ul `DISABLED`.
+- Ultimele două merge-uri tehnice sunt clarificarea regresiei originale
+  locale, `eaacc504be8582e99edab4fd05633458b8190984`, și stabilizarea test-only
+  a waiterilor lifecycle,
+  `ecce84d3b1be65e591879f8dc2443a9058ddb581`.
+- La acest arbore: FastMssql Rust `54/54`, strict `340/340`, true-async
+  `16/16`, framework `33/33`, resilience `6/6`, load `11/11`, regresia
+  originală locală `930/930` și exact `337/337` ID-uri din specificație,
+  toate PASS, fără skip sau not-run.
+- OPMET-011 a executat 10.000 de operații cu 100 workeri, pool maxim 20,
+  maximum 20 conexiuni fizice, maximum 100 operații in-flight,
+  `9.550,61 qps`, 2.649 snapshoturi, 18.011 event-loop ticks și exact 10.000
+  rezultate `succeeded`.
+- Stress-ul enterprise anterior rămâne valid în ancestry: profilele
+  `10.000:100`, `99.999:100` și `99.999:200` au trecut atât persistent, cât
+  și pooled, cu numărul exact de COMMIT/ROLLBACK, smoke PASS și zero sesiuni
+  după teardown. Gate-ul separat de overhead a validat 599.994 operații.
+- La SHA-ul tehnic exact, Linux/macOS/Windows sunt verzi prin
+  [#30214510722](https://github.com/galeamarcel/FastMssql/actions/runs/30214510722),
+  iar RustSec este verde prin
+  [#30214510719](https://github.com/galeamarcel/FastMssql/actions/runs/30214510719).
+- Wheel-ul ABI3 a fost construit și instalat separat pe cele trei sisteme,
+  iar contractele Python instalate, raw Cargo, `cargo fmt`, Clippy cu
+  `-D warnings`, Ruff și `compileall` au trecut.
+- SQL-auth real a fost executat local pe containerul MSSQL aprobat;
+  workflow-urile hosted validează Rust/wheel/contracts, nu pretind un SQL
+  Server real.
+- Parametrii SQL tipizați, streamingul/resultseturile multiple, batch/bulk
+  enterprise, named instances și matricea cu servere web reale rămân deschise
+  în ordinea de implementare.
+- Toate schimbările și dovezile au fost publicate exclusiv pe fork. Nu există
+  push, PR sau release în repository-ul original.
 
 Starea de mai sus este rezultatul arborelui tehnic exact înaintea acestui
-update documentar. Branchurile validate au fost integrate numai în fork; nu
-s-a făcut push și nu s-a creat PR către `upstream`.
+update documentar. Branchurile validate au fost integrate numai în fork.
 
 Pentru evidența testului de tranzacții concurente:
 [SQL_AUTH_TRANSACTION_STRESS_REPORT.md](SQL_AUTH_TRANSACTION_STRESS_REPORT.md).
