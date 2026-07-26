@@ -680,7 +680,6 @@ privileged fixture. Wait until the server session is absent, then execute
 Assert:
 
 ```python
-assert replacement_spid != killed_spid
 assert replacement_connection_id != killed_connection_id
 assert after["connections_closed_invalid"] \
     == before["connections_closed_invalid"] + 1
@@ -691,7 +690,10 @@ assert after["connections_closed_broken"] \
 ```
 
 Checkout validation, not a later application error, must discover the killed
-idle transport.
+idle transport. Do not require a different `@@SPID`: SQL Server can
+immediately reuse the smallint session ID after `KILL`. The
+`sys.dm_exec_connections.connection_id` UUID is the physical-connection
+identity required by this case.
 
 - [ ] **Step 3: Extend maximum-lifetime retirement as `OBS-007`**
 
