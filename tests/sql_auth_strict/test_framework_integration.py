@@ -1353,7 +1353,9 @@ async def test_framework_lifecycle_shutdown_modes(
         assert fastapi_shutdown.done() is False
         assert (await fastapi_request).json() == {"value": 15}
         fastapi_request = None
-        assert await fastapi_shutdown is None
+        # LifespanManager follows the async context-manager protocol and
+        # returns False to leave exception suppression disabled.
+        assert await fastapi_shutdown is False
         fastapi_shutdown = None
         fastapi_manager_open = False
         assert (
@@ -1442,7 +1444,7 @@ async def test_framework_lifecycle_shutdown_modes(
         assert flask_shutdown.done() is False
         assert await flask_holder == 15
         flask_holder = None
-        assert await flask_shutdown is None
+        assert await flask_shutdown is False
         flask_shutdown = None
         flask_lifespan_open = False
         assert (
