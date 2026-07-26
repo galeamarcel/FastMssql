@@ -348,29 +348,112 @@ async def test_date_parameter(owner_connection: Connection) -> None:
 
 @case("PARAM-012")
 @pytest.mark.asyncio
-async def test_naive_and_timezone_aware_datetime(
+async def test_naive_datetime_and_aware_datetimeoffset_parameters(
     owner_connection: Connection,
 ) -> None:
     naive = datetime(2024, 2, 29, 23, 58, 57, 123456)
-    naive_result = await owner_connection.query(
-        "SELECT CAST(@P1 AS DATETIME2(6)) AS value", [naive]
-    )
-    assert naive_result.fetchone()["value"] == naive
+    naive_row = (
+        await owner_connection.query(
+            """
+            SELECT
+                @P1 AS value,
+                CONVERT(
+                    VARCHAR(128),
+                    SQL_VARIANT_PROPERTY(@P1, 'BaseType')
+                ) AS base_type,
+                CONVERT(
+                    INT,
+                    SQL_VARIANT_PROPERTY(@P1, 'Scale')
+                ) AS scale_value
+            """,
+            [naive],
+        )
+    ).fetchone()
+    assert naive_row is not None
+    assert type(naive_row["value"]) is datetime
+    assert naive_row["value"] == naive
+    assert naive_row["value"].tzinfo is None
+    assert naive_row["base_type"] == "datetime2"
+    assert naive_row["scale_value"] == 7
 
-    aware = datetime(
-        2024,
-        2,
-        29,
-        23,
-        58,
-        57,
-        123456,
-        tzinfo=timezone(timedelta(hours=2)),
-    )
-    aware_result = await owner_connection.query(
-        "SELECT CAST(@P1 AS DATETIME2(6)) AS value", [aware]
-    )
-    assert aware_result.fetchone()["value"] == aware.replace(tzinfo=None)
+    offsets = [
+        timedelta(hours=2, minutes=30),
+        -timedelta(hours=5, minutes=45),
+        timedelta(hours=14),
+        -timedelta(hours=14),
+    ]
+    for offset in offsets:
+        aware = datetime(
+            2024,
+            2,
+            29,
+            12,
+            34,
+            56,
+            123456,
+            tzinfo=timezone(offset),
+        )
+        row = (
+            await owner_connection.query(
+                """
+                SELECT
+                    @P1 AS value,
+                    CONVERT(
+                        VARCHAR(128),
+                        SQL_VARIANT_PROPERTY(@P1, 'BaseType')
+                    ) AS base_type,
+                    CONVERT(
+                        INT,
+                        SQL_VARIANT_PROPERTY(@P1, 'Scale')
+                    ) AS scale_value
+                """,
+                [aware],
+            )
+        ).fetchone()
+        assert row is not None
+        returned = row["value"]
+        assert type(returned) is datetime
+        assert row["base_type"] == "datetimeoffset"
+        assert row["scale_value"] == 7
+        assert returned.utcoffset() == aware.utcoffset()
+        assert returned.astimezone(timezone.utc) == aware.astimezone(timezone.utc)
+
+    invalid_cases = [
+        (
+            timezone(timedelta(seconds=30)),
+            "offset_not_whole_minute",
+            "Datetime offset must be a whole number of minutes",
+        ),
+        (
+            timezone(timedelta(hours=14, minutes=1)),
+            "offset_out_of_range",
+            "Datetime offset must be between -14:00 and +14:00",
+        ),
+        (
+            timezone(-timedelta(hours=14, minutes=1)),
+            "offset_out_of_range",
+            "Datetime offset must be between -14:00 and +14:00",
+        ),
+    ]
+    for tzinfo, reason, message in invalid_cases:
+        value = datetime(
+            2024,
+            2,
+            29,
+            12,
+            34,
+            56,
+            123456,
+            tzinfo=tzinfo,
+        )
+        with pytest.raises(ConversionError, match=rf"^{re.escape(message)}$") as error:
+            await owner_connection.query("SELECT @P1", [value])
+
+        assert error.value.message == message
+        assert error.value.parameter_index == 0
+        assert error.value.sql_type == "DATETIMEOFFSET(7)"
+        assert error.value.reason == reason
+        assert error.value.retryable is False
 
 
 @case("PARAM-013")
