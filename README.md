@@ -64,11 +64,62 @@ async def main():
             f"connected={stats['connected']}, "
             f"size={stats['connections']}/{stats['max_size']}, "
             f"idle={stats['idle_connections']}, "
-            f"min_idle={stats['min_idle']}"
+            f"min_idle={stats['min_idle']}, "
+            f"pending={stats['pending_gets']}, "
+            f"wait_s={stats['get_wait_time_seconds']:.6f}, "
+            f"closed_broken={stats['connections_closed_broken']}"
         )
 
 asyncio.run(main())
 ```
+
+### Pool statistics
+
+`await connection.pool_stats()` is a pull-only snapshot of the current pool.
+It performs no SQL, does not create a pool, does not log or export anything,
+and contains only fixed low-cardinality scalar values:
+
+- `connected`: whether the `Connection` currently owns a pool handle.
+- `connections`: managed physical connections.
+- `idle_connections`: managed connections currently idle.
+- `active_connections`: managed connections currently leased.
+- `max_size`: configured pool maximum.
+- `min_idle`: configured minimum idle value or `None`.
+- `get_started`: checkout attempts started.
+- `get_direct`: successful checkouts that did not wait.
+- `get_waited`: successful checkouts that waited.
+- `get_timed_out`: checkouts that reached the acquisition timeout.
+- `pending_gets`: checkouts currently outstanding.
+- `get_wait_time_seconds`: cumulative checkout wait time in seconds, not an
+  average or percentile.
+- `connections_created`: physical connections created.
+- `connections_closed_broken`: connections retired as broken.
+- `connections_closed_invalid`: connections retired after validation failed.
+- `connections_closed_max_lifetime`: connections retired at maximum lifetime.
+- `connections_closed_idle_timeout`: connections retired by idle timeout.
+
+The four `connections_closed_*` values are bb8 retirement-event counters, not
+mutually exclusive close reasons. For example, a failed checkout validation
+can increment both `connections_closed_invalid` and
+`connections_closed_broken` when the same transport is also unsafe. Do not sum
+them to calculate a count of unique physical connections closed.
+
+Every snapshot satisfies:
+
+```text
+active_connections == connections - idle_connections
+get_started == get_direct + get_waited + get_timed_out + pending_gets
+```
+
+Counters are monotonic only within the current concrete pool epoch. They reset
+after `disconnect()` removes that pool and a reconnect creates a new one.
+Applications that need process-lifetime totals should scrape before shutdown
+and let their monitoring system handle counter resets.
+
+These values never include SQL, parameters, connection strings, credentials,
+server/database/login/application identifiers or arbitrary labels. The method
+describes shared-pool operations only; direct `execute_batch()` and direct
+`Transaction(...)` sockets are intentionally excluded.
 
 ## Explicit Connection Management
 

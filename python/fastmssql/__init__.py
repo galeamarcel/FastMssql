@@ -95,8 +95,29 @@ class Connection:
     async def pool_stats(self):
         """Get connection pool statistics.
 
-        Returns a dict with keys: connected, connections, idle_connections,
-        active_connections, max_size, min_idle
+        Returns the current pool epoch as a fixed scalar dictionary:
+        - connected (bool): whether this object owns a pool handle
+        - connections (int): managed physical connections
+        - idle_connections (int): currently idle connections
+        - active_connections (int): currently leased connections
+        - max_size (int): configured maximum pool size
+        - min_idle (int | None): configured minimum idle count
+        - get_started (int): checkout attempts started
+        - get_direct (int): checkouts completed without waiting
+        - get_waited (int): checkouts completed after waiting
+        - get_timed_out (int): checkouts that reached the acquire timeout
+        - pending_gets (int): currently outstanding checkouts
+        - get_wait_time_seconds (float): cumulative checkout wait seconds
+        - connections_created (int): physical connections created
+        - connections_closed_broken (int): broken connections retired
+        - connections_closed_invalid (int): validation failures retired
+        - connections_closed_max_lifetime (int): lifetime retirements
+        - connections_closed_idle_timeout (int): idle-timeout retirements
+
+        Retirement-event counters are not mutually exclusive. A failed
+        validation can also retire the same transport as broken.
+
+        Reading statistics performs no SQL and never creates a pool.
         """
         return await self._conn.pool_stats()
 
