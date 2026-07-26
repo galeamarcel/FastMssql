@@ -8,6 +8,7 @@ from uuid import UUID
 
 from fastmssql import (
     Connection,
+    ConversionError,
     Parameter,
     Parameters,
     SqlError,
@@ -159,20 +160,96 @@ async def test_float_finite_signed_zero_and_nonfinite_behavior(
 
 @case("PARAM-006")
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "value",
-    [
-        Decimal("0"),
-        Decimal("-0.0001"),
-        Decimal("12.3400"),
-        Decimal("9" * 38),
-    ],
-)
-async def test_decimal_currently_rejected_deterministically(
-    owner_connection: Connection, value: Decimal
+async def test_decimal_parameters_are_exact_and_errors_are_redacted(
+    owner_connection: Connection,
 ) -> None:
-    with pytest.raises(ValueError, match="^Unsupported type: Decimal$"):
-        await owner_connection.query("SELECT @P1", [value])
+    cases = [
+        (Decimal("0"), Decimal("0"), 0, 1, 0),
+        (Decimal("-0.0001"), Decimal("-0.0001"), -4, 4, 4),
+        (Decimal("12.3400"), Decimal("12.3400"), -4, 6, 4),
+        (Decimal("1E-38"), Decimal("1E-38"), -38, 38, 38),
+        (Decimal("9" * 38), Decimal("9" * 38), 0, 38, 0),
+        (
+            Decimal("-" + "9" * 38),
+            Decimal("-" + "9" * 38),
+            0,
+            38,
+            0,
+        ),
+        (Decimal("1E+3"), Decimal("1000"), 0, 4, 0),
+    ]
+    for value, expected, exponent, precision, scale in cases:
+        row = (
+            await owner_connection.query(
+                """
+                SELECT
+                    @P1 AS value,
+                    CONVERT(
+                        VARCHAR(128),
+                        SQL_VARIANT_PROPERTY(@P1, 'BaseType')
+                    ) AS base_type,
+                    CONVERT(
+                        INT,
+                        SQL_VARIANT_PROPERTY(@P1, 'Precision')
+                    ) AS precision_value,
+                    CONVERT(
+                        INT,
+                        SQL_VARIANT_PROPERTY(@P1, 'Scale')
+                    ) AS scale_value
+                """,
+                [value],
+            )
+        ).fetchone()
+        assert row is not None
+        assert type(row["value"]) is Decimal
+        assert row["value"] == expected
+        assert row["value"].as_tuple().exponent == exponent
+        assert row["base_type"] == "numeric"
+        assert row["precision_value"] == precision
+        assert row["scale_value"] == scale
+
+    invalid_cases = [
+        (Decimal("NaN"), "non_finite", "Decimal parameter must be finite"),
+        (Decimal("sNaN"), "non_finite", "Decimal parameter must be finite"),
+        (
+            Decimal("Infinity"),
+            "non_finite",
+            "Decimal parameter must be finite",
+        ),
+        (
+            Decimal("-Infinity"),
+            "non_finite",
+            "Decimal parameter must be finite",
+        ),
+        (
+            Decimal("1" + "0" * 38),
+            "precision_overflow",
+            "Decimal parameter exceeds SQL Server NUMERIC precision 38",
+        ),
+        (
+            Decimal("1E-39"),
+            "precision_overflow",
+            "Decimal parameter exceeds SQL Server NUMERIC precision 38",
+        ),
+        (
+            Decimal("1E+38"),
+            "precision_overflow",
+            "Decimal parameter exceeds SQL Server NUMERIC precision 38",
+        ),
+    ]
+    for value, reason, message in invalid_cases:
+        rendered_value = str(value)
+        with pytest.raises(
+            ConversionError, match=rf"^{re.escape(message)}$"
+        ) as error:
+            await owner_connection.query("SELECT @P1", [value])
+
+        assert rendered_value not in str(error.value)
+        assert error.value.message == message
+        assert error.value.parameter_index == 0
+        assert error.value.sql_type == "NUMERIC"
+        assert error.value.reason == reason
+        assert error.value.retryable is False
 
 
 @case("PARAM-007")

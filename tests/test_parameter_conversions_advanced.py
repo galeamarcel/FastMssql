@@ -182,27 +182,18 @@ async def test_parameter_datetime_types(test_config: Config):
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_parameter_decimal_types(test_config: Config):
-    """Test decimal parameter type conversions (via float)."""
-    try:
-        async with Connection(test_config.connection_string) as conn:
-            # Decimal not directly supported - convert to float
-            decimal_val = Decimal("123.45")
-            float_val = float(decimal_val)
-            result = await conn.query("SELECT @P1 as value", [float_val])
-            returned = result.rows()[0]["value"]
-            # Check if approximately equal
-            if returned is not None:
-                assert abs(float(returned) - 123.45) < 0.01
+    """Decimal parameters preserve value and trailing-zero scale exactly."""
+    async with Connection(test_config.connection_string) as conn:
+        value = Decimal("1234567890.123400")
 
-            # Small decimal
-            decimal_val = Decimal("0.001")
-            float_val = float(decimal_val)
-            result = await conn.query("SELECT @P1 as value", [float_val])
+        for _ in range(3):
+            result = await conn.query("SELECT @P1 AS value", [value])
             returned = result.rows()[0]["value"]
-            if returned is not None:
-                assert abs(float(returned) - 0.001) < 0.0001
-    except Exception as e:
-        pytest.fail(f"Database not available: {e}")
+
+            assert type(returned) is Decimal
+            assert returned == Decimal("1234567890.123400")
+            assert returned.as_tuple().exponent == -6
+            value = returned
 
 
 @pytest.mark.integration
