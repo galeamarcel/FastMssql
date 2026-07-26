@@ -3,20 +3,21 @@
 Data auditului: 24 iulie 2026  
 Fork auditat: `https://github.com/galeamarcel/FastMssql.git`  
 Branch: `test/sql-auth-validation`  
-Commit tehnic: `776f9033975f8727fba57f51effb81c8fafd9acb`
+Commit tehnic: `d9df1f9943f218a6fcd12aada2cd52c4d32967b6`
 
-Ultima actualizare live: 25 iulie 2026
-Ultimul fix verificat: `feat/operation-timeouts` la `822ab2a`, inclusiv
-contractul RED cross-platform `2d8e526`
-Ultimul harness tranzacțional de load verificat: `822ab2a`
+Ultima actualizare live: 26 iulie 2026
+Ultimul fix verificat: `feat/lifecycle-state` la `6c5cbff`, inclusiv
+reproducerile RED `4609de7` și `7d2fa6b` pentru lifecycle și anularea
+`Transaction.close()`
+Ultimul harness tranzacțional de load verificat: `6c5cbff`
 Ultimul contract de readiness load verificat: LOAD-009 în `d891db8`
-Ultimul merge tehnic verificat: `test/sql-auth-validation` la `776f903`
+Ultimul merge tehnic verificat: `test/sql-auth-validation` la `d9df1f9`
 Ultimul gate hosted verificat: `rust-unit-tests.yml`, rularea
-[#30179649298](https://github.com/galeamarcel/FastMssql/actions/runs/30179649298)
-verde pe Linux, macOS și Windows la `776f903`
+[#30185323201](https://github.com/galeamarcel/FastMssql/actions/runs/30185323201)
+verde pe Linux, macOS și Windows la feature SHA `6c5cbff`
 Ultimul gate dependency-security verificat: rularea
-[#30179649321](https://github.com/galeamarcel/FastMssql/actions/runs/30179649321)
-verde la același `776f903`
+[#30185327671](https://github.com/galeamarcel/FastMssql/actions/runs/30185327671)
+verde la același feature SHA
 
 ## Concluzie
 
@@ -52,11 +53,19 @@ lease-ul este retras, SQL-ul nu este retrimis, iar pierderea confirmării
 este identic pe Linux, macOS și Windows printr-un plafon portabil explicit de
 100 de ani.
 
-Toate defectele P0 de corectitudine identificate de acest audit sunt închise
-pe fork. Aceasta nu declară încă biblioteca complet enterprise
-production-ready: lifecycle-ul `Open | Closing | Closed`, observabilitatea,
-streamingul cu memorie limitată, tipurile lipsă, multiple result sets/RPC și
-gate-urile de packaging prin servere reale rămân cerințe P1/P2.
+Lifecycle-ul public `Open | Closing | Closed` este acum generation-aware.
+`disconnect()` coalescează apelurile concurente, așteaptă operațiile și
+tranzacțiile deja admise, respinge lucru SQL nou în `Closing` și retrage
+fail-closed transporturile la expirarea bugetului. Anularea primului waiter
+sau a unui `Transaction.close()` nu mai poate pierde supervisorul ori permitul
+de tranzacție.
+
+Toate defectele P0 de corectitudine identificate de acest audit și candidatul
+P1 de graceful lifecycle sunt închise pe fork. Aceasta nu declară încă
+biblioteca complet enterprise production-ready: observabilitatea,
+backpressure-ul explicit, streamingul cu memorie limitată, tipurile lipsă,
+multiple result sets/RPC și gate-urile de packaging prin servere reale rămân
+cerințe P1/P2.
 
 Auditul corectează explicit o concluzie anterioară: TDS `ATTENTION` nu este o
 condiție necesară pentru a termina sigur un request dacă driverul închide
@@ -943,8 +952,8 @@ Limite păstrate intenționat de candidatul readiness:
 - un eșec de readiness retrage conexiunea nesigură, dar nu distruge automat
   întregul pool comun; proprietarul aplicației decide retry sau `disconnect()`;
 - `is_connected()` nu face I/O și nu este un health check;
-- serializarea unui `disconnect()` concurent aparține viitoarei mașini de
-  lifecycle `Open | Closing | Closed`;
+- serializarea unui `disconnect()` concurent era exclusă din candidatul
+  readiness și a fost implementată ulterior în `feat/lifecycle-state`;
 - timeouturile generale per operație și taxonomia lor publică erau excluse
   din acel diff și au fost implementate ulterior în
   `feat/operation-timeouts`; telemetry și retry-ul automat rămân excluse;
@@ -1355,8 +1364,9 @@ Limitele rămase sunt intenționat vizibile:
 - timeoutul anulează future-ul și retrage transportul; nu trimite încă TDS
   `ATTENTION` și nu reutilizează aceeași sesiune după anulare;
 - nu există override per apel, retry SQL nou sau telemetry implicită;
-- lifecycle-ul `Open | Closing | Closed`, așteptarea lease-urilor și
-  observabilitatea rămân candidați separați;
+- lifecycle-ul `Open | Closing | Closed` și așteptarea lease-urilor au fost
+  implementate ulterior în `feat/lifecycle-state`; observabilitatea rămâne
+  candidat separat;
 - agregarea unei excepții din corp cu o excepție de cleanup în context manager
   rămâne un candidat separat.
 
@@ -1365,6 +1375,148 @@ este `DISABLED`. Lista PR-urilor upstream pentru
 `galeamarcel:feat/operation-timeouts` este goală. Orice branch curat, push sau
 PR către repository-ul original cere rebase/reproducere proaspătă și aprobarea
 separată, explicită, a lui Marcel Galea.
+
+## Lifecycle și graceful shutdown — implementate și verificate
+
+Statusul candidatului este `VERIFIED_FORK`. Defectul măsurat pe baseline-ul
+`0992f60` era un fals shutdown: în timp ce SQL Server executa
+`WAITFOR DELAY '00:00:02'; SELECT 42`, `disconnect()` elimina numai handle-ul
+vizibil al pool-ului și revenea în `0,000` secunde, dar query-ul și lease-ul
+bb8 continuau până la `2,012` secunde. Un waiter care deținea deja o clonă a
+pool-ului, o tranzacție pooled sau socketul direct din `execute_batch()` putea
+supraviețui aceluiași shutdown.
+
+Istoricul păstrează designul, RED-ul și GREEN-ul separat, numai pe fork:
+
+- `docs/lifecycle-state-design`
+  - `0184e8f` — designul mașinii de stare și al barierelor;
+  - `2314969` — planul TDD și gate-urile;
+  - `fcf6e25` / `093edba` — amendamentul cancellation-safe pentru close;
+- `test/lifecycle-state`
+  - `f2c722a` — contractele RED inițiale;
+  - `4609de7` — contractul final al wheel-ului hosted;
+- `test/lifecycle-close-cancellation`
+  - `b31b4d2` — reproducerea SQL-auth a permitului rămas după anulare;
+  - `7d2fa6b` — unit RED pentru eliberarea exact o dată;
+- `feat/lifecycle-state`
+  - `96fbafd` — coordonatorul generation-aware;
+  - `abf1f92` — admission pe toate căile SQL;
+  - `c5bacb8` — API, stuburi și documentație;
+  - `00696df` — close cancellation-safe;
+  - `fd79495` — arborele tehnic final;
+  - `6c5cbff` — dovezile finale regenerate;
+- `test/sql-auth-validation`
+  - `d9df1f9943f218a6fcd12aada2cd52c4d32967b6` — merge-ul tehnic exact
+    reverificat local.
+
+Suprafața publică verificată este:
+
+```text
+LifecycleConfig(shutdown_timeout_secs=30.0, force_timeout_secs=5.0)
+ConnectionLifecycleState.OPEN / CLOSING / CLOSED
+connection.lifecycle_config
+connection.lifecycle_state
+ConnectionLifecycleError(SqlConnectionError)
+ShutdownTimeoutError(ConnectionLifecycleError)
+```
+
+Valorile lifecycle acceptă de la o nanosecundă până la 100 × 365 zile,
+inclusiv, identic pe Linux/macOS/Windows. Configurația este copiată la
+construcția conexiunii, iar proprietățile obiectului `Connection` sunt
+read-only.
+
+Semantica implementată:
+
+1. orice cale SQL a unui `Connection` primește un permit asociat generației;
+2. o tranzacție pooled păstrează un permit pentru întregul lease, nu numai
+   pentru metoda curentă;
+3. primul `disconnect()` mută atomic `Open -> Closing`; apelurile concurente
+   se abonează la același rezultat;
+4. supervisorul este detached și panic-contained, deci anularea waiterului
+   inițiator nu abandonează cleanup-ul;
+5. în `Closing`, lucru SQL nou este respins tipat, dar tranzacția deja admisă
+   își poate executa o singură cale de commit/rollback/close;
+6. după drenare, pool-ul este retras și starea devine `Closed`; următoarea
+   operație creează o generație nouă;
+7. după grace timeout, participanții retrag fail-closed socketurile în
+   bugetul separat de force și `disconnect()` ridică `ShutdownTimeoutError`
+   chiar dacă force cleanup reușește;
+8. writes nu sunt retrimise, iar un COMMIT neconfirmat păstrează
+   `CommitOutcomeUnknown` ca rezultat principal.
+
+Al doilea audit a găsit o cursă suplimentară reală. Dacă răspunsul rollback
+din `Transaction.close()` era blocat și taskul Python era anulat, socketul
+era retras și SQL Server făcea rollback, dar `TransactionPermit` rămânea în
+`TransactionSession`. Următorul `disconnect()` consuma grace timeoutul și
+intra inutil în force. `00696df` tratează `Closing` drept fază in-flight,
+armează guard-ul de anulare imediat după preluarea lease-ului și eliberează
+permitul generation-aware exact o dată. LIFE-016 trece fără un al doilea
+`transaction.close()` compensator.
+
+Dovada locală finală este separată între feature-ul final și merge-ul exact:
+
+```text
+registru LIFE pe SQL-auth real           LIFE-001–LIFE-016 PASS
+test_lifecycle.py                        16 noduri PASS
+LIFE-015 în lane-ul framework            PASS
+100 generații / operații                 100 / 2.000 PASS, zero sesiuni
+matrice SQL-auth la merge                311/311 PASS
+strict / async / framework               321/321 + 16/16 + 30/30 PASS
+resilience / load                          6/6 + 9/9 PASS
+regresie upstream                        921/921 PASS
+FastMssql Rust                             40/40 PASS
+contracte instalate hosted                 18/18 PASS
+cargo fmt / Clippy -D warnings             PASS
+Ruff / compileall / RustSec                PASS
+post-test failures/errors/skips         0 / 0 / 0
+```
+
+Gate-ul tranzacțional existent a fost repetat după remedierea LIFE-016.
+Acesta măsoară driverul cu obiecte `Transaction` persistente și nu este un
+benchmark universal SQL Server:
+
+```text
+10.000, concurență 100     3.752,67 tx/s, 100 sesiuni, RSS +47.857.664
+99.999, concurență 100     4.029,22 tx/s, 100 sesiuni, RSS  +9.027.584
+99.999, concurență 200     3.665,04 tx/s, 200 sesiuni, RSS +18.202.624
+```
+
+Fiecare profil a avut exact numărul așteptat de COMMIT/ROLLBACK, smoke query
+PASS și zero sesiuni rămase. Separat, LIFE-014 a exercitat pool-ul lifecycle
+pe 100 de generații și 2.000 de operații fără permit sau sesiune stale.
+
+[Run-ul final #30185323201](https://github.com/galeamarcel/FastMssql/actions/runs/30185323201)
+a verificat exact feature SHA `6c5cbff`:
+
+- [Ubuntu](https://github.com/galeamarcel/FastMssql/actions/runs/30185323201/job/89748818322)
+  — raw Cargo, `40/40` Rust, wheel și `18/18` contracte: `success`;
+- [macOS](https://github.com/galeamarcel/FastMssql/actions/runs/30185323201/job/89748818324)
+  — aceleași gate-uri: `success`;
+- [Windows](https://github.com/galeamarcel/FastMssql/actions/runs/30185323201/job/89748818296)
+  — aceleași gate-uri, inclusiv lifecycle cancellation: `success`;
+- [RustSec #30185327671](https://github.com/galeamarcel/FastMssql/actions/runs/30185327671)
+  — vulnerabilități și warnings respinse: `success`.
+
+SQL-auth real rămâne un gate local pe containerul MSSQL Docker aprobat; nu
+există în repository un runner hosted cu SQL Server. Gate-ul hosted validează
+Rust și wheel-ul instalat pe cele trei sisteme, fără a pretinde o execuție
+MSSQL hosted.
+
+Limitele rămase sunt explicite:
+
+- nu există încă limită separată pentru numărul waiterilor sau telemetry;
+- metricile bb8 complete, tracing și OpenTelemetry aparțin candidatului
+  `feat/observability`;
+- nu există TDS `ATTENTION`/`DONE_ATTN`; force retrage transportul, nu îl
+  reutilizează;
+- obiectele construite direct prin `Transaction(...)` rămân în afara
+  lifecycle-ului unui `Connection`;
+- fiecare proces de aplicație deține propriul pool; bugetul agregat și ordinea
+  shutdown-ului multiprocess aparțin deploymentului;
+- nu s-a schimbat versiunea și nu există `VERSION.md` în repository.
+
+Nu s-a creat niciun branch sau PR upstream. `origin` este
+`galeamarcel/FastMssql`, iar push URL-ul `upstream` rămâne `DISABLED`.
 
 ## Corecții și nuanțări față de primul audit
 
@@ -1484,8 +1636,8 @@ Această abstracție rezolvă simultan:
 `Connection.transaction()`: pool-ul comun produce un lease owned, iar
 dispozițiile `NeedsReset` și `Broken` sunt aplicate înainte de returnarea sau
 retragerea conexiunii. Deadline-urile fail-closed au fost generalizate
-ulterior în `feat/operation-timeouts`; streamingul, bulk și graceful shutdown
-rămân lucru P1.
+ulterior în `feat/operation-timeouts`, iar graceful shutdown în
+`feat/lifecycle-state`; streamingul și bulk rămân lucru P1.
 
 Implementarea actuală relevantă este împărțită între
 [pool_manager.rs](../src/pool_manager.rs#L201),
@@ -1526,19 +1678,22 @@ nedeterministe după intrarea în `Committing`; conexiunea a fost deja eliminat�
 - Override-urile per apel și orice retry explicit rămân decizii API viitoare;
   nu sunt necesare pentru contractul fail-closed verificat.
 
-### Lifecycle și graceful shutdown — deschis
+### Lifecycle și graceful shutdown — `VERIFIED_FORK`
 
-- Readiness-ul inițial este **remediat în `158d801`**: `connect()` este strict
-  implicit, `ping()` face I/O real, iar `connect(validate=False)` este
-  singura cale explicit lazy. `is_connected()` rămâne intenționat numai
-  lifecycle local; politica de retry/startup aparține aplicației.
-- Graceful shutdown cu stări `Open | Closing | Closed`, deadline și
-  așteptarea lease-urilor active.
-- Limite pentru waiters/backpressure și un buget global:
-  `workers * pool.max_size`, nu un pool calculat independent în fiecare
-  proces.
+- Readiness-ul inițial rămâne remediat prin `158d801`: `connect()` este strict
+  implicit, `ping()` face I/O real, iar `is_connected()` descrie numai
+  existența locală a pool-ului.
+- `6c5cbff`, integrat tehnic în `d9df1f9`, implementează stările
+  `Open | Closing | Closed`, admission generation-aware, coalescing pentru
+  shutdown concurent, drenarea operațiilor/lease-urilor și force cleanup
+  bounded.
+- LIFE-016 confirmă că anularea `Transaction.close()` retrage lease-ul și
+  eliberează permitul fără close compensator.
+- Limitele pentru waiters/backpressure și bugetul agregat
+  `workers * pool.max_size` rămân cerințe operaționale/observability
+  separate; nu invalidează corectitudinea lifecycle-ului verificat.
 
-### Observabilitate — deschis
+### Observabilitate — următorul candidat
 
 - Metricile bb8 complete: timp de așteptare, checkout direct/așteptat,
   timeouturi, conexiuni create/eliminate și motivul eliminării.
@@ -1790,8 +1945,9 @@ funcție ar necesita lucru la nivelul driverului TDS:
     finalizate și verificate hosted**
 13. `feat/operation-timeouts` — **deadline-uri separate, taxonomie tipată,
     retragere fail-closed și gate Linux/macOS/Windows finalizate și verificate**
-14. `feat/lifecycle-state`
-15. `feat/observability`
+14. `feat/lifecycle-state` — **Open/Closing/Closed, drain generation-aware,
+    force bounded și close cancellation-safe finalizate și verificate**
+15. `feat/observability` — **următorul candidat**
 16. `feat/typed-parameters`
 17. `feat/resultsets-streaming`
 18. `feat/batch-bulk`
@@ -1827,6 +1983,9 @@ upstream fără aprobarea explicită a proprietarului forkului.
 - [x] timeouturile publice separate pentru connect/acquire/operație/tranzacție/
   rollback aplică deadline-uri absolute și elimină conexiunea când protocolul
   rămâne incert;
+- [x] lifecycle-ul `Open | Closing | Closed` așteaptă operațiile și
+  tranzacțiile admise, coalescează shutdown-ul concurent și retrage bounded
+  transporturile la expirarea grace timeoutului;
 - [x] răspunsul pierdut după COMMIT produce `CommitOutcomeUnknown`, fără
   rollback sau retry automat;
 - [x] numărul sesiunilor tranzacționale nu depășește `pool.max_size`, inclusiv
@@ -1843,30 +2002,32 @@ upstream fără aprobarea explicită a proprietarului forkului.
 - Fork: `https://github.com/galeamarcel/FastMssql.git`
 - Branch cumulativ: `test/sql-auth-validation`
 - HEAD tehnic verificat:
-  `776f9033975f8727fba57f51effb81c8fafd9acb`
+  `d9df1f9943f218a6fcd12aada2cd52c4d32967b6`
 - `origin` indică forkul; `upstream` permite numai fetch, cu push
   `DISABLED`.
-- Feature-ul final este `822ab2a`; raportul generat din artefactele sale este
-  `eec7e83`, iar statusul narativ este `ec6161b`; raportul păstrează commitul
-  tehnic al merge-ului `776f903` în antet.
-- La acest source tree: FastMssql Rust `23/23`, contractele instalate
-  TimeoutConfig + PoolConfig `12/12`, strict `305/305`, true-async `16/16`,
-  framework `29/29`, resilience `6/6`, load `9/9`, upstream `915/915` și
-  exact `295/295` ID-uri din specificație, toate PASS.
-- Stress-ul final: `99.999` tranzacții la concurență 100, exact
-  `50.000/49.999` COMMIT/ROLLBACK, smoke PASS și zero sesiuni după teardown.
-- Hosted la `776f903`: Linux/macOS/Windows
-  [#30179649298](https://github.com/galeamarcel/FastMssql/actions/runs/30179649298)
+- Feature-ul lifecycle final este `6c5cbff`; arborele său tehnic este
+  `fd79495`, iar raportul regenerat pe merge păstrează `d9df1f9` în antet.
+- La acest source tree: FastMssql Rust `40/40`, contractele instalate
+  PoolConfig + TimeoutConfig + Lifecycle `18/18`, strict `321/321`,
+  true-async `16/16`, framework `30/30`, resilience `6/6`, load `9/9`,
+  upstream `921/921` și exact `311/311` ID-uri din specificație, toate PASS.
+- Stress-ul final: profilele `10.000:100`, `99.999:100` și `99.999:200`,
+  fiecare cu numărul exact de COMMIT/ROLLBACK, smoke PASS și zero sesiuni
+  după teardown.
+- Hosted la `6c5cbff`: Linux/macOS/Windows
+  [#30185323201](https://github.com/galeamarcel/FastMssql/actions/runs/30185323201)
   și RustSec
-  [#30179649321](https://github.com/galeamarcel/FastMssql/actions/runs/30179649321)
+  [#30185327671](https://github.com/galeamarcel/FastMssql/actions/runs/30185327671)
   sunt verzi.
 - Run-ul Windows RED
   [#30178680707](https://github.com/galeamarcel/FastMssql/actions/runs/30178680707)
   rămâne vizibil și este legat de reproducerea `2d8e526` și fixul `822ab2a`.
-- Nu există PR upstream pentru acest candidat.
+- Nu există PR upstream pentru lifecycle sau operation timeouts.
 - Wheel-ul `cp311-abi3` a fost construit, instalat și importat dintr-un
   virtualenv curat. `cargo fmt`, Clippy cu `-D warnings`, Ruff și `compileall`
   au trecut; `cargo audit` a scanat 219 dependențe cu zero findings.
+- SQL-auth real a fost executat local pe containerul MSSQL aprobat; workflow-ul
+  găzduit nu are un runner SQL Server și validează Rust/wheel/contracts.
 - Gate-ul hosted precedent, pentru candidatul PoolConfig,
   [#30172198247](https://github.com/galeamarcel/FastMssql/actions/runs/30172198247)
   a trecut separat pe Ubuntu, macOS și Windows: raw Cargo, `14/14` teste Rust,
