@@ -182,6 +182,13 @@ All new integer counters are monotonic within one concrete bb8 pool instance.
 - `connections_closed_idle_timeout`: connections reaped after the configured
   idle timeout.
 
+The checkout counters measure every bb8 pool acquisition, not only
+application query calls. `connect(validate=True)` and `ping()` perform a real
+readiness checkout and therefore advance the counters. Repeating
+`connect(validate=True)` reuses the same pool but deliberately performs and
+counts a new readiness checkout; `connect(validate=False)` and `pool_stats()`
+do not acquire a connection.
+
 The four `connections_closed_*` counters are historical event categories, not
 an exclusive partition of physical connection closures. In bb8 0.9.1,
 checkout validation records `connections_closed_invalid` before it marks the
@@ -409,6 +416,10 @@ This is an additive value-level extension with one explicit schema migration:
 - CONN-019 currently asserts the exact six-key set; GREEN replaces that
   assertion with the complete seventeen-key set and preserves every existing
   value/invariant assertion;
+- CONN-011 continues to prove that repeated `connect()` reuses the same pool,
+  but no longer compares historical counters for whole-dictionary equality:
+  the default `validate=True` performs exactly one additional direct readiness
+  checkout;
 - no SQL, pool, timeout, lifecycle or transaction behavior changes;
 - no application configuration or data migration is required.
 
