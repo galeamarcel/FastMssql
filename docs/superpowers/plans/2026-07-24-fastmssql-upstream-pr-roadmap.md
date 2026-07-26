@@ -1429,7 +1429,7 @@ Rezultate pe source tree-ul cumulativ `9d51d07`:
 TX-020/TX-021 focalizat           10/10 PASS
 strict transaction + compat      46/46 PASS
 strict SQL-auth complet           329/329 PASS
-upstream aplicabil                896/896 PASS
+regresia originală locală        896/896 PASS
 FastMssql Rust unit tests         9/9 PASS
 cargo fmt / Clippy -D warnings    PASS
 cargo audit, 219 dependențe       0 findings
@@ -1581,7 +1581,7 @@ TX-022–TX-026 focalizat               5/5 PASS
 strict transaction + compat          94/94 PASS
 strict SQL-auth complet               334/334 PASS
 cazuri raportate din specificație     269/269
-upstream aplicabil                    896/896 PASS
+regresia originală locală            896/896 PASS
 FastMssql Rust unit tests             9/9 PASS
 cargo fmt / Clippy -D warnings        PASS
 cargo audit, 219 dependențe           0 findings
@@ -1752,7 +1752,7 @@ TX-027–TX-031 focalizat              5/5 PASS
 tranzacții stricte + upstream       100/100 PASS
 suita strictă SQL-auth              340/340 PASS în 127,85 s
 cazuri raportate din specificație   274/274 PASS
-upstream aplicabil                  896/896 PASS în 64,09 s
+regresia originală locală          896/896 PASS în 64,09 s
 FastMssql Rust unit tests           9/9 PASS
 cargo fmt / Clippy -D warnings      PASS
 cargo audit, 219 dependențe         0 findings
@@ -1926,7 +1926,7 @@ TX-026 + TX-032–TX-034 + proxy       5/5 PASS
 tranzacții/async/batch + upstream    140/140 PASS
 suita strictă SQL-auth               344/344 PASS în 124,32 s
 cazuri raportate din specificație    277/277 PASS
-upstream aplicabil                   896/896 PASS în 62,99 s
+regresia originală locală           896/896 PASS în 62,99 s
 FastMssql Rust unit tests            13/13 PASS
 Tiberius vendored unit tests         123/123 PASS
 cargo fmt / Clippy / Ruff            PASS
@@ -2101,7 +2101,7 @@ FRAME-025–FRAME-026                2/2 PASS
 LOAD-009                           PASS
 suita strictă SQL-auth             354/354 PASS în 135,56 s
 cazuri raportate din specificație  285/285 PASS
-upstream aplicabil                 896/896 PASS în 64,38 s
+regresia originală locală         896/896 PASS în 64,38 s
 FastMssql Rust unit tests          13/13 PASS
 Tiberius unit tests                123/123 PASS
 Tiberius doctests executate        20/20 PASS, 1 ignorat
@@ -2290,7 +2290,7 @@ publication                  forbidden until a new explicit user approval
 matrice SQL-auth                         295/295 PASS
 strict / async / framework              305/305 + 16/16 + 29/29 PASS
 resilience / load                         6/6 + 9/9 PASS
-upstream aplicabil                      915/915 PASS
+regresia originală locală              915/915 PASS
 FastMssql Rust                            23/23 PASS
 wheel TimeoutConfig + PoolConfig          12/12 PASS
 stress tranzacțional                      99.999 la concurrency 100 PASS
@@ -2420,7 +2420,7 @@ publication                  forbidden until a new explicit user approval
 matrice SQL-auth                         311/311 PASS
 strict / async / framework              321/321 + 16/16 + 30/30 PASS
 resilience / load                         6/6 + 9/9 PASS
-upstream aplicabil                      921/921 PASS
+regresia originală locală              921/921 PASS
 FastMssql Rust                            40/40 PASS
 wheel contracts                           18/18 PASS
 100 generații / operații                 100 / 2.000 PASS
@@ -2533,7 +2533,7 @@ FastMssql Rust                              43/43 PASS
 matrice SQL-auth                            321/321 PASS
 strict / async / framework        326/326 + 16/16 + 30/30 PASS
 resilience / load                     6/6 + 10/10 PASS
-upstream aplicabil                      923/923 PASS
+regresia originală locală              923/923 PASS
 OBS-001–OBS-010                            10/10 PASS
 ABI3 installed-wheel contracts             20/20 PASS
 OBS-009             10.000 ops, 100 workers, pool 20, 0 sessions
@@ -2587,6 +2587,122 @@ același SHA.
 Prezintă diff-ul curat, RED/GREEN, migrarea aditivă a schemei, limitele de
 privacy/performance și URL-urile hosted. Nu executa push către repository-ul
 original și nu crea PR fără o aprobare nouă, explicită, a lui Marcel Galea.
+
+### Task 24: PR-25 — Metrici bounded de durată și rezultat per operație
+
+**Status:** `VERIFIED_FORK / requires fresh original-base rebase`. Implementat
+și verificat numai pe fork; nu există branch pregătit pentru repository-ul
+original, iar publicarea nu este aprobată.
+
+```text
+fork design branch          docs/operation-metrics-design
+fork design SHA             b8808ca82056fc83fb44444e8033e6f982cde412
+coherence design SHA        fd3b7c24084639b99bb38b97cfe9bb7ad094f915
+fork RED branch             test/operation-metrics
+fork final RED SHA          74f7ef943eb23b7e9ed48d8d5f4e0897fc21f872
+fork feature branch         feat/operation-metrics
+fork feature SHA            123553d7d6e42ef06c240c3a84e211c2923ec03c
+technical merge SHA         bbeacc9443fc46687ae5fd12b31c5d777b3a2261
+evidence status SHA         4a93d7e7dbf7f20e58912fdbfa12fbb85d38bf87
+hosted workflow SHA         d82527e79f82738193384fb2ea8c497f6a68ff5c
+future clean fork branch    feat/pr-operation-metrics
+future title                feat: add bounded operation duration metrics
+case IDs                    OPMET-001 through OPMET-016
+publication                 forbidden until a new explicit user approval
+```
+
+**Scope reviewable:**
+
+- `OperationMetricsConfig(enabled=False)` opt-in și argument final aditiv în
+  `Connection`;
+- `await connection.operation_stats()` cu exact 13 operații, 17 bucketuri
+  finite și cinci rezultate mutual exclusive;
+- registry fixed-size per `Connection`, propagat tranzacțiilor pooled și
+  păstrat peste generațiile disconnect/reconnect;
+- calea default-off fără registry, clock sau atomic update;
+- guard RAII pentru rezultat, timeout, anulare și
+  `CommitOutcomeUnknown`, fără schimbarea excepției returnate;
+- snapshot aritmetic reconciliat, saturating și exact după quiescence;
+- API runtime, wrapper, stuburi, README, contract static, Rust și SQL-auth
+  sincronizate;
+- zero SQL, parametri, identificatori, credențiale sau labels arbitrare.
+
+**Dovada locală și hosted:**
+
+```text
+FastMssql Rust                              54/54 PASS
+matrice SQL-auth                            337/337 PASS
+strict / async / framework        339/339 + 16/16 + 33/33 PASS
+resilience / load                     6/6 + 11/11 PASS
+regresia originală locală                  930/930 PASS
+OPMET-001–OPMET-016                          16/16 PASS
+ABI3 build/install și contracte                  PASS
+10.000 scrape load       100 workers, pool 20, 9.968,74 qps
+operation stress         6 × 99.999, 200 workers, pool 100 PASS
+median degradation       -1,7098%, gate maxim +15%
+stress persistent        10.000:100, 99.999:100, 99.999:200 PASS
+stress pooled max 100    10.000:100, 99.999:100, 99.999:200 PASS
+```
+
+[Run-ul #30210993458](https://github.com/galeamarcel/FastMssql/actions/runs/30210993458)
+este verde pe Ubuntu, macOS și Windows pentru raw Cargo, 54/54 Rust, ABI3
+wheel build/install și contractele instalate.
+[RustSec #30210993463](https://github.com/galeamarcel/FastMssql/actions/runs/30210993463)
+este verde și respinge atât vulnerabilitățile, cât și warningurile. SHA-ul
+hosted conține feature-ul exact și numai două schimbări de trigger workflow;
+diff-ul tehnic față de feature este gol. MSSQL SQL-auth real este verificat
+local în Docker, nu pe runnerul hosted.
+
+**Semantica de păstrat:**
+
+- metricile măsoară corpul async Rust de la primul poll, nu așteptarea Python
+  anterioară;
+- `completed` este suma exactă a celor cinci rezultate terminale;
+- `started == completed + in_flight`, inclusiv în scrape concurent;
+- bucketurile sunt cumulative și `completed` este bucketul implicit `+Inf`;
+- `CommitOutcomeUnknown` are prioritate față de cauza sa timeout/error;
+- un batch este o operație publică, nu câte o serie per statement;
+- readiness și cleanup intern nu sunt dublu numărate;
+- snapshotul nu rulează SQL și nu achiziționează conexiune din pool.
+
+**Exclus din PR-25:**
+
+- SQL text/fingerprint, labels per tabel/procedură și percentiles în driver;
+- bucketuri configurabile, reset/epoch și agregare globală/multiprocess;
+- tracing, OpenTelemetry, Prometheus, exporter, callback sau metric push;
+- metrici pentru constructorul direct `Transaction(...)`;
+- streaming, RPC/result sets, typed parameters și bulk TDS nativ;
+- schimbări Tiberius/bb8, dependențe, versiune, release sau publicare pachet.
+
+- [ ] **Step 1: Cere aprobarea separată pentru pregătirea candidatului**
+
+Nu porni branchul de PR și nu modifica repository-ul original fără o nouă
+aprobare explicită a lui Marcel Galea.
+
+- [ ] **Step 2: Reproduce RED pe o bază originală proaspătă**
+
+După aprobare, actualizează numai referința fetch-only, creează branchul curat
+în fork din ultimul commit original și aplică mai întâi contractele minime.
+Confirmă RED pentru API, disabled hot path, outcomes, privacy și installed
+wheel înaintea implementării.
+
+- [ ] **Step 3: Extrage diff-ul minim reviewable**
+
+Portează registry-ul, RAII guard, API/stuburi/README și testele strict
+necesare. Nu include istoricul cumulativ, exporter, tracing, typed parameters
+sau alte funcții enterprise.
+
+- [ ] **Step 4: Reexecută toate gate-urile**
+
+Rulează OPMET-001–OPMET-016 pe SQL-auth real, cele șase trial-uri de 99.999,
+Rust/format/Clippy, wheel izolat, matricea completă, regresia originală locală,
+Linux/macOS/Windows și RustSec pe exact candidatul curat.
+
+- [ ] **Step 5: Prezintă candidatul și cere aprobarea de publicare**
+
+Prezintă diff-ul, RED/GREEN, impactul API/performance/privacy și URL-urile
+hosted. Orice push rămâne în fork; nu executa push, PR sau release în
+repository-ul original fără aprobarea nouă, explicită, a lui Marcel Galea.
 
 ### PyO3 build/test separation — VERIFIED_FORK
 
@@ -2696,7 +2812,7 @@ fork, testată live și auditată.
 | Named instances | SQL Browser Tokio | instanță reală fără port explicit |
 | Operation timeouts | PR-22, connect/acquire/operation/transaction/rollback | `VERIFIED_FORK`; rebase curat, RED proaspăt, comparație cu #121, gate pe trei sisteme și aprobare separată înainte de upstream |
 | Pool observability | PR-24, migrare aditivă `pool_stats()` peste contoarele bb8 | `VERIFIED_FORK`; dependency-free, RED + SQL-auth real + installed-wheel Linux/macOS/Windows, fără PR upstream |
-| Operation observability | durată și rezultat per operație | următorul candidat; separat de tracing/OpenTelemetry și fără SQL/parametri sensibili implicit |
+| Operation observability | PR-25, durată și rezultat per operație | `VERIFIED_FORK`; 16 cazuri SQL-auth, stress 6 × 99.999, gate hosted pe trei sisteme, fără PR în repository-ul original |
 | Graceful shutdown | PR-23, Open/Closing/Closed generation-aware | `VERIFIED_FORK`; RED proaspăt, rebase curat și aprobare separată înainte de upstream |
 | SQLAlchemy | dialect async | pool ownership și transaction semantics clare |
 | Azure identity | credential callback standardizat | expirare fail-closed și fără fallback lent accidental |
