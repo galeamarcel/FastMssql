@@ -139,15 +139,21 @@ pytest paths. The report must not render a lane cell `| upstream |`.
 ## Deterministic TDD contract
 
 The RED branch modifies only
-`tests/sql_auth_strict/test_matrix_contract.py` and requires:
+`tests/sql_auth_strict/test_matrix_contract.py`. It executes a temporary copy
+of the real runner with deterministic local stub executables for `uv`,
+`cargo`, `docker` and provisioning. The test requires:
 
-1. the runner source to contain the exact public label;
-2. the baseline runner to fail because it still prints `upstream`;
-3. a synthetic `upstream.exitcode`/`upstream.xml` fixture to render
+1. the runner process to exit zero and print the exact public label;
+2. the baseline runner to fail the assertion because it still prints
+   `[sql-auth] upstream: passed`;
+3. the runner to preserve `upstream.command`, `upstream.exitcode` and
+   `upstream.log`, without creating display-name artifacts;
+4. the recorded lane command to contain only local pytest selection and no
+   Git, GitHub CLI, HTTP or repository URL;
+5. a synthetic `upstream.exitcode`/`upstream.xml` fixture to render
    `original-local-regression`;
-4. the rendered report not to contain the exact lane cell `| upstream |`;
-5. internal artifact fixtures to remain named `upstream.*`;
-6. the runner to contain no `git`, `gh`, `curl` or repository URL in the lane.
+6. the rendered report not to contain the exact lane cell `| upstream |`;
+7. internal report fixtures to remain named `upstream.*`.
 
 The fix branch changes only:
 

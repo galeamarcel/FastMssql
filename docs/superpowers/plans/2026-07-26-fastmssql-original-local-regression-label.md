@@ -99,7 +99,7 @@ The symlink must remain ignored and status must be clean.
 
 ---
 
-### Task 2: Add and prove the RED presentation contract
+### Task 2: Add and prove the RED behavior contract
 
 **Files:**
 
@@ -109,21 +109,113 @@ The symlink must remain ignored and status must be clean.
 
 - Consumes: `scripts/sql_auth/run_all.sh` and
   `scripts/sql_auth/generate_report.py`.
-- Produces: failing public-label and repository-safety contracts.
+- Produces: failing end-to-end runner/report presentation contracts.
 
-- [ ] **Step 1: Strengthen the runner source contract**
+- [ ] **Step 1: Add imports and one test-only executable helper**
 
-In `test_full_runner_contract()`, keep all internal assertions and append:
+Add:
 
 ```python
-assert "record upstream \\" in source
-assert "original-local-regression" in source
+import shutil
 ```
 
-The first assertion preserves the internal artifact identifier. The second
-must fail on the baseline because the presentation mapping is absent.
+After `ROOT`, add:
 
-- [ ] **Step 2: Strengthen the generated-report behavior contract**
+```python
+def _write_executable(path: Path, source: str) -> None:
+    path.write_text(source, encoding="utf-8")
+    path.chmod(0o755)
+```
+
+This helper belongs only to the test and writes deterministic local stubs.
+
+- [ ] **Step 2: Execute the real runner in a deterministic sandbox**
+
+Append:
+
+```python
+def test_full_runner_uses_original_local_regression_display_name(
+    tmp_path: Path,
+) -> None:
+    sandbox = tmp_path / "repo"
+    scripts = sandbox / "scripts" / "sql_auth"
+    scripts.mkdir(parents=True)
+    runner = scripts / "run_all.sh"
+    shutil.copy2(ROOT / "scripts/sql_auth/run_all.sh", runner)
+
+    (sandbox / ".env.sql-auth.local").write_text(
+        "\n".join(
+            (
+                "FASTMSSQL_SQL_AUTH_CONTAINER=fastmssql-sql-auth-dev",
+                "FASTMSSQL_SQL_AUTH_HOST=127.0.0.1",
+                "FASTMSSQL_SQL_AUTH_PORT=14333",
+                "FASTMSSQL_SQL_AUTH_OWNER_USER=test_owner",
+                "FASTMSSQL_SQL_AUTH_OWNER_PASSWORD=test_only_password",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _write_executable(
+        scripts / "provision.sh",
+        "#!/usr/bin/env bash\nexit 0\n",
+    )
+
+    fake_bin = sandbox / "fake-bin"
+    fake_bin.mkdir()
+    for name in ("uv", "cargo", "docker"):
+        _write_executable(
+            fake_bin / name,
+            "#!/usr/bin/env bash\nexit 0\n",
+        )
+
+    environment = os.environ.copy()
+    environment["PATH"] = (
+        f"{fake_bin}{os.pathsep}{environment.get('PATH', '')}"
+    )
+    completed = subprocess.run(
+        [str(runner)],
+        cwd=sandbox,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert (
+        "[sql-auth] original-local-regression: passed"
+        in completed.stdout
+    )
+    assert "[sql-auth] upstream:" not in completed.stdout
+
+    artifacts = sandbox / ".artifacts" / "sql-auth"
+    assert (artifacts / "upstream.exitcode").read_text(
+        encoding="utf-8"
+    ) == "0\n"
+    assert (artifacts / "upstream.log").is_file()
+    command = (artifacts / "upstream.command").read_text(
+        encoding="utf-8"
+    )
+    assert "uv run pytest -n 1 tests" in command
+    assert "--ignore=tests/sql_auth_strict" in command
+    for forbidden in (
+        "git ",
+        "gh ",
+        "curl ",
+        "http://",
+        "https://",
+        "Rivendael/FastMssql",
+    ):
+        assert forbidden not in command
+    assert not (artifacts / "original-local-regression.exitcode").exists()
+```
+
+The baseline must fail only the stdout-label assertion. The runner still
+produces the internal compatibility artifacts and the recorded command proves
+that the lane is local.
+
+- [ ] **Step 3: Strengthen the generated-report behavior contract**
 
 In `test_report_generator_preserves_not_run_and_redacts()`, replace:
 
@@ -140,55 +232,24 @@ assert "| upstream |" not in report
 
 Keep the synthetic files named `upstream.exitcode` and `upstream.xml`.
 
-- [ ] **Step 3: Add an explicit local-only lane test**
-
-Append:
-
-```python
-def test_original_regression_lane_is_local_and_repository_safe() -> None:
-    runner = (ROOT / "scripts/sql_auth/run_all.sh").read_text(
-        encoding="utf-8"
-    )
-    start = runner.index("record upstream \\")
-    end = runner.index("record report \\", start)
-    lane = runner[start:end]
-
-    assert "uv run pytest -n 1 tests" in lane
-    assert "--ignore=tests/sql_auth_strict" in lane
-    assert 'upstream.xml" -vv' in lane
-    for forbidden in (
-        "git ",
-        "gh ",
-        "curl ",
-        "http://",
-        "https://",
-        "Rivendael/FastMssql",
-    ):
-        assert forbidden not in lane
-```
-
-This test checks the executable lane slice rather than globally banning the
-legitimate internal word `upstream`.
-
 - [ ] **Step 4: Run RED and inspect the exact failures**
 
 Run:
 
 ```bash
 uv run pytest \
-  tests/sql_auth_strict/test_matrix_contract.py::test_full_runner_contract \
+  tests/sql_auth_strict/test_matrix_contract.py::test_full_runner_uses_original_local_regression_display_name \
   tests/sql_auth_strict/test_matrix_contract.py::test_report_generator_preserves_not_run_and_redacts \
-  tests/sql_auth_strict/test_matrix_contract.py::test_original_regression_lane_is_local_and_repository_safe \
   -q
 ```
 
 Expected:
 
 ```text
-test_full_runner_contract FAIL because original-local-regression is absent
+test_full_runner_uses_original_local_regression_display_name FAIL because
+  stdout still uses [sql-auth] upstream: passed
 test_report_generator_preserves_not_run_and_redacts FAIL because the report
   still renders | upstream |
-test_original_regression_lane_is_local_and_repository_safe PASS
 ```
 
 Any syntax/import error is not the required RED and must be corrected before
@@ -354,13 +415,12 @@ Run:
 
 ```bash
 uv run pytest \
-  tests/sql_auth_strict/test_matrix_contract.py::test_full_runner_contract \
+  tests/sql_auth_strict/test_matrix_contract.py::test_full_runner_uses_original_local_regression_display_name \
   tests/sql_auth_strict/test_matrix_contract.py::test_report_generator_preserves_not_run_and_redacts \
-  tests/sql_auth_strict/test_matrix_contract.py::test_original_regression_lane_is_local_and_repository_safe \
   -q
 ```
 
-Expected: 3/3 PASS.
+Expected: 2/2 PASS.
 
 - [ ] **Step 4: Run the entire matrix contract module**
 
