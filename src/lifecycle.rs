@@ -772,6 +772,27 @@ mod tests {
         .expect("lifecycle state transition must be bounded");
     }
 
+    async fn wait_until_shutdown_waiters(
+        lifecycle: &ConnectionLifecycle,
+        expected_receivers: usize,
+    ) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let receivers = lifecycle
+                    .lock_inner()
+                    .shutdown_sender
+                    .as_ref()
+                    .map_or(0, |sender| sender.receiver_count());
+                if receivers == expected_receivers {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown waiters must subscribe before work is released");
+    }
+
     fn force_completed(error: &PyErr) -> bool {
         Python::attach(|py| {
             error
@@ -864,6 +885,7 @@ mod tests {
             );
             let third =
                 tokio::spawn(Arc::clone(&lifecycle).shutdown(pool, PyLifecycleConfig::default()));
+            wait_until_shutdown_waiters(&lifecycle, 2).await;
             drop(permit);
 
             for waiter in [second, third] {
