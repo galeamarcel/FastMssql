@@ -50,6 +50,10 @@ pub fn python_to_fast_parameter(obj: &Bound<PyAny>) -> PyResult<FastParameter> {
         return Ok(FastParameter::Null(tn));
     }
 
+    // Python bool is a subclass of int, so it must be detected first.
+    if let Ok(py_b) = obj.cast::<PyBool>() {
+        return Ok(FastParameter::Bool(py_b.is_true()));
+    }
     if let Ok(py_i) = obj.cast::<PyInt>() {
         return py_i
             .extract::<i64>()
@@ -64,9 +68,6 @@ pub fn python_to_fast_parameter(obj: &Bound<PyAny>) -> PyResult<FastParameter> {
     }
     if let Ok(py_f) = obj.cast::<PyFloat>() {
         return Ok(FastParameter::F64(py_f.value()));
-    }
-    if let Ok(py_b) = obj.cast::<PyBool>() {
-        return Ok(FastParameter::Bool(py_b.is_true()));
     }
     if let Ok(py_by) = obj.cast::<PyBytes>() {
         return Ok(FastParameter::Bytes(py_by.as_bytes().to_vec()));
