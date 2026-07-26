@@ -232,7 +232,9 @@ def record_framework_metric():
 @pytest.fixture
 def record_load_metric():
     def record(case_id: str, **values: object) -> None:
-        if not case_id.startswith("LOAD-"):
+        if not (
+            case_id.startswith("LOAD-") or case_id == "OBS-009"
+        ):
             raise ValueError(f"not a load case ID: {case_id}")
         json.dumps(values)
         existing = _LOAD_METRICS.setdefault(case_id, {})

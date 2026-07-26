@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+import math
 import time
 
 from fastmssql import (
@@ -24,6 +25,36 @@ from sql_auth_strict.tcp_fault_proxy import DownstreamGateProxy
 
 
 pytestmark = [pytest.mark.sql_auth_strict, pytest.mark.integration]
+
+POOL_STATS_KEYS = {
+    "connected",
+    "connections",
+    "idle_connections",
+    "active_connections",
+    "max_size",
+    "min_idle",
+    "get_started",
+    "get_direct",
+    "get_waited",
+    "get_timed_out",
+    "pending_gets",
+    "get_wait_time_seconds",
+    "connections_created",
+    "connections_closed_broken",
+    "connections_closed_invalid",
+    "connections_closed_max_lifetime",
+    "connections_closed_idle_timeout",
+}
+POOL_INTEGER_KEYS = POOL_STATS_KEYS - {
+    "connected",
+    "min_idle",
+    "get_wait_time_seconds",
+}
+POOL_EPOCH_KEYS = POOL_STATS_KEYS - {
+    "connected",
+    "max_size",
+    "min_idle",
+}
 
 
 def _small_pool() -> PoolConfig:
@@ -423,22 +454,28 @@ async def test_is_connected_state_transitions(
     assert await connection.is_connected() is False
 
 
-@case("CONN-019")
+@case("CONN-019", "OBS-001")
 @pytest.mark.asyncio
 async def test_pool_stats_keys_and_invariants(
     sql_auth_config: SqlAuthConfig,
 ) -> None:
     connection = _individual_connection(sql_auth_config)
+    disconnected = await connection.pool_stats()
+    assert set(disconnected) == POOL_STATS_KEYS
+    assert disconnected["connected"] is False
+    assert disconnected["max_size"] == 2
+    assert disconnected["min_idle"] == 1
+    assert type(disconnected["get_wait_time_seconds"]) is float
+    assert all(
+        type(disconnected[key]) is int for key in POOL_INTEGER_KEYS
+    )
+    assert all(disconnected[key] == 0 for key in POOL_EPOCH_KEYS)
+
     assert await connection.connect() is True
+    assert await scalar(connection, "SELECT @P1", [19]) == 19
+    assert await scalar(connection, "SELECT @P1", [20]) == 20
     stats = await connection.pool_stats()
-    assert set(stats) == {
-        "connected",
-        "connections",
-        "idle_connections",
-        "active_connections",
-        "max_size",
-        "min_idle",
-    }
+    assert set(stats) == POOL_STATS_KEYS
     assert stats["connected"] is True
     assert 0 <= stats["idle_connections"] <= stats["connections"]
     assert stats["active_connections"] == (
@@ -447,6 +484,30 @@ async def test_pool_stats_keys_and_invariants(
     assert stats["connections"] <= stats["max_size"]
     assert stats["max_size"] == 2
     assert stats["min_idle"] == 1
+    assert stats["get_started"] == (
+        stats["get_direct"]
+        + stats["get_waited"]
+        + stats["get_timed_out"]
+        + stats["pending_gets"]
+    )
+    assert all(type(stats[key]) is int for key in POOL_INTEGER_KEYS)
+    assert all(stats[key] >= 0 for key in POOL_INTEGER_KEYS)
+    assert type(stats["get_wait_time_seconds"]) is float
+    assert math.isfinite(stats["get_wait_time_seconds"])
+    assert stats["get_wait_time_seconds"] >= 0.0
+    assert stats["get_started"] >= 3
+
+    assert await connection.disconnect() is True
+    after_disconnect = await connection.pool_stats()
+    assert set(after_disconnect) == POOL_STATS_KEYS
+    assert after_disconnect["connected"] is False
+    assert all(after_disconnect[key] == 0 for key in POOL_EPOCH_KEYS)
+
+    assert await connection.connect() is True
+    reconnected = await connection.pool_stats()
+    assert reconnected["connected"] is True
+    assert reconnected["get_started"] < stats["get_started"]
+    assert reconnected["pending_gets"] == 0
     assert await connection.disconnect() is True
 
 
