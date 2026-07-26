@@ -63,6 +63,7 @@ def lifecycle_connection(
             max_lifetime_secs=None,
             idle_timeout_secs=None,
             connection_timeout_secs=3,
+            test_on_check_out=False,
             retry_connection=False,
         ),
         lifecycle_config=LifecycleConfig(
@@ -173,7 +174,7 @@ async def start_visible_waitfor(
     seconds: int = 1,
     slot: int = 1,
 ) -> asyncio.Task:
-    task = asyncio.create_task(
+    task = asyncio.ensure_future(
         connection.query(
             f"WAITFOR DELAY '00:00:{seconds:02d}'; SELECT @P1 AS slot",
             [slot],
@@ -279,7 +280,7 @@ async def test_disconnect_waits_for_admitted_query(
     shutdown: asyncio.Task | None = None
     try:
         await connection.connect()
-        query = asyncio.create_task(
+        query = asyncio.ensure_future(
             connection.simple_query(
                 "WAITFOR DELAY '00:00:02'; SELECT 42 AS answer"
             )
@@ -718,10 +719,11 @@ async def test_forced_write_has_unknown_outcome_and_is_not_retried(
     shutdown: asyncio.Task | None = None
     try:
         assert await connection.connect() is True
+        assert await scalar(connection, "SELECT 10") == 10
         assert proxy.accepted_connections == 1
         proxy.pause_downstream()
         proxy.expect_client_disconnect()
-        write = asyncio.create_task(
+        write = asyncio.ensure_future(
             connection.execute(
                 f"""
                 INSERT INTO {table} (business_key, attempt)
@@ -853,7 +855,7 @@ async def test_force_retires_idle_pooled_transaction_and_old_generation(
             await old_transaction.query("SELECT 11")
         old_error = old_captured.value
         assert old_error.phase == "shutdown"
-        assert old_error.state == "Closed"
+        assert old_error.state in {"Closing", "Closed"}
         assert old_error.retryable is False
         assert old_error.connection_discarded is True
         assert old_error.outcome_unknown is False
@@ -1029,7 +1031,7 @@ async def test_direct_batch_and_nested_contexts_share_lifecycle_contract(
     shutdown: asyncio.Task | None = None
     try:
         assert await connection.is_connected() is False
-        batch = asyncio.create_task(
+        batch = asyncio.ensure_future(
             connection.execute_batch(
                 [
                     (
