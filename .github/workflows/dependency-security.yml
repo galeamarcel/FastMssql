@@ -5,6 +5,7 @@ on:
     branches:
       - master
       - test/sql-auth-validation
+      - test/operation-metrics-hosted
   pull_request:
     branches:
       - master
