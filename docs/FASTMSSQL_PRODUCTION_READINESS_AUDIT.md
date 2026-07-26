@@ -427,7 +427,7 @@ authentication:
 - toate testele stricte de tranzacție, inclusiv compatibilitatea upstream:
   46/46 PASS;
 - suita strictă SQL-auth completă: 329/329 PASS în 129,51 s;
-- regresia upstream aplicabilă: 896/896 PASS în 63,89 s;
+- regresia originală locală: 896/896 PASS în 63,89 s;
 - `cargo test --locked`: 9/9 PASS;
 - `cargo fmt --check` și
   `cargo clippy --locked --all-targets -- -D warnings`: PASS;
@@ -509,7 +509,7 @@ Dovada executată pe MSSQL Docker cu SQL authentication:
 - toate testele stricte de tranzacție și compatibilitate: 94/94 PASS;
 - suita strictă SQL-auth completă: 334/334 PASS în 125,96 s, cu toate cele 269
   de cazuri din specificație raportate;
-- regresia upstream aplicabilă: 896/896 PASS în 63,16 s;
+- regresia originală locală: 896/896 PASS în 63,16 s;
 - `cargo test --locked`: 9/9 PASS;
 - `cargo fmt --check` și
   `cargo clippy --locked --all-targets -- -D warnings`: PASS;
@@ -622,7 +622,7 @@ TX-027–TX-031 focalizat              5/5 PASS
 tranzacții stricte + upstream       100/100 PASS
 suita strictă SQL-auth              340/340 PASS în 127,85 s
 cazuri raportate din specificație   274/274 PASS
-regresie upstream aplicabilă        896/896 PASS în 64,09 s
+regresia originală locală           896/896 PASS în 64,09 s
 FastMssql Rust unit tests           9/9 PASS
 cargo fmt / Clippy -D warnings      PASS
 cargo audit, 219 dependențe         0 findings
@@ -735,7 +735,7 @@ TX-026 + TX-032–TX-034 + proxy       5/5 PASS
 tranzacții/async/batch + upstream    140/140 PASS
 suita strictă SQL-auth               344/344 PASS în 124,32 s
 cazuri raportate din specificație    277/277 PASS
-regresie upstream aplicabilă         896/896 PASS în 62,99 s
+regresia originală locală            896/896 PASS în 62,99 s
 FastMssql Rust unit tests            13/13 PASS
 Tiberius vendored unit tests         123/123 PASS
 cargo fmt / Clippy -D warnings       PASS
@@ -841,7 +841,7 @@ suita strictă SQL-auth               296/296 PASS
 cazuri raportate din specificație    285/285 PASS
 async / framework                    16/16, 28/28 PASS
 resilience / load                    6/6, 9/9 PASS
-regresie upstream aplicabilă         902/902 PASS
+regresia originală locală            902/902 PASS
 FastMssql Rust unit tests            13/13 PASS
 cargo fmt / Clippy -D warnings       PASS
 cargo audit, 219 dependențe          0 findings
@@ -929,7 +929,7 @@ durată / throughput                  0,172589 s / 5.794,11 probe/s
 post-load query                      PASS
 suita strictă SQL-auth               354/354 PASS în 135,56 s
 ID-uri raportate din specificație    285/285 PASS
-regresie upstream aplicabilă         896/896 PASS în 64,38 s
+regresia originală locală            896/896 PASS în 64,38 s
 FastMssql Rust unit tests            13/13 PASS
 Tiberius unit / doctests executate   123/123 + 20/20 PASS
 Tiberius doctests ignorate           1, intenționat
@@ -1056,7 +1056,7 @@ suita true-async                      16/16 PASS
 suita framework                       28/28 PASS
 suita resilience                      6/6 PASS
 suita load                            9/9 PASS
-regresie upstream                     901/901 PASS
+regresia originală locală             901/901 PASS
 Tiberius unit tests                   123/123 PASS
 Tiberius doctests executate           20/20 PASS, 1 ignorat intenționat
 cargo audit, 219 dependențe           0 findings
@@ -1182,7 +1182,7 @@ suita strictă SQL-auth                           296/296 PASS
 cazuri raportate din specificație                285/285 PASS
 async / framework                                16/16, 28/28 PASS
 resilience / load                                  6/6, 9/9 PASS
-regresie upstream aplicabilă                     906/906 PASS
+regresia originală locală                        906/906 PASS
 cargo fmt / Clippy -D warnings / Ruff            PASS
 compileall / wheel cp311-abi3 curat               PASS
 cargo audit, 219 dependențe                       0 findings
@@ -1316,7 +1316,7 @@ matrice SQL-auth                               295/295 PASS
 suita strictă SQL-auth                        305/305 PASS
 async / framework                              16/16, 29/29 PASS
 resilience / load                                6/6, 9/9 PASS
-regresie upstream aplicabilă                  915/915 PASS
+regresia originală locală                     915/915 PASS
 FastMssql Rust                                  23/23 PASS
 TimeoutConfig + PoolConfig wheel izolat         12/12 PASS
 cargo fmt / Clippy -D warnings / Ruff          PASS
@@ -1474,7 +1474,7 @@ LIFE-015 în lane-ul framework            PASS
 matrice SQL-auth la merge                311/311 PASS
 strict / async / framework               321/321 + 16/16 + 30/30 PASS
 resilience / load                          6/6 + 9/9 PASS
-regresie upstream                        921/921 PASS
+regresia originală locală                921/921 PASS
 FastMssql Rust                             40/40 PASS
 contracte instalate hosted                 18/18 PASS
 cargo fmt / Clippy -D warnings             PASS
@@ -1651,7 +1651,7 @@ contract static pool observability            2/2 PASS
 matrice SQL-auth                            321/321 PASS
 strict / async / framework        326/326 + 16/16 + 30/30 PASS
 resilience / load                     6/6 + 10/10 PASS
-regresie upstream                         923/923 PASS
+regresia originală locală                 923/923 PASS
 ABI3 cp311 wheel instalat                    20/20 PASS
 cargo fmt / Clippy -D warnings                   PASS
 Ruff / compileall / RustSec                      PASS
@@ -1670,19 +1670,174 @@ Limitele curente sunt explicite:
 
 - statisticile descriu numai pool-ul curent; conexiunile directe construite
   prin `Transaction(...)` nu sunt agregate;
-- snapshotul nu oferă histograme sau metrici de durată/rezultat per operație;
+- `pool_stats()` nu oferă histograme sau metrici de durată/rezultat; API-ul
+  separat `operation_stats()` documentat mai jos acoperă această nevoie fără
+  să schimbe semantica adaptorului bb8;
 - nu există tracing, OpenTelemetry, exporter ori etichete configurabile;
 - nu există încă o limită publică separată pentru numărul waiterilor;
 - SQL-auth real este dovadă locală Docker; workflow-ul hosted nu rulează MSSQL;
 - nu s-au schimbat dependențele, lockfile-ul, versiunea sau release metadata.
 
-Următorul candidat independent este observabilitatea duratei și rezultatului
-operațiilor. Acesta trebuie proiectat separat de tracing/OpenTelemetry și de
-adaptorul bb8 deja verificat.
+Observabilitatea duratei și rezultatului operațiilor a fost implementată ca
+un candidat independent, separat de tracing/OpenTelemetry și de adaptorul bb8.
+Următorul candidat enterprise este suportul parametrilor tipizați.
 
-Nu s-a creat niciun branch și niciun PR upstream pentru observability.
-`origin` rămâne `galeamarcel/FastMssql`, iar push URL-ul `upstream` este
-`DISABLED`.
+Nu s-a creat niciun branch și niciun PR în repository-ul original pentru
+observability. `origin` rămâne `galeamarcel/FastMssql`, iar push URL-ul
+repository-ului original este `DISABLED`.
+
+## Metrici de durată și rezultat per operație — implementate și verificate
+
+Statusul candidatului este `VERIFIED_FORK`. API-ul este opt-in și
+dependency-free:
+
+```python
+connection = Connection(
+    connection_string,
+    operation_metrics_config=OperationMetricsConfig(enabled=True),
+)
+snapshot = await connection.operation_stats()
+```
+
+`OperationMetricsConfig` este dezactivat implicit și acceptă un `bool` exact.
+Calea dezactivată nu alocă registru și nu citește ceasul sau atomicele.
+Snapshotul are o schemă fixă cu 13 operații, 17 limite cumulative și cinci
+rezultate terminale mutual exclusive: `succeeded`, `errors`, `timed_out`,
+`cancelled` și `outcome_unknown`. Nu conține SQL, parametri, identificatori,
+mesaje de eroare, credențiale sau labels configurabile.
+
+Istoricul TDD este separat și publicat numai pe fork:
+
+- design principal: `docs/operation-metrics-design` la
+  `b8808ca82056fc83fb44444e8033e6f982cde412`;
+- amendament saturation/coherence:
+  `fd3b7c24084639b99bb38b97cfe9bb7ad094f915`;
+- contract RED final: `test/operation-metrics` la
+  `74f7ef943eb23b7e9ed48d8d5f4e0897fc21f872`;
+- feature final, cu RED în ancestry:
+  `123553d7d6e42ef06c240c3a84e211c2923ec03c`;
+- merge tehnic cumulativ exact:
+  `bbeacc9443fc46687ae5fd12b31c5d777b3a2261`;
+- matricea și raportul regenerate din artefactele merge-ului:
+  `4a93d7e7dbf7f20e58912fdbfa12fbb85d38bf87`.
+
+Contoarele urmăresc corpul async Rust de la primul poll până la rezultat sau
+drop. Includ admission, acquire, I/O TDS, consumul răspunsului și construcția
+rezultatului curent; nu pretind că măsoară timpul petrecut în coada Python
+înainte de primul poll. Tranzacțiile create prin `Connection.transaction()`
+folosesc registrul proprietarului. Constructorul direct de compatibilitate
+`Transaction(...)` rămâne în afara acestui contract.
+
+Registrul aparține obiectului logic `Connection` și supraviețuiește ciclurilor
+disconnect/reconnect; aceasta este intenționat diferit de epoca pool-ului
+raportată de `pool_stats()`. Snapshoturile concurente sunt weakly consistent,
+dar reconcilează mereu:
+
+```text
+started == completed + in_flight
+completed == succeeded + errors + timed_out + cancelled + outcome_unknown
+```
+
+După quiescence snapshotul este exact. Contoarele, suma duratelor și bucketurile
+sunt saturating și nu pot face wrap; flagul `saturated` rămâne permanent
+adevărat după atingerea limitei.
+
+OPMET-001–OPMET-016 au verificat configurația, calea default-off, durate și
+bucketuri, erori, acquire/operation/shutdown timeout, anulare confirmată de
+server, tranzacții pooled, reconnect, batch/bulk, privacy, pierderea
+confirmării COMMIT și integrarea FastAPI/Flask WSGI/Flask ASGI. Toate au
+trecut fără skip, retry sau excepții înghițite.
+
+OPMET-011, pe merge-ul tehnic exact, a măsurat:
+
+```text
+operații parametrizate                    10.000
+workers / pool max                         100 / 20
+conexiuni fizice maxime                         20
+in-flight maxim                                100
+elapsed                                  1,003 s
+throughput                            9.968,74 qps
+snapshoturi concurente                      2.536
+event-loop ticks                           17.249
+rezultate                         10.000 succeeded
+sesiuni aplicație după teardown                 0
+```
+
+Gate-ul separat de overhead a rulat șase trial-uri pe merge-ul
+`bbeacc9443fc46687ae5fd12b31c5d777b3a2261`, fiecare cu 99.999 operații,
+200 workeri și `PoolConfig(max_size=100)`:
+
+```text
+pereche 1  disabled 21.023,97 / enabled 21.904,71 ops/s   -4,1892%
+pereche 2  disabled 21.276,68 / enabled 21.640,46 ops/s   -1,7098%
+pereche 3  disabled 21.894,93 / enabled 21.164,63 ops/s   +3,3355%
+mediană degradare                                            -1,7098%
+gate maxim acceptat                                           +15,0000%
+```
+
+Toate cele 599.994 rezultate au fost exacte. Trial-urile enabled au publicat
+exact câte 99.999 `started/completed/succeeded`, cele disabled au rămas la
+zero, event loop-ul a progresat, maximumul pool/sesiuni SQL a fost 100/100,
+iar teardown-ul a lăsat zero sesiuni candidate. SHA-256 al artefactului este
+`54ff521f51f038b392ee5134e4d3ec1df2465ed65b16b0bf0015a6d2b8f5abc4`.
+Acesta este un gate al overheadului driverului, nu un benchmark universal SQL
+Server.
+
+Arborele feature și arborele merge-ului tehnic sunt identice. Pe același
+arbore au trecut și profilele tranzacționale:
+
+```text
+persistent 10.000:100       3.290,99 tx/s, 100 conexiuni, 0 rămase
+persistent 99.999:100       3.407,64 tx/s, 100 conexiuni, 0 rămase
+persistent 99.999:200       3.174,49 tx/s, 200 conexiuni, 0 rămase
+pooled 10.000:100           2.718,17 tx/s, max 100 conexiuni, 0 rămase
+pooled 99.999:100           3.150,47 tx/s, max 100 conexiuni, 0 rămase
+pooled 99.999:200           3.232,95 tx/s, max 100 conexiuni, 0 rămase
+```
+
+Fiecare profil a avut exact 5.000/5.000 sau 50.000/49.999
+COMMIT/ROLLBACK, smoke query PASS și zero sesiuni rămase.
+
+Dovada finală pe merge-ul tehnic exact:
+
+```text
+FastMssql Rust                              54/54 PASS
+contract static operation metrics              7/7 PASS
+matrice SQL-auth                            337/337 PASS
+strict / async / framework        339/339 + 16/16 + 33/33 PASS
+resilience / load                     6/6 + 11/11 PASS
+regresia originală locală                  930/930 PASS
+cargo fmt / Clippy -D warnings                   PASS
+ABI3 build/install și contracte                  PASS
+failures / errors / skips / not-run       0 / 0 / 0 / 0
+```
+
+Branchul hosted `test/operation-metrics-hosted` la
+`d82527e79f82738193384fb2ea8c497f6a68ff5c` conține exact feature-ul tehnic și
+numai două ajustări de trigger în workflow-uri. Diff-ul pentru `src`,
+`python`, `tests`, `scripts`, `README.md`, manifest și lockfile față de
+feature este gol.
+[Run-ul #30210993458](https://github.com/galeamarcel/FastMssql/actions/runs/30210993458)
+a trecut raw Cargo, 54/54 teste Rust, ABI3 wheel build/install și contractele
+instalate pe Ubuntu, macOS și Windows.
+[RustSec #30210993463](https://github.com/galeamarcel/FastMssql/actions/runs/30210993463)
+a trecut gate-ul care respinge atât vulnerabilitățile, cât și warningurile.
+Workflow-urile hosted nu rulează un SQL Server real; validarea SQL-auth este
+cea locală Docker descrisă mai sus.
+
+Limitele rămase sunt explicite:
+
+- bucketurile sunt fixe; nu există reset sau epoch public;
+- snapshoturile concurente sunt reconciliate, nu tranzacțional atomice;
+- constructorul standalone `Transaction(...)` nu are registru;
+- nu există tracing, OpenTelemetry, exporter, callback sau metric push;
+- nu există SQL labels, fingerprinting ori cardinalitate controlată de input;
+- nu există agregare globală sau multiprocess;
+- nu s-a făcut version bump, release sau publicare de pachet.
+
+Toate branchurile, commiturile și push-urile acestui candidat există numai în
+`galeamarcel/FastMssql`. Nu s-a făcut push, PR sau release în repository-ul
+original, al cărui push URL local rămâne `DISABLED`.
 
 ## Corecții și nuanțări față de primul audit
 
@@ -1869,9 +2024,24 @@ nedeterministe după intrarea în `Committing`; conexiunea a fost deja eliminat�
   concurent.
 - Contoarele de retragere sunt evenimente care se pot suprapune; nu reprezintă
   un total de conexiuni fizice unice.
-- Metricile de durată/rezultat per operație sunt următorul candidat
-  independent. Tracing/OpenTelemetry și exporterul rămân un scope separat,
-  fără SQL sau parametri sensibili implicit.
+- Metricile de durată/rezultat au fost implementate separat prin candidatul
+  operation metrics; adaptorul bb8 și semantica epocii pool-ului nu au fost
+  modificate.
+
+### Observabilitate operații — `VERIFIED_FORK`
+
+- `123553d`, integrat tehnic în `bbeacc9`, adaugă opt-in
+  `OperationMetricsConfig` și `operation_stats()` pentru exact 13 operații,
+  cinci rezultate terminale și 17 bucketuri fixe.
+- OPMET-001–OPMET-016 verifică default-off, durate, erori, timeout, anulare,
+  commit incert, batch/bulk, lifecycle, tranzacții pooled, privacy și
+  framework-urile FastAPI/Flask.
+- Gate-ul de 599.994 operații a măsurat o degradare mediană de `-1,7098%`,
+  sub limita `+15%`, cu pool și sesiuni SQL plafonate la 100.
+- Snapshoturile concurente sunt weakly consistent, dar aritmetic reconciliate
+  și exacte după quiescence; bucketurile sunt fixe și nu există reset.
+- Tracing/OpenTelemetry, exporterul, labels SQL și constructorul direct
+  `Transaction(...)` rămân scope-uri separate.
 
 ### Rezultate și streaming
 
@@ -2122,8 +2292,10 @@ funcție ar necesita lucru la nivelul driverului TDS:
     force bounded și close cancellation-safe finalizate și verificate**
 15. `feat/observability-metrics` — **cele 17 metrici bb8 privacy-safe,
     saturația și loadul cu scrape concurent finalizate și verificate hosted**
-16. `feat/operation-outcome-observability` — **următorul candidat**
-17. `feat/typed-parameters`
+16. `feat/operation-metrics` — **metricile opt-in de durată/rezultat,
+    histogramele bounded, privacy și stress-ul de 599.994 operații finalizate
+    și verificate hosted**
+17. `feat/typed-parameters` — **următorul candidat**
 18. `feat/resultsets-streaming`
 19. `feat/batch-bulk`
 20. `fix/named-instance`
