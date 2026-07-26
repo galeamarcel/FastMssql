@@ -142,7 +142,11 @@ impl TransactionState {
     fn is_in_flight(self) -> bool {
         matches!(
             self,
-            Self::Beginning | Self::Executing | Self::Committing | Self::RollingBack
+            Self::Beginning
+                | Self::Executing
+                | Self::Committing
+                | Self::RollingBack
+                | Self::Closing
         )
     }
 
@@ -1099,6 +1103,7 @@ impl Transaction {
         let timeout_config = self.timeout_config.clone();
 
         future_into_py(py, async move {
+            let mut cancellation_guard = TransactionCancellationGuard::new(Arc::clone(&session));
             let mut session = session.lock().await;
             if session.lifecycle_failure.is_none() {
                 session.authorize_settlement(OperationName::Close, false)?;
@@ -1106,7 +1111,8 @@ impl Transaction {
             let previous_state = session.state;
             let force_receiver = session.force_receiver();
             let mut conn = session.conn.take();
-            session.transition_to(TransactionState::Closing);
+            let epoch = session.enter_in_flight(TransactionState::Closing);
+            cancellation_guard.arm(epoch);
             let mut close_result: PyResult<()> = Ok(());
 
             if let Some(conn_ref) = conn.as_mut() {
@@ -1192,6 +1198,7 @@ impl Transaction {
             } else {
                 session.transition_to(TransactionState::Idle);
             }
+            cancellation_guard.disarm();
             close_result
         })
     }
