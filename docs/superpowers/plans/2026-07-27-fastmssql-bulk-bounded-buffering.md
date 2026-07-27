@@ -48,6 +48,8 @@ SQL authentication.
 - `tests/sql_auth_strict/test_batch_strict.py`: real SQL Server proof that a
   later conversion failure occurs after a prior chunk reached the server and
   still rolls the transaction back.
+- `tests/sql_auth_strict/test_matrix_contract.py`: exact canonical case count
+  changes from 372 to 374 when the two new cases are registered.
 - `docs/superpowers/specs/2026-07-24-fastmssql-sql-auth-validation-design.md`:
   canonical registration for `BULK-001` and `BULK-002`.
 - `scripts/sql_auth/bulk_buffering_probe.py`: opt-in RSS and event-loop-stall
@@ -119,7 +121,13 @@ from __future__ import annotations
 
 import asyncio
 
-from fastmssql import Connection, OperationMetricsConfig, SslConfig
+from fastmssql import (
+    Connection,
+    OperationMetricsConfig,
+    PoolConfig,
+    SslConfig,
+    TimeoutConfig,
+)
 import pytest
 
 
@@ -140,6 +148,16 @@ def _offline_connection() -> Connection:
         username="bulk_probe",
         password="not-used",
         ssl_config=SslConfig.development(),
+        pool_config=PoolConfig(
+            max_size=1,
+            min_idle=0,
+            connection_timeout_secs=1,
+            retry_connection=False,
+        ),
+        timeout_config=TimeoutConfig(
+            connect_timeout_secs=1.0,
+            acquire_timeout_secs=1.0,
+        ),
         operation_metrics_config=OperationMetricsConfig(enabled=True),
     )
 
@@ -150,11 +168,12 @@ async def test_bulk_insert_does_not_convert_cells_during_method_creation() -> No
     probe = _IndexProbe()
 
     awaitable = connection.bulk_insert("dbo.target", ["value"], [[probe]])
-
-    assert probe.conversions == 0
-    assert awaitable.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await awaitable
+    try:
+        assert probe.conversions == 0
+    finally:
+        assert awaitable.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await awaitable
 ```
 
 - [ ] **Step 2: Run the timing test and observe the intended RED**
@@ -204,6 +223,7 @@ implementation, and the displayed/package version remains `0.7.7`.
 **Files:**
 
 - Modify: `tests/sql_auth_strict/test_batch_strict.py`
+- Modify: `tests/sql_auth_strict/test_matrix_contract.py`
 - Modify:
   `docs/superpowers/specs/2026-07-24-fastmssql-sql-auth-validation-design.md`
 - Modify: `VERSION.md`
@@ -225,6 +245,11 @@ implementation, and the displayed/package version remains `0.7.7`.
 - `BULK-002`: empty compatibility bulk returns zero without pool admission or
   operation-metric activity.
 ```
+
+Update every exact matrix-contract expectation in
+`tests/sql_auth_strict/test_matrix_contract.py` from `372` to `374`, including
+the test name, generated row count, missing-evidence diagnostic and report
+summary.
 
 - [ ] **Step 2: Write `BULK-001`**
 
@@ -267,10 +292,23 @@ async def test_bulk_late_conversion_failure_rolls_back_sent_chunk(
         ["id", "value"],
         rows,
     )
-    task = asyncio.create_task(awaitable)
-    await _wait_for_request(sa_connection, raw_table, present=True)
-    with pytest.raises(ValueError, match="Unsupported type"):
-        await task
+    task = asyncio.ensure_future(awaitable)
+    try:
+        await _wait_for_request(
+            sa_connection,
+            raw_table,
+            present=True,
+            timeout=5.0,
+        )
+        with pytest.raises(ValueError, match="Unsupported type"):
+            await task
+    finally:
+        if not task.done():
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        elif not task.cancelled():
+            task.exception()
 
     assert await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}") == 0
 ```
@@ -288,6 +326,16 @@ async def test_empty_bulk_has_no_pool_or_metric_activity() -> None:
         username="bulk_probe",
         password="not-used",
         ssl_config=SslConfig.development(),
+        pool_config=PoolConfig(
+            max_size=1,
+            min_idle=0,
+            connection_timeout_secs=1,
+            retry_connection=False,
+        ),
+        timeout_config=TimeoutConfig(
+            connect_timeout_secs=1.0,
+            acquire_timeout_secs=1.0,
+        ),
         operation_metrics_config=OperationMetricsConfig(enabled=True),
     )
     assert await connection.bulk_insert("dbo.target", ["value"], []) == 0
@@ -336,7 +384,7 @@ SQL Server is not acceptable evidence.
 - Produces: one JSON object with `row_count`, `payload_bytes`,
   `rss_baseline_bytes`, `rss_peak_bytes`, `rss_growth_bytes`,
   `max_event_loop_stall_seconds`, `elapsed_seconds`, `affected_rows`, and
-  `post_smoke_value`.
+  `post_smoke_value`, plus a `violations` list that controls the exit status.
 
 - [ ] **Step 1: Implement the CLI contract**
 
@@ -345,24 +393,67 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from dataclasses import dataclass
 import gc
 import json
 import os
 import time
-import uuid
+from uuid import uuid4
 
-from fastmssql import Connection, SslConfig
+from fastmssql import Connection, PoolConfig, SslConfig
 import psutil
 
 
-def _required_env(name: str) -> str:
-    value = os.environ.get(name)
-    if not value:
-        raise RuntimeError(f"required environment variable is missing: {name}")
-    return value
+@dataclass(frozen=True, repr=False)
+class SqlAuthSettings:
+    host: str
+    port: int
+    database: str
+    username: str
+    password: str
+
+    @classmethod
+    def from_env(cls) -> SqlAuthSettings:
+        password = os.getenv("FASTMSSQL_SQL_AUTH_OWNER_PASSWORD", "")
+        if not password:
+            raise RuntimeError(
+                "missing required environment setting FASTMSSQL_SQL_AUTH_OWNER_PASSWORD"
+            )
+        return cls(
+            host=os.getenv("FASTMSSQL_SQL_AUTH_HOST", "127.0.0.1"),
+            port=int(os.getenv("FASTMSSQL_SQL_AUTH_PORT", "14334")),
+            database=os.getenv(
+                "FASTMSSQL_SQL_AUTH_DATABASE",
+                "fastmssql_validation",
+            ),
+            username=os.getenv(
+                "FASTMSSQL_SQL_AUTH_OWNER_USER",
+                "fastmssql_owner",
+            ),
+            password=password,
+        )
+
+    def connection(self, *, application_name: str) -> Connection:
+        return Connection(
+            server=self.host,
+            port=self.port,
+            database=self.database,
+            username=self.username,
+            password=self.password,
+            application_name=application_name,
+            ssl_config=SslConfig.development(),
+            pool_config=PoolConfig(
+                max_size=1,
+                min_idle=1,
+                max_lifetime_secs=None,
+                idle_timeout_secs=None,
+                connection_timeout_secs=5,
+                retry_connection=False,
+            ),
+        )
 
 
-def _quote_part(value: str) -> str:
+def quote_identifier_part(value: str) -> str:
     return f"[{value.replace(']', ']]')}]"
 
 
@@ -396,17 +487,12 @@ def parse_args() -> argparse.Namespace:
 
 
 async def run_probe(args: argparse.Namespace) -> int:
-    connection = Connection(
-        server=_required_env("FASTMSSQL_SQL_AUTH_HOST"),
-        port=int(_required_env("FASTMSSQL_SQL_AUTH_PORT")),
-        database=_required_env("FASTMSSQL_SQL_AUTH_DATABASE"),
-        username=_required_env("FASTMSSQL_SQL_AUTH_OWNER_USER"),
-        password=_required_env("FASTMSSQL_SQL_AUTH_OWNER_PASSWORD"),
-        ssl_config=SslConfig.development(),
-    )
-    raw_table = f"fastmssql_bulk_buffer_{uuid.uuid4().hex}"
+    settings = SqlAuthSettings.from_env()
+    application_name = f"fastmssql-bulk-buffer-{uuid4().hex}"
+    connection = settings.connection(application_name=application_name)
+    raw_table = f"fastmssql_bulk_buffer_{uuid4().hex}"
     qualified_table = f"dbo.{raw_table}"
-    sql_table = f"[dbo].{_quote_part(raw_table)}"
+    sql_table = f"[dbo].{quote_identifier_part(raw_table)}"
     process = psutil.Process()
 
     async with connection:
@@ -456,7 +542,7 @@ async def run_probe(args: argparse.Namespace) -> int:
             rss_peak = max(rss_peak, process.memory_info().rss)
             persisted = (
                 await connection.query(
-                    f"SELECT COUNT(*) AS row_count FROM {sql_table}"
+                    f"SELECT COUNT_BIG(*) AS row_count FROM {sql_table}"
                 )
             ).fetchone()["row_count"]
             post_smoke_value = (
@@ -466,6 +552,16 @@ async def run_probe(args: argparse.Namespace) -> int:
             await connection.execute(f"DROP TABLE IF EXISTS {sql_table}")
 
     rss_growth = max(0, rss_peak - rss_baseline)
+    violations: list[str] = []
+    if affected != args.rows or persisted != args.rows:
+        violations.append("row_count_mismatch")
+    if post_smoke_value != 1:
+        violations.append("post_smoke_failed")
+    if rss_growth > args.rss_growth_limit_bytes:
+        violations.append("rss_growth_exceeded")
+    if max_stall > args.event_loop_stall_limit_seconds:
+        violations.append("event_loop_stall_exceeded")
+
     result = {
         "affected_rows": affected,
         "elapsed_seconds": elapsed,
@@ -477,21 +573,10 @@ async def run_probe(args: argparse.Namespace) -> int:
         "rss_baseline_bytes": rss_baseline,
         "rss_growth_bytes": rss_growth,
         "rss_peak_bytes": rss_peak,
+        "violations": violations,
     }
     print(json.dumps(result, sort_keys=True))
-
-    violations: list[str] = []
-    if affected != args.rows or persisted != args.rows:
-        violations.append("row_count_mismatch")
-    if post_smoke_value != 1:
-        violations.append("post_smoke_failed")
-    if rss_growth > args.rss_growth_limit_bytes:
-        violations.append("rss_growth_exceeded")
-    if max_stall > args.event_loop_stall_limit_seconds:
-        violations.append("event_loop_stall_exceeded")
-    if violations:
-        raise RuntimeError(",".join(violations))
-    return 0
+    return 1 if violations else 0
 
 
 if __name__ == "__main__":
@@ -538,6 +623,7 @@ git diff --check
 rg -n 'T[B]D|TO[D]O|implement la[t]er|fill in detai[l]s|Similar to Tas[k]' \
   tests/test_bulk_bounded_buffering.py \
   tests/sql_auth_strict/test_batch_strict.py \
+  tests/sql_auth_strict/test_matrix_contract.py \
   docs/superpowers/specs/2026-07-24-fastmssql-sql-auth-validation-design.md \
   scripts/sql_auth/bulk_buffering_probe.py \
   VERSION.md
@@ -551,6 +637,7 @@ Expected: no output.
 git add \
   tests/test_bulk_bounded_buffering.py \
   tests/sql_auth_strict/test_batch_strict.py \
+  tests/sql_auth_strict/test_matrix_contract.py \
   docs/superpowers/specs/2026-07-24-fastmssql-sql-auth-validation-design.md \
   scripts/sql_auth/bulk_buffering_probe.py \
   VERSION.md

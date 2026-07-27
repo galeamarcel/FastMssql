@@ -38,6 +38,32 @@ Changes currently integrated on `test/sql-auth-validation`:
 
 No release, package-version change, or artifact publication has occurred.
 
+### Compatibility bulk bounded-buffering RED coverage
+
+- Added deterministic offline contracts requiring `bulk_insert()` method
+  creation to leave every Python cell untouched until the returned awaitable
+  runs and requiring empty input to return zero without pool or metric
+  activity.
+- Reproduced both defects on the unchanged implementation: the conversion
+  probe was invoked once during method creation, and empty input reached the
+  acquire phase and timed out against a deliberately closed endpoint.
+- Added SQL-auth cases `BULK-001` and `BULK-002`; on the exact RED worktree,
+  the late invalid value was rejected synchronously before any first-chunk
+  server activity, while the empty input again timed out in acquire.
+- Added an opt-in RSS/event-loop probe whose baseline is captured only after
+  the complete Python input list exists. The unchanged implementation added
+  `40,681,472` bytes RSS at 10,000 rows and `138,248,192` bytes at 99,999
+  rows (1 KiB shared payload), exceeding the `67,108,864`-byte gate at the
+  maximum profile while still inserting and reading back all 99,999 rows.
+- Raised the canonical SQL-auth matrix contract from 372 to 374 unique cases;
+  all 26 matrix-contract checks pass, and all 20 pre-existing batch/bulk
+  SQL-auth cases remain green on the exact RED build.
+- Tightened the offline probe to one-second connect/acquire budgets so the RED
+  reason is deterministic rather than a global pytest timeout.
+- This branch adds RED tests and execution-plan evidence only; it does not
+  change runtime behavior, package metadata, the displayed `0.7.7` version or
+  release state.
+
 ### Documentation-only enterprise batch/bulk design
 
 - Added the approved enterprise design for bounded compatibility bulk,

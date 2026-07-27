@@ -537,6 +537,13 @@ evidence reference.
 - `BATCH-019`: identity/default/computed/trigger interactions.
 - `BATCH-020`: batch and bulk cancellation cleanup.
 
+Enterprise compatibility-bulk buffering:
+
+- `BULK-001`: late second-chunk conversion failure occurs after first-chunk
+  server activity and rolls back the full compatibility bulk transaction.
+- `BULK-002`: empty compatibility bulk returns zero without pool admission or
+  operation-metric activity.
+
 ### TX — dedicated transactions
 
 - `TX-001`: dedicated session ID remains constant.

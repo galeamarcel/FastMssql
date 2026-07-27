@@ -6,11 +6,13 @@ from datetime import date, datetime
 
 from fastmssql import (
     Connection,
+    OperationMetricsConfig,
     Parameter,
     Parameters,
     PoolConfig,
     SqlError,
     SslConfig,
+    TimeoutConfig,
     TypedNull,
 )
 import pytest
@@ -777,3 +779,92 @@ async def test_batch_and_bulk_cancellation_cleanup(
         assert await scalar(owner_connection, f"SELECT COUNT(*) FROM {bulk_table}") == 0
     finally:
         await bulk_connection.disconnect()
+
+
+@case("BULK-001")
+@pytest.mark.asyncio
+async def test_bulk_late_conversion_failure_rolls_back_sent_chunk(
+    owner_connection: Connection,
+    sa_connection: Connection,
+    unique_sql_name: Callable[[str], str],
+    cleanup_registry: CleanupRegistry,
+) -> None:
+    raw_table = unique_sql_name("strict_bulk_late_conversion")
+    raw_trigger = unique_sql_name("strict_bulk_late_conversion_trigger")
+    table = quote_identifier(raw_table)
+    trigger = quote_identifier(raw_trigger)
+    cleanup_registry.add(f"DROP TRIGGER IF EXISTS {trigger}")
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
+    await owner_connection.execute(
+        f"CREATE TABLE {table} (id INT PRIMARY KEY, value INT NOT NULL)"
+    )
+    await owner_connection.simple_query(
+        f"""
+        CREATE TRIGGER {trigger}
+        ON {table}
+        AFTER INSERT
+        AS
+        BEGIN
+            SET NOCOUNT ON;
+            IF EXISTS (SELECT 1 FROM inserted WHERE id = 0)
+                WAITFOR DELAY '00:00:02';
+        END
+        """
+    )
+    rows: list[list[object]] = [[index, index] for index in range(1000)]
+    rows.append([1000, object()])
+
+    awaitable = owner_connection.bulk_insert(
+        raw_table,
+        ["id", "value"],
+        rows,
+    )
+    task = asyncio.ensure_future(awaitable)
+    try:
+        await _wait_for_request(
+            sa_connection,
+            raw_table,
+            present=True,
+            timeout=5.0,
+        )
+        with pytest.raises(ValueError, match="Unsupported type"):
+            await task
+    finally:
+        if not task.done():
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        elif not task.cancelled():
+            task.exception()
+
+    assert await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}") == 0
+
+
+@case("BULK-002")
+@pytest.mark.asyncio
+async def test_empty_bulk_has_no_pool_or_metric_activity() -> None:
+    connection = Connection(
+        server="127.0.0.1",
+        port=1,
+        database="master",
+        username="bulk_probe",
+        password="not-used",
+        ssl_config=SslConfig.development(),
+        pool_config=PoolConfig(
+            max_size=1,
+            min_idle=0,
+            connection_timeout_secs=1,
+            retry_connection=False,
+        ),
+        timeout_config=TimeoutConfig(
+            connect_timeout_secs=1.0,
+            acquire_timeout_secs=1.0,
+        ),
+        operation_metrics_config=OperationMetricsConfig(enabled=True),
+    )
+
+    assert await connection.bulk_insert("dbo.target", ["value"], []) == 0
+    assert await connection.is_connected() is False
+    snapshot = await connection.operation_stats()
+    assert snapshot["operations"]["bulk_insert"]["started"] == 0
+    assert snapshot["operations"]["bulk_insert"]["completed"] == 0
