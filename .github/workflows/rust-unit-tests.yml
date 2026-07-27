@@ -117,4 +117,5 @@ jobs:
             tests/test_timeout_config_contract.py \
             tests/test_lifecycle_contract.py \
             tests/test_pool_observability_contract.py \
-            tests/test_operation_metrics_contract.py -q
+            tests/test_operation_metrics_contract.py \
+            tests/test_result_stream_contract.py -q

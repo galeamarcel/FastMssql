@@ -443,6 +443,31 @@ pub struct ColumnInfo {
     pub column_types: Vec<ColumnType>,
 }
 
+impl ColumnInfo {
+    /// Build shared row-conversion metadata directly from TDS COLMETADATA.
+    ///
+    /// Bounded result streams must expose empty result sets, so their metadata
+    /// cannot depend on observing a first row.
+    pub(crate) fn from_response_columns(columns: &[tiberius::ResponseColumn]) -> Arc<Self> {
+        let mut names = Vec::with_capacity(columns.len());
+        let mut column_types = Vec::with_capacity(columns.len());
+        let mut map = HashMap::with_capacity(columns.len());
+
+        for (index, column) in columns.iter().enumerate() {
+            let name = column.name().to_owned();
+            map.insert(name.clone(), index);
+            names.push(name);
+            column_types.push(column.column_type());
+        }
+
+        Arc::new(Self {
+            names,
+            map,
+            column_types,
+        })
+    }
+}
+
 /// Memory-optimized to share column metadata across all rows in a result set.
 #[pyclass(name = "FastRow", from_py_object)]
 pub struct PyFastRow {
@@ -602,9 +627,9 @@ fn build_column_info(first_row: &Row) -> Arc<ColumnInfo> {
     })
 }
 
-/// A streaming wrapper around a Tiberius QueryStream
-/// Implements async iteration to fetch rows one at a time
-/// Lazy conversion: stores raw rows, converts to Python on-demand, caches for reset()
+/// A synchronous compatibility wrapper around a buffered first result set.
+/// Rows are fetched from SQL Server before this object is returned; Python
+/// conversion remains lazy and is cached for reset and replay.
 #[pyclass(name = "QueryStream")]
 pub struct PyQueryStream {
     // Store raw Tiberius rows in Option (Row doesn't impl Clone, so we take() on first access)

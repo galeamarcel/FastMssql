@@ -73,6 +73,44 @@ async def main():
 asyncio.run(main())
 ```
 
+### Bounded true-async result streaming
+
+Use `stream()` for a parameterized statement and `batch()` for an
+unparameterized multi-statement batch. Both retain one pooled physical
+connection until the complete SQL Server response is consumed, finished, or
+closed. `buffer_size` bounds unacknowledged result events; individual rows and
+LOB values are not byte-chunked.
+
+```python
+async with Connection(conn_str) as conn:
+    response = await conn.stream(
+        """
+        SELECT id, payload
+        FROM dbo.events
+        WHERE tenant_id = @P1
+        ORDER BY id
+        """,
+        [tenant_id],
+        buffer_size=64,
+    )
+
+    async with response:
+        async for result_set in response:
+            print(result_set.index, result_set.column_names)
+            async for row in result_set:
+                await handle(row)
+
+    summary = response.summary
+    print(summary.result_set_count, summary.done, summary.messages)
+```
+
+`ResultStream` and each nested `ResultSet` are async-only. Call
+`await result_set.aclose()` to skip the remainder of one set while retaining
+later sets, `await response.finish()` to discard remaining rows and obtain the
+terminal summary, or `await response.aclose()` to abort the full response.
+The legacy `query()` and `simple_query()` methods remain synchronous-iteration
+compatibility APIs after awaiting them; they buffer the first result set.
+
 ### Pool statistics
 
 `await connection.pool_stats()` is a pull-only snapshot of the current pool.
@@ -963,20 +1001,23 @@ async def main():
 asyncio.run(main())
 ```
 
-### 2. Use iteration for large result sets (not `.rows()`)
+### 2. Use bounded async streaming for large result sets
 
 ```python
-result = await conn.query("SELECT * FROM large_table")
-
-# ✅ Good: Lazy conversion, one row at a time (minimal GIL contention)
-for row in result:
-    process(row)
-
-# ❌ Bad: Eager conversion, all rows at once (GIL bottleneck)
-all_rows = result.rows()  # or result.fetchall()
+response = await conn.stream(
+    "SELECT * FROM large_table",
+    buffer_size=64,
+)
+async with response:
+    async for result_set in response:
+        async for row in result_set:
+            await process(row)
 ```
 
-Lazy iteration distributes GIL acquisition across rows, dramatically improving performance with multiple Python workers.
+`query()` still performs lazy Python conversion while iterating, but its SQL
+rows are already buffered before the compatibility `QueryStream` is returned.
+Use `stream()` when wire-level backpressure and bounded in-flight result events
+matter.
 
 ## Examples & benchmarks
 

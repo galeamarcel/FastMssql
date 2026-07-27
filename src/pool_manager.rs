@@ -432,6 +432,28 @@ impl<'a> PooledOperationGuard<'a> {
         }
     }
 
+    pub(crate) fn begin_operation(&mut self) {
+        self.connection.begin_operation();
+    }
+
+    pub(crate) fn complete_success(&mut self, retire_after_operation: bool) {
+        if retire_after_operation {
+            self.connection.mark_unusable();
+        } else {
+            self.connection.finish_operation_success();
+        }
+        self.completed = true;
+    }
+
+    pub(crate) fn complete_error(&mut self, error: &PyErr, retire_after_operation: bool) {
+        if retire_after_operation {
+            self.connection.mark_unusable();
+        } else {
+            self.connection.apply_operation_error(error);
+        }
+        self.completed = true;
+    }
+
     pub(crate) fn complete(&mut self) {
         self.connection.mark_needs_reset();
         self.completed = true;
@@ -442,20 +464,15 @@ impl<'a> PooledOperationGuard<'a> {
         result: &PyResult<T>,
         retire_after_operation: bool,
     ) {
-        if retire_after_operation {
-            // EXECUTE AS can take effect before a later statement raises a
-            // nonfatal SQL error. Never return that physical security context
-            // to the pool, regardless of the operation's final result.
-            self.connection.mark_unusable();
-            self.completed = true;
-            return;
-        }
-
         match result {
-            Ok(_) => self.connection.mark_needs_reset(),
-            Err(error) => self.connection.apply_operation_error(error),
+            Ok(_) => self.complete_success(retire_after_operation),
+            Err(error) => {
+                // EXECUTE AS can take effect before a later statement raises a
+                // nonfatal SQL error. Never return that physical security
+                // context to the pool, regardless of the final result.
+                self.complete_error(error, retire_after_operation);
+            }
         }
-        self.completed = true;
     }
 
     pub(crate) fn observe_error(&mut self, error: &PyErr) {
@@ -518,6 +535,17 @@ pub(crate) async fn acquire_owned_connection(
     pool.get_owned()
         .await
         .map_err(|error| map_pool_checkout_error(error, operation, acquire_timeout))
+}
+
+pub(crate) async fn acquire_owned_operation_guard(
+    pool: &ConnectionPool,
+    operation: OperationName,
+    acquire_timeout: Duration,
+) -> PyResult<PooledOperationGuard<'static>> {
+    let connection = acquire_owned_connection(pool, operation, acquire_timeout).await?;
+    let mut guard = PooledOperationGuard::new(connection);
+    guard.begin_operation();
+    Ok(guard)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

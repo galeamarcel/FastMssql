@@ -14,7 +14,9 @@ from .fastmssql import (
     CommitOutcomeUnknown,
     ConnectionLifecycleError,
     ConnectionLifecycleState,
+    ColumnMetadata,
     ConversionError,
+    DoneResult,
     SqlConnectionError,
     EncryptionLevel,
     FastRow,
@@ -26,9 +28,13 @@ from .fastmssql import (
     OperationTimeoutError,
     ProtocolError,
     QueryStream,
+    ResultSet,
+    ResultStream,
+    ResultSummary,
     SqlError,
     SslConfig,
     ShutdownTimeoutError,
+    SqlMessage,
     TlsError,
     TimeoutConfig,
     TypedNull,
@@ -85,6 +91,18 @@ class Connection:
         This performs no network I/O. Use ``ping()`` for SQL Server readiness.
         """
         return await self._conn.is_connected()
+
+    async def stream(self, sql, params=None, *, buffer_size=64):
+        """Stream all result sets with bounded true-async backpressure."""
+        return await self._conn.stream(
+            sql,
+            params,
+            buffer_size=buffer_size,
+        )
+
+    async def batch(self, sql, *, buffer_size=64):
+        """Stream every result set from an unparameterized SQL batch."""
+        return await self._conn.batch(sql, buffer_size=buffer_size)
 
     async def __aenter__(self):
         await self._conn.__aenter__()
@@ -301,7 +319,9 @@ __all__ = [
     "Connection",
     "ConnectionLifecycleError",
     "ConnectionLifecycleState",
+    "ColumnMetadata",
     "ConversionError",
+    "DoneResult",
     "SqlConnectionError",
     "EncryptionLevel",
     "FastRow",
@@ -313,9 +333,13 @@ __all__ = [
     "OperationTimeoutError",
     "ProtocolError",
     "QueryStream",
+    "ResultSet",
+    "ResultStream",
+    "ResultSummary",
     "SqlError",
     "SslConfig",
     "ShutdownTimeoutError",
+    "SqlMessage",
     "TlsError",
     "TimeoutConfig",
     "Transaction",

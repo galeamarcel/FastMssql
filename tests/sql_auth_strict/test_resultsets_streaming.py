@@ -444,6 +444,7 @@ async def test_normal_eof_reuses_but_security_sql_retires_size_one_lease(
         await _wait_for_active(connection, 0)
         reset_identity = await _connection_identity(connection)
         assert reset_identity == first_identity
+        retirement_stats_before = await connection.pool_stats()
 
         retiring = await _batch(
             connection,
@@ -464,8 +465,15 @@ async def test_normal_eof_reuses_but_security_sql_retires_size_one_lease(
         await _wait_for_active(connection, 0)
 
         replacement_identity = await _connection_identity(connection)
-        assert replacement_identity[0] != first_identity[0]
+        retirement_stats_after = await connection.pool_stats()
+        # SQL Server may immediately reuse the numeric SPID after closing a
+        # transport. connection_id plus bb8's retirement counter identify the
+        # physical connection generation without that server-side race.
         assert replacement_identity[1] != first_identity[1]
+        assert (
+            retirement_stats_after["connections_closed_broken"]
+            == retirement_stats_before["connections_closed_broken"] + 1
+        )
         assert await scalar(connection, "SELECT 20") == 20
     finally:
         await connection.disconnect()
@@ -543,7 +551,9 @@ async def test_concurrent_consumer_and_buffer_errors_fail_locally_and_safely(
         """,
         buffer_size=1,
     )
-    first_consumer = asyncio.create_task(response.__anext__())
+    # PyO3 exposes the Rust future as a standards-compliant awaitable.
+    # ensure_future accepts both coroutine objects and generic awaitables.
+    first_consumer = asyncio.ensure_future(response.__anext__())
     await asyncio.sleep(0)
     with pytest.raises(RuntimeError) as captured:
         await response.__anext__()

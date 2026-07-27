@@ -10,9 +10,11 @@ from .fastmssql import (
     AzureCredential,
     AzureCredentialType,
     CommitOutcomeUnknown,
+    ColumnMetadata,
     ConnectionLifecycleError,
     ConnectionLifecycleState,
     ConversionError,
+    DoneResult,
     EncryptionLevel,
     FastRow,
     Parameter,
@@ -22,10 +24,14 @@ from .fastmssql import (
     PoolConfig,
     ProtocolError,
     QueryStream,
+    ResultSet,
+    ResultStream,
+    ResultSummary,
     SqlConnectionError,
     SqlError,
     SslConfig,
     ShutdownTimeoutError,
+    SqlMessage,
     TlsError,
     TimeoutConfig,
     TypedNull,
@@ -206,9 +212,8 @@ class Connection:
         params: Optional[List[Any]] = None,
     ) -> Coroutine[Any, Any, QueryStream]:
         """
-        Execute SELECT query that returns rows as an async stream.
-
-        Returns a QueryStream for memory-efficient iteration over large result sets.
+        Execute SELECT and return the buffered first result set for synchronous
+        compatibility iteration after awaiting this method.
 
         Args:
             sql: SQL query with @P1, @P2, etc. placeholders for parameters
@@ -218,16 +223,30 @@ class Connection:
         """
         ...
 
+    async def stream(
+        self,
+        sql: str,
+        params: list[Any] | Parameters | None = None,
+        *,
+        buffer_size: int = 64,
+    ) -> ResultStream: ...
+
+    async def batch(
+        self,
+        sql: str,
+        *,
+        buffer_size: int = 64,
+    ) -> ResultStream: ...
+
     def simple_query(
         self,
         sql: str,
     ) -> Coroutine[Any, Any, QueryStream]:
         """
-        Execute a raw SQL query (non-prepared statement) that returns rows as an async stream.
+        Execute raw SQL and return the buffered first result set for
+        synchronous compatibility iteration after awaiting this method.
 
         Only use this when required (creating stored procedures may require this in certain cases)
-
-        Returns a QueryStream for memory-efficient iteration over large result sets.
 
         Args:
             sql: Raw SQL query
@@ -394,7 +413,7 @@ class Transaction:
         sql: str,
         params: Optional[List[Any]] = None,
     ) -> Coroutine[Any, Any, QueryStream]:
-        """Execute a SELECT query that returns rows."""
+        """Return the buffered first result set for synchronous iteration."""
         ...
 
     def execute(
@@ -424,7 +443,8 @@ class Transaction:
         sql: str,
     ) -> Coroutine[Any, Any, QueryStream]:
         """
-        Execute a raw (non-prepared) SQL query and return a QueryStream.
+        Execute raw SQL and return the buffered first result set for
+        synchronous compatibility iteration after awaiting this method.
 
         Only use this when required (creating stored procedures may require this in certain cases)
         """
@@ -467,8 +487,10 @@ __all__ = [
     "Connection",
     "ConnectionLifecycleError",
     "ConnectionLifecycleState",
+    "ColumnMetadata",
     "EncryptionLevel",
     "FastRow",
+    "DoneResult",
     "Parameter",
     "Parameters",
     "OperationTimeoutError",
@@ -477,10 +499,14 @@ __all__ = [
     "PoolConfig",
     "ProtocolError",
     "QueryStream",
+    "ResultSet",
+    "ResultStream",
+    "ResultSummary",
     "SqlConnectionError",
     "SqlError",
     "SslConfig",
     "ShutdownTimeoutError",
+    "SqlMessage",
     "TlsError",
     "TimeoutConfig",
     "Transaction",

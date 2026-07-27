@@ -129,3 +129,32 @@ No release, package-version change, or artifact publication has occurred.
 - This RED branch intentionally does not implement the new Python result API
   and does not change package metadata, the displayed `0.7.7` version or
   release state.
+
+### Bounded async result-stream implementation
+
+- Added pooled `Connection.stream()` and `Connection.batch()` entry points
+  backed by owned SQL Server leases and async-only nested result iterators.
+- Added bounded producer/consumer event credit, explicit conversion
+  acknowledgements, deterministic close/finish behavior and terminal release
+  only after the response and lease are released or retired.
+- Added immutable column, DONE, informational-message and terminal-summary
+  value types while preserving exact empty-result metadata.
+- Corrected the legacy `QueryStream`, `query()` and `simple_query()` contract:
+  the first result set is buffered before synchronous compatibility
+  iteration; bounded wire-level streaming uses the new API.
+- Added Tokio macro support required by cancellation-aware producer selects
+  and extended the installed-wheel Linux/macOS/Windows contract gate.
+- Preserved conversion failures over simultaneous cancellation, kept
+  post-final-ACK cancellation fail-closed, and made context exit resume a
+  summary-ACKed terminal wait instead of spuriously aborting it. Explicit
+  close after a consumer failure now also waits for confirmed lease release
+  and re-raises the first stored failure.
+- Made the SQL-auth retirement proof robust to immediate SQL Server SPID
+  number reuse by asserting a new `connection_id` and the bb8 broken-close
+  counter; concurrent-consumer coverage now schedules the PyO3 awaitable with
+  `asyncio.ensure_future()`.
+- Updated the disabled-metrics source contract to follow the movable
+  `OperationObserver`: its `Option::and_then` gate still prevents clock and
+  atomic work when metrics are disabled.
+- This feature does not change package metadata, the displayed `0.7.7`
+  version or release state.
