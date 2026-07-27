@@ -39,6 +39,34 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Tiberius bulk column-subset implementation
+
+- Added the additive vendored-Tiberius
+  `Client::bulk_insert_columns(table, columns)` primitive without changing
+  `Client::bulk_insert(table)`.
+- Added a closed raw-identifier grammar with independent bracket quoting,
+  exact ordered metadata validation, explicit writable/restricted-flag
+  checks and privacy-safe error context.
+- Replaced the new path's use of `MetaDataColumn::fmt` with a total checked
+  declaration formatter covering fixed, integer, float, money, temporal,
+  binary, ANSI/Unicode, exact numeric and XML metadata. Invalid widths,
+  precision/scale, legacy LOB, UDT and SQL_VARIANT metadata return typed
+  errors without a panic path.
+- The committed RED ancestor is `549ea180e5d80e9881a782b8cf12c60b06663d96`;
+  it failed exactly for the absent private module and public method.
+- Verification passed on the exact feature worktree: vendored Tiberius
+  `168/168`; new direct SQL-auth `5/5`; response API `2/2`; response
+  SQL-auth `7/7`; token safety SQL-auth `2/2`; root Rust `73/73`; focused
+  Python batch/bulk `29/29`; strict batch/parameters `87/87`; and matrix
+  contract `26/26` with 377 unique case IDs.
+- Vendored/root Cargo fmt and Clippy with warnings denied passed. The native
+  editable build resolved both the Python wrapper and ABI3 extension from
+  this feature worktree.
+- This local dependency feature does not yet expose FastMssql
+  `native_bulk_insert()`, complete iterable backpressure, `execute_many()` or
+  `query_many()`. It does not change package metadata, the displayed `0.7.7`
+  version or release state.
+
 ### Tiberius bulk column-subset RED coverage
 
 - Added unit contracts for closed table/column identifier grammar, exact

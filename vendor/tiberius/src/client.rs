@@ -1,4 +1,5 @@
 mod auth;
+mod bulk_columns;
 #[cfg(test)]
 mod bulk_columns_tests;
 mod config;
@@ -13,6 +14,7 @@ mod tls;
 mod tls_stream;
 
 pub use auth::*;
+use bulk_columns::BulkInsertColumns;
 pub use config::*;
 pub(crate) use connection::*;
 
@@ -472,6 +474,59 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
 
         let ts = TokenStream::new(&mut self.connection);
         ts.flush_done().await?;
+
+        BulkLoadRequest::new(&mut self.connection, columns)
+    }
+
+    /// Starts a bulk upload for an exact ordered subset of table columns.
+    ///
+    /// `table` and every entry in `columns` are raw SQL Server identifiers,
+    /// not SQL fragments. The table accepts one through three dot-separated
+    /// qualification parts; every column is treated as one literal identifier
+    /// part. The returned request must be finalized after all rows are sent.
+    pub async fn bulk_insert_columns<'a>(
+        &'a mut self,
+        table: &str,
+        columns: &[&str],
+    ) -> crate::Result<BulkLoadRequest<'a, S>> {
+        let target = BulkInsertColumns::new(table, columns)?;
+
+        self.connection.flush_stream().await?;
+
+        let query = Self::query_with_reset_baseline(
+            target.metadata_query(),
+            self.connection.is_connection_reset_pending(),
+        );
+        let req = BatchRequest::new(query, self.connection.context().transaction_descriptor());
+        let id = self.connection.context_mut().next_packet_id();
+        self.connection.send(PacketHeader::batch(id), req).await?;
+
+        let token_stream = TokenStream::new(&mut self.connection).try_unfold();
+        let (resultset_count, columns) = token_stream
+            .try_fold(
+                (0usize, None),
+                |(mut resultset_count, mut columns), token| async move {
+                    if let ReceivedToken::NewResultset(metadata) = token {
+                        resultset_count = resultset_count.checked_add(1).ok_or_else(|| {
+                            crate::Error::Protocol("bulk metadata result-set count overflow".into())
+                        })?;
+                        columns = Some(metadata.columns.clone());
+                    }
+                    Ok((resultset_count, columns))
+                },
+            )
+            .await?;
+
+        let columns = target.validate_metadata(resultset_count, columns)?;
+        let query = target.insert_query(&columns)?;
+
+        self.connection.flush_stream().await?;
+        let req = BatchRequest::new(query, self.connection.context().transaction_descriptor());
+        let id = self.connection.context_mut().next_packet_id();
+        self.connection.send(PacketHeader::batch(id), req).await?;
+
+        let token_stream = TokenStream::new(&mut self.connection);
+        token_stream.flush_done().await?;
 
         BulkLoadRequest::new(&mut self.connection, columns)
     }
