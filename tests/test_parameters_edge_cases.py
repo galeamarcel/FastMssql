@@ -8,7 +8,13 @@ import pytest
 from conftest import Config
 
 try:
-    from fastmssql import Connection, Parameter, Parameters, SqlError
+    from fastmssql import (
+        Connection,
+        ConversionError,
+        Parameter,
+        Parameters,
+        SqlError,
+    )
 except ImportError:
     pytest.fail("fastmssql not available - run 'maturin develop' first")
 
@@ -226,6 +232,23 @@ class TestParameterSqlTypeGrammar:
         assert time.sql_type == "TIME(3)"
 
     @pytest.mark.parametrize(
+        ("declaration", "metadata"),
+        [
+            ("FLOAT", {"precision": True}),
+            ("TIME", {"scale": False}),
+            ("FLOAT", {"precision": 1.5}),
+            ("TIME", {"scale": "3"}),
+            ("FLOAT", {"precision": -1}),
+            ("TIME", {"scale": 256}),
+        ],
+    )
+    def test_numeric_metadata_requires_a_plain_unsigned_integer(
+        self, declaration, metadata
+    ):
+        with pytest.raises(ValueError):
+            Parameter(None, declaration, **metadata)
+
+    @pytest.mark.parametrize(
         "direction",
         ["", "IN", "INPUT OUTPUT", "INOUT", "RETURN", "SIDEWAYS", 1],
     )
@@ -241,6 +264,23 @@ class TestParameterSqlTypeGrammar:
             Parameter(None, declaration)
 
         assert secret not in str(error.value)
+
+    def test_empty_expanded_non_input_parameter_is_rejected_before_network(self):
+        connection = Connection(
+            server="127.0.0.1",
+            port=1,
+            username="not-used",
+            password="not-used",
+        )
+        parameter = Parameter([], "INT", direction="OUTPUT")
+
+        with pytest.raises(ConversionError) as error:
+            connection.query("SELECT 1", [parameter])
+
+        assert error.value.parameter_index == 0
+        assert error.value.sql_type == "INT"
+        assert error.value.reason == "unsupported_direction"
+        assert error.value.retryable is False
 
 
 class TestParametersEdgeCases:

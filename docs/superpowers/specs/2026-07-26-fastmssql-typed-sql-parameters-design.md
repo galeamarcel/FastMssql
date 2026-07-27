@@ -297,7 +297,8 @@ objects are rejected because SQL Server `TIME` carries no offset.
 
 Explicit `TIME`, `DATETIME2`, and `DATETIMEOFFSET` scales from 0 through 7
 use exact integer rescaling. `DATETIME` uses its 1/300-second resolution and
-range beginning at 1753-01-01. `SMALLDATETIME` uses minute rounding and its
+range beginning at 1753-01-01. `SMALLDATETIME` uses its documented minute
+boundary—`29.998` seconds rounds down and `29.999` seconds rounds up—and its
 1900-01-01 through 2079-06-06 range. Overflow after rounding is a local
 conversion error.
 
@@ -359,10 +360,20 @@ type_info: enum-derived TDS TypeInfo
 `RpcParam` encodes explicit `TYPE_INFO` before encoding the compatible value
 against that metadata. Inferred callers continue to use the existing
 `ColumnData::type_name()` and self-describing encoding.
+For `DATE`, `DATEN` `TYPE_INFO` is exactly the one-byte type identifier; the
+three-byte payload length is emitted once as part of the value rather than
+being duplicated in the metadata.
 
-The context stores current session collation, updates it on
-`TokenEnvChange::SqlCollation`, and clears it only when protocol state truly
-loses it. Pool reset must not discard the login/database collation.
+The context stores both the current session collation and the initial LOGIN7
+collation. It updates the current value on
+`TokenEnvChange::SqlCollation`. Because `RESETCONNECTION` restores the login
+environment before processing the request carrying that flag, pool reset
+restores the initial collation locally before deriving that request's
+parameter `TYPE_INFO`; a later server `ENVCHANGE` remains authoritative.
+Every LOGIN7 advertises TDS 7.4 `UTF8_SUPPORT`; the corresponding
+`FEATUREEXTACK` is decoded without panics and retained in context. A collation
+with `fUTF8` uses UTF-8 rather than its legacy LCID code page, and explicit
+ANSI parameters fail locally if SQL Server did not acknowledge UTF-8 support.
 
 All enum variants validate their range before declaration or encoding.
 No public constructor accepts a raw declaration string. The local patch is
@@ -418,7 +429,18 @@ parameter_index
 sql_type
 reason
 retryable = False
+wire_sent = False
+connection_discarded = False
+outcome_unknown = False
 ```
+
+Structured parameter conversion errors are completed before the encoded RPC
+payload is handed to the transport. They therefore leave the TDS stream and
+an active transaction synchronized; the connection can continue without
+silently replaying the failed operation.
+Batch preflight preserves the original exception class and these attributes,
+adds the zero-based `batch_index`, and prefixes only the safe exception
+message with `Batch item N parameter validation failed`.
 
 Messages may contain the canonical closed SQL declaration and Python type
 name. They never contain `repr(value)`, string/binary contents, decimal
@@ -451,9 +473,15 @@ Existing limitation tests become desired contracts:
 The SQL-auth specification gains:
 
 - `PARAM-025`: every supported explicit scalar declaration and typed null
-  reports the intended base type;
+  reports the intended base type, `DATE` remains byte-aligned, an empty XML
+  value leaves a following RPC parameter aligned, and the exact
+  `SMALLDATETIME` rounding boundary is preserved;
 - `PARAM-026`: precision, scale, max length, rounding and overflow;
-- `PARAM-027`: ANSI collation, Unicode code-unit and binary length behavior;
+- `PARAM-027`: legacy and `_UTF8` ANSI collation, Unicode code-unit and binary
+  length behavior; the `_UTF8` assertion connects with the temporary database
+  in LOGIN7 instead of relying on `USE` state that a pooled checkout might not
+  preserve, and a one-session contamination/reset assertion proves that the
+  first reset RPC uses the initial login collation;
 - `PARAM-028`: safe parser rejects malformed, injected and unsupported
   declarations before network I/O;
 - `PARAM-029`: typed iterable expansion preserves the type for every child;
@@ -467,8 +495,8 @@ The SQL-auth specification gains:
 
 `TYPE-004`, `TYPE-010`, `TYPE-012`, and `TYPE-013` are extended for symmetric
 round trips. Tiberius unit tests validate declaration text, enum ranges,
-collation context updates, explicit RPC `TYPE_INFO`, numeric scale 38 and
-temporal scale encoding.
+collation context updates, exact `DATE` and scaled temporal RPC `TYPE_INFO`,
+numeric scale 38, and temporal boundary encoding.
 
 The RED evidence for each subproblem is recorded on its own test branch
 before its corresponding fix or feature branch.
@@ -623,6 +651,9 @@ Corrections made during self-review:
     as exact while Tiberius decodes/encodes them through floating point.
 14. Final evidence requires real MSSQL and concurrent load, while hosted
     operating-system gates remain database-independent.
+15. Local RPC encoding failure leaves the connection's response state
+    unchanged and is classified as reusable, so deterministic bad input does
+    not poison an active transaction.
 
 The specification contains no placeholder, swallowed exception, unbounded
 input path, arbitrary declaration concatenation, or authorization for an

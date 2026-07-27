@@ -21,7 +21,7 @@ use crate::timeout_config::PyTimeoutConfig;
 use crate::types::{TimeoutErrorMetadata, create_sql_error};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyList;
+use pyo3::types::{PyList, PyTypeMethods};
 use pyo3_async_runtimes::tokio::future_into_py;
 use smallvec::SmallVec;
 use std::sync::Arc;
@@ -33,6 +33,32 @@ type SqlClient = tiberius::Client<tokio_util::compat::Compat<TcpStream>>;
 
 const MAX_BULK_PARAMETERS_PER_INSERT: usize = 2_000;
 const MAX_ROWS_PER_VALUES_INSERT: usize = 1_000;
+
+fn attach_batch_validation_context(error: PyErr, py: Python<'_>, batch_index: usize) -> PyErr {
+    let value = error.value(py);
+    let error_name = value
+        .get_type()
+        .name()
+        .ok()
+        .and_then(|name| name.extract::<String>().ok())
+        .unwrap_or_else(|| "Exception".to_owned());
+    let original_message = value
+        .getattr("args")
+        .ok()
+        .and_then(|args| args.get_item(0).ok())
+        .and_then(|message| message.extract::<String>().ok());
+
+    if let Some(original_message) = original_message {
+        let contextual_message = format!(
+            "Batch item {batch_index} parameter validation failed: \
+             {error_name}: {original_message}"
+        );
+        let _ = value.setattr("args", (contextual_message,));
+    }
+    let _ = value.setattr("batch_index", batch_index);
+
+    error
+}
 
 fn bulk_rows_per_batch(column_count: usize) -> usize {
     debug_assert!(column_count > 0);
@@ -122,12 +148,8 @@ pub fn parse_batch_items<'p>(
         let fast_params = if params_py.is_none() {
             SmallVec::new()
         } else {
-            convert_parameters_to_fast(Some(&params_py), py).map_err(|e| {
-                PyValueError::new_err(format!(
-                    "Batch item {} parameter validation failed: {}",
-                    batch_index, e
-                ))
-            })?
+            convert_parameters_to_fast(Some(&params_py), py)
+                .map_err(|error| attach_batch_validation_context(error, py, batch_index))?
         };
 
         if fast_params.len() > MAX_USER_QUERY_PARAMETERS {
@@ -475,15 +497,26 @@ fn fix_bulk_null_types(flat_data: &mut [FastParameter], col_count: usize) {
             .map(|row| &flat_data[row * col_count + col])
             .find_map(|parameter| match &parameter.value {
                 FastParameterValue::String(_) => Some(TypedNull::String),
+                FastParameterValue::U8(_) => Some(TypedNull::U8),
+                FastParameterValue::I16(_) => Some(TypedNull::I16),
+                FastParameterValue::I32(_) => Some(TypedNull::I32),
                 FastParameterValue::I64(_) => Some(TypedNull::I64),
+                FastParameterValue::F32(_) => Some(TypedNull::F32),
                 FastParameterValue::F64(_) => Some(TypedNull::F64),
                 FastParameterValue::Bool(_) => Some(TypedNull::Bit),
                 FastParameterValue::Bytes(_) => Some(TypedNull::Binary),
+                FastParameterValue::Xml(_) => Some(TypedNull::Xml),
                 FastParameterValue::Numeric(_) => Some(TypedNull::Numeric),
                 FastParameterValue::Date(_) => Some(TypedNull::Date),
                 FastParameterValue::Time(_) => Some(TypedNull::Time),
                 FastParameterValue::DateTime(_) => Some(TypedNull::DateTime),
                 FastParameterValue::DateTimeOffset(_) => Some(TypedNull::DateTimeOffset),
+                FastParameterValue::TdsDate(_) => Some(TypedNull::Date),
+                FastParameterValue::TdsTime(_) => Some(TypedNull::Time),
+                FastParameterValue::TdsDateTime(_) => Some(TypedNull::DateTime),
+                FastParameterValue::TdsSmallDateTime(_) => Some(TypedNull::SmallDateTime),
+                FastParameterValue::TdsDateTime2(_) => Some(TypedNull::DateTime2),
+                FastParameterValue::TdsDateTimeOffset(_) => Some(TypedNull::DateTimeOffset),
                 FastParameterValue::Uuid(_) => Some(TypedNull::Guid),
                 FastParameterValue::Null(_) => None,
             })

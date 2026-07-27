@@ -117,6 +117,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             .await?;
 
         connection.flush_done().await?;
+        connection.context.capture_initial_collation();
 
         Ok(connection)
     }
@@ -172,11 +173,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     where
         E: Sized + Encode<BytesMut>,
     {
-        self.flushed = false;
         let packet_size = (self.context.packet_size() as usize) - HEADER_BYTES;
 
         let mut payload = BytesMut::new();
         item.encode(&mut payload)?;
+        self.flushed = false;
 
         let reset_connection = self.reset_connection_on_next_request
             && matches!(
@@ -322,6 +323,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         prelogin: PreloginMessage,
     ) -> crate::Result<Self> {
         let mut login_message = LoginMessage::new();
+        login_message.utf8_support(true);
 
         if let Some(db) = db {
             login_message.db_name(db);
@@ -599,5 +601,50 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> SqlReadBytes for Connection<S> {
     /// A mutable reference to the current execution context.
     fn context_mut(&mut self) -> &mut Context {
         &mut self.context
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Connection, Context, Encode, Framed, MaybeTlsStream, PacketCodec, PacketHeader};
+    use bytes::{BufMut, BytesMut};
+    use futures_util::io::Cursor;
+    use std::borrow::Cow;
+
+    struct FailingLocalEncoder;
+
+    impl Encode<BytesMut> for FailingLocalEncoder {
+        fn encode(self, dst: &mut BytesMut) -> crate::Result<()> {
+            dst.put_u8(0xaa);
+            Err(crate::Error::Conversion(Cow::Borrowed(
+                "intentional local encoding failure",
+            )))
+        }
+    }
+
+    #[async_std::test]
+    async fn local_encoding_failure_does_not_mark_a_response_pending() {
+        let transport = Framed::new(
+            MaybeTlsStream::Raw(Cursor::new(Vec::<u8>::new())),
+            PacketCodec,
+        );
+        let mut connection = Connection {
+            transport,
+            flushed: true,
+            context: Context::new(),
+            buf: BytesMut::new(),
+            reset_connection_on_next_request: false,
+        };
+
+        let error = connection
+            .send(PacketHeader::rpc(1), FailingLocalEncoder)
+            .await
+            .expect_err("local encoding must fail");
+
+        assert!(matches!(error, crate::Error::Conversion(_)));
+        assert!(
+            connection.flushed,
+            "no response can be pending when request encoding failed locally"
+        );
     }
 }

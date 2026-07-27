@@ -1,5 +1,8 @@
 use super::{AllHeaderTy, Encode, ALL_HEADERS_LEN_TX};
-use crate::{tds::codec::ColumnData, BytesMutWithTypeInfo, Result};
+use crate::{
+    tds::codec::{ColumnData, TypeInfo},
+    BytesMutWithTypeInfo, Result,
+};
 use bytes::{BufMut, BytesMut};
 use enumflags2::{bitflags, BitFlags};
 use std::borrow::BorrowMut;
@@ -51,6 +54,40 @@ pub struct RpcParam<'a> {
     pub name: Cow<'a, str>,
     pub flags: BitFlags<RpcStatus>,
     pub value: ColumnData<'a>,
+    pub type_info: Option<TypeInfo>,
+    pub(crate) parameter_metadata: Option<RpcParameterMetadata>,
+}
+
+#[derive(Debug)]
+pub(crate) struct RpcParameterMetadata {
+    pub(crate) parameter_index: usize,
+    pub(crate) declaration: String,
+}
+
+impl RpcParameterMetadata {
+    fn wrap_encoding_error(self, error: crate::Error) -> crate::Error {
+        let reason = match &error {
+            crate::Error::Encoding(_) => "encoding_error",
+            crate::Error::BulkInput(message)
+                if message.contains("length")
+                    || message.contains("large")
+                    || message.contains("limit") =>
+            {
+                "length_overflow"
+            }
+            crate::Error::BulkInput(_) => "incompatible_metadata",
+            crate::Error::Protocol(_) => "metadata_error",
+            crate::Error::Conversion(_) => "conversion_failed",
+            crate::Error::ParameterConversion { .. } => return error,
+            _ => "encoding_failed",
+        };
+        crate::Error::parameter_conversion(
+            self.parameter_index,
+            self.declaration,
+            reason,
+            "SQL parameter value is incompatible with its declared type",
+        )
+    }
 }
 
 /// 2.2.6.6 RPC Request
@@ -134,12 +171,195 @@ impl<'a> Encode<BytesMut> for RpcParam<'a> {
 
         dst.put_u8(self.flags.bits());
 
-        let mut dst_fi = BytesMutWithTypeInfo::new(dst);
-        self.value.encode(&mut dst_fi)?;
+        let result = if let Some(type_info) = self.type_info {
+            type_info.clone().encode(dst)?;
+            let mut dst_fi = BytesMutWithTypeInfo::new(dst).with_type_info(&type_info);
+            self.value.encode(&mut dst_fi)
+        } else {
+            let mut dst_fi = BytesMutWithTypeInfo::new(dst);
+            self.value.encode(&mut dst_fi)
+        };
+        if let Err(error) = result {
+            return Err(match self.parameter_metadata {
+                Some(metadata) => metadata.wrap_encoding_error(error),
+                None => error,
+            });
+        }
 
         let dst: &mut [u8] = dst.borrow_mut();
         dst[len_pos] = length;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Encode, RpcParam, RpcParameterMetadata};
+    use crate::{
+        tds::{
+            codec::{ColumnData, TypeInfo, VarLenContext, VarLenType},
+            Collation,
+        },
+        Error, SqlParameterType, TypeLength,
+    };
+    use bytes::BytesMut;
+    use enumflags2::BitFlags;
+    use std::borrow::Cow;
+
+    fn encode_explicit(value: ColumnData<'static>, parameter_type: SqlParameterType) -> Vec<u8> {
+        let collation = Collation::new(0x0000_0409, 0);
+        let declaration = parameter_type.declaration();
+        let parameter = RpcParam {
+            name: Cow::Borrowed(""),
+            flags: BitFlags::empty(),
+            value,
+            type_info: Some(parameter_type.type_info(Some(collation)).unwrap()),
+            parameter_metadata: Some(RpcParameterMetadata {
+                parameter_index: 0,
+                declaration,
+            }),
+        };
+        let mut bytes = BytesMut::new();
+        parameter.encode(&mut bytes).unwrap();
+        bytes.to_vec()
+    }
+
+    #[test]
+    fn explicit_integer_and_decimal_rpc_bytes_use_declared_storage() {
+        assert_eq!(
+            encode_explicit(ColumnData::I32(Some(7)), SqlParameterType::int()),
+            [0, 0, 0x26, 4, 4, 7, 0, 0, 0]
+        );
+        assert_eq!(
+            encode_explicit(
+                ColumnData::Numeric(Some(crate::numeric::Numeric::new_with_scale(123_400, 4))),
+                SqlParameterType::decimal(19, 4).unwrap(),
+            ),
+            [0, 0, 0x6a, 9, 19, 4, 9, 1, 0x08, 0xe2, 0x01, 0, 0, 0, 0, 0,]
+        );
+    }
+
+    #[test]
+    fn explicit_character_and_binary_rpc_bytes_use_length_and_collation() {
+        assert_eq!(
+            encode_explicit(
+                ColumnData::String(Some(Cow::Borrowed("café"))),
+                SqlParameterType::varchar(TypeLength::Limited(4)).unwrap(),
+            ),
+            [0, 0, 0xa7, 4, 0, 0x09, 0x04, 0, 0, 0, 4, 0, b'c', b'a', b'f', 0xe9,]
+        );
+        assert_eq!(
+            encode_explicit(
+                ColumnData::String(Some(Cow::Borrowed("😀"))),
+                SqlParameterType::nvarchar(TypeLength::Limited(2)).unwrap(),
+            ),
+            [0, 0, 0xe7, 4, 0, 0x09, 0x04, 0, 0, 0, 4, 0, 0x3d, 0xd8, 0, 0xde,]
+        );
+        assert_eq!(
+            encode_explicit(
+                ColumnData::Binary(Some(Cow::Borrowed(&[0x01, 0xff]))),
+                SqlParameterType::varbinary(TypeLength::Limited(2)).unwrap(),
+            ),
+            [0, 0, 0xa5, 2, 0, 2, 0, 0x01, 0xff]
+        );
+    }
+
+    #[test]
+    fn explicit_utf8_varchar_rpc_bytes_use_utf8_collation_and_payload() {
+        let parameter_type = SqlParameterType::varchar(TypeLength::Limited(4)).unwrap();
+        let declaration = parameter_type.declaration();
+        let parameter = RpcParam {
+            name: Cow::Borrowed(""),
+            flags: BitFlags::empty(),
+            value: ColumnData::String(Some(Cow::Borrowed("😀"))),
+            type_info: Some(
+                parameter_type
+                    .type_info(Some(Collation::new(0x0400_0409, 0)))
+                    .unwrap(),
+            ),
+            parameter_metadata: Some(RpcParameterMetadata {
+                parameter_index: 0,
+                declaration,
+            }),
+        };
+        let mut bytes = BytesMut::new();
+
+        parameter.encode(&mut bytes).unwrap();
+
+        assert_eq!(
+            bytes.as_ref(),
+            [0, 0, 0xa7, 4, 0, 0x09, 0x04, 0x00, 0x04, 0, 4, 0, 0xf0, 0x9f, 0x98, 0x80,]
+        );
+    }
+
+    #[cfg(feature = "tds73")]
+    #[test]
+    fn explicit_temporal_and_typed_null_rpc_bytes_use_declared_scale() {
+        let time = crate::time::Time::new(1, 3);
+        let date = crate::time::Date::new(2);
+        let datetime2 = crate::time::DateTime2::new(date, time);
+        let datetimeoffset = crate::time::DateTimeOffset::new(datetime2, 60);
+
+        assert_eq!(
+            encode_explicit(ColumnData::Date(Some(date)), SqlParameterType::date()),
+            [0, 0, 0x28, 3, 2, 0, 0]
+        );
+        assert_eq!(
+            encode_explicit(
+                ColumnData::Time(Some(time)),
+                SqlParameterType::time(3).unwrap(),
+            ),
+            [0, 0, 0x29, 3, 4, 1, 0, 0, 0]
+        );
+        assert_eq!(
+            encode_explicit(
+                ColumnData::DateTime2(Some(datetime2)),
+                SqlParameterType::date_time2(3).unwrap(),
+            ),
+            [0, 0, 0x2a, 3, 7, 1, 0, 0, 0, 2, 0, 0]
+        );
+        assert_eq!(
+            encode_explicit(
+                ColumnData::DateTimeOffset(Some(datetimeoffset)),
+                SqlParameterType::date_time_offset(3).unwrap(),
+            ),
+            [0, 0, 0x2b, 3, 9, 1, 0, 0, 0, 2, 0, 0, 60, 0]
+        );
+        assert_eq!(
+            encode_explicit(ColumnData::I32(None), SqlParameterType::int()),
+            [0, 0, 0x26, 4, 0]
+        );
+    }
+
+    #[test]
+    fn explicit_parameter_encoding_errors_keep_structured_metadata() {
+        let parameter = RpcParam {
+            name: Cow::Borrowed("@P1"),
+            flags: BitFlags::empty(),
+            value: ColumnData::String(Some(Cow::Borrowed("too long"))),
+            type_info: Some(TypeInfo::VarLenSized(VarLenContext::new(
+                VarLenType::BigVarChar,
+                1,
+                Some(Collation::new(13_632_521, 52)),
+            ))),
+            parameter_metadata: Some(RpcParameterMetadata {
+                parameter_index: 0,
+                declaration: "VARCHAR(1)".to_owned(),
+            }),
+        };
+        let mut bytes = BytesMut::new();
+
+        let error = parameter.encode(&mut bytes).unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::ParameterConversion {
+                parameter_index: 0,
+                ref sql_type,
+                ref reason,
+                ..
+            } if sql_type == "VARCHAR(1)" && reason == "length_overflow"
+        ));
     }
 }

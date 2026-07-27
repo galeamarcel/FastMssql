@@ -25,6 +25,18 @@ pub enum Error {
     #[error("Conversion error: {}", _0)]
     /// Conversion failure from one type to another.
     Conversion(Cow<'static, str>),
+    #[error("SQL parameter conversion failed")]
+    /// A value could not be encoded using its explicit SQL parameter metadata.
+    ParameterConversion {
+        /// Zero-based user parameter index.
+        parameter_index: usize,
+        /// Canonical SQL parameter declaration.
+        sql_type: String,
+        /// Stable machine-readable failure reason.
+        reason: String,
+        /// Redacted human-readable failure detail.
+        message: String,
+    },
     #[error("UTF-8 error")]
     /// Tried to convert data to UTF-8 that was not valid.
     Utf8,
@@ -77,6 +89,20 @@ impl Error {
         match self {
             Error::Server(e) => Some(e.code()),
             _ => None,
+        }
+    }
+
+    pub(crate) fn parameter_conversion(
+        parameter_index: usize,
+        sql_type: impl Into<String>,
+        reason: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::ParameterConversion {
+            parameter_index,
+            sql_type: sql_type.into(),
+            reason: reason.into(),
+            message: message.into(),
         }
     }
 }

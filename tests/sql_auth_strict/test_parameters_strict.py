@@ -11,12 +11,14 @@ from fastmssql import (
     ConversionError,
     Parameter,
     Parameters,
+    PoolConfig,
     SqlError,
     TypedNull,
 )
 import pytest
 
 from sql_auth_strict.cases import case
+from sql_auth_strict.config import SqlAuthConfig
 from sql_auth_strict.helpers import CleanupRegistry, quote_identifier, scalar
 
 
@@ -1236,6 +1238,44 @@ async def test_every_supported_explicit_scalar_and_typed_null_wire_type(
         ).fetchone()
         assert row["value"] == expected
 
+    empty_xml_row = (
+        await owner_connection.query(
+            """
+            SELECT
+                CONVERT(NVARCHAR(MAX), @P1) AS xml_value,
+                @P2 AS following_parameter
+            """,
+            [
+                Parameter("", "XML"),
+                Parameter(7, "INT"),
+            ],
+        )
+    ).fetchone()
+    assert empty_xml_row.to_dict() == {
+        "xml_value": "",
+        "following_parameter": 7,
+    }
+
+    smalldatetime_boundary = (
+        await owner_connection.query(
+            "SELECT @P1 AS rounds_down, @P2 AS rounds_up",
+            [
+                Parameter(
+                    datetime(2024, 2, 29, 12, 34, 29, 998000),
+                    "SMALLDATETIME",
+                ),
+                Parameter(
+                    datetime(2024, 2, 29, 12, 34, 29, 999000),
+                    "SMALLDATETIME",
+                ),
+            ],
+        )
+    ).fetchone()
+    assert smalldatetime_boundary.to_dict() == {
+        "rounds_down": datetime(2024, 2, 29, 12, 34),
+        "rounds_up": datetime(2024, 2, 29, 12, 35),
+    }
+
 
 @case("PARAM-026")
 @pytest.mark.asyncio
@@ -1311,10 +1351,11 @@ async def test_explicit_precision_scale_rounding_and_overflow(
         assert returned == expected
 
     overflow_cases = [
-        (Decimal("9999.995"), "DECIMAL(6,2)"),
+        (Decimal("9999.995"), "DECIMAL(6,2)", "precision_overflow"),
         (
             datetime(9999, 12, 31, 23, 59, 59, 999500),
             "DATETIME2(3)",
+            "datetime_out_of_range",
         ),
         (
             datetime(
@@ -1328,9 +1369,10 @@ async def test_explicit_precision_scale_rounding_and_overflow(
                 tzinfo=timezone.utc,
             ),
             "DATETIMEOFFSET(3)",
+            "datetime_out_of_range",
         ),
     ]
-    for value, declaration in overflow_cases:
+    for value, declaration, reason in overflow_cases:
         with pytest.raises(ConversionError) as error:
             await owner_connection.query(
                 "SELECT @P1",
@@ -1338,13 +1380,20 @@ async def test_explicit_precision_scale_rounding_and_overflow(
             )
         assert error.value.parameter_index == 0
         assert error.value.sql_type == declaration
+        assert error.value.reason == reason
         assert error.value.retryable is False
+        assert error.value.wire_sent is False
+        assert error.value.connection_discarded is False
+        assert error.value.outcome_unknown is False
 
 
 @case("PARAM-027")
 @pytest.mark.asyncio
 async def test_explicit_character_collation_and_length_units(
     owner_connection: Connection,
+    sa_connection: Connection,
+    sql_auth_config: SqlAuthConfig,
+    unique_sql_name,
 ) -> None:
     ansi = (
         await owner_connection.query(
@@ -1410,6 +1459,169 @@ async def test_explicit_character_collation_and_length_units(
         assert secret not in str(error.value)
 
     assert await scalar(owner_connection, "SELECT 1") == 1
+
+    utf8_database_name = unique_sql_name("strict_utf8")
+    utf8_database = quote_identifier(utf8_database_name)
+    try:
+        await sa_connection.execute(
+            f"""
+            CREATE DATABASE {utf8_database}
+            COLLATE Latin1_General_100_CI_AS_SC_UTF8
+            """
+        )
+        async with Connection(
+            sql_auth_config.connection_string(
+                sql_auth_config.sa_user,
+                sql_auth_config.sa_password,
+                database=utf8_database_name,
+            )
+        ) as utf8_connection:
+            utf8_row = (
+                await utf8_connection.query(
+                    """
+                    SELECT
+                        @P1 AS value,
+                        DATALENGTH(@P1) AS byte_length,
+                        CONVERT(
+                            NVARCHAR(128),
+                            SQL_VARIANT_PROPERTY(@P1, 'Collation')
+                        ) AS parameter_collation,
+                        CONVERT(
+                            NVARCHAR(128),
+                            DATABASEPROPERTYEX(DB_NAME(), 'Collation')
+                        ) AS database_collation
+                    """,
+                    [Parameter("😀", "VARCHAR(4)")],
+                )
+            ).fetchone()
+            assert utf8_row.to_dict() == {
+                "value": "😀",
+                "byte_length": 4,
+                "parameter_collation": "Latin1_General_100_CI_AS_SC_UTF8",
+                "database_collation": "Latin1_General_100_CI_AS_SC_UTF8",
+            }
+
+            transaction = utf8_connection.transaction()
+            try:
+                await transaction.begin()
+                before_error = (
+                    await transaction.query(
+                        """
+                        SELECT
+                            @@SPID AS session_id,
+                            XACT_STATE() AS transaction_state
+                        """
+                    )
+                ).fetchone()
+
+                with pytest.raises(ConversionError) as error:
+                    await transaction.query(
+                        "SELECT @P1",
+                        [Parameter("😀", "VARCHAR(3)")],
+                    )
+                assert error.value.parameter_index == 0
+                assert error.value.sql_type == "VARCHAR(3)"
+                assert error.value.reason == "length_overflow"
+                assert error.value.retryable is False
+                assert error.value.wire_sent is False
+                assert error.value.connection_discarded is False
+                assert error.value.outcome_unknown is False
+
+                after_error = (
+                    await transaction.query(
+                        """
+                        SELECT
+                            @@SPID AS session_id,
+                            XACT_STATE() AS transaction_state
+                        """
+                    )
+                ).fetchone()
+                assert after_error.to_dict() == before_error.to_dict()
+                assert after_error["transaction_state"] == 1
+                await transaction.rollback()
+            finally:
+                await transaction.close()
+
+        reset_connection = Connection(
+            sql_auth_config.connection_string(
+                sql_auth_config.sa_user,
+                sql_auth_config.sa_password,
+            ),
+            pool_config=PoolConfig(
+                max_size=1,
+                min_idle=1,
+                max_lifetime_secs=None,
+                idle_timeout_secs=None,
+                connection_timeout_secs=10,
+                test_on_check_out=False,
+                retry_connection=False,
+            ),
+        )
+        async with reset_connection:
+            baseline = (
+                await reset_connection.query(
+                    """
+                    SELECT
+                        @@SPID AS session_id,
+                        DB_NAME() AS database_name,
+                        CONVERT(
+                            NVARCHAR(128),
+                            DATABASEPROPERTYEX(DB_NAME(), 'Collation')
+                        ) AS database_collation
+                    """
+                )
+            ).fetchone()
+            assert not baseline["database_collation"].endswith("_UTF8")
+
+            changed = await reset_connection.simple_query(
+                f"""
+                USE {utf8_database};
+                SELECT
+                    @@SPID AS session_id,
+                    DB_NAME() AS database_name,
+                    CONVERT(
+                        NVARCHAR(128),
+                        DATABASEPROPERTYEX(DB_NAME(), 'Collation')
+                    ) AS database_collation;
+                """
+            )
+            changed_row = changed.fetchone()
+            assert changed_row.to_dict() == {
+                "session_id": baseline["session_id"],
+                "database_name": utf8_database_name,
+                "database_collation": "Latin1_General_100_CI_AS_SC_UTF8",
+            }
+
+            restored = (
+                await reset_connection.query(
+                    """
+                    SELECT
+                        @@SPID AS session_id,
+                        DB_NAME() AS database_name,
+                        @P1 AS value,
+                        DATALENGTH(@P1) AS byte_length,
+                        CONVERT(
+                            NVARCHAR(128),
+                            SQL_VARIANT_PROPERTY(@P1, 'Collation')
+                        ) AS parameter_collation,
+                        CONVERT(
+                            NVARCHAR(128),
+                            DATABASEPROPERTYEX(DB_NAME(), 'Collation')
+                        ) AS database_collation
+                    """,
+                    [Parameter("café", "VARCHAR(4)")],
+                )
+            ).fetchone()
+            assert restored.to_dict() == {
+                "session_id": baseline["session_id"],
+                "database_name": baseline["database_name"],
+                "value": "café",
+                "byte_length": 4,
+                "parameter_collation": baseline["database_collation"],
+                "database_collation": baseline["database_collation"],
+            }
+    finally:
+        await sa_connection.execute(f"DROP DATABASE IF EXISTS {utf8_database}")
 
 
 @case("PARAM-028")

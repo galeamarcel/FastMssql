@@ -85,6 +85,31 @@ impl Numeric {
         }
     }
 
+    pub(crate) fn encode_with_len(self, dst: &mut BytesMut, len: u8) -> crate::Result<()> {
+        if !matches!(len, 5 | 9 | 13 | 17) || self.len() > len {
+            return Err(Error::BulkInput(
+                "NUMERIC value exceeds the declared parameter precision".into(),
+            ));
+        }
+
+        dst.put_u8(len);
+        dst.put_u8(u8::from(self.value >= 0));
+
+        let value = self.value.unsigned_abs();
+        match len {
+            5 => dst.put_u32_le(value as u32),
+            9 => dst.put_u64_le(value as u64),
+            13 => {
+                dst.put_u64_le(value as u64);
+                dst.put_u32_le((value >> 64) as u32);
+            }
+            17 => dst.put_u128_le(value),
+            _ => unreachable!("validated numeric storage length"),
+        }
+
+        Ok(())
+    }
+
     pub(crate) async fn decode<R>(src: &mut R, scale: u8) -> crate::Result<Option<Self>>
     where
         R: SqlReadBytes + Unpin,
@@ -152,27 +177,7 @@ impl Numeric {
 
 impl Encode<BytesMut> for Numeric {
     fn encode(self, dst: &mut BytesMut) -> crate::Result<()> {
-        dst.put_u8(self.len());
-
-        if self.value < 0 {
-            dst.put_u8(0);
-        } else {
-            dst.put_u8(1);
-        }
-
-        let value = self.value().abs();
-
-        match self.len() {
-            5 => dst.put_u32_le(value as u32),
-            9 => dst.put_u64_le(value as u64),
-            13 => {
-                dst.put_u64_le(value as u64);
-                dst.put_u32_le((value >> 64) as u32)
-            }
-            _ => dst.put_u128_le(value as u128),
-        }
-
-        Ok(())
+        self.encode_with_len(dst, self.len())
     }
 }
 

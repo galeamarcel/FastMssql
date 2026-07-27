@@ -586,6 +586,7 @@ test/typed-parameter-descriptor
   `docs/superpowers/specs/2026-07-24-fastmssql-sql-auth-validation-design.md`
 - Modify: `tests/test_parameters.py`
 - Modify: `tests/test_parameters_edge_cases.py`
+- Modify: `tests/test_parameter_limit_conversion.py`
 - Modify: `tests/test_parameter_conversions_advanced.py`
 - Modify: `tests/sql_auth_strict/test_parameters_strict.py`
 - Modify: `tests/sql_auth_strict/test_transactions_strict.py`
@@ -612,6 +613,7 @@ test/typed-parameter-descriptor
 - Modify: `vendor/tiberius/src/tds/stream/token.rs`
 - Modify: `vendor/tiberius/src/tds/codec/rpc_request.rs`
 - Modify: `vendor/tiberius/src/tds/codec/column_data.rs`
+- Modify: `vendor/tiberius/src/tds/codec/type_info.rs`
 - Modify: `vendor/tiberius/FASTMSSQL_PATCH.md`
 
 - [ ] **Step 1: Add SQL-auth cases `PARAM-025` through `PARAM-030`,
@@ -713,14 +715,31 @@ For typed values:
 4. return a typed error for incompatible value/type metadata.
 
 Existing untyped Tiberius APIs must produce byte-identical inferred behavior.
-Add encoder tests for integer, decimal, ANSI/Unicode, binary, time,
-datetime2, datetimeoffset and typed null metadata.
+Add encoder tests for integer, decimal, ANSI/Unicode, binary, date, time,
+datetime2, datetimeoffset, empty XML followed by another parameter, and typed
+null metadata. The `DATEN` `TYPE_INFO` contains only its type byte; its
+three-byte value length is emitted exactly once with the value.
+Add a transport-state regression proving that a local encoder failure leaves
+the prior `flushed` state intact because no RPC packet was sent.
 
 - [ ] **Step 6: Track negotiated collation**
 
-Store `Option<Collation>` in Tiberius `Context`. Update it on
-`TokenEnvChange::SqlCollation`. Preserve it across pool reset. Add tests for
-login/update/reset behavior.
+Store current and initial-login `Option<Collation>` values in Tiberius
+`Context`. Update the current value on `TokenEnvChange::SqlCollation`,
+capture the initial value after login, and restore that initial value before
+the first request carrying `RESETCONNECTION`. Add tests for
+login/update/reset behavior and a one-session SQL-auth reset from `_UTF8`
+back to the login database.
+
+Advertise TDS 7.4 `UTF8_SUPPORT` in LOGIN7 for every authentication mode,
+decode its `FEATUREEXTACK`, preserve the negotiated capability across pool
+reset, and honor the collation `fUTF8` bit. Add exact LOGIN7, ACK, collation
+and UTF-8 RPC byte tests. Extend `PARAM-027` with a temporary `_UTF8` database
+that proves a four-byte supplementary character round-trips through
+`VARCHAR(4)` and is rejected for `VARCHAR(3)`.
+Connect directly to that database through the login database field; do not
+depend on a preceding pooled `USE` statement selecting the same physical
+connection.
 
 Eliminate every `unwrap()` on a typed ANSI collation path; missing or
 unsupported encoding must return an error.
@@ -758,6 +777,9 @@ For each parameter:
 - retain the bounded 2,098 parameter limit.
 
 No error may evaluate or include the value representation.
+Batch preflight retains the original exception class and structured
+attributes, adds `batch_index`, and preserves the stable
+`Batch item N parameter validation failed` message context.
 
 - [ ] **Step 10: Implement compatible value conversion**
 
@@ -771,6 +793,9 @@ Implement range and kind checks for every accepted type. Use:
 - byte lengths for binary;
 - UUID and XML owned values;
 - exact integer temporal rounding and rollover.
+
+`SMALLDATETIME` rounds `29.998` seconds down and `29.999` seconds up, matching
+SQL Server's documented boundary.
 
 Limited values that exceed length fail; no truncation is permitted.
 

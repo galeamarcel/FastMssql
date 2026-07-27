@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastmssql import Connection
+from fastmssql import Connection, ConversionError, Parameter
 import pytest
 
 
@@ -56,3 +56,28 @@ def test_batch_validation_uses_same_effective_rpc_limit(
         disconnected_connection.query_batch(
             [("SELECT 1", list(range(2099)))]
         )
+
+
+def test_batch_validation_adds_item_context_without_erasing_conversion_metadata(
+    disconnected_connection: Connection,
+) -> None:
+    with pytest.raises(
+        ConversionError,
+        match=(
+            "^Batch item 0 parameter validation failed: "
+            "ConversionError: Python value has the wrong kind for the "
+            "declared SQL parameter type$"
+        ),
+    ) as error:
+        disconnected_connection.query_batch(
+            [("SELECT @P1", [Parameter("not-an-integer", "INT")])]
+        )
+
+    assert error.value.batch_index == 0
+    assert error.value.parameter_index == 0
+    assert error.value.sql_type == "INT"
+    assert error.value.reason == "wrong_value_kind"
+    assert error.value.retryable is False
+    assert error.value.wire_sent is False
+    assert error.value.connection_discarded is False
+    assert error.value.outcome_unknown is False
