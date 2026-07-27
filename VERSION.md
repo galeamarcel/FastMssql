@@ -310,3 +310,14 @@ No release, package-version change, or artifact publication has occurred.
   six `E0599` errors from tests enabled by OS alone.
 - This test-only change does not modify runtime behavior, package metadata,
   the displayed `0.7.7` version or release state.
+
+### Portable Tiberius Windows authentication-test gates
+
+- ADO.NET and JDBC tests that reference `AuthMethod::Integrated` or
+  `AuthMethod::windows` now compile only when both Windows and the vendored
+  Tiberius `winauth` feature are active, matching the production API gates.
+- The SQL-auth/rustls-only feature profile therefore keeps the same coverage
+  on every hosted OS without accidentally compiling unavailable
+  Windows-authentication test APIs.
+- This test-gating fix does not modify runtime behavior, package metadata,
+  the displayed `0.7.7` version or release state.
