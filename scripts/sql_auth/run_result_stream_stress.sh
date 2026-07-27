@@ -6,6 +6,8 @@ readonly local_env_file="${root_dir}/.env.sql-auth.local"
 readonly shared_env_file="${root_dir}/../../.env.sql-auth.local"
 readonly artifact_dir="${root_dir}/.artifacts/sql-auth"
 readonly profiles="${FASTMSSQL_RESULT_STREAM_STRESS_PROFILES:-1000:64}"
+readonly pool_size="${FASTMSSQL_RESULT_STREAM_STRESS_POOL_SIZE:-8}"
+readonly buffer_size="${FASTMSSQL_RESULT_STREAM_STRESS_BUFFER_SIZE:-8}"
 readonly rss_growth_limit_bytes="${FASTMSSQL_RESULT_STREAM_STRESS_RSS_GROWTH_LIMIT_BYTES:-134217728}"
 
 if [[ -n "${FASTMSSQL_RESULT_STREAM_STRESS_METRICS_PATH:-}" ]]; then
@@ -57,8 +59,8 @@ fi
 
 "${python_bin}" scripts/sql_auth/result_stream_stress.py \
   --profiles "${profiles}" \
-  --pool-size 8 \
-  --buffer-size 8 \
+  --pool-size "${pool_size}" \
+  --buffer-size "${buffer_size}" \
   --rss-growth-limit-bytes "${rss_growth_limit_bytes}" \
   --metrics-output "${metrics_path}" \
   --results-output "${results_path}"

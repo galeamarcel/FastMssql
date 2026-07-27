@@ -908,22 +908,65 @@ def test_result_stream_stress_harness_is_bounded_and_required(
     assert "concurrency must be between 1 and 500" in source
     assert "--buffer-size must be between 1 and 1,024" in source
 
+    sandbox_root = tmp_path / "repo"
+    sandbox_runner = sandbox_root / "scripts/sql_auth/run_result_stream_stress.sh"
+    sandbox_runner.parent.mkdir(parents=True)
+    shutil.copy2(shell_runner, sandbox_runner)
+    (sandbox_root / ".env.sql-auth.local").write_text("", encoding="utf-8")
+    fake_python = sandbox_root / ".venv/bin/python"
+    fake_python.parent.mkdir(parents=True)
+    _write_executable(
+        fake_python,
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "${CAPTURE_PATH}"\n',
+    )
+    captured_arguments = tmp_path / "result-stream-stress-arguments.txt"
+    runner_env = os.environ.copy()
+    for name in tuple(runner_env):
+        if name.startswith("FASTMSSQL_RESULT_STREAM_STRESS_"):
+            del runner_env[name]
+    runner_env.update(
+        {
+            "CAPTURE_PATH": str(captured_arguments),
+            "FASTMSSQL_RESULT_STREAM_STRESS_PROFILES": "3:2",
+            "FASTMSSQL_RESULT_STREAM_STRESS_POOL_SIZE": "17",
+            "FASTMSSQL_RESULT_STREAM_STRESS_BUFFER_SIZE": "23",
+        }
+    )
+    completed = subprocess.run(
+        [str(sandbox_runner)],
+        cwd=sandbox_root,
+        env=runner_env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    arguments = captured_arguments.read_text(encoding="utf-8").splitlines()
+    assert arguments[arguments.index("--pool-size") + 1] == "17"
+    assert arguments[arguments.index("--buffer-size") + 1] == "23"
+
     shell_source = shell_runner.read_text(encoding="utf-8")
     for token in (
         "FASTMSSQL_RESULT_STREAM_STRESS_METRICS_PATH",
         "FASTMSSQL_RESULT_STREAM_STRESS_RESULTS_PATH",
         "FASTMSSQL_RESULT_STREAM_STRESS_PROFILES",
+        "FASTMSSQL_RESULT_STREAM_STRESS_POOL_SIZE",
+        "FASTMSSQL_RESULT_STREAM_STRESS_BUFFER_SIZE",
         "FASTMSSQL_RESULT_STREAM_STRESS_RSS_GROWTH_LIMIT_BYTES",
         "result-stream-stress-metrics.json",
         "result-stream-stress-metrics-extended.json",
         "result-stream-load-results.json",
         "--profiles",
-        "--pool-size 8",
-        "--buffer-size 8",
+        'readonly pool_size="${FASTMSSQL_RESULT_STREAM_STRESS_POOL_SIZE:-8}"',
+        'readonly buffer_size="${FASTMSSQL_RESULT_STREAM_STRESS_BUFFER_SIZE:-8}"',
+        '--pool-size "${pool_size}"',
+        '--buffer-size "${buffer_size}"',
         "--rss-growth-limit-bytes",
         ".env.sql-auth.local",
     ):
         assert token in shell_source
+    assert "--pool-size 8" not in shell_source
+    assert "--buffer-size 8" not in shell_source
 
     full_source = full_runner.read_text(encoding="utf-8")
     assert "record result-stream-load " in full_source
