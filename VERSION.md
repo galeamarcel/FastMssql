@@ -9,7 +9,7 @@ component represents a feature-level patch. It is documented here but is not
 yet applied to package metadata; release versioning remains a separate,
 explicit decision.
 
-Changes currently prepared on `feat/typed-parameter-descriptor`:
+Changes currently verified on `verify/typed-parameter-merge`:
 
 - closed, validated SQL parameter descriptors with exact TDS metadata;
 - exact decimal, UUID, temporal, ANSI/Unicode, binary, XML, and typed-null
@@ -21,7 +21,9 @@ Changes currently prepared on `feat/typed-parameter-descriptor`:
 - deterministic SQL-auth, exact-wire, compatibility, and 1,000-operation
   concurrent load coverage;
 - load-metric contract coverage for the typed-parameter case `PARAM-033`.
-- regenerated SQL-auth matrix/report evidence tied to technical commit
-  `1909a72cb83fd8f36638a6aa99072b3a99045ed8` (346/346 required cases pass).
+- regenerated SQL-auth matrix/report evidence tied to exact cumulative merge
+  `7a881c57ef2bbd08477271d2b58d7d5aaefd5b99`: 346/346 required
+  matrix cases, 16 async, 33 framework, 6 resilience, 12 load, and 1,072
+  original-local-regression tests pass.
 
 No release, package-version change, or artifact publication has occurred.
