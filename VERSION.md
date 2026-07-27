@@ -42,6 +42,19 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Native TDS bulk wire-encoding retirement RED contract
+
+- Extended `BULK-010` with a real UTF-8 `VARCHAR(1)` boundary where one
+  Unicode character exceeds the target's encoded-byte capacity only inside
+  Tiberius row encoding.
+- Required a post-`send()` local encoding failure to retire the physical
+  connection immediately, without issuing cleanup SQL on the undrained bulk
+  stream or attaching a secondary cleanup error.
+- The regression also requires zero persisted rows, a replacement physical
+  identity and successful post-fault pool smoke. This test-only change does
+  not change runtime behavior, package metadata, the displayed `0.7.7`
+  version or release state.
+
 ### Native TDS bulk stress row-shape RED contract
 
 - Added a focused executable contract requiring the stress harness to build
