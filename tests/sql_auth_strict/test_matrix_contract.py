@@ -1016,6 +1016,29 @@ def test_result_stream_stress_harness_is_bounded_and_required(
     assert list(evidence_path.parent.glob(".*.tmp")) == []
 
 
+def test_result_stream_isolated_wheel_gate_installs_test_dependencies() -> None:
+    plan = ROOT / (
+        "docs/superpowers/plans/"
+        "2026-07-27-fastmssql-resultsets-streaming.md"
+    )
+    source = plan.read_text(encoding="utf-8")
+    start = source.index("- [ ] **Step 5: Build and test an isolated installed wheel**")
+    end = source.index("- [ ] **Step 6: Run privacy, secret and artifact checks**")
+    wheel_gate = source[start:end]
+
+    for requirement in (
+        "python-dotenv==1.2.2",
+        "pytest-timeout==2.4.0",
+        "pytest==9.1.1",
+        "pytest-asyncio==1.4.0",
+        "psutil==7.2.2",
+    ):
+        assert requirement in wheel_gate, (
+            f"isolated wheel SQL-auth gate is missing {requirement}"
+        )
+    assert "env -u PYTHONPATH" in wheel_gate
+
+
 def test_result_messages_redact_every_nonempty_password() -> None:
     assert redact_message(
         "owner=OwnerSecret readonly=ReadonlySecret",

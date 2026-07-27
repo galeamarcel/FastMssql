@@ -257,3 +257,14 @@ No release, package-version change, or artifact publication has occurred.
   instead of silently using the defaults.
 - This test-harness fix does not modify package runtime behavior, package
   metadata, the displayed `0.7.7` version or release state.
+
+### RED isolated-wheel SQL-auth dependency contract
+
+- Added a deterministic contract requiring the RESULT-030 isolated-wheel gate
+  to install every dependency needed for SQL-auth test collection and timeout
+  enforcement.
+- The contract reproduces the missing `python-dotenv` collection dependency
+  and also requires `pytest-timeout` so the documented 30-second integration
+  timeout is active in the isolated environment.
+- This test-only change does not modify runtime behavior, package metadata,
+  the displayed `0.7.7` version or release state.
