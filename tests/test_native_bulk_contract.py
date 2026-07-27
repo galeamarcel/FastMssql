@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import argparse
 import ast
 import importlib
 import inspect
+import json
 from pathlib import Path
+import runpy
+import subprocess
+import sys
 
 import fastmssql
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -157,3 +163,89 @@ def test_native_bulk_transaction_source_has_rollback_only_state() -> None:
     transaction = (ROOT / "src/transaction.rs").read_text(encoding="utf-8")
     assert "RollbackOnly" in transaction
     assert "rollback required" in transaction.lower()
+
+
+def test_native_bulk_stress_harness_is_bounded_and_extended_is_explicit(
+    tmp_path: Path,
+) -> None:
+    runner = ROOT / "scripts/sql_auth/native_bulk_stress.py"
+    completed = subprocess.run(
+        [sys.executable, str(runner), "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    for option in (
+        "--profiles",
+        "--allow-extended",
+        "--metrics-output",
+        "--rss-growth-limit-bytes",
+        "--event-loop-stall-limit-seconds",
+        "--operation-timeout-seconds",
+    ):
+        assert option in completed.stdout
+
+    namespace = runpy.run_path(str(runner))
+    parse_profiles = namespace["parse_profiles"]
+    profiles = parse_profiles("1_000:250,10_000:1_000,99_999:1_000")
+    assert [(profile.rows, profile.chunk_size) for profile in profiles] == [
+        (1_000, 250),
+        (10_000, 1_000),
+        (99_999, 1_000),
+    ]
+    for invalid in (
+        "0:1",
+        "100_000:1_000",
+        "1_000:0",
+        "1_000:10_001",
+        "1_000",
+        "1_000:250,1_000:250",
+    ):
+        with pytest.raises(argparse.ArgumentTypeError):
+            parse_profiles(invalid)
+
+    parse_args = namespace["parse_args"]
+    baseline = parse_args(
+        [
+            "--profiles",
+            "1_000:250,10_000:1_000",
+            "--metrics-output",
+            str(tmp_path / "baseline.json"),
+        ]
+    )
+    assert baseline.allow_extended is False
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--profiles",
+                "99_999:1_000",
+                "--metrics-output",
+                str(tmp_path / "rejected.json"),
+            ]
+        )
+    extended = parse_args(
+        [
+            "--profiles",
+            "99_999:1_000",
+            "--allow-extended",
+            "--metrics-output",
+            str(tmp_path / "extended.json"),
+        ]
+    )
+    assert extended.allow_extended is True
+
+    nearest_rank = namespace["nearest_rank"]
+    assert nearest_rank([50, 10, 40, 20, 30], 50) == 30
+    assert nearest_rank([50, 10, 40, 20, 30], 95) == 50
+
+    evidence_path = tmp_path / "nested" / "metrics.json"
+    namespace["atomic_write"](
+        evidence_path,
+        {"schema_version": 1, "status": "contract"},
+    )
+    assert json.loads(evidence_path.read_text(encoding="utf-8")) == {
+        "schema_version": 1,
+        "status": "contract",
+    }
+    assert list(evidence_path.parent.glob(".*.tmp")) == []

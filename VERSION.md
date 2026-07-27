@@ -42,6 +42,18 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Native TDS bulk stress RED contract
+
+- Added an executable contract for a bounded native-bulk stress harness with
+  exact `ROWS:CHUNK_SIZE` profiles, a 99,999-row hard ceiling and explicit
+  opt-in for the extended profile.
+- Required atomic metrics output, deterministic percentile calculation and
+  explicit RSS, event-loop-stall and operation-timeout controls.
+- The expected RED is the absent
+  `scripts/sql_auth/native_bulk_stress.py` runner. This test-only change does
+  not implement the harness, change runtime behavior, package metadata, the
+  displayed `0.7.7` version or release state.
+
 ### Native TDS bulk insert RED coverage
 
 - Raised the canonical SQL-auth matrix from 377 to 384 unique IDs and added
