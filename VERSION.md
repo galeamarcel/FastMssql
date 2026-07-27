@@ -42,6 +42,23 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Documentation-only FastMssql native TDS bulk insert design and plan
+
+- Added the focused public/runtime design for list-bounded
+  `Connection.native_bulk_insert()` and `Transaction.native_bulk_insert()`
+  over the verified vendored-Tiberius ordered-column primitive.
+- Required exact target-metadata-guided cell conversion, one finalized TDS
+  bulk request per chunk, connection-form atomicity across all chunks and an
+  explicit rollback-only transaction state after reusable post-wire failure.
+- Defined seven deterministic SQL-auth contracts (`BULK-006` through
+  `BULK-012`), observed-RED ancestry, compatibility regression gates and
+  concrete-list load profiles through the explicitly approved 99,999 rows.
+- Kept iterable/async-iterable backpressure, `execute_many()` and
+  `query_many()` as separate later slices and preserved compatibility
+  `bulk_insert()` unchanged.
+- This documentation-only change does not modify runtime behavior, package
+  metadata, the displayed `0.7.7` version or release state.
+
 ### Tiberius bulk column-subset audit status
 
 - Updated the live production-readiness audit to the exact cumulative feature
