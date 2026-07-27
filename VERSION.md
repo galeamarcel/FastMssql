@@ -62,8 +62,9 @@ No release, package-version change, or artifact publication has occurred.
 
 - Added real SQL-auth reproductions for TABNAME/COLINFO emitted by
   `FOR BROWSE` and the SQL_VARIANT metadata panic.
-- Added raw token/type-info and source contracts that require exact payload
-  consumption and typed unsupported errors without Rust panic macros.
+- Added correctly typed raw `u8` token/type-info and source contracts that
+  require exact payload consumption and typed unsupported errors without Rust
+  panic macros.
 - Added required local-runner and hosted-CI contracts without changing
   production decoder behavior on this RED branch.
 - This test-only change does not modify package metadata, the displayed

@@ -88,6 +88,6 @@ mod tests {
 
     #[test]
     fn tib_safe_003_tabname_token_is_recognized() {
-        assert_eq!(TokenType::try_from(0xa4), Ok(TokenType::TableName));
+        assert_eq!(TokenType::try_from(0xa4_u8), Ok(TokenType::TableName));
     }
 }
