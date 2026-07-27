@@ -134,7 +134,10 @@ fn assert_column(
     Ok(())
 }
 
-async fn rpc_fixture_events(application_name: &str) -> Result<(Vec<ResponseEvent>, String)> {
+async fn rpc_fixture_events(
+    application_name: &str,
+    reset_before_rpc: bool,
+) -> Result<(Vec<ResponseEvent>, String)> {
     let mut client = connect_sql_auth(application_name).await?;
     let fixture = format!("fastmssql_response_{}", Uuid::new_v4().simple());
     let qualified = format!("dbo.[{fixture}]");
@@ -147,7 +150,13 @@ async fn rpc_fixture_events(application_name: &str) -> Result<(Vec<ResponseEvent
             SET NOCOUNT ON;
             RAISERROR(N'fastmssql-response-info', 5, 17);
             SET @value = @value + 1;
-            SELECT @value AS echoed;
+            SELECT
+                @value AS echoed,
+                (
+                    SELECT transaction_isolation_level
+                    FROM sys.dm_exec_sessions
+                    WHERE session_id = @@SPID
+                ) AS isolation_level;
             RETURN -7;
         END
         "
@@ -167,6 +176,11 @@ async fn rpc_fixture_events(application_name: &str) -> Result<(Vec<ResponseEvent
     }
 
     let response_result = AssertUnwindSafe(async {
+        if reset_before_rpc {
+            drain_batch(&mut client, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").await?;
+            client.reset_connection_on_next_request();
+        }
+
         let parameters = vec![RpcParameter::new(
             "@value".to_owned(),
             ColumnData::I32(Some(41)),
@@ -545,7 +559,7 @@ async fn tib_result_003_done_count_distinguishes_absent_and_zero() -> Result<()>
 
 #[tokio::test]
 async fn tib_result_004_info_fields_round_trip() -> Result<()> {
-    let (events, fixture) = rpc_fixture_events("FastMssql TIB-RESULT-004").await?;
+    let (events, fixture) = rpc_fixture_events("FastMssql TIB-RESULT-004", false).await?;
     let info: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
@@ -575,7 +589,7 @@ async fn tib_result_004_info_fields_round_trip() -> Result<()> {
 
 #[tokio::test]
 async fn tib_result_005_return_status_is_signed() -> Result<()> {
-    let (events, _) = rpc_fixture_events("FastMssql TIB-RESULT-005").await?;
+    let (events, _) = rpc_fixture_events("FastMssql TIB-RESULT-005", false).await?;
     let statuses: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
@@ -590,7 +604,7 @@ async fn tib_result_005_return_status_is_signed() -> Result<()> {
 
 #[tokio::test]
 async fn tib_result_006_return_value_keeps_ordinal_name_type_and_value() -> Result<()> {
-    let (events, _) = rpc_fixture_events("FastMssql TIB-RESULT-006").await?;
+    let (events, _) = rpc_fixture_events("FastMssql TIB-RESULT-006", true).await?;
     let value = output_value(&events)?;
 
     anyhow::ensure!(value.ordinal() == 0, "RETURNVALUE ordinal changed");
@@ -612,6 +626,17 @@ async fn tib_result_006_return_value_keeps_ordinal_name_type_and_value() -> Resu
     anyhow::ensure!(
         matches!(value.value(), ColumnData::I32(Some(42))),
         "RETURNVALUE payload changed"
+    );
+    let isolation_levels: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            ResponseEvent::Row(row) => row.get::<i16, _>("isolation_level"),
+            _ => None,
+        })
+        .collect();
+    anyhow::ensure!(
+        isolation_levels == [2],
+        "reset-bearing direct RPC did not restore READ COMMITTED"
     );
 
     Ok(())

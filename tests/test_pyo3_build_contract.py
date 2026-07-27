@@ -111,11 +111,21 @@ def test_hosted_gate_runs_database_independent_vendored_tests() -> None:
         "cargo test --manifest-path vendor/tiberius/Cargo.toml "
         "--no-default-features --features chrono,tds73,rustls --lib"
     )
+    response_api_gate = (
+        "cargo test --manifest-path vendor/tiberius/Cargo.toml "
+        "--no-default-features --features chrono,tds73,rustls "
+        "--test response_api"
+    )
 
     assert normalized_workflow.count(vendored_unit_gate) == 1
+    assert normalized_workflow.count(response_api_gate) == 1
     assert "token_safety_sql_auth" not in workflow
+    assert "response_events_sql_auth" not in workflow
     assert workflow.index("cargo test --locked") < workflow.index(
         "--manifest-path vendor/tiberius/Cargo.toml"
+    )
+    assert normalized_workflow.index(vendored_unit_gate) < normalized_workflow.index(
+        response_api_gate
     )
 
 

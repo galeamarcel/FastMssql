@@ -281,7 +281,10 @@ pub use sql_parameter_type::{SqlParameterKind, SqlParameterType};
 pub use tds::{
     codec::{BulkLoadRequest, ColumnData, ColumnFlag, IntoRow, TokenRow, TypeLength},
     numeric,
-    stream::QueryStream,
+    stream::{
+        QueryStream, ResponseColumn, ResponseDone, ResponseDoneKind, ResponseEvent, ResponseInfo,
+        ResponseLength, ResponseMetadata, ResponseReturnValue, ResponseStream, RpcParameter,
+    },
     time, xml, EncryptionLevel,
 };
 pub use to_sql::{IntoSql, ToSql};

@@ -57,6 +57,22 @@ impl TokenDone {
     pub(crate) fn rows(&self) -> u64 {
         self.done_rows
     }
+
+    pub(crate) fn has_count(&self) -> bool {
+        self.status.contains(DoneStatus::Count)
+    }
+
+    pub(crate) fn has_more_results(&self) -> bool {
+        self.status.contains(DoneStatus::More)
+    }
+
+    pub(crate) fn is_in_transaction(&self) -> bool {
+        self.status.contains(DoneStatus::Inexact)
+    }
+
+    pub(crate) fn attention_acknowledged(&self) -> bool {
+        self.status.contains(DoneStatus::Attention)
+    }
 }
 
 impl Encode<BytesMut> for TokenDone {

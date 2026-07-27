@@ -31,7 +31,6 @@ use libgssapi::{
     name::Name,
     oid::{OidSet, GSS_MECH_KRB5, GSS_NT_KRB5_PRINCIPAL},
 };
-use pretty_hex::*;
 #[cfg(all(unix, feature = "integrated-auth-gssapi"))]
 use std::ops::Deref;
 use std::{cmp, fmt::Debug, io, pin::Pin, task};
@@ -66,7 +65,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Debug for Connection<S> {
             .field("transport", &"Framed<..>")
             .field("flushed", &self.flushed)
             .field("context", &self.context)
-            .field("buf", &self.buf.as_ref().hex_dump())
+            .field("buf_len", &self.buf.len())
             .field(
                 "reset_connection_on_next_request",
                 &self.reset_connection_on_next_request,
@@ -588,9 +587,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> futures_util::io::AsyncRead for C
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> SqlReadBytes for Connection<S> {
-    /// Hex dump of the current buffer.
+    /// Structural size of the current buffer without exposing payload bytes.
     fn debug_buffer(&self) {
-        dbg!(self.buf.as_ref().hex_dump());
+        event!(Level::TRACE, buf_len = self.buf.len());
     }
 
     /// The current execution context.

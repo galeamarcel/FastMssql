@@ -95,3 +95,19 @@ No release, package-version change, or artifact publication has occurred.
 - This RED branch records required behavior only; it does not change runtime
   response decoding, package metadata, the displayed `0.7.7` version or
   release state.
+
+### Complete TDS response events and direct named RPC
+
+- Added an owned vendored-Tiberius response stream for metadata, rows,
+  DONE-family state, INFO messages, signed return status and output values,
+  while retaining legacy `QueryStream` behavior as a filtered adapter.
+- Added checked named-RPC encoding, typed input/output parameter metadata and
+  a fully drained reset-bearing READ COMMITTED baseline before direct RPC on
+  recycled sessions.
+- Preserved complete nullable/precision/scale/length metadata and corrected
+  nullable SMALLMONEY/SMALLDATETIME storage-width mapping found by the real
+  SQL-auth suite.
+- Removed value-bearing token traces and raw connection-buffer diagnostics,
+  and added database-independent Linux/macOS/Windows response API coverage.
+- This vendored-driver feature does not yet expose a new FastMssql Python API
+  or change package metadata, the displayed `0.7.7` version or release state.

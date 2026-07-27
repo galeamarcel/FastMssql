@@ -1,11 +1,10 @@
 use super::{AllHeaderTy, Encode, ALL_HEADERS_LEN_TX};
 use crate::{
     tds::codec::{ColumnData, TypeInfo},
-    BytesMutWithTypeInfo, Result,
+    BytesMutWithTypeInfo, Error, Result,
 };
 use bytes::{BufMut, BytesMut};
 use enumflags2::{bitflags, BitFlags};
-use std::borrow::BorrowMut;
 use std::borrow::Cow;
 
 #[bitflags]
@@ -140,10 +139,14 @@ impl<'a> Encode<BytesMut> for TokenRpcRequest<'a> {
                 let val = (0xffff_u32) | ((*id as u16) as u32) << 16;
                 dst.put_u32_le(val);
             }
-            RpcProcIdValue::Name(ref _name) => {
-                //let (left_bytes, _) = try!(write_varchar::<u16>(&mut cursor, name, 0));
-                //assert_eq!(left_bytes, 0);
-                todo!()
+            RpcProcIdValue::Name(ref name) => {
+                let utf16_len = u16::try_from(name.encode_utf16().count()).map_err(|_| {
+                    Error::Protocol("RPC procedure name exceeds the US_VARCHAR limit".into())
+                })?;
+                dst.put_u16_le(utf16_len);
+                for code_unit in name.encode_utf16() {
+                    dst.put_u16_le(code_unit);
+                }
             }
         }
 
@@ -159,13 +162,12 @@ impl<'a> Encode<BytesMut> for TokenRpcRequest<'a> {
 
 impl<'a> Encode<BytesMut> for RpcParam<'a> {
     fn encode(self, dst: &mut BytesMut) -> Result<()> {
-        let len_pos = dst.len();
-        let mut length = 0u8;
-
-        dst.put_u8(length);
+        let utf16_len = u8::try_from(self.name.encode_utf16().count()).map_err(|_| {
+            Error::Protocol("RPC parameter name exceeds the B_VARCHAR limit".into())
+        })?;
+        dst.put_u8(utf16_len);
 
         for codepoint in self.name.encode_utf16() {
-            length += 1;
             dst.put_u16_le(codepoint);
         }
 
@@ -185,9 +187,6 @@ impl<'a> Encode<BytesMut> for RpcParam<'a> {
                 None => error,
             });
         }
-
-        let dst: &mut [u8] = dst.borrow_mut();
-        dst[len_pos] = length;
 
         Ok(())
     }

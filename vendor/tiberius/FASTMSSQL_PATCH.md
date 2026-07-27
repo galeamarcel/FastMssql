@@ -4,7 +4,7 @@ This directory is the minimal build source subset of the published `tiberius`
 crate version `0.12.3`, whose registry source records upstream commit
 `c34fab2e14c52ab74519d073d7a7b65bd023fc1a`.
 
-FastMssql temporarily carries five narrowly scoped patch sets.
+FastMssql temporarily carries six narrowly scoped patch sets.
 
 The TLS dependency migration includes:
 
@@ -85,14 +85,36 @@ The token-decoder safety patch:
   the pinned Rust 1.94 toolchain;
 - deliberately does not claim UDT or SQL_VARIANT value conversion support.
 
+The complete-response and direct-RPC patch:
+
+- adds an owned `ResponseStream` that preserves result metadata, rows,
+  DONE/DONEPROC/DONEINPROC state, informational messages, signed return
+  status and output parameter values in wire order;
+- keeps the existing `QueryStream` API as a metadata/row-only compatibility
+  adapter over the complete response stream;
+- preserves nullability, precision, scale and declared character/binary
+  capacities, including UTF-16 units and MAX metadata;
+- resolves nullable `MONEYN(4)` and `DATETIMEN(4)` metadata to SMALLMONEY and
+  SMALLDATETIME instead of their wider types;
+- implements checked MS-TDS US_VARCHAR procedure-name and B_VARCHAR
+  parameter-name encoding without panic paths;
+- supports direct named RPC input/output parameters and restores READ
+  COMMITTED with a fully consumed reset-bearing batch before the first RPC on
+  a recycled session;
+- makes token traces and connection diagnostics structural, with no SQL
+  Server message, metadata name, row/output value, environment value,
+  procedure name or raw-buffer payload.
+
 No Tiberius fork has been created or published by the FastMssql fork owner.
 The path dependency keeps the reviewed source inside the FastMssql repository
 and makes builds independent of the contributor fork remaining available.
 The registry-only `Cargo.toml.orig` file is intentionally omitted because
 Cargo reserves that name when `maturin` packages a local path dependency; the
 effective normalized manifest is retained as `Cargo.toml`.
-Examples, tests, CI files, Docker fixtures, and test certificate keys are also
+Upstream examples, CI files, Docker fixtures, and test certificate keys are
 omitted because they are not part of the FastMssql runtime dependency.
+FastMssql-specific unit and SQL-auth integration contracts are retained under
+`tests/` to make each local protocol patch independently reproducible.
 
 Remove this directory and return to a crates.io dependency after an equivalent
 Tiberius release is published and passes the full FastMssql SQL-auth matrix.

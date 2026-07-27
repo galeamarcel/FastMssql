@@ -22,7 +22,7 @@ pub enum ReceivedToken {
     Done(TokenDone),
     DoneInProc(TokenDone),
     DoneProc(TokenDone),
-    ReturnStatus(u32),
+    ReturnStatus(i32),
     ReturnValue(TokenReturnValue),
     Order(TokenOrder),
     EnvChange(TokenEnvChange),
@@ -120,7 +120,11 @@ where
         let meta = Arc::new(TokenColMetaData::decode(self.conn).await?);
         self.conn.context_mut().set_last_meta(meta.clone());
 
-        event!(Level::TRACE, ?meta);
+        event!(
+            Level::TRACE,
+            token = "COLMETADATA",
+            column_count = meta.columns.len()
+        );
 
         Ok(ReceivedToken::NewResultset(meta))
     }
@@ -128,25 +132,38 @@ where
     async fn get_row(&mut self) -> crate::Result<ReceivedToken> {
         let return_value = TokenRow::decode(self.conn).await?;
 
-        event!(Level::TRACE, message = ?return_value);
+        event!(
+            Level::TRACE,
+            token = "ROW",
+            column_count = return_value.len()
+        );
         Ok(ReceivedToken::Row(return_value))
     }
 
     async fn get_nbc_row(&mut self) -> crate::Result<ReceivedToken> {
         let return_value = TokenRow::decode_nbc(self.conn).await?;
 
-        event!(Level::TRACE, message = ?return_value);
+        event!(
+            Level::TRACE,
+            token = "NBCROW",
+            column_count = return_value.len()
+        );
         Ok(ReceivedToken::Row(return_value))
     }
 
     async fn get_return_value(&mut self) -> crate::Result<ReceivedToken> {
         let return_value = TokenReturnValue::decode(self.conn).await?;
-        event!(Level::TRACE, message = ?return_value);
+        event!(
+            Level::TRACE,
+            token = "RETURNVALUE",
+            ordinal = return_value.param_ordinal
+        );
         Ok(ReceivedToken::ReturnValue(return_value))
     }
 
     async fn get_return_status(&mut self) -> crate::Result<ReceivedToken> {
-        let status = self.conn.read_u32_le().await?;
+        let status = self.conn.read_i32_le().await?;
+        event!(Level::TRACE, token = "RETURNSTATUS");
         Ok(ReceivedToken::ReturnStatus(status))
     }
 
@@ -157,31 +174,41 @@ where
             self.last_error = Some(Error::Server(err.clone()));
         }
 
-        event!(Level::ERROR, message = %err.message, code = err.code);
+        event!(
+            Level::ERROR,
+            token = "ERROR",
+            number = err.code,
+            state = err.state,
+            severity = err.class
+        );
         Ok(ReceivedToken::Error(err))
     }
 
     async fn get_order(&mut self) -> crate::Result<ReceivedToken> {
         let order = TokenOrder::decode(self.conn).await?;
-        event!(Level::TRACE, message = ?order);
+        event!(
+            Level::TRACE,
+            token = "ORDER",
+            column_count = order.column_indexes.len()
+        );
         Ok(ReceivedToken::Order(order))
     }
 
     async fn get_done_value(&mut self) -> crate::Result<ReceivedToken> {
         let done = TokenDone::decode(self.conn).await?;
-        event!(Level::TRACE, "{}", done);
+        event!(Level::TRACE, token = "DONE");
         Ok(ReceivedToken::Done(done))
     }
 
     async fn get_done_proc_value(&mut self) -> crate::Result<ReceivedToken> {
         let done = TokenDone::decode(self.conn).await?;
-        event!(Level::TRACE, "{}", done);
+        event!(Level::TRACE, token = "DONEPROC");
         Ok(ReceivedToken::DoneProc(done))
     }
 
     async fn get_done_in_proc_value(&mut self) -> crate::Result<ReceivedToken> {
         let done = TokenDone::decode(self.conn).await?;
-        event!(Level::TRACE, "{}", done);
+        event!(Level::TRACE, token = "DONEINPROC");
         Ok(ReceivedToken::DoneInProc(done))
     }
 
@@ -206,20 +233,31 @@ where
             _ => (),
         }
 
-        event!(Level::INFO, "{}", change);
+        event!(Level::INFO, token = "ENVCHANGE");
 
         Ok(ReceivedToken::EnvChange(change))
     }
 
     async fn get_info(&mut self) -> crate::Result<ReceivedToken> {
         let info = TokenInfo::decode(self.conn).await?;
-        event!(Level::INFO, "{}", info.message);
+        event!(
+            Level::INFO,
+            token = "INFO",
+            number = info.number,
+            state = info.state,
+            severity = info.class
+        );
         Ok(ReceivedToken::Info(info))
     }
 
     async fn get_login_ack(&mut self) -> crate::Result<ReceivedToken> {
         let ack = TokenLoginAck::decode(self.conn).await?;
-        event!(Level::INFO, "{} version {}", ack.prog_name, ack.version);
+        event!(
+            Level::INFO,
+            token = "LOGINACK",
+            interface = ack.interface,
+            version = ack.version
+        );
         Ok(ReceivedToken::LoginAck(ack))
     }
 
