@@ -78,6 +78,12 @@ jobs:
       - name: Run Rust unit tests
         run: cargo test --locked
 
+      - name: Run vendored Tiberius unit tests
+        run: cargo test --manifest-path vendor/tiberius/Cargo.toml --no-default-features --features chrono,tds73,rustls --lib
+
+      - name: Run vendored Tiberius response API tests
+        run: cargo test --manifest-path vendor/tiberius/Cargo.toml --no-default-features --features chrono,tds73,rustls --test response_api
+
       - name: Build Python extension wheel
         shell: bash
         run: |
@@ -111,4 +117,5 @@ jobs:
             tests/test_timeout_config_contract.py \
             tests/test_lifecycle_contract.py \
             tests/test_pool_observability_contract.py \
-            tests/test_operation_metrics_contract.py -q
+            tests/test_operation_metrics_contract.py \
+            tests/test_result_stream_contract.py -q

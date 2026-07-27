@@ -1,5 +1,5 @@
-use crate::tds::stream::ReceivedToken;
-use crate::{row::ColumnType, Column, Row};
+use crate::tds::stream::{ResponseEvent, ResponseStream};
+use crate::{Column, Row};
 use futures_util::{
     ready,
     stream::{BoxStream, Peekable, Stream, StreamExt, TryStreamExt},
@@ -89,28 +89,26 @@ use std::{
 /// [`into_first_result`]: struct.QueryStream.html#method.into_first_result
 /// [`into_row`]: struct.QueryStream.html#method.into_row
 pub struct QueryStream<'a> {
-    token_stream: Peekable<BoxStream<'a, crate::Result<ReceivedToken>>>,
+    response_stream: Peekable<ResponseStream<'a>>,
     columns: Option<Arc<Vec<Column>>>,
-    result_set_index: Option<usize>,
 }
 
 impl<'a> Debug for QueryStream<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QueryStream")
             .field(
-                "token_stream",
-                &"BoxStream<'a, crate::Result<ReceivedToken>>",
+                "response_stream",
+                &"ResponseStream<'a, crate::Result<ResponseEvent>>",
             )
             .finish()
     }
 }
 
 impl<'a> QueryStream<'a> {
-    pub(crate) fn new(token_stream: BoxStream<'a, crate::Result<ReceivedToken>>) -> Self {
+    pub(crate) fn new(response_stream: ResponseStream<'a>) -> Self {
         Self {
-            token_stream: token_stream.peekable(),
+            response_stream: response_stream.peekable(),
             columns: None,
-            result_set_index: None,
         }
     }
 
@@ -118,16 +116,16 @@ impl<'a> QueryStream<'a> {
     /// error.
     pub(crate) async fn forward_to_metadata(&mut self) -> crate::Result<()> {
         loop {
-            let item = Pin::new(&mut self.token_stream)
+            let item = Pin::new(&mut self.response_stream)
                 .peek()
                 .await
                 .map(|r| r.as_ref().map_err(|e| e.clone()))
                 .transpose()?;
 
             match item {
-                Some(ReceivedToken::NewResultset(_)) => break,
+                Some(ResponseEvent::Metadata(_)) => break,
                 Some(_) => {
-                    self.token_stream.try_next().await?;
+                    self.response_stream.try_next().await?;
                 }
                 None => break,
             }
@@ -186,10 +184,10 @@ impl<'a> QueryStream<'a> {
     /// # }
     /// ```
     pub async fn columns(&mut self) -> crate::Result<Option<&[Column]>> {
-        use ReceivedToken::*;
+        use ResponseEvent::*;
 
         loop {
-            let item = Pin::new(&mut self.token_stream)
+            let item = Pin::new(&mut self.response_stream)
                 .peek()
                 .await
                 .map(|r| r.as_ref().map_err(|e| e.clone()))
@@ -197,15 +195,18 @@ impl<'a> QueryStream<'a> {
 
             match item {
                 Some(token) => match token {
-                    NewResultset(metadata) => {
-                        self.columns = Some(Arc::new(metadata.columns().collect()));
+                    Metadata(metadata) => {
+                        self.columns = Some(metadata.row_columns());
                         break;
                     }
-                    Row(_) => {
+                    Row(row) => {
+                        if self.columns.is_none() {
+                            self.columns = Some(Arc::new(row.columns().to_vec()));
+                        }
                         break;
                     }
                     _ => {
-                        self.token_stream.try_next().await?;
+                        self.response_stream.try_next().await?;
                         continue;
                     }
                 },
@@ -355,44 +356,21 @@ impl<'a> Stream for QueryStream<'a> {
         let this = self.get_mut();
 
         loop {
-            let token = match ready!(this.token_stream.poll_next_unpin(cx)) {
+            let event = match ready!(this.response_stream.poll_next_unpin(cx)) {
                 Some(res) => res?,
                 None => return Poll::Ready(None),
             };
 
-            return match token {
-                ReceivedToken::NewResultset(meta) => {
-                    let column_meta = meta
-                        .columns
-                        .iter()
-                        .map(|x| Column {
-                            name: x.col_name.to_string(),
-                            column_type: ColumnType::from(&x.base.ty),
-                        })
-                        .collect::<Vec<_>>();
-
-                    let column_meta = Arc::new(column_meta);
+            return match event {
+                ResponseEvent::Metadata(metadata) => {
+                    let column_meta = metadata.row_columns();
                     this.columns = Some(column_meta.clone());
 
-                    this.result_set_index = this.result_set_index.map(|i| i + 1);
-
-                    let query_item =
-                        QueryItem::metadata(column_meta, *this.result_set_index.get_or_insert(0));
+                    let query_item = QueryItem::metadata(column_meta, metadata.result_index());
 
                     return Poll::Ready(Some(Ok(query_item)));
                 }
-                ReceivedToken::Row(data) => {
-                    let columns = this.columns.as_ref().unwrap().clone();
-                    let result_index = this.result_set_index.unwrap();
-
-                    let row = Row {
-                        columns,
-                        data,
-                        result_index,
-                    };
-
-                    Poll::Ready(Some(Ok(QueryItem::Row(row))))
-                }
+                ResponseEvent::Row(row) => Poll::Ready(Some(Ok(QueryItem::Row(row)))),
                 _ => continue,
             };
         }

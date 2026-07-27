@@ -83,6 +83,11 @@ def parse_spec(path: Path) -> list[tuple[str, str]]:
 def _result_files(primary: Path, artifact_dir: Path) -> list[Path]:
     candidates = {primary}
     candidates.update(artifact_dir.glob("*-results.json"))
+    result_stream_override = os.getenv(
+        "FASTMSSQL_RESULT_STREAM_STRESS_RESULTS_PATH"
+    )
+    if result_stream_override:
+        candidates.add(Path(result_stream_override))
     return sorted(path for path in candidates if path.is_file())
 
 
@@ -90,10 +95,22 @@ def load_results(
     primary: Path,
     artifact_dir: Path,
     secrets: tuple[str, ...],
+    expected_source_sha: str,
 ) -> dict[str, dict[str, object]]:
     merged: dict[str, dict[str, object]] = {}
     for path in _result_files(primary, artifact_dir):
         payload = json.loads(path.read_text(encoding="utf-8"))
+        external_result_stream_evidence = (
+            path.resolve() != primary.resolve()
+            and "RESULT-029" in payload.get("cases", {})
+        )
+        if external_result_stream_evidence:
+            if payload.get("schema_version") != 1:
+                raise ValueError(
+                    "unsupported result-stream result schema"
+                )
+            if payload.get("source_sha") != expected_source_sha:
+                continue
         for case_id, raw in payload.get("cases", {}).items():
             outcome = STATUS_MAP.get(
                 str(raw.get("outcome", "")).lower(),
@@ -175,6 +192,37 @@ def load_case_metrics(artifact_dir: Path, filename: str) -> dict[str, dict]:
     return dict(payload.get("cases", {}))
 
 
+def load_result_stream_metrics(
+    artifact_dir: Path,
+    expected_source_sha: str,
+) -> dict[str, object]:
+    path = Path(
+        os.getenv(
+            "FASTMSSQL_RESULT_STREAM_STRESS_METRICS_PATH",
+            str(artifact_dir / "result-stream-stress-metrics.json"),
+        )
+    )
+    if not path.is_file():
+        return {
+            "schema_version": 1,
+            "source_sha": "",
+            "status": "NOT RUN",
+            "profiles": [],
+        }
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schema_version") != 1:
+        raise ValueError("unsupported result-stream metrics schema")
+    if payload.get("source_sha") != expected_source_sha:
+        return {
+            "schema_version": 1,
+            "source_sha": str(payload.get("source_sha", "")),
+            "expected_source_sha": expected_source_sha,
+            "status": "STALE",
+            "profiles": [],
+        }
+    return payload
+
+
 def _git_commit(root: Path) -> str:
     completed = subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -228,6 +276,7 @@ def render_report(
     lanes: list[dict],
     framework_metrics: dict[str, dict],
     load_metrics: dict[str, dict],
+    result_stream_metrics: dict[str, object],
     secrets: tuple[str, ...],
 ) -> str:
     counts = Counter(
@@ -354,6 +403,39 @@ def render_report(
             f"| `{case_id}` | "
             f"{markdown_cell(json.dumps(metrics, sort_keys=True), secrets)} |"
         )
+    lines.extend(
+        [
+            "",
+            "## Result-stream stress metrics",
+            "",
+            "- Schema version: "
+            f"`{markdown_cell(result_stream_metrics.get('schema_version'), secrets)}`",
+            "- Evidence status: "
+            f"`{markdown_cell(result_stream_metrics.get('status'), secrets)}`",
+            "- Source SHA: "
+            f"`{markdown_cell(result_stream_metrics.get('source_sha'), secrets)}`",
+            "- Configuration: "
+            f"`{markdown_cell(json.dumps(result_stream_metrics.get('configuration', {}), sort_keys=True), secrets)}`",
+            "",
+            "| Profile | Status | Operations | Concurrency | Metrics |",
+            "|---|---|---:|---:|---|",
+        ]
+    )
+    result_profiles = result_stream_metrics.get("profiles", [])
+    if not result_profiles:
+        lines.append(
+            "| none | "
+            f"{markdown_cell(result_stream_metrics.get('status'), secrets)} "
+            "| 0 | 0 | |"
+        )
+    for index, metrics in enumerate(result_profiles, start=1):
+        lines.append(
+            f"| {index} | "
+            f"{markdown_cell(metrics.get('status'), secrets)} | "
+            f"{markdown_cell(metrics.get('operations'), secrets)} | "
+            f"{markdown_cell(metrics.get('concurrency'), secrets)} | "
+            f"{markdown_cell(json.dumps(metrics, sort_keys=True), secrets)} |"
+        )
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -376,17 +458,23 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     secrets = _secret_values()
     cases = parse_spec(args.spec)
+    root = Path(__file__).resolve().parents[2]
+    source_sha = _git_commit(root)
     results = load_results(
         args.strict_results,
         args.artifact_dir,
         secrets,
+        source_sha,
     )
     lanes = load_lanes(args.artifact_dir, secrets)
     framework_metrics = load_case_metrics(
         args.artifact_dir, "framework-metrics.json"
     )
     load_metrics = load_case_metrics(args.artifact_dir, "load-metrics.json")
-    root = Path(__file__).resolve().parents[2]
+    result_stream_metrics = load_result_stream_metrics(
+        args.artifact_dir,
+        source_sha,
+    )
     matrix = render_matrix(cases, results, secrets)
     report = render_report(
         root,
@@ -395,6 +483,7 @@ def main(argv: list[str] | None = None) -> int:
         lanes,
         framework_metrics,
         load_metrics,
+        result_stream_metrics,
         secrets,
     )
     args.matrix_output.parent.mkdir(parents=True, exist_ok=True)

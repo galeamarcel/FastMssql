@@ -17,15 +17,17 @@ use crate::helpers::{
 use crate::lifecycle::ConnectionLifecycle;
 use crate::lifecycle_config::{ConnectionLifecycleState, PyLifecycleConfig};
 use crate::operation_metrics::{
-    OperationMetricsRegistry, OperationMetricsSnapshot, observe_operation,
+    OperationMetricsRegistry, OperationMetricsSnapshot, OperationObserver, observe_operation,
 };
 use crate::operation_metrics_config::PyOperationMetricsConfig;
 use crate::parameter_conversion::{FastParameter, convert_parameters_to_fast, params_as_sql_refs};
 use crate::pool_config::PyPoolConfig;
 use crate::pool_manager::{
-    ConnectionPool, PooledOperationGuard, ensure_pool_initialized_with_auth,
-    map_pool_checkout_error, timeout_error_or_metadata_failure,
+    ConnectionPool, PooledOperationGuard, acquire_owned_operation_guard,
+    ensure_pool_initialized_with_auth, map_pool_checkout_error, timeout_error_or_metadata_failure,
 };
+use crate::procedure::build_procedure_call;
+use crate::result_stream::{BufferSize, PyResultStream, ResultRequest};
 use crate::ssl_config::PySslConfig;
 use crate::timeout_config::PyTimeoutConfig;
 use crate::transaction::Transaction;
@@ -156,6 +158,49 @@ impl PyConnection {
             timeout_config: self.timeout_config.clone(),
             lifecycle: Arc::clone(&self.lifecycle),
             azure_credential: self.azure_credential.clone(),
+        }
+    }
+
+    async fn start_result_stream(
+        handles: ConnectionHandles,
+        operation_metrics: Option<Arc<OperationMetricsRegistry>>,
+        operation: OperationName,
+        request: ResultRequest,
+        retire_after_operation: bool,
+        buffer_size: usize,
+    ) -> PyResult<Py<PyResultStream>> {
+        let observer = OperationObserver::start(operation_metrics, operation);
+        let startup = async {
+            let permit = handles.lifecycle.admit_operation(operation, true)?;
+            let pool = handles.ensure_connected(operation).await?;
+            let guard = acquire_owned_operation_guard(
+                &pool,
+                operation,
+                handles.timeout_config.acquire_timeout,
+            )
+            .await?;
+            Ok::<_, PyErr>((permit, guard))
+        }
+        .await;
+
+        match startup {
+            Ok((permit, guard)) => {
+                let stream = PyResultStream::spawn(
+                    guard,
+                    permit,
+                    observer,
+                    request,
+                    operation,
+                    handles.timeout_config.operation_timeout,
+                    retire_after_operation,
+                    buffer_size,
+                );
+                Python::attach(|py| Py::new(py, stream))
+            }
+            Err(error) => {
+                observer.error(&error);
+                Err(error)
+            }
         }
     }
 
@@ -458,6 +503,93 @@ impl PyConnection {
                     })
                     .await
             })
+            .await
+        })
+    }
+
+    #[pyo3(
+        signature = (sql, params=None, *, buffer_size = BufferSize::DEFAULT),
+        text_signature = "($self, sql, params=None, *, buffer_size=64)"
+    )]
+    pub(crate) fn stream<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        params: Option<&Bound<PyAny>>,
+        buffer_size: BufferSize,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let fast_parameters = convert_parameters_to_fast(params, py)?;
+        let retire_after_operation = requires_connection_retirement(&sql);
+        let handles = self.clone_handles();
+        let operation_metrics = self.operation_metrics.clone();
+
+        future_into_py(py, async move {
+            Self::start_result_stream(
+                handles,
+                operation_metrics,
+                OperationName::Query,
+                ResultRequest::Query {
+                    sql,
+                    parameters: fast_parameters.into_vec(),
+                },
+                retire_after_operation,
+                buffer_size.get(),
+            )
+            .await
+        })
+    }
+
+    #[pyo3(
+        signature = (sql, *, buffer_size = BufferSize::DEFAULT),
+        text_signature = "($self, sql, *, buffer_size=64)"
+    )]
+    pub(crate) fn batch<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        buffer_size: BufferSize,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let retire_after_operation = requires_connection_retirement(&sql);
+        let handles = self.clone_handles();
+        let operation_metrics = self.operation_metrics.clone();
+
+        future_into_py(py, async move {
+            Self::start_result_stream(
+                handles,
+                operation_metrics,
+                OperationName::QueryBatch,
+                ResultRequest::Batch { sql },
+                retire_after_operation,
+                buffer_size.get(),
+            )
+            .await
+        })
+    }
+
+    #[pyo3(
+        signature = (procedure, params=None, *, buffer_size = BufferSize::DEFAULT),
+        text_signature = "($self, procedure, params=None, *, buffer_size=64)"
+    )]
+    pub(crate) fn callproc<'p>(
+        &self,
+        py: Python<'p>,
+        procedure: String,
+        params: Option<&Bound<PyAny>>,
+        buffer_size: BufferSize,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let call = build_procedure_call(&procedure, params, py)?;
+        let handles = self.clone_handles();
+        let operation_metrics = self.operation_metrics.clone();
+
+        future_into_py(py, async move {
+            Self::start_result_stream(
+                handles,
+                operation_metrics,
+                OperationName::Query,
+                ResultRequest::Procedure(call),
+                false,
+                buffer_size.get(),
+            )
             .await
         })
     }

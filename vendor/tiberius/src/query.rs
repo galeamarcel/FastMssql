@@ -3,7 +3,10 @@ use std::borrow::Cow;
 use futures_util::io::{AsyncRead, AsyncWrite};
 
 use crate::{
-    tds::{codec::RpcProcId, stream::TokenStream},
+    tds::{
+        codec::RpcProcId,
+        stream::{ResponseStream, TokenStream},
+    },
     Client, ColumnData, ExecuteResult, IntoSql, QueryStream,
 };
 
@@ -138,7 +141,8 @@ impl<'a> Query<'a> {
             .await?;
 
         let ts = TokenStream::new(&mut client.connection);
-        let mut result = QueryStream::new(ts.try_unfold());
+        let response = ResponseStream::new(ts.try_unfold());
+        let mut result = QueryStream::new(response);
         result.forward_to_metadata().await?;
 
         Ok(result)

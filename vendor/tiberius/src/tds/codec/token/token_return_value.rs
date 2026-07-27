@@ -1,7 +1,7 @@
 use super::BaseMetaDataColumn;
 use crate::{tds::codec::ColumnData, Error, SqlReadBytes};
+use std::fmt;
 
-#[derive(Debug)]
 #[allow(dead_code)]
 pub struct TokenReturnValue {
     pub param_ordinal: u16,
@@ -10,6 +10,18 @@ pub struct TokenReturnValue {
     pub udf: bool,
     pub meta: BaseMetaDataColumn,
     pub value: ColumnData<'static>,
+}
+
+impl fmt::Debug for TokenReturnValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TokenReturnValue")
+            .field("param_ordinal", &self.param_ordinal)
+            .field("param_name", &"<redacted>")
+            .field("udf", &self.udf)
+            .field("meta", &"<redacted>")
+            .field("value", &"<redacted>")
+            .finish()
+    }
 }
 
 impl TokenReturnValue {

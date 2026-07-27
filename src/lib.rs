@@ -18,7 +18,10 @@ mod operation_metrics_config;
 mod parameter_conversion;
 mod pool_config;
 mod pool_manager;
+mod procedure;
 mod py_parameters;
+mod result_stream;
+mod result_types;
 mod sql_parameter_type;
 mod ssl_config;
 mod timeout_config;
@@ -32,6 +35,8 @@ pub use lifecycle_config::{ConnectionLifecycleState, PyLifecycleConfig};
 pub use operation_metrics_config::PyOperationMetricsConfig;
 pub use pool_config::PyPoolConfig;
 pub use py_parameters::{Parameter, Parameters};
+pub use result_stream::{PyResultSet, PyResultStream};
+pub use result_types::{PyColumnMetadata, PyDoneResult, PyResultSummary, PySqlMessage};
 pub use ssl_config::{EncryptionLevel, PySslConfig};
 pub use timeout_config::PyTimeoutConfig;
 pub use transaction::Transaction;
@@ -80,6 +85,12 @@ fn fastmssql(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Transaction>()?;
     m.add_class::<PyFastRow>()?;
     m.add_class::<PyQueryStream>()?;
+    m.add_class::<PyResultStream>()?;
+    m.add_class::<PyResultSet>()?;
+    m.add_class::<PyResultSummary>()?;
+    m.add_class::<PyColumnMetadata>()?;
+    m.add_class::<PyDoneResult>()?;
+    m.add_class::<PySqlMessage>()?;
     m.add_class::<Parameter>()?;
     m.add_class::<Parameters>()?;
     m.add_class::<PyPoolConfig>()?;
@@ -116,6 +127,10 @@ fn fastmssql(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add("TlsError", py.get_type::<TlsError>())?;
         m.add("ProtocolError", py.get_type::<ProtocolError>())?;
         m.add("ConversionError", py.get_type::<ConversionError>())?;
+        m.add(
+            "_ResultReceiveCancelled",
+            py.get_type::<types::ResultReceiveCancelled>(),
+        )?;
     }
 
     m.add_function(wrap_pyfunction!(version, m)?)?;

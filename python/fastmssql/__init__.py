@@ -4,6 +4,8 @@ High-performance Rust-backed Python driver for SQL Server with async/await suppo
 connection pooling, SSL/TLS encryption, Azure Active Directory authentication, and parameterized queries.
 """
 
+import asyncio
+
 # Import from the compiled Rust module
 from .fastmssql import (
     Connection as _RustConnection,
@@ -14,7 +16,9 @@ from .fastmssql import (
     CommitOutcomeUnknown,
     ConnectionLifecycleError,
     ConnectionLifecycleState,
+    ColumnMetadata,
     ConversionError,
+    DoneResult,
     SqlConnectionError,
     EncryptionLevel,
     FastRow,
@@ -26,12 +30,17 @@ from .fastmssql import (
     OperationTimeoutError,
     ProtocolError,
     QueryStream,
+    ResultSet,
+    ResultStream,
+    ResultSummary,
     SqlError,
     SslConfig,
     ShutdownTimeoutError,
+    SqlMessage,
     TlsError,
     TimeoutConfig,
     TypedNull,
+    _ResultReceiveCancelled,
     version,
 )
 from .fastmssql import (
@@ -39,6 +48,37 @@ from .fastmssql import (
 )
 
 from enum import StrEnum
+
+
+async def _await_result_stream_receive(awaitable, cancellation):
+    """Preserve receive state until Rust acknowledges Python cancellation."""
+    try:
+        return await asyncio.shield(awaitable)
+    except asyncio.CancelledError as cancelled:
+        cancellation.cancel()
+        while True:
+            try:
+                await asyncio.shield(awaitable)
+            except _ResultReceiveCancelled:
+                break
+            except asyncio.CancelledError as repeated_cancel:
+                if awaitable.cancelled():
+                    cancelled.__cause__ = repeated_cancel
+                    break
+            except BaseException as cleanup_error:
+                cancelled.__cause__ = cleanup_error
+                break
+            else:
+                break
+        raise cancelled
+    finally:
+        cancellation.disarm()
+
+
+def _observe_result_stream_receive(awaitable):
+    """Mark completion observed without changing what an awaiter receives."""
+    if not awaitable.cancelled():
+        awaitable.exception()
 
 
 class ApplicationIntent(StrEnum):
@@ -85,6 +125,26 @@ class Connection:
         This performs no network I/O. Use ``ping()`` for SQL Server readiness.
         """
         return await self._conn.is_connected()
+
+    async def stream(self, sql, params=None, *, buffer_size=64):
+        """Stream all result sets with bounded true-async backpressure."""
+        return await self._conn.stream(
+            sql,
+            params,
+            buffer_size=buffer_size,
+        )
+
+    async def batch(self, sql, *, buffer_size=64):
+        """Stream every result set from an unparameterized SQL batch."""
+        return await self._conn.batch(sql, buffer_size=buffer_size)
+
+    async def callproc(self, procedure, params=None, *, buffer_size=64):
+        """Call a named procedure by direct RPC and stream all results."""
+        return await self._conn.callproc(
+            procedure,
+            params,
+            buffer_size=buffer_size,
+        )
 
     async def __aenter__(self):
         await self._conn.__aenter__()
@@ -198,6 +258,26 @@ class Transaction:
         """Execute a SELECT query that returns rows."""
         return await self._rust_conn.query(sql, params)
 
+    async def stream(self, sql, params=None, *, buffer_size=64):
+        """Stream all result sets while retaining this transaction session."""
+        return await self._rust_conn.stream(
+            sql,
+            params,
+            buffer_size=buffer_size,
+        )
+
+    async def batch(self, sql, *, buffer_size=64):
+        """Stream an unparameterized batch on this transaction session."""
+        return await self._rust_conn.batch(sql, buffer_size=buffer_size)
+
+    async def callproc(self, procedure, params=None, *, buffer_size=64):
+        """Call a named procedure by direct RPC on this transaction."""
+        return await self._rust_conn.callproc(
+            procedure,
+            params,
+            buffer_size=buffer_size,
+        )
+
     async def execute(self, sql, params=None):
         """Execute an INSERT/UPDATE/DELETE/DDL command."""
         return await self._rust_conn.execute(sql, params)
@@ -301,7 +381,9 @@ __all__ = [
     "Connection",
     "ConnectionLifecycleError",
     "ConnectionLifecycleState",
+    "ColumnMetadata",
     "ConversionError",
+    "DoneResult",
     "SqlConnectionError",
     "EncryptionLevel",
     "FastRow",
@@ -313,9 +395,13 @@ __all__ = [
     "OperationTimeoutError",
     "ProtocolError",
     "QueryStream",
+    "ResultSet",
+    "ResultStream",
+    "ResultSummary",
     "SqlError",
     "SslConfig",
     "ShutdownTimeoutError",
+    "SqlMessage",
     "TlsError",
     "TimeoutConfig",
     "Transaction",

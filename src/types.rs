@@ -27,6 +27,7 @@ create_exception!(crate::fastmssql, CommitOutcomeUnknown, PyException);
 create_exception!(crate::fastmssql, TlsError, PyException);
 create_exception!(crate::fastmssql, ProtocolError, PyException);
 create_exception!(crate::fastmssql, ConversionError, PyException);
+create_exception!(crate::fastmssql, ResultReceiveCancelled, PyException);
 
 const UNKNOWN_COMMIT_MESSAGE: &str =
     "COMMIT completion was not confirmed; the transaction outcome is unknown";
@@ -176,6 +177,9 @@ fn is_tls_io_failure(message: &str) -> bool {
         || lower.contains("unknown issuer")
 }
 
+const DRIVER_METADATA_DECODE_ERROR: &str =
+    "SQL Server driver could not decode SQL Server result metadata";
+
 pub fn create_sql_error(err: TError, base: &'static str) -> PyErr {
     match err {
         TError::Server(s) => {
@@ -220,6 +224,11 @@ pub fn create_sql_error(err: TError, base: &'static str) -> PyErr {
         }
         TError::Protocol(msg) => {
             let message = msg.into_owned();
+            if let Some(column_type) = message.strip_prefix("unsupported column type: ") {
+                return create_protocol_error(format!(
+                    "{DRIVER_METADATA_DECODE_ERROR}: {column_type}"
+                ));
+            }
             Python::attach(|py| {
                 let exc = ProtocolError::new_err(format!("{base}: {message}"));
                 let _ = exc.value(py).setattr("message", message.as_str());
@@ -306,9 +315,9 @@ pub(crate) fn create_parameter_conversion_error(
 
 #[cfg(test)]
 mod error_classification_tests {
-    use super::{ConversionError, create_sql_error, is_tls_io_failure};
+    use super::{ConversionError, ProtocolError, create_sql_error, is_tls_io_failure};
     use pyo3::Python;
-    use pyo3::types::PyAnyMethods;
+    use pyo3::types::{PyAnyMethods, PyStringMethods};
     use tiberius::error::Error as TError;
 
     #[test]
@@ -392,6 +401,34 @@ mod error_classification_tests {
             );
         });
     }
+
+    #[test]
+    fn unsupported_driver_metadata_keeps_the_stable_python_contract() {
+        Python::initialize();
+        let error = create_sql_error(
+            TError::Protocol("unsupported column type: SSVariant".into()),
+            "Query execution failed",
+        );
+
+        Python::attach(|py| {
+            assert!(error.is_instance_of::<ProtocolError>(py));
+            let value = error.value(py);
+            let rendered_value = value.str().unwrap();
+            let rendered = rendered_value.to_str().unwrap();
+            assert!(
+                rendered
+                    .starts_with("SQL Server driver could not decode SQL Server result metadata")
+            );
+            assert_eq!(
+                value
+                    .getattr("message")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "SQL Server driver could not decode SQL Server result metadata: SSVariant"
+            );
+        });
+    }
 }
 
 /// Memory-optimized to share column metadata across all rows in a result set.
@@ -405,6 +442,31 @@ pub struct ColumnInfo {
     pub map: HashMap<String, usize>,
     /// Cached column types (one per column) to avoid repeated lookups during value conversion
     pub column_types: Vec<ColumnType>,
+}
+
+impl ColumnInfo {
+    /// Build shared row-conversion metadata directly from TDS COLMETADATA.
+    ///
+    /// Bounded result streams must expose empty result sets, so their metadata
+    /// cannot depend on observing a first row.
+    pub(crate) fn from_response_columns(columns: &[tiberius::ResponseColumn]) -> Arc<Self> {
+        let mut names = Vec::with_capacity(columns.len());
+        let mut column_types = Vec::with_capacity(columns.len());
+        let mut map = HashMap::with_capacity(columns.len());
+
+        for (index, column) in columns.iter().enumerate() {
+            let name = column.name().to_owned();
+            map.insert(name.clone(), index);
+            names.push(name);
+            column_types.push(column.column_type());
+        }
+
+        Arc::new(Self {
+            names,
+            map,
+            column_types,
+        })
+    }
 }
 
 /// Memory-optimized to share column metadata across all rows in a result set.
@@ -432,33 +494,26 @@ impl PyFastRow {
         let num_columns = column_info.names.len();
         let mut values = Vec::with_capacity(num_columns);
 
-        // Eagerly convert all values in column order using cached column types
-        for i in 0..num_columns {
+        // Eagerly convert all values in column order using the same raw
+        // ColumnData converter used by stored-procedure output values.
+        for (index, (_, value)) in row.cells().enumerate() {
             let col_type = column_info
                 .column_types
-                .get(i)
+                .get(index)
                 .copied()
                 .ok_or_else(|| PyValueError::new_err("Column type not found"))?;
-            let value = Self::extract_value_direct(&row, i, col_type, py)?;
-            values.push(value);
+            values.push(type_mapping::column_data_to_python(value, col_type, py)?);
+        }
+        if values.len() != num_columns {
+            return Err(PyValueError::new_err(
+                "SQL Server row value count did not match column metadata",
+            ));
         }
 
         Ok(PyFastRow {
             values,
             column_info,
         })
-    }
-
-    /// Convert value directly from Tiberius to Python using centralized type mapping
-    /// Uses cached column type to avoid repeated lookups
-    #[inline]
-    fn extract_value_direct(
-        row: &Row,
-        index: usize,
-        col_type: ColumnType,
-        py: Python,
-    ) -> PyResult<Py<PyAny>> {
-        type_mapping::sql_to_python(row, index, col_type, py)
     }
 }
 
@@ -566,9 +621,9 @@ fn build_column_info(first_row: &Row) -> Arc<ColumnInfo> {
     })
 }
 
-/// A streaming wrapper around a Tiberius QueryStream
-/// Implements async iteration to fetch rows one at a time
-/// Lazy conversion: stores raw rows, converts to Python on-demand, caches for reset()
+/// A synchronous compatibility wrapper around a buffered first result set.
+/// Rows are fetched from SQL Server before this object is returned; Python
+/// conversion remains lazy and is cached for reset and replay.
 #[pyclass(name = "QueryStream")]
 pub struct PyQueryStream {
     // Store raw Tiberius rows in Option (Row doesn't impl Clone, so we take() on first access)

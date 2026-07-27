@@ -104,6 +104,31 @@ def test_sql_auth_runner_uses_locked_cargo_tests() -> None:
     assert "record cargo-test cargo test\n" not in runner
 
 
+def test_hosted_gate_runs_database_independent_vendored_tests() -> None:
+    workflow = _read_required(WORKFLOW)
+    normalized_workflow = " ".join(workflow.replace("\\", " ").split())
+    vendored_unit_gate = (
+        "cargo test --manifest-path vendor/tiberius/Cargo.toml "
+        "--no-default-features --features chrono,tds73,rustls --lib"
+    )
+    response_api_gate = (
+        "cargo test --manifest-path vendor/tiberius/Cargo.toml "
+        "--no-default-features --features chrono,tds73,rustls "
+        "--test response_api"
+    )
+
+    assert normalized_workflow.count(vendored_unit_gate) == 1
+    assert normalized_workflow.count(response_api_gate) == 1
+    assert "token_safety_sql_auth" not in workflow
+    assert "response_events_sql_auth" not in workflow
+    assert workflow.index("cargo test --locked") < workflow.index(
+        "--manifest-path vendor/tiberius/Cargo.toml"
+    )
+    assert normalized_workflow.index(vendored_unit_gate) < normalized_workflow.index(
+        response_api_gate
+    )
+
+
 def test_hosted_gate_builds_extension_and_checks_configuration_contracts() -> None:
     workflow = _read_required(WORKFLOW)
 
@@ -117,7 +142,8 @@ def test_hosted_gate_builds_extension_and_checks_configuration_contracts() -> No
         "tests/test_timeout_config_contract.py "
         "tests/test_lifecycle_contract.py "
         "tests/test_pool_observability_contract.py "
-        "tests/test_operation_metrics_contract.py -q"
+        "tests/test_operation_metrics_contract.py "
+        "tests/test_result_stream_contract.py -q"
         in normalized_workflow
     )
     assert (
@@ -129,4 +155,7 @@ def test_hosted_gate_builds_extension_and_checks_configuration_contracts() -> No
     )
     assert workflow.index("uv pip install") < workflow.index(
         "tests/test_pool_config_default_contract.py"
+    )
+    assert workflow.index("tests/test_operation_metrics_contract.py") < (
+        workflow.index("tests/test_result_stream_contract.py")
     )

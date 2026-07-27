@@ -1,7 +1,7 @@
 use crate::SqlReadBytes;
+use std::fmt;
 
 #[allow(dead_code)] // we might want to debug the values
-#[derive(Debug)]
 pub struct TokenInfo {
     /// info number
     pub(crate) number: u32,
@@ -13,6 +13,20 @@ pub struct TokenInfo {
     pub(crate) server: String,
     pub(crate) procedure: String,
     pub(crate) line: u32,
+}
+
+impl fmt::Debug for TokenInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TokenInfo")
+            .field("number", &self.number)
+            .field("state", &self.state)
+            .field("class", &self.class)
+            .field("message", &"<redacted>")
+            .field("server", &"<redacted>")
+            .field("procedure", &"<redacted>")
+            .field("line", &self.line)
+            .finish()
+    }
 }
 
 impl TokenInfo {

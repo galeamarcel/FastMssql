@@ -427,7 +427,7 @@ evidence reference.
 - `TYPE-017`: unsupported SQL_VARIANT/spatial/hierarchyid/UDT behavior is
   explicit rather than silently converted to a wrong value.
 
-### RESULT — `FastRow` and `QueryStream`
+### RESULT — `FastRow`, buffered `QueryStream`, and bounded `ResultStream`
 
 - `RESULT-001`: row access by valid name and index.
 - `RESULT-002`: negative and out-of-range row indices.
@@ -444,6 +444,75 @@ evidence reference.
 - `RESULT-013`: empty result methods.
 - `RESULT-014`: documented sync versus async iterator behavior matches runtime.
 - `RESULT-015`: lazy-conversion and memory claims are measured, not inferred.
+- `RESULT-016`: three result sets are streamed in exact wire order.
+- `RESULT-017`: an empty middle result set retains exact declared metadata,
+  including Unicode code-unit lengths, byte lengths, MAX, precision, and
+  temporal scale.
+- `RESULT-018`: outer `ResultStream` and inner `ResultSet` iteration are
+  genuinely asynchronous; normal and early context exits preserve their
+  distinct completion contracts.
+- `RESULT-019`: a fixed-payload slow consumer proves the configured event
+  bound and records baseline, peak, final, and ceiling RSS without claiming
+  byte-chunked LOB streaming.
+- `RESULT-020`: ordinary EOF returns a resettable size-one pool lease, while
+  successfully drained security-context SQL returns its results and retires
+  the physical session before the next smoke query.
+- `RESULT-021`: `ResultSet.aclose()` skips only the active set, preserves an
+  empty following set, and reaches the terminal summary.
+- `RESULT-022`: complete `ResultStream.aclose()` waits for physical-session
+  retirement, returns the pool's active count to zero, and permits a clean
+  checkout on a different connection identity.
+- `RESULT-023`: dropping either an open `ResultStream` or its active
+  `ResultSet` cancels the complete response, eventually retires its physical
+  session, and leaves the pool usable.
+- `RESULT-024`: cancellation of a pending outer or inner `__anext__` does not
+  lose the unconsumed event; queued nonfatal SQL errors reset and reuse the
+  synchronized session, while post-wire conversion uncertainty retires it
+  with stable terminal classification.
+- `RESULT-025`: concurrent consumers and invalid buffer sizes fail locally,
+  deterministically, and without exposing SQL text.
+- `RESULT-026`: graceful disconnect waits for a live response to finish,
+  while an expired shutdown budget force-cancels the producer, retires its
+  session, and reports exact typed lifecycle counts.
+- `RESULT-027`: pooled and direct transaction streams own the session for the
+  complete response; normal EOF and per-set close preserve the transaction,
+  while response retirement, close, or drop fails the transaction and rolls
+  back its open SQL transaction.
+- `RESULT-028`: DONE records, valid zero row counts, and informational
+  messages remain distinct from result rows.
+- `RESULT-029`: fresh SHA-bound evidence proves 1,000 exactly-once bounded
+  streams at concurrency 64 and pool size 8, with latency, pool, RSS,
+  process-CPU, SQL-session-CPU, event-loop, and post-load smoke invariants.
+- `RESULT-031`: queued metadata and rows retain their lease until successful
+  consumer acknowledgement; a full queue cannot block timeout release, and
+  conversion failure after server EOF retires rather than reuses the
+  connection.
+
+### RPC — direct stored procedures, output values, and return status
+
+- `RPC-001`: a direct named procedure with no parameters preserves its exact
+  signed nonzero return status without constructing an `EXEC` SQL string.
+- `RPC-002`: positional INPUT, OUTPUT, and INPUT_OUTPUT integers round-trip,
+  and output mappings are fresh snapshots keyed by original descriptor index.
+- `RPC-003`: Unicode, binary, decimal, UUID, date, time, DATETIME2, and
+  DATETIMEOFFSET outputs preserve exact Python values and types.
+- `RPC-004`: multiple and empty result sets remain in wire order before the
+  terminal output mapping and return status become available.
+- `RPC-005`: reordered NVARCHAR(MAX) and VARBINARY(MAX) output tokens match
+  their original validated names and positional ordinals, never arrival order.
+- `RPC-006`: return status zero remains an integer distinct from an absent
+  status, and an explicit RETURN_VALUE descriptor receives the same value.
+- `RPC-007`: nonfatal SQL errors, cancelled receives, and complete early close
+  each apply their exact reset-or-retire connection disposition.
+- `RPC-008`: positional/named modes, direction rules, parameter count, and
+  procedure/parameter identifier grammars are deterministic, injection-safe,
+  value-free, and validated before pool checkout.
+- `RPC-009`: pooled connection, pooled transaction, and direct compatibility
+  transaction paths preserve identical result/output/status behavior.
+- `RPC-010`: concurrent direct RPC calls preserve independent outputs without
+  exceeding the configured physical pool/session bound.
+- `RPC-011`: a recycled physical session returns to READ COMMITTED before a
+  named RPC; punctuation-bearing procedure input is rejected before checkout.
 
 ### BATCH — query batch, execute batch, and bulk insert
 

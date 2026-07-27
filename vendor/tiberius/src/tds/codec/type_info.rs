@@ -288,6 +288,10 @@ impl TypeInfo {
                     size: 0xfffffffffffffffe_usize,
                 })
             }
+            Ok(VarLenType::Udt) => Err(Error::Protocol("unsupported column type: Udt".into())),
+            Ok(VarLenType::SSVariant) => {
+                Err(Error::Protocol("unsupported column type: SSVariant".into()))
+            }
             Ok(ty) => {
                 let len = match ty {
                     #[cfg(feature = "tds73")]
@@ -313,7 +317,11 @@ impl TypeInfo {
                     VarLenType::Image | VarLenType::Text | VarLenType::NText => {
                         src.read_u32_le().await? as usize
                     }
-                    _ => todo!("not yet implemented for {:?}", ty),
+                    VarLenType::Xml | VarLenType::Udt | VarLenType::SSVariant => {
+                        return Err(Error::Protocol(
+                            format!("unsupported column type: {:?}", ty).into(),
+                        ))
+                    }
                 };
 
                 let collation = match ty {
@@ -394,5 +402,27 @@ mod tests {
 
             assert_eq!(nti, ti)
         }
+    }
+
+    #[tokio::test]
+    async fn tib_safe_003_sql_variant_type_info_is_typed_error() {
+        let mut source = BytesMut::from(&[VarLenType::SSVariant as u8][..]).into_sql_read_bytes();
+
+        let error = TypeInfo::decode(&mut source)
+            .await
+            .expect_err("SQL_VARIANT metadata must be rejected");
+
+        assert!(matches!(error, Error::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn tib_safe_003_udt_type_info_is_typed_error() {
+        let mut source = BytesMut::from(&[VarLenType::Udt as u8][..]).into_sql_read_bytes();
+
+        let error = TypeInfo::decode(&mut source)
+            .await
+            .expect_err("UDT metadata must be rejected");
+
+        assert!(matches!(error, Error::Protocol(_)));
     }
 }

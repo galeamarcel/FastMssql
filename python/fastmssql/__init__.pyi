@@ -1,8 +1,9 @@
 """Type stubs for FastMSSQL wrapper classes.
 
 The re-exported ``Parameter`` surface includes closed SQL declarations,
-canonical metadata, typed NULL handling, bounded expansion, and INPUT-only
-execution semantics for the currently modeled direction field.
+canonical metadata, typed NULL handling, and bounded expansion. ``callproc``
+supports INPUT, OUTPUT, INPUT_OUTPUT, and RETURN_VALUE descriptors; ordinary
+query execution accepts INPUT descriptors.
 """
 
 from typing import Any, Coroutine, Dict, List, Literal, Optional, StrEnum, Tuple, TypedDict
@@ -10,9 +11,11 @@ from .fastmssql import (
     AzureCredential,
     AzureCredentialType,
     CommitOutcomeUnknown,
+    ColumnMetadata,
     ConnectionLifecycleError,
     ConnectionLifecycleState,
     ConversionError,
+    DoneResult,
     EncryptionLevel,
     FastRow,
     Parameter,
@@ -22,10 +25,14 @@ from .fastmssql import (
     PoolConfig,
     ProtocolError,
     QueryStream,
+    ResultSet,
+    ResultStream,
+    ResultSummary,
     SqlConnectionError,
     SqlError,
     SslConfig,
     ShutdownTimeoutError,
+    SqlMessage,
     TlsError,
     TimeoutConfig,
     TypedNull,
@@ -206,9 +213,8 @@ class Connection:
         params: Optional[List[Any]] = None,
     ) -> Coroutine[Any, Any, QueryStream]:
         """
-        Execute SELECT query that returns rows as an async stream.
-
-        Returns a QueryStream for memory-efficient iteration over large result sets.
+        Execute SELECT and return the buffered first result set for synchronous
+        compatibility iteration after awaiting this method.
 
         Args:
             sql: SQL query with @P1, @P2, etc. placeholders for parameters
@@ -218,16 +224,38 @@ class Connection:
         """
         ...
 
+    async def stream(
+        self,
+        sql: str,
+        params: list[Any] | Parameters | None = None,
+        *,
+        buffer_size: int = 64,
+    ) -> ResultStream: ...
+
+    async def batch(
+        self,
+        sql: str,
+        *,
+        buffer_size: int = 64,
+    ) -> ResultStream: ...
+
+    async def callproc(
+        self,
+        procedure: str,
+        params: list[Any] | Parameters | None = None,
+        *,
+        buffer_size: int = 64,
+    ) -> ResultStream: ...
+
     def simple_query(
         self,
         sql: str,
     ) -> Coroutine[Any, Any, QueryStream]:
         """
-        Execute a raw SQL query (non-prepared statement) that returns rows as an async stream.
+        Execute raw SQL and return the buffered first result set for
+        synchronous compatibility iteration after awaiting this method.
 
         Only use this when required (creating stored procedures may require this in certain cases)
-
-        Returns a QueryStream for memory-efficient iteration over large result sets.
 
         Args:
             sql: Raw SQL query
@@ -394,7 +422,36 @@ class Transaction:
         sql: str,
         params: Optional[List[Any]] = None,
     ) -> Coroutine[Any, Any, QueryStream]:
-        """Execute a SELECT query that returns rows."""
+        """Return the buffered first result set for synchronous iteration."""
+        ...
+
+    async def stream(
+        self,
+        sql: str,
+        params: list[Any] | Parameters | None = None,
+        *,
+        buffer_size: int = 64,
+    ) -> ResultStream:
+        """Stream every result set while retaining this transaction session."""
+        ...
+
+    async def batch(
+        self,
+        sql: str,
+        *,
+        buffer_size: int = 64,
+    ) -> ResultStream:
+        """Stream an unparameterized batch on this transaction session."""
+        ...
+
+    async def callproc(
+        self,
+        procedure: str,
+        params: list[Any] | Parameters | None = None,
+        *,
+        buffer_size: int = 64,
+    ) -> ResultStream:
+        """Call a named procedure by direct RPC on this transaction."""
         ...
 
     def execute(
@@ -424,7 +481,8 @@ class Transaction:
         sql: str,
     ) -> Coroutine[Any, Any, QueryStream]:
         """
-        Execute a raw (non-prepared) SQL query and return a QueryStream.
+        Execute raw SQL and return the buffered first result set for
+        synchronous compatibility iteration after awaiting this method.
 
         Only use this when required (creating stored procedures may require this in certain cases)
         """
@@ -467,8 +525,10 @@ __all__ = [
     "Connection",
     "ConnectionLifecycleError",
     "ConnectionLifecycleState",
+    "ColumnMetadata",
     "EncryptionLevel",
     "FastRow",
+    "DoneResult",
     "Parameter",
     "Parameters",
     "OperationTimeoutError",
@@ -477,10 +537,14 @@ __all__ = [
     "PoolConfig",
     "ProtocolError",
     "QueryStream",
+    "ResultSet",
+    "ResultStream",
+    "ResultSummary",
     "SqlConnectionError",
     "SqlError",
     "SslConfig",
     "ShutdownTimeoutError",
+    "SqlMessage",
     "TlsError",
     "TimeoutConfig",
     "Transaction",

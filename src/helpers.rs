@@ -12,9 +12,9 @@ type SqlClient = Client<Compat<TcpStream>>;
 
 /// Convert panics in the SQL Server driver into a stable Python exception.
 ///
-/// Tiberius 0.12 still uses `todo!()` for metadata belonging to SQL_VARIANT
-/// and UDT-backed SQL Server types. A query supplied by an application must
-/// never leak that dependency panic through the Python API.
+/// The vendored decoder maps its known SQL_VARIANT and UDT metadata paths to
+/// typed errors. Keep this boundary as defence in depth: no other dependency
+/// decoder panic may unwind through the Python API.
 pub async fn catch_driver_panic<F, T>(future: F) -> Result<T, PyErr>
 where
     F: Future<Output = T>,

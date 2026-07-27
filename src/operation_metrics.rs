@@ -334,6 +334,57 @@ struct OperationGuard {
     armed: bool,
 }
 
+/// A movable operation observation that may outlive the Python method which
+/// created it.
+///
+/// Result-stream producers keep this observer until the complete TDS
+/// response has released or retired its physical connection. Dropping an
+/// unfinished observer records one cancellation.
+pub(crate) struct OperationObserver {
+    guard: Option<OperationGuard>,
+}
+
+impl OperationObserver {
+    pub(crate) fn start(
+        metrics: Option<Arc<OperationMetricsRegistry>>,
+        operation: OperationName,
+    ) -> Self {
+        let guard = metrics.and_then(|registry| {
+            metric_index(operation).map(|operation_index| {
+                OperationGuard::start(registry, operation_index, Instant::now())
+            })
+        });
+        Self { guard }
+    }
+
+    fn finish(mut self, outcome: OperationOutcome) {
+        if let Some(guard) = self.guard.take() {
+            let elapsed = guard.elapsed();
+            guard.finish(outcome, elapsed);
+        }
+    }
+
+    pub(crate) fn success(self) {
+        self.finish(OperationOutcome::Succeeded);
+    }
+
+    pub(crate) fn error(self, error: &PyErr) {
+        self.finish(classify_error(error));
+    }
+
+    pub(crate) fn cancel(mut self) {
+        // Taking and dropping the still-armed guard records cancellation.
+        drop(self.guard.take());
+    }
+
+    pub(crate) fn finish_result<T>(self, result: &PyResult<T>) {
+        match result {
+            Ok(_) => self.success(),
+            Err(error) => self.error(error),
+        }
+    }
+}
+
 impl OperationGuard {
     fn start(
         registry: Arc<OperationMetricsRegistry>,
@@ -370,10 +421,7 @@ impl Drop for OperationGuard {
     }
 }
 
-fn classify_result<T>(result: &PyResult<T>) -> OperationOutcome {
-    let Err(error) = result else {
-        return OperationOutcome::Succeeded;
-    };
+fn classify_error(error: &PyErr) -> OperationOutcome {
     Python::attach(|py| {
         if error.is_instance_of::<CommitOutcomeUnknown>(py) {
             OperationOutcome::OutcomeUnknown
@@ -387,6 +435,14 @@ fn classify_result<T>(result: &PyResult<T>) -> OperationOutcome {
     })
 }
 
+#[cfg(test)]
+fn classify_result<T>(result: &PyResult<T>) -> OperationOutcome {
+    match result {
+        Ok(_) => OperationOutcome::Succeeded,
+        Err(error) => classify_error(error),
+    }
+}
+
 pub(crate) async fn observe_operation<F, T>(
     metrics: Option<Arc<OperationMetricsRegistry>>,
     operation: OperationName,
@@ -395,21 +451,10 @@ pub(crate) async fn observe_operation<F, T>(
 where
     F: Future<Output = PyResult<T>>,
 {
-    match metrics {
-        None => future.await,
-        Some(registry) => {
-            let Some(operation_index) = metric_index(operation) else {
-                return future.await;
-            };
-            let started_at = Instant::now();
-            let guard = OperationGuard::start(registry, operation_index, started_at);
-            let result = future.await;
-            let elapsed = guard.elapsed();
-            let outcome = classify_result(&result);
-            guard.finish(outcome, elapsed);
-            result
-        }
-    }
+    let observer = OperationObserver::start(metrics, operation);
+    let result = future.await;
+    observer.finish_result(&result);
+    result
 }
 
 #[cfg(test)]

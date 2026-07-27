@@ -280,10 +280,23 @@ def test_wrapper_stub_publishes_exact_operation_metrics_contract() -> None:
 def test_disabled_branch_precedes_clock_and_atomic_recording() -> None:
     assert RUST_METRICS.is_file(), "missing src/operation_metrics.rs"
     source = RUST_METRICS.read_text(encoding="utf-8")
-    observer = source.index("pub(crate) async fn observe_operation")
-    disabled = source.index("None => future.await", observer)
-    clock = source.index("Instant::now()", observer)
-    assert disabled < clock
+    observer_impl = source.index("impl OperationObserver")
+    observer_start = source.index("pub(crate) fn start(", observer_impl)
+    disabled_gate = source.index(
+        "let guard = metrics.and_then(|registry| {",
+        observer_start,
+    )
+    clock = source.index("Instant::now()", disabled_gate)
+    observer_finish = source.index("    fn finish(", observer_start)
+    assert disabled_gate < clock < observer_finish
+
+    observe_operation = source.index(
+        "pub(crate) async fn observe_operation"
+    )
+    assert (
+        "OperationObserver::start(metrics, operation)"
+        in source[observe_operation:]
+    )
     assert "Python callback" not in source
     assert "opentelemetry" not in source.lower()
 

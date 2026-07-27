@@ -8,7 +8,7 @@ use crate::{
     Error, SqlReadBytes, TokenType,
 };
 use futures_util::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite},
     stream::{BoxStream, TryStreamExt},
 };
 use std::{convert::TryFrom, sync::Arc};
@@ -22,7 +22,7 @@ pub enum ReceivedToken {
     Done(TokenDone),
     DoneInProc(TokenDone),
     DoneProc(TokenDone),
-    ReturnStatus(u32),
+    ReturnStatus(i32),
     ReturnValue(TokenReturnValue),
     Order(TokenOrder),
     EnvChange(TokenEnvChange),
@@ -31,11 +31,30 @@ pub enum ReceivedToken {
     Sspi(TokenSspi),
     FeatureExtAck(TokenFeatureExtAck),
     Error(TokenError),
+    TableName(usize),
+    ColInfo(usize),
 }
 
 pub(crate) struct TokenStream<'a, S: AsyncRead + AsyncWrite + Unpin + Send> {
     conn: &'a mut Connection<S>,
     last_error: Option<Error>,
+}
+
+async fn consume_ushort_payload<R>(src: &mut R) -> crate::Result<usize>
+where
+    R: SqlReadBytes + Unpin,
+{
+    let byte_len = src.read_u16_le().await? as usize;
+    let mut remaining = byte_len;
+    let mut discard = [0_u8; 1024];
+
+    while remaining > 0 {
+        let chunk_len = remaining.min(discard.len());
+        src.read_exact(&mut discard[..chunk_len]).await?;
+        remaining -= chunk_len;
+    }
+
+    Ok(byte_len)
 }
 
 impl<'a, S> TokenStream<'a, S>
@@ -101,7 +120,11 @@ where
         let meta = Arc::new(TokenColMetaData::decode(self.conn).await?);
         self.conn.context_mut().set_last_meta(meta.clone());
 
-        event!(Level::TRACE, ?meta);
+        event!(
+            Level::TRACE,
+            token = "COLMETADATA",
+            column_count = meta.columns.len()
+        );
 
         Ok(ReceivedToken::NewResultset(meta))
     }
@@ -109,25 +132,38 @@ where
     async fn get_row(&mut self) -> crate::Result<ReceivedToken> {
         let return_value = TokenRow::decode(self.conn).await?;
 
-        event!(Level::TRACE, message = ?return_value);
+        event!(
+            Level::TRACE,
+            token = "ROW",
+            column_count = return_value.len()
+        );
         Ok(ReceivedToken::Row(return_value))
     }
 
     async fn get_nbc_row(&mut self) -> crate::Result<ReceivedToken> {
         let return_value = TokenRow::decode_nbc(self.conn).await?;
 
-        event!(Level::TRACE, message = ?return_value);
+        event!(
+            Level::TRACE,
+            token = "NBCROW",
+            column_count = return_value.len()
+        );
         Ok(ReceivedToken::Row(return_value))
     }
 
     async fn get_return_value(&mut self) -> crate::Result<ReceivedToken> {
         let return_value = TokenReturnValue::decode(self.conn).await?;
-        event!(Level::TRACE, message = ?return_value);
+        event!(
+            Level::TRACE,
+            token = "RETURNVALUE",
+            ordinal = return_value.param_ordinal
+        );
         Ok(ReceivedToken::ReturnValue(return_value))
     }
 
     async fn get_return_status(&mut self) -> crate::Result<ReceivedToken> {
-        let status = self.conn.read_u32_le().await?;
+        let status = self.conn.read_i32_le().await?;
+        event!(Level::TRACE, token = "RETURNSTATUS");
         Ok(ReceivedToken::ReturnStatus(status))
     }
 
@@ -138,31 +174,41 @@ where
             self.last_error = Some(Error::Server(err.clone()));
         }
 
-        event!(Level::ERROR, message = %err.message, code = err.code);
+        event!(
+            Level::ERROR,
+            token = "ERROR",
+            number = err.code,
+            state = err.state,
+            severity = err.class
+        );
         Ok(ReceivedToken::Error(err))
     }
 
     async fn get_order(&mut self) -> crate::Result<ReceivedToken> {
         let order = TokenOrder::decode(self.conn).await?;
-        event!(Level::TRACE, message = ?order);
+        event!(
+            Level::TRACE,
+            token = "ORDER",
+            column_count = order.column_indexes.len()
+        );
         Ok(ReceivedToken::Order(order))
     }
 
     async fn get_done_value(&mut self) -> crate::Result<ReceivedToken> {
         let done = TokenDone::decode(self.conn).await?;
-        event!(Level::TRACE, "{}", done);
+        event!(Level::TRACE, token = "DONE");
         Ok(ReceivedToken::Done(done))
     }
 
     async fn get_done_proc_value(&mut self) -> crate::Result<ReceivedToken> {
         let done = TokenDone::decode(self.conn).await?;
-        event!(Level::TRACE, "{}", done);
+        event!(Level::TRACE, token = "DONEPROC");
         Ok(ReceivedToken::DoneProc(done))
     }
 
     async fn get_done_in_proc_value(&mut self) -> crate::Result<ReceivedToken> {
         let done = TokenDone::decode(self.conn).await?;
-        event!(Level::TRACE, "{}", done);
+        event!(Level::TRACE, token = "DONEINPROC");
         Ok(ReceivedToken::DoneInProc(done))
     }
 
@@ -187,20 +233,31 @@ where
             _ => (),
         }
 
-        event!(Level::INFO, "{}", change);
+        event!(Level::INFO, token = "ENVCHANGE");
 
         Ok(ReceivedToken::EnvChange(change))
     }
 
     async fn get_info(&mut self) -> crate::Result<ReceivedToken> {
         let info = TokenInfo::decode(self.conn).await?;
-        event!(Level::INFO, "{}", info.message);
+        event!(
+            Level::INFO,
+            token = "INFO",
+            number = info.number,
+            state = info.state,
+            severity = info.class
+        );
         Ok(ReceivedToken::Info(info))
     }
 
     async fn get_login_ack(&mut self) -> crate::Result<ReceivedToken> {
         let ack = TokenLoginAck::decode(self.conn).await?;
-        event!(Level::INFO, "{} version {}", ack.prog_name, ack.version);
+        event!(
+            Level::INFO,
+            token = "LOGINACK",
+            interface = ack.interface,
+            version = ack.version
+        );
         Ok(ReceivedToken::LoginAck(ack))
     }
 
@@ -251,17 +308,81 @@ where
                 TokenType::ReturnValue => this.get_return_value().await?,
                 TokenType::Error => this.get_error().await?,
                 TokenType::Order => this.get_order().await?,
+                TokenType::TableName => {
+                    let byte_len = consume_ushort_payload(this.conn).await?;
+                    event!(Level::TRACE, token = "TABNAME", byte_len = byte_len);
+                    ReceivedToken::TableName(byte_len)
+                }
+                TokenType::ColInfo => {
+                    let byte_len = consume_ushort_payload(this.conn).await?;
+                    event!(Level::TRACE, token = "COLINFO", byte_len = byte_len);
+                    ReceivedToken::ColInfo(byte_len)
+                }
                 TokenType::EnvChange => this.get_env_change().await?,
                 TokenType::Info => this.get_info().await?,
                 TokenType::LoginAck => this.get_login_ack().await?,
                 TokenType::Sspi => this.get_sspi().await?,
                 TokenType::FeatureExtAck => this.get_feature_ext_ack().await?,
-                _ => panic!("Token {:?} unimplemented!", ty),
             };
 
             Ok(Some((token, this)))
         });
 
         Box::pin(stream)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::IoErrorKind;
+    use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
+    use bytes::BytesMut;
+
+    #[tokio::test]
+    async fn tib_safe_003_tabname_payload_preserves_the_next_token() {
+        let mut source = BytesMut::from(&[3, 0, 0x11, 0x22, 0x33, 0xfd][..]).into_sql_read_bytes();
+
+        let consumed = consume_ushort_payload(&mut source)
+            .await
+            .expect("valid TABNAME payload must be consumed");
+
+        assert_eq!(consumed, 3);
+        assert_eq!(
+            source.read_u8().await.expect("next token must remain"),
+            0xfd
+        );
+    }
+
+    #[tokio::test]
+    async fn tib_safe_003_colinfo_payload_preserves_the_next_token() {
+        let mut source = BytesMut::from(&[2, 0, 0x44, 0x55, 0xd1][..]).into_sql_read_bytes();
+
+        let consumed = consume_ushort_payload(&mut source)
+            .await
+            .expect("valid COLINFO payload must be consumed");
+
+        assert_eq!(consumed, 2);
+        assert_eq!(
+            source.read_u8().await.expect("next token must remain"),
+            0xd1
+        );
+    }
+
+    #[tokio::test]
+    async fn tib_safe_003_truncated_browse_payload_is_typed_io_error() {
+        let mut source = BytesMut::from(&[3, 0, 0x11, 0x22][..]).into_sql_read_bytes();
+
+        let error = consume_ushort_payload(&mut source)
+            .await
+            .expect_err("truncated browse payload must fail");
+
+        assert!(matches!(
+            error,
+            Error::Io {
+                kind: IoErrorKind::UnexpectedEof,
+                ..
+            }
+        ));
     }
 }

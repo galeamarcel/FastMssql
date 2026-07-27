@@ -19,12 +19,12 @@ use crate::{
     result::ExecuteResult,
     tds::{
         codec::{self, IteratorJoin},
-        stream::{QueryStream, TokenStream},
+        stream::{QueryStream, ResponseStream, RpcParameter, TokenStream},
     },
     BulkLoadRequest, ColumnFlag, SqlParameterType, SqlReadBytes, ToSql,
 };
 use codec::{
-    BatchRequest, ColumnData, PacketHeader, RpcParam, RpcParameterMetadata, RpcProcId,
+    BatchRequest, ColumnData, PacketHeader, RpcParam, RpcParameterMetadata, RpcProcId, RpcStatus,
     TokenRpcRequest,
 };
 use enumflags2::BitFlags;
@@ -67,6 +67,9 @@ pub struct Client<S: AsyncRead + AsyncWrite + Unpin + Send> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
+    const RESET_ISOLATION_BASELINE: &'static str =
+        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED;\n";
+
     /// Uses an instance of [`Config`] to specify the connection
     /// options required to connect to the database using an established
     /// tcp connection
@@ -203,6 +206,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     where
         'a: 'b,
     {
+        let response = self.response_query(query, params).await?;
+        let mut result = QueryStream::new(response);
+        result.forward_to_metadata().await?;
+
+        Ok(result)
+    }
+
+    /// Executes parameterized SQL and preserves every supported response
+    /// event in wire order.
+    pub async fn response_query<'a, 'b>(
+        &'a mut self,
+        query: impl Into<Cow<'b, str>>,
+        params: &'b [&'b dyn ToSql],
+    ) -> crate::Result<ResponseStream<'a>>
+    where
+        'a: 'b,
+    {
         self.connection.flush_stream().await?;
         let query =
             Self::query_with_reset_baseline(query, self.connection.is_connection_reset_pending());
@@ -215,10 +235,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             .await?;
 
         let ts = TokenStream::new(&mut self.connection);
-        let mut result = QueryStream::new(ts.try_unfold());
-        result.forward_to_metadata().await?;
-
-        Ok(result)
+        Ok(ResponseStream::new(ts.try_unfold()))
     }
 
     /// Execute multiple queries, delimited with `;` and return multiple result
@@ -258,6 +275,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
     where
         'a: 'b,
     {
+        let response = self.response_batch(query).await?;
+        let mut result = QueryStream::new(response);
+        result.forward_to_metadata().await?;
+
+        Ok(result)
+    }
+
+    /// Executes a raw SQL batch and preserves every supported response event
+    /// in wire order.
+    pub async fn response_batch<'a, 'b>(
+        &'a mut self,
+        query: impl Into<Cow<'b, str>>,
+    ) -> crate::Result<ResponseStream<'a>>
+    where
+        'a: 'b,
+    {
         self.connection.flush_stream().await?;
         let query =
             Self::query_with_reset_baseline(query, self.connection.is_connection_reset_pending());
@@ -268,11 +301,79 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         self.connection.send(PacketHeader::batch(id), req).await?;
 
         let ts = TokenStream::new(&mut self.connection);
+        Ok(ResponseStream::new(ts.try_unfold()))
+    }
 
-        let mut result = QueryStream::new(ts.try_unfold());
-        result.forward_to_metadata().await?;
+    /// Executes a stored procedure through a direct named RPC request and
+    /// preserves every supported response event in wire order.
+    pub async fn response_rpc<'a>(
+        &'a mut self,
+        procedure: String,
+        params: Vec<RpcParameter>,
+    ) -> crate::Result<ResponseStream<'a>> {
+        self.connection.flush_stream().await?;
+        self.reset_session_for_named_rpc().await?;
 
-        Ok(result)
+        let collation = self.connection.context().collation();
+        let utf8_support = self.connection.context().utf8_support();
+        let mut rpc_params = Vec::with_capacity(params.len());
+
+        for parameter in params {
+            let (name, value, parameter_type, by_ref, parameter_index) = parameter.into_parts();
+            let declaration = parameter_type
+                .as_ref()
+                .map(SqlParameterType::declaration)
+                .unwrap_or_else(|| value.type_name().into_owned());
+            let type_info = match parameter_type.as_ref() {
+                Some(parameter_type) => {
+                    if parameter_type.requires_utf8_support(collation) && !utf8_support {
+                        return Err(crate::Error::parameter_conversion(
+                            parameter_index,
+                            declaration,
+                            "metadata_error",
+                            "SQL Server did not acknowledge UTF-8 parameter support",
+                        ));
+                    }
+
+                    Some(parameter_type.type_info(collation).map_err(|_| {
+                        crate::Error::parameter_conversion(
+                            parameter_index,
+                            declaration.clone(),
+                            "metadata_error",
+                            "SQL parameter metadata is incompatible with the active session",
+                        )
+                    })?)
+                }
+                None => None,
+            };
+            let flags = if by_ref {
+                BitFlags::from_flag(RpcStatus::ByRefValue)
+            } else {
+                BitFlags::empty()
+            };
+
+            rpc_params.push(RpcParam {
+                name: Cow::Owned(name),
+                flags,
+                value,
+                type_info,
+                parameter_metadata: Some(RpcParameterMetadata {
+                    parameter_index,
+                    declaration,
+                }),
+            });
+        }
+
+        let request = TokenRpcRequest::new(
+            procedure,
+            rpc_params,
+            self.connection.context().transaction_descriptor(),
+        );
+        let id = self.connection.context_mut().next_packet_id();
+        self.connection.send(PacketHeader::rpc(id), request).await?;
+
+        let token_stream = TokenStream::new(&mut self.connection);
+        Ok(ResponseStream::new(token_stream.try_unfold()))
     }
 
     /// Execute a `BULK INSERT` statement, efficiantly storing a large number of
@@ -387,11 +488,31 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             return query;
         }
 
-        const ISOLATION_BASELINE: &str = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED;\n";
-        let mut prefixed = String::with_capacity(ISOLATION_BASELINE.len() + query.len());
-        prefixed.push_str(ISOLATION_BASELINE);
+        let mut prefixed =
+            String::with_capacity(Self::RESET_ISOLATION_BASELINE.len() + query.len());
+        prefixed.push_str(Self::RESET_ISOLATION_BASELINE);
         prefixed.push_str(query.as_ref());
         Cow::Owned(prefixed)
+    }
+
+    async fn reset_session_for_named_rpc(&mut self) -> crate::Result<()> {
+        if !self.connection.is_connection_reset_pending() {
+            return Ok(());
+        }
+
+        let request = BatchRequest::new(
+            Cow::Borrowed(Self::RESET_ISOLATION_BASELINE),
+            self.connection.context().transaction_descriptor(),
+        );
+        let id = self.connection.context_mut().next_packet_id();
+        self.connection
+            .send(PacketHeader::batch(id), request)
+            .await?;
+
+        let mut tokens = TokenStream::new(&mut self.connection).try_unfold();
+        while tokens.try_next().await?.is_some() {}
+
+        Ok(())
     }
 
     pub(crate) fn rpc_params<'a>(query: impl Into<Cow<'a, str>>) -> Vec<RpcParam<'a>> {

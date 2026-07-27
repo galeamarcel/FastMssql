@@ -138,8 +138,15 @@ impl From<&TypeInfo> for ColumnType {
                     8 => Self::Float8,
                     _ => Self::Floatn,
                 },
-                VarLenType::Money => Self::Money,
-                VarLenType::Datetimen => Self::Datetimen,
+                VarLenType::Money => match cx.len() {
+                    4 => Self::Money4,
+                    _ => Self::Money,
+                },
+                VarLenType::Datetimen => match cx.len() {
+                    4 => Self::Datetime4,
+                    8 => Self::Datetime,
+                    _ => Self::Datetimen,
+                },
                 #[cfg(feature = "tds73")]
                 VarLenType::Daten => Self::Daten,
                 #[cfg(feature = "tds73")]

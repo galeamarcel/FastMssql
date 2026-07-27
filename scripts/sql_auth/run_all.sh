@@ -5,6 +5,20 @@ readonly root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly env_file="${root_dir}/.env.sql-auth.local"
 readonly artifact_dir="${root_dir}/.artifacts/sql-auth"
 readonly container_name="fastmssql-sql-auth-dev"
+# Tiberius 0.12.3 predates Rust 1.94 and triggers these audited legacy lint
+# categories in unchanged vendored code. Keep every other warning denied.
+readonly tiberius_clippy_legacy_lints=(
+  -A clippy::doc_lazy_continuation
+  -A clippy::extra_unused_lifetimes
+  -A clippy::large_enum_variant
+  -A clippy::io_other_error
+  -A clippy::needless_lifetimes
+  -A clippy::legacy_numeric_constants
+  -A clippy::cast_enum_truncation
+  -A clippy::derivable_impls
+  -A clippy::manual_div_ceil
+  -A clippy::items_after_test_module
+)
 required_failures=0
 
 cd "${root_dir}"
@@ -66,11 +80,38 @@ record maturin-develop uv run maturin develop --release
 record cargo-fmt cargo fmt --check
 record cargo-clippy cargo clippy --all-targets -- -D warnings
 record cargo-test cargo test --locked
+record tiberius-fmt \
+  cargo fmt --manifest-path vendor/tiberius/Cargo.toml --check
+record tiberius-clippy \
+  cargo clippy \
+  --manifest-path vendor/tiberius/Cargo.toml \
+  --no-default-features \
+  --features chrono,tds73,rustls \
+  --all-targets -- -D warnings "${tiberius_clippy_legacy_lints[@]}"
+record tiberius-lib \
+  cargo test \
+  --manifest-path vendor/tiberius/Cargo.toml \
+  --no-default-features \
+  --features chrono,tds73,rustls \
+  --lib
 
 record compose-up \
   docker compose --env-file "${env_file}" \
   -f docker-compose.sql-auth.yml up -d sqlserver
 record provision scripts/sql_auth/provision.sh
+record tiberius-token-safety-sql-auth \
+  cargo test \
+  --manifest-path vendor/tiberius/Cargo.toml \
+  --no-default-features \
+  --features chrono,tds73,rustls \
+  --test token_safety_sql_auth -- --test-threads=1
+record tiberius-response-sql-auth \
+  cargo test \
+  --manifest-path vendor/tiberius/Cargo.toml \
+  --no-default-features \
+  --features chrono,tds73,rustls \
+  --test response_events_sql_auth -- --test-threads=1
+record result-stream-load scripts/sql_auth/run_result_stream_stress.sh
 
 export FASTMSSQL_TEST_CONNECTION_STRING="Server=${FASTMSSQL_SQL_AUTH_HOST},${FASTMSSQL_SQL_AUTH_PORT};Database=fastmssql_upstream_regression;User Id=${FASTMSSQL_SQL_AUTH_OWNER_USER};Password=${FASTMSSQL_SQL_AUTH_OWNER_PASSWORD};Encrypt=True;TrustServerCertificate=True"
 export FAST_MSSQL_TEST_DB_USER="${FASTMSSQL_SQL_AUTH_OWNER_USER}"
@@ -90,6 +131,9 @@ readonly strict_functional=(
   tests/sql_auth_strict/test_parameters_strict.py
   tests/sql_auth_strict/test_type_mapping_strict.py
   tests/sql_auth_strict/test_results_strict.py
+  tests/sql_auth_strict/test_resultsets_streaming.py
+  tests/sql_auth_strict/test_resultstream_lifecycle.py
+  tests/sql_auth_strict/test_rpc_results.py
   tests/sql_auth_strict/test_batch_strict.py
   tests/sql_auth_strict/test_transactions_strict.py
   tests/sql_auth_strict/test_operation_timeouts.py

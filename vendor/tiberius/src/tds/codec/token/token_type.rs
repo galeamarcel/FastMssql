@@ -22,6 +22,9 @@ uint_enum! {
         /// Used to inform the client by which columns the data is ordered.
         Order = 0xA9,
 
+        /// Describes base table names used by browse-mode column metadata.
+        TableName = 0xA4,
+
         /// Describes the column information in browse mode.
         ColInfo = 0xA5,
 
@@ -78,5 +81,16 @@ uint_enum! {
         /// are defined in FeatureExt. The token stream is sent only along with the LOGINACK
         /// in a Login Response message.
         FeatureExtAck = 0xAE,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::convert::TryFrom;
+
+    #[test]
+    fn tib_safe_003_tabname_token_is_recognized() {
+        assert_eq!(TokenType::try_from(0xa4_u8), Ok(TokenType::TableName));
     }
 }

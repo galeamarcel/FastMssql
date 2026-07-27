@@ -6,7 +6,7 @@ High-performance Rust-backed Python driver for SQL Server with:
 - Connection pooling with configurable parameters
 - SSL/TLS encryption support
 - Parameterized queries with automatic type conversion
-- Memory-efficient result handling
+- Bounded async result-set streaming
 """
 
 from typing import Any, Coroutine, Dict, List, Literal, Optional, Tuple, TypedDict
@@ -196,6 +196,11 @@ class SqlError(Exception):
         code: SQL Server error number (e.g. 208 for object not found).
         message: Human-readable error message from the server.
         state: SQL Server error state byte.
+        severity: SQL Server error class/severity.
+
+        When this is a terminal ResultStream error, it also carries
+        operation, phase, retryable, wire_sent, connection_discarded, and
+        outcome_unknown metadata.
 
     Example::
 
@@ -208,6 +213,7 @@ class SqlError(Exception):
     code: int
     message: str
     state: int
+    severity: int
     ...
 
 class SqlConnectionError(Exception):
@@ -287,6 +293,10 @@ class ProtocolError(Exception):
 
     Attributes:
         message: Human-readable error description.
+
+        When this is a terminal ResultStream error, it also carries
+        operation, phase, retryable, wire_sent, connection_discarded, and
+        outcome_unknown metadata.
     """
 
     message: str
@@ -307,6 +317,10 @@ class ConversionError(Exception):
         wire_sent: False when parameter serialization failed before network I/O.
         connection_discarded: False for a synchronized pre-wire failure.
         outcome_unknown: False for a deterministic pre-wire failure.
+
+        A post-wire ResultStream conversion failure additionally carries
+        operation and phase, sets wire_sent and connection_discarded to True,
+        and remains outcome_unknown=False.
     """
 
     message: str
@@ -396,25 +410,151 @@ class FastRow:
         """Convert row to dictionary mapping column names to values."""
         ...
 
+class ColumnMetadata:
+    """Immutable SQL Server result-column metadata."""
+
+    @property
+    def ordinal(self) -> int: ...
+
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def type_name(self) -> str: ...
+
+    @property
+    def nullable(self) -> bool | None: ...
+
+    @property
+    def precision(self) -> int | None: ...
+
+    @property
+    def scale(self) -> int | None: ...
+
+    @property
+    def length(self) -> int | Literal["MAX"] | None: ...
+
+class DoneResult:
+    """Immutable DONE, DONEPROC, or DONEINPROC status."""
+
+    @property
+    def kind(self) -> str: ...
+
+    @property
+    def rows_affected(self) -> int | None: ...
+
+    @property
+    def more_results(self) -> bool: ...
+
+    @property
+    def in_transaction(self) -> bool: ...
+
+    @property
+    def attention_acknowledged(self) -> bool: ...
+
+class SqlMessage:
+    """Immutable informational SQL Server message."""
+
+    @property
+    def number(self) -> int: ...
+
+    @property
+    def state(self) -> int: ...
+
+    @property
+    def severity(self) -> int: ...
+
+    @property
+    def message(self) -> str: ...
+
+    @property
+    def server(self) -> str: ...
+
+    @property
+    def procedure(self) -> str: ...
+
+    @property
+    def line(self) -> int: ...
+
+class ResultSummary:
+    """Immutable terminal summary for a completely drained response."""
+
+    @property
+    def result_set_count(self) -> int: ...
+
+    @property
+    def done(self) -> tuple[DoneResult, ...]: ...
+
+    @property
+    def messages(self) -> tuple[SqlMessage, ...]: ...
+
+    @property
+    def return_status(self) -> int | None: ...
+
+    @property
+    def output_parameters(self) -> dict[str | int, object]: ...
+
+class ResultStream:
+    """Bounded async-only stream of SQL Server result sets."""
+
+    def __aiter__(self) -> ResultStream: ...
+
+    async def __anext__(self) -> ResultSet: ...
+
+    async def __aenter__(self) -> ResultStream: ...
+
+    async def __aexit__(
+        self,
+        exc_type: Any,
+        exc_value: Any,
+        traceback: Any,
+    ) -> None: ...
+
+    async def aclose(self) -> None: ...
+
+    async def finish(self) -> ResultSummary: ...
+
+    @property
+    def closed(self) -> bool: ...
+
+    @property
+    def complete(self) -> bool: ...
+
+    @property
+    def summary(self) -> ResultSummary: ...
+
+class ResultSet:
+    """One async-only result set within a ResultStream."""
+
+    def __aiter__(self) -> ResultSet: ...
+
+    async def __anext__(self) -> FastRow: ...
+
+    async def aclose(self) -> None: ...
+
+    @property
+    def index(self) -> int: ...
+
+    @property
+    def columns(self) -> tuple[ColumnMetadata, ...]: ...
+
+    @property
+    def column_names(self) -> tuple[str, ...]: ...
+
+    @property
+    def closed(self) -> bool: ...
+
 class QueryStream:
     """
-    Async iterator for streaming query results row-by-row.
+    Synchronous compatibility iterator over a buffered first result set.
 
-    Enables memory-efficient processing of large result sets by fetching rows
-    on-demand instead of loading all rows into memory at once.
-
-    Example:
-        stream = await conn.query("SELECT * FROM large_table")
-        async for row in stream:
-            process(row)
-
-        # Or fetch all remaining rows at once
-        remaining = await stream.all()
+    SQL Server rows are buffered before this object is returned. Use
+    Connection.stream() for bounded async result-set iteration.
     """
 
-    async def __anext__(self) -> FastRow:
-        """Get the next row in the stream (for async iteration)."""
-        ...
+    def __iter__(self) -> QueryStream: ...
+
+    def __next__(self) -> FastRow: ...
 
     def all(self) -> List[FastRow]:
         """Load and return all remaining rows at once."""
@@ -529,8 +669,8 @@ class Parameter:
     Attributes:
         value: Original Python value.
         sql_type: Canonical SQL declaration, or None for inferred conversion.
-        direction: INPUT, OUTPUT, INPUT_OUTPUT, or RETURN_VALUE. Execution
-            currently supports INPUT only.
+        direction: INPUT, OUTPUT, INPUT_OUTPUT, or RETURN_VALUE. ``callproc``
+            supports all four directions; query execution accepts INPUT.
         precision: FLOAT/DECIMAL/NUMERIC precision.
         scale: DECIMAL/NUMERIC or temporal fractional-second scale.
         length: Character/binary length as an integer or "MAX".
@@ -580,9 +720,10 @@ class Parameters:
     """
     Collection of parameter descriptors.
 
-    Positional descriptors are accepted by SQL execution. Named descriptors
-    remain available for construction compatibility but are rejected by the
-    SQL Server wire conversion.
+    Positional descriptors are accepted by SQL execution. ``callproc`` accepts
+    either positional or named descriptors and supports INPUT, OUTPUT,
+    INPUT_OUTPUT, and RETURN_VALUE; query execution accepts INPUT positional
+    descriptors.
 
     Attributes:
         *args: List of Parameter objects in positional order
@@ -874,9 +1015,8 @@ class Connection:
         params: Optional[List[Any]] = None,
     ) -> Coroutine[Any, Any, QueryStream]:
         """
-        Execute SELECT query that returns rows as an async stream.
-
-        Returns a QueryStream for memory-efficient iteration over large result sets.
+        Execute SELECT and return the buffered first result set for synchronous
+        compatibility iteration after awaiting this method.
 
         Args:
             sql: SQL query with @P1, @P2, etc. placeholders for parameters
@@ -886,16 +1026,44 @@ class Connection:
         """
         ...
 
+    async def stream(
+        self,
+        sql: str,
+        params: list[Any] | Parameters | None = None,
+        *,
+        buffer_size: int = 64,
+    ) -> ResultStream:
+        """Stream every result set on one retained pooled connection."""
+        ...
+
+    async def batch(
+        self,
+        sql: str,
+        *,
+        buffer_size: int = 64,
+    ) -> ResultStream:
+        """Stream an unparameterized batch on one retained pooled connection."""
+        ...
+
+    async def callproc(
+        self,
+        procedure: str,
+        params: list[Any] | Parameters | None = None,
+        *,
+        buffer_size: int = 64,
+    ) -> ResultStream:
+        """Call a named procedure by direct RPC and stream all results."""
+        ...
+
     def simple_query(
         self,
         sql: str,
     ) -> Coroutine[Any, Any, QueryStream]:
         """
-        Execute a raw SQL query (non-prepared statement) that returns rows as an async stream.
+        Execute raw SQL and return the buffered first result set for
+        synchronous compatibility iteration after awaiting this method.
 
         Only use this when required (creating stored procedures may require this in certain cases)
-
-        Returns a QueryStream for memory-efficient iteration over large result sets.
 
         Args:
             sql: Raw SQL query
@@ -1060,7 +1228,36 @@ class Transaction:
         sql: str,
         params: Optional[List[Any]] = None,
     ) -> Coroutine[Any, Any, QueryStream]:
-        """Execute a SELECT query that returns rows as a stream."""
+        """Return the buffered first result set for synchronous iteration."""
+        ...
+
+    async def stream(
+        self,
+        sql: str,
+        params: list[Any] | Parameters | None = None,
+        *,
+        buffer_size: int = 64,
+    ) -> ResultStream:
+        """Stream every result set while retaining this transaction session."""
+        ...
+
+    async def batch(
+        self,
+        sql: str,
+        *,
+        buffer_size: int = 64,
+    ) -> ResultStream:
+        """Stream an unparameterized batch on this transaction session."""
+        ...
+
+    async def callproc(
+        self,
+        procedure: str,
+        params: list[Any] | Parameters | None = None,
+        *,
+        buffer_size: int = 64,
+    ) -> ResultStream:
+        """Call a named procedure by direct RPC on this transaction."""
         ...
 
     def simple_query(
@@ -1068,11 +1265,10 @@ class Transaction:
         sql: str,
     ) -> Coroutine[Any, Any, QueryStream]:
         """
-        Execute a raw SQL query (non-prepared statement) that returns rows as an async stream.
+        Execute raw SQL and return the buffered first result set for
+        synchronous compatibility iteration after awaiting this method.
 
         Only use this when required (creating stored procedures may require this in certain cases)
-
-        Returns a QueryStream for memory-efficient iteration over large result sets.
 
         Args:
             sql: Raw SQL query

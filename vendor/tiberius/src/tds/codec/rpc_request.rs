@@ -1,11 +1,10 @@
 use super::{AllHeaderTy, Encode, ALL_HEADERS_LEN_TX};
 use crate::{
     tds::codec::{ColumnData, TypeInfo},
-    BytesMutWithTypeInfo, Result,
+    BytesMutWithTypeInfo, Error, Result,
 };
 use bytes::{BufMut, BytesMut};
 use enumflags2::{bitflags, BitFlags};
-use std::borrow::BorrowMut;
 use std::borrow::Cow;
 
 #[bitflags]
@@ -140,10 +139,14 @@ impl<'a> Encode<BytesMut> for TokenRpcRequest<'a> {
                 let val = (0xffff_u32) | ((*id as u16) as u32) << 16;
                 dst.put_u32_le(val);
             }
-            RpcProcIdValue::Name(ref _name) => {
-                //let (left_bytes, _) = try!(write_varchar::<u16>(&mut cursor, name, 0));
-                //assert_eq!(left_bytes, 0);
-                todo!()
+            RpcProcIdValue::Name(ref name) => {
+                let utf16_len = u16::try_from(name.encode_utf16().count()).map_err(|_| {
+                    Error::Protocol("RPC procedure name exceeds the US_VARCHAR limit".into())
+                })?;
+                dst.put_u16_le(utf16_len);
+                for code_unit in name.encode_utf16() {
+                    dst.put_u16_le(code_unit);
+                }
             }
         }
 
@@ -159,13 +162,12 @@ impl<'a> Encode<BytesMut> for TokenRpcRequest<'a> {
 
 impl<'a> Encode<BytesMut> for RpcParam<'a> {
     fn encode(self, dst: &mut BytesMut) -> Result<()> {
-        let len_pos = dst.len();
-        let mut length = 0u8;
-
-        dst.put_u8(length);
+        let utf16_len = u8::try_from(self.name.encode_utf16().count()).map_err(|_| {
+            Error::Protocol("RPC parameter name exceeds the B_VARCHAR limit".into())
+        })?;
+        dst.put_u8(utf16_len);
 
         for codepoint in self.name.encode_utf16() {
-            length += 1;
             dst.put_u16_le(codepoint);
         }
 
@@ -186,16 +188,15 @@ impl<'a> Encode<BytesMut> for RpcParam<'a> {
             });
         }
 
-        let dst: &mut [u8] = dst.borrow_mut();
-        dst[len_pos] = length;
-
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Encode, RpcParam, RpcParameterMetadata};
+    use super::{
+        Encode, RpcParam, RpcParameterMetadata, RpcStatus, TokenRpcRequest, ALL_HEADERS_LEN_TX,
+    };
     use crate::{
         tds::{
             codec::{ColumnData, TypeInfo, VarLenContext, VarLenType},
@@ -361,5 +362,65 @@ mod tests {
                 ..
             } if sql_type == "VARCHAR(1)" && reason == "length_overflow"
         ));
+    }
+
+    #[test]
+    fn tib_result_007_named_rpc_uses_us_varchar() {
+        let mut bytes = BytesMut::new();
+        TokenRpcRequest::new("dbo.fm_rpc", Vec::new(), [0; 8])
+            .encode(&mut bytes)
+            .expect("a bounded named RPC must encode");
+
+        assert_eq!(
+            &bytes[ALL_HEADERS_LEN_TX..],
+            &[
+                10, 0, b'd', 0, b'b', 0, b'o', 0, b'.', 0, b'f', 0, b'm', 0, b'_', 0, b'r', 0,
+                b'p', 0, b'c', 0, 0, 0,
+            ]
+        );
+
+        let mut procedure_overflow = BytesMut::new();
+        let procedure_error =
+            TokenRpcRequest::new("p".repeat(u16::MAX as usize + 1), Vec::new(), [0; 8])
+                .encode(&mut procedure_overflow)
+                .expect_err("a procedure name wider than USHORT must be rejected");
+        assert!(matches!(procedure_error, Error::Protocol(_)));
+
+        let mut parameter_overflow = BytesMut::new();
+        let parameter_error = RpcParam {
+            name: Cow::Owned("p".repeat(u8::MAX as usize + 1)),
+            flags: BitFlags::empty(),
+            value: ColumnData::I32(Some(1)),
+            type_info: None,
+            parameter_metadata: None,
+        }
+        .encode(&mut parameter_overflow)
+        .expect_err("a parameter name wider than BYTE must be rejected");
+        assert!(matches!(parameter_error, Error::Protocol(_)));
+    }
+
+    #[test]
+    fn tib_result_008_by_ref_flag_is_output_only() {
+        fn encoded_status(flags: BitFlags<RpcStatus>) -> u8 {
+            let name = "@value";
+            let mut bytes = BytesMut::new();
+            RpcParam {
+                name: Cow::Borrowed(name),
+                flags,
+                value: ColumnData::I32(Some(7)),
+                type_info: None,
+                parameter_metadata: None,
+            }
+            .encode(&mut bytes)
+            .expect("a bounded RPC parameter must encode");
+
+            bytes[1 + name.encode_utf16().count() * 2]
+        }
+
+        assert_eq!(encoded_status(BitFlags::empty()), 0);
+        assert_eq!(
+            encoded_status(BitFlags::from_flag(RpcStatus::ByRefValue)),
+            RpcStatus::ByRefValue as u8
+        );
     }
 }

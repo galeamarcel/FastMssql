@@ -4,7 +4,7 @@ This directory is the minimal build source subset of the published `tiberius`
 crate version `0.12.3`, whose registry source records upstream commit
 `c34fab2e14c52ab74519d073d7a7b65bd023fc1a`.
 
-FastMssql temporarily carries four narrowly scoped patch sets.
+FastMssql temporarily carries six narrowly scoped patch sets.
 
 The TLS dependency migration includes:
 
@@ -70,14 +70,51 @@ The typed RPC parameter patch:
 - marks a response pending only after the complete request payload encodes,
   preserving connection synchronization after a local parameter error.
 
+The token-decoder safety patch:
+
+- recognizes TABNAME and COLINFO browse metadata emitted by `FOR BROWSE`;
+- consumes each USHORT-length payload exactly without retaining base-table
+  names or logging payload bytes;
+- replaces wildcard token-dispatch panics with an exhaustive match;
+- returns typed protocol errors for unsupported UDT and SQL_VARIANT metadata
+  instead of reaching `todo!` or unwinding a runtime worker;
+- lets the FastMssql boundary normalize those controlled typed errors to its
+  stable public metadata-decoding `ProtocolError`;
+- runs Clippy with every non-baseline warning denied while explicitly listing
+  the legacy lint categories already emitted by unchanged Tiberius 0.12.3 on
+  the pinned Rust 1.94 toolchain;
+- deliberately does not claim UDT or SQL_VARIANT value conversion support.
+
+The complete-response and direct-RPC patch:
+
+- adds an owned `ResponseStream` that preserves result metadata, rows,
+  DONE/DONEPROC/DONEINPROC state, informational messages, signed return
+  status and output parameter values in wire order;
+- keeps the existing `QueryStream` API as a metadata/row-only compatibility
+  adapter over the complete response stream;
+- preserves nullability, precision, scale and declared character/binary
+  capacities, including UTF-16 units and MAX metadata;
+- resolves nullable `MONEYN(4)` and `DATETIMEN(4)` metadata to SMALLMONEY and
+  SMALLDATETIME instead of their wider types;
+- implements checked MS-TDS US_VARCHAR procedure-name and B_VARCHAR
+  parameter-name encoding without panic paths;
+- supports direct named RPC input/output parameters and restores READ
+  COMMITTED with a fully consumed reset-bearing batch before the first RPC on
+  a recycled session;
+- makes token traces and connection diagnostics structural, with no SQL
+  Server message, metadata name, row/output value, environment value,
+  procedure name or raw-buffer payload.
+
 No Tiberius fork has been created or published by the FastMssql fork owner.
 The path dependency keeps the reviewed source inside the FastMssql repository
 and makes builds independent of the contributor fork remaining available.
 The registry-only `Cargo.toml.orig` file is intentionally omitted because
 Cargo reserves that name when `maturin` packages a local path dependency; the
 effective normalized manifest is retained as `Cargo.toml`.
-Examples, tests, CI files, Docker fixtures, and test certificate keys are also
+Upstream examples, CI files, Docker fixtures, and test certificate keys are
 omitted because they are not part of the FastMssql runtime dependency.
+FastMssql-specific unit and SQL-auth integration contracts are retained under
+`tests/` to make each local protocol patch independently reproducible.
 
 Remove this directory and return to a crates.io dependency after an equivalent
 Tiberius release is published and passes the full FastMssql SQL-auth matrix.

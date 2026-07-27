@@ -73,6 +73,107 @@ async def main():
 asyncio.run(main())
 ```
 
+### Bounded true-async result streaming
+
+Use `stream()` for a parameterized statement and `batch()` for an
+unparameterized multi-statement batch. On `Connection`, both retain one pooled
+physical connection until the complete SQL Server response is consumed,
+finished, or closed. The same methods are available on `Transaction` and keep
+its session mutex and physical connection for the full response.
+`buffer_size` bounds unacknowledged result events; individual rows and LOB
+values are not byte-chunked.
+
+```python
+async with Connection(conn_str) as conn:
+    response = await conn.stream(
+        """
+        SELECT id, payload
+        FROM dbo.events
+        WHERE tenant_id = @P1
+        ORDER BY id
+        """,
+        [tenant_id],
+        buffer_size=64,
+    )
+
+    async with response:
+        async for result_set in response:
+            print(result_set.index, result_set.column_names)
+            async for row in result_set:
+                await handle(row)
+
+    summary = response.summary
+    print(summary.result_set_count, summary.done, summary.messages)
+```
+
+`ResultStream` and each nested `ResultSet` are async-only. Call
+`await result_set.aclose()` to skip the remainder of one set while retaining
+later sets, `await response.finish()` to discard remaining rows and obtain the
+terminal summary, or `await response.aclose()` to abort the full response.
+Explicit full-response close and abandonment are fail-closed: FastMssql waits
+for resource-release acknowledgement or retires the uncertain physical
+connection. Cancelling a receive before it owns an event leaves that event
+available for a later receive; cancellation after ownership conservatively
+aborts the full response so no event can be silently lost.
+
+Terminal SQL, protocol, and conversion errors exposed by a result stream carry
+`operation`, `phase`, `retryable`, `wire_sent`, `connection_discarded`, and
+`outcome_unknown` metadata. A fully drained nonfatal SQL Server error can keep
+`connection_discarded=False`; conversion or protocol uncertainty retires the
+connection. FastMssql never retries a response automatically.
+
+### Direct stored-procedure RPC
+
+Use `callproc()` for a stored procedure that has output parameters or a return
+status. FastMssql sends the validated procedure name as a native TDS RPC; it
+does not build an `EXEC` SQL string. `callproc()` is available on both
+`Connection` and a begun `Transaction`.
+
+```python
+from fastmssql import Parameter, Parameters
+
+params = Parameters(
+    order_id=Parameter(42, "INT"),
+    new_total=Parameter(
+        None,
+        "DECIMAL(19,4)",
+        direction="OUTPUT",
+    ),
+    status=Parameter(
+        None,
+        direction="RETURN_VALUE",
+    ),
+)
+
+response = await conn.callproc(
+    "dbo.reprice_order",
+    params,
+    buffer_size=64,
+)
+
+async with response:
+    async for result_set in response:
+        async for row in result_set:
+            await handle(row)
+
+summary = response.summary
+print(summary.return_status)
+print(summary.output_parameters["new_total"])
+print(summary.output_parameters["status"])
+```
+
+Named parameters may include one leading `@`; output dictionary keys omit it.
+Positional output keys are their original zero-based descriptor indices.
+`INPUT` may infer its SQL type. `OUTPUT` and `INPUT_OUTPUT` require an explicit
+SQL type, while `RETURN_VALUE` accepts only an omitted type or `INT` and is not
+sent as an RPC argument. Output values and the return status become available
+only after normal terminal completion. Invalid procedure names, parameter
+names, direction combinations, counts, and buffer sizes are rejected locally
+before pool checkout.
+
+The legacy `query()` and `simple_query()` methods remain synchronous-iteration
+compatibility APIs after awaiting them; they buffer the first result set.
+
 ### Pool statistics
 
 `await connection.pool_stats()` is a pull-only snapshot of the current pool.
@@ -854,6 +955,29 @@ When an operation is cancelled while TDS is in flight, the transaction becomes
 fail-closed. Call `close()`; the uncertain physical connection is retired
 instead of being returned to the pool.
 
+Transactions support the same bounded multi-result API while retaining the
+session exclusively until terminal disposition:
+
+```python
+async with database.transaction() as transaction:
+    response = await transaction.stream(
+        "SELECT id, total FROM orders WHERE customer_id = @P1",
+        [123],
+        buffer_size=32,
+    )
+    async with response:
+        async for result_set in response:
+            async for row in result_set:
+                await handle(row)
+```
+
+While `response` is live, another query, execute, commit, or rollback on that
+transaction waits for the same session mutex. Normal complete EOF restores the
+prior transaction state. Closing or dropping the full response, a post-wire
+conversion failure, a deadline, or forced shutdown retires the transport,
+marks the transaction failed, and makes a later commit fail locally. Closing
+only one `ResultSet` preserves the transaction and advances to the next set.
+
 #### Direct constructor compatibility
 
 `Transaction(conn_str)` remains supported for backward compatibility. It owns
@@ -963,20 +1087,23 @@ async def main():
 asyncio.run(main())
 ```
 
-### 2. Use iteration for large result sets (not `.rows()`)
+### 2. Use bounded async streaming for large result sets
 
 ```python
-result = await conn.query("SELECT * FROM large_table")
-
-# ✅ Good: Lazy conversion, one row at a time (minimal GIL contention)
-for row in result:
-    process(row)
-
-# ❌ Bad: Eager conversion, all rows at once (GIL bottleneck)
-all_rows = result.rows()  # or result.fetchall()
+response = await conn.stream(
+    "SELECT * FROM large_table",
+    buffer_size=64,
+)
+async with response:
+    async for result_set in response:
+        async for row in result_set:
+            await process(row)
 ```
 
-Lazy iteration distributes GIL acquisition across rows, dramatically improving performance with multiple Python workers.
+`query()` still performs lazy Python conversion while iterating, but its SQL
+rows are already buffered before the compatibility `QueryStream` is returned.
+Use `stream()` when wire-level backpressure and bounded in-flight result events
+matter.
 
 ## Examples & benchmarks
 
