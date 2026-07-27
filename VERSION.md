@@ -42,6 +42,16 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Native TDS bulk stress row-shape RED contract
+
+- Added a focused executable contract requiring the stress harness to build
+  each concrete native-bulk row as a Python `list`, matching the deliberately
+  strict list-only public API.
+- The expected RED is the absent `build_rows()` helper after real Docker
+  baselines exposed `ConversionError(reason="row_must_be_list")` for tuple
+  rows. This test-only change does not change runtime behavior, package
+  metadata, the displayed `0.7.7` version or release state.
+
 ### Native TDS bulk transaction fixture determinism
 
 - Made `BULK-011` verify transaction neutrality directly on the pinned
