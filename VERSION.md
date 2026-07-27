@@ -10,7 +10,7 @@ yet applied to package metadata; release versioning remains a separate,
 explicit decision.
 
 Changes currently integrated in fork history through
-`dec2914874d35d04655305d41d7a21fde23c40da`:
+`deef315cc6be7b2c303040cca99a268aa201a28d`:
 
 - closed, validated SQL parameter descriptors with exact TDS metadata;
 - exact decimal, UUID, temporal, ANSI/Unicode, binary, XML, and typed-null
@@ -38,6 +38,25 @@ Changes currently integrated in fork history through
   `30284587019`.
 
 No release, package-version change, or artifact publication has occurred.
+
+### Live audit status for typed bulk row conversion
+
+- Advanced the live production-readiness audit from bounded compatibility
+  bulk at `dec2914874d35d04655305d41d7a21fde23c40da` to the exact typed-row
+  conversion fix `deef315cc6be7b2c303040cca99a268aa201a28d`.
+- Recorded the committed RED reproduction at `b283c5c`, the shared
+  single-value converter, global privacy-safe error positions, exact typed
+  NULL/value round trips, late-chunk rollback and replacement physical
+  `connection_id` evidence.
+- Recorded exact local/Docker verification while keeping the latest complete
+  hosted Linux/macOS/Windows, RustSec and 372-case matrix evidence tied to its
+  actual ancestor `a9d5c2a`; no 377-case full run is inferred.
+- Marked the first two of seven batch/bulk slices verified and kept the five
+  remaining slices explicit: Tiberius column subsets, native TDS bulk,
+  iterable backpressure, `execute_many()` and bounded-concurrency
+  `query_many()`.
+- This status-only documentation change does not modify runtime behavior,
+  package metadata, the displayed `0.7.7` version or release state.
 
 ### Typed bulk row conversion implementation
 
