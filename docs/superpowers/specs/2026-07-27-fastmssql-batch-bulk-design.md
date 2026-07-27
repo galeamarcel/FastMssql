@@ -128,6 +128,9 @@ The existing positional signature and return value remain compatible:
 - row width and value conversion are checked chunk by chunk;
 - all chunks remain one atomic transaction;
 - empty input returns `0` without acquiring a connection;
+- callers must not resize `rows` until the awaitable completes; a top-level
+  length change is rejected before first wire I/O or rolls back all chunks
+  already sent;
 - identifier validation occurs before wire I/O;
 - conversion or SQL failure rolls back every previously sent chunk;
 - cancellation, timeout, panic or uncertain cleanup retires the socket;
@@ -285,10 +288,12 @@ The raw Rust compatibility method keeps an owned `Py<PyList>` handle, never a
 GIL-bound `Bound` reference, across awaits. Each iteration:
 
 1. acquires the GIL briefly;
-2. reads at most one SQL VALUES chunk;
-3. validates row width and converts cells to owned `FastParameter` values;
-4. releases the GIL;
-5. sends and fully drains that chunk before converting the next one.
+2. verifies that the top-level list still has its captured length;
+3. reads at most one SQL VALUES chunk;
+4. validates row width and converts cells to owned `FastParameter` values;
+5. releases the GIL;
+6. sends and fully drains that chunk;
+7. drops the converted chunk before converting the next one.
 
 The transaction begins before the first non-empty chunk and the existing
 absolute deadline covers every chunk. Any error after `BEGIN` follows the

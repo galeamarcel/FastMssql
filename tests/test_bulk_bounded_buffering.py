@@ -74,3 +74,27 @@ async def test_empty_bulk_insert_is_zero_io_and_zero_metric() -> None:
     snapshot = await connection.operation_stats()
     assert snapshot["operations"]["bulk_insert"]["started"] == 0
     assert snapshot["operations"]["bulk_insert"]["completed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_bulk_insert_rejects_resized_input_before_pool_activity() -> None:
+    """Deferred conversion must not silently consume a resized input list."""
+
+    connection = _offline_connection()
+    rows = [[1]]
+    awaitable = connection.bulk_insert("dbo.target", ["value"], rows)
+    rows.append([2])
+
+    try:
+        with pytest.raises(
+            ValueError,
+            match="bulk_insert data_rows must not be resized while the operation is running",
+        ):
+            await awaitable
+        assert await connection.is_connected() is False
+        snapshot = await connection.operation_stats()
+        operation = snapshot["operations"]["bulk_insert"]
+        assert operation["started"] == operation["completed"] == 1
+        assert operation["errors"] == 1
+    finally:
+        await connection.disconnect()
