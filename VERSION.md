@@ -236,3 +236,13 @@ No release, package-version change, or artifact publication has occurred.
   continuing to deny every non-baseline warning.
 - This feature does not change package metadata, the displayed `0.7.7`
   version or release state.
+
+### RED configurable result-stream stress runner contract
+
+- Added a deterministic runner contract proving that custom pool and event
+  buffer sizes are forwarded to the bounded result-stream stress program.
+- Required explicit environment-variable defaults of pool size 8 and buffer
+  size 8 while rejecting the previous hard-coded command arguments that made
+  extended-profile configuration ineffective.
+- This test-only change does not modify runtime behavior, package metadata,
+  the displayed `0.7.7` version or release state.
