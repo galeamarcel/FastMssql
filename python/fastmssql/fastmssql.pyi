@@ -310,6 +310,10 @@ class ConversionError(Exception):
         message: Human-readable error description.
         batch_index: Zero-based batch item index when conversion failed during
             batch preflight.
+        row_index: Zero-based row index when conversion failed during bulk
+            preflight.
+        column_index: Zero-based column index when conversion failed during
+            bulk preflight.
         parameter_index: Zero-based index for a structured parameter error.
         sql_type: Canonical declaration for a structured parameter error.
         reason: Stable reason code for a structured parameter error.
@@ -325,6 +329,8 @@ class ConversionError(Exception):
 
     message: str
     batch_index: int
+    row_index: int
+    column_index: int
     parameter_index: int
     sql_type: str
     reason: str

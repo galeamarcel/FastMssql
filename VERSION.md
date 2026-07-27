@@ -39,6 +39,34 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Typed bulk row conversion implementation
+
+- Shared the existing closed raw/typed single-value converter between
+  ordinary query descriptors and compatibility bulk cells while preserving
+  ordinary iterable expansion and query parameter-limit accounting.
+- Added privacy-safe, zero-based global bulk row, column and flattened
+  parameter metadata to conversion failures. First-chunk preflight remains
+  pre-wire; later-chunk failure reports prior wire activity and conservative
+  physical-connection retirement without exposing SQL identifiers or values.
+- Rejected expanded and non-input bulk descriptors through stable
+  `ConversionError` reasons, and documented the new bulk position fields in
+  the public type stub.
+- Preserved explicit SQL type metadata during bulk NULL inference, including
+  an explicitly typed `TINYINT` NULL beside an inferred `BIGINT` sibling.
+- Corrected the live retirement assertion after SQL Server immediately reused
+  a numeric SPID: `sys.dm_exec_connections.connection_id` proved that the
+  original physical connection was closed and replaced.
+- Verification passed: Rust `73/73`; focused offline descriptor `5/5`;
+  bounded-buffering regression `3/3`; SQL-auth batch/bulk `25/25`; strict
+  parameters `62/62`; matrix contract `26/26` with 377 unique IDs; legacy
+  batch validation `21/21`; and the 1,000-row resource probe with 8,634,368
+  bytes RSS growth, 0.000384-second maximum event-loop stall and zero
+  violations. Cargo fmt/Clippy and Ruff lint/format checks also passed on
+  their scoped files.
+- This implementation does not change package metadata, the displayed
+  `0.7.7` version or release state, and it does not claim completion of the
+  remaining compatibility/native bulk work.
+
 ### Typed bulk row conversion RED coverage
 
 - Added five deterministic offline contracts requiring compatibility bulk
@@ -67,8 +95,9 @@ No release, package-version change, or artifact publication has occurred.
   non-expanded `Parameter` conversion path with compatibility bulk rows.
 - Locked zero-based global row, column and flattened parameter indexes,
   privacy-safe error fields, truthful first/late
-  `wire_sent`/`connection_discarded` semantics, replacement-SPID recovery and
-  preservation of the original typed conversion exception.
+  `wire_sent`/`connection_discarded` semantics, replacement physical
+  connection recovery and preservation of the original typed conversion
+  exception.
 - Defined SQL-auth cases `BULK-003` through `BULK-005` for exact
   numeric/temporal/UUID values, typed NULLs, expanded/non-input rejection,
   late-chunk rollback and identifier/value redaction.

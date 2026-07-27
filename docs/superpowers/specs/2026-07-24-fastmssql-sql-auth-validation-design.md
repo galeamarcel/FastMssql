@@ -550,7 +550,8 @@ Enterprise compatibility-bulk buffering:
   typed, privacy-safe conversion failures with global bulk positions.
 - `BULK-005`: a typed conversion failure beyond the first chunk reports
   global positions and prior wire/retirement activity, leaks no
-  identifiers/value, and rolls back every earlier row.
+  identifiers/value, rolls back every earlier row, and recovers on a new
+  physical `connection_id` even if SQL Server reuses the numeric SPID.
 
 ### TX — dedicated transactions
 

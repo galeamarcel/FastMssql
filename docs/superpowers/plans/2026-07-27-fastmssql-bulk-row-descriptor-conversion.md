@@ -214,7 +214,8 @@ are not acceptable RED reasons.
   `Parameter("MustNotLeakValue", "INT")` is row 1,000, column 1, flattened
   parameter 2,001. Use an isolated pool of size one; require
   `wire_sent=True`, `connection_discarded=True`, exact safe metadata, full
-  rollback and a successful post-error `SELECT 1` on a replacement SPID.
+  rollback and a successful post-error `SELECT 1` on a new physical
+  `connection_id`, even if SQL Server immediately reuses the numeric SPID.
 - [ ] Scan captured output and exception dictionaries for the table, column,
   value and credential sentinels.
 - [ ] Run the three new cases on Docker SQL Server and observe the intended
@@ -341,8 +342,8 @@ git diff --check
   both single-cell conversion and `bulk_insert`.
 - [ ] Self-review privacy, error identity, first/late
   `wire_sent`/`connection_discarded`, explicit typed NULL preservation,
-  replacement-SPID recovery, row-index behavior across chunk boundaries and
-  ordinary query expansion.
+  replacement-connection recovery, row-index behavior across chunk boundaries
+  and ordinary query expansion.
 - [ ] Commit as `fix: share typed conversion with bulk rows`.
 - [ ] Push only `fix/bulk-row-descriptor-conversion`; verify exact remote SHA
   and upstream push URL `DISABLED`.

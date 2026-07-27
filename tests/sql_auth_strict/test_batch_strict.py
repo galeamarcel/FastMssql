@@ -99,6 +99,18 @@ def _isolated_connection(config: SqlAuthConfig) -> Connection:
     )
 
 
+async def _physical_connection_id(connection: Connection) -> str:
+    value = await scalar(
+        connection,
+        """
+        SELECT CONVERT(NVARCHAR(36), connection_id)
+        FROM sys.dm_exec_connections
+        WHERE session_id = @@SPID
+        """,
+    )
+    return str(value)
+
+
 @case("BATCH-001")
 @pytest.mark.asyncio
 async def test_empty_single_and_multiple_query_batches(
@@ -1070,7 +1082,7 @@ async def test_bulk_late_typed_failure_is_private_atomic_and_retires_session(
     bulk_connection = _isolated_connection(sql_auth_config)
     try:
         await bulk_connection.connect()
-        original_spid = await scalar(bulk_connection, "SELECT @@SPID")
+        original_connection_id = await _physical_connection_id(bulk_connection)
 
         with pytest.raises(ConversionError) as captured:
             await bulk_connection.bulk_insert(
@@ -1099,8 +1111,8 @@ async def test_bulk_late_typed_failure_is_private_atomic_and_retires_session(
             assert sentinel not in rendered
 
         assert await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}") == 0
-        replacement_spid = await scalar(bulk_connection, "SELECT @@SPID")
-        assert replacement_spid != original_spid
+        replacement_connection_id = await _physical_connection_id(bulk_connection)
+        assert replacement_connection_id != original_connection_id
         assert await scalar(bulk_connection, "SELECT 1") == 1
     finally:
         await bulk_connection.disconnect()

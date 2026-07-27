@@ -10,7 +10,7 @@ use crate::lifecycle::ConnectionLifecycle;
 use crate::operation_metrics::{OperationMetricsRegistry, observe_operation};
 use crate::parameter_conversion::{
     FastParameter, FastParameterValue, MAX_USER_QUERY_PARAMETERS, TypedNull,
-    convert_parameters_to_fast, params_as_sql_refs, python_to_fast_parameter,
+    convert_parameters_to_fast, params_as_sql_refs, python_to_single_fast_parameter,
 };
 use crate::pool_config::PyPoolConfig;
 use crate::pool_manager::{
@@ -63,6 +63,30 @@ fn attach_batch_validation_context(error: PyErr, py: Python<'_>, batch_index: us
 fn bulk_rows_per_batch(column_count: usize) -> usize {
     debug_assert!(column_count > 0);
     (MAX_BULK_PARAMETERS_PER_INSERT / column_count).clamp(1, MAX_ROWS_PER_VALUES_INSERT)
+}
+
+fn attach_bulk_conversion_context(
+    error: PyErr,
+    row_index: usize,
+    column_index: usize,
+    parameter_index: usize,
+    wire_sent: bool,
+) -> PyErr {
+    Python::attach(|py| {
+        let value = error.value(py);
+        let _ = value.setattr("row_index", row_index);
+        let _ = value.setattr("column_index", column_index);
+        let _ = value.setattr("parameter_index", parameter_index);
+        if value.getattr("sql_type").is_err() {
+            let _ = value.setattr("sql_type", "INFERRED");
+        }
+        if value.getattr("reason").is_err() {
+            let _ = value.setattr("reason", "bulk_conversion_failed");
+        }
+        let _ = value.setattr("wire_sent", wire_sent);
+        let _ = value.setattr("connection_discarded", wire_sent);
+    });
+    error
 }
 
 async fn consume_simple_command(
@@ -525,10 +549,12 @@ fn fix_bulk_null_types(flat_data: &mut [FastParameter], col_count: usize) {
         // Patch every untyped Null in this column.
         for row in 0..row_count {
             let idx = row * col_count + col;
-            if matches!(
-                &flat_data[idx].value,
-                FastParameterValue::Null(TypedNull::U8)
-            ) {
+            let is_untyped_null = !flat_data[idx].has_explicit_sql_type()
+                && matches!(
+                    &flat_data[idx].value,
+                    FastParameterValue::Null(TypedNull::U8)
+                );
+            if is_untyped_null {
                 flat_data[idx].value = FastParameterValue::Null(null_type.clone());
             }
         }
@@ -558,6 +584,7 @@ fn convert_bulk_chunk(
         let remaining = expected_row_count - start;
         let end = start + rows_per_batch.min(remaining);
         let mut chunk = Vec::with_capacity((end - start) * col_count);
+        let wire_sent = start > 0;
 
         for row_index in start..end {
             let row = rows.get_item(row_index)?;
@@ -569,8 +596,26 @@ fn convert_bulk_chunk(
                     col_count
                 )));
             }
-            for value in row.iter() {
-                chunk.push(python_to_fast_parameter(&value)?);
+            for (column_index, value) in row.iter().enumerate() {
+                let parameter_index = row_index
+                    .checked_mul(col_count)
+                    .and_then(|offset| offset.checked_add(column_index))
+                    .ok_or_else(|| {
+                        PyOverflowError::new_err(
+                            "bulk_insert parameter diagnostic index overflowed usize",
+                        )
+                    })?;
+                let parameter =
+                    python_to_single_fast_parameter(&value, parameter_index).map_err(|error| {
+                        attach_bulk_conversion_context(
+                            error,
+                            row_index,
+                            column_index,
+                            parameter_index,
+                            wire_sent,
+                        )
+                    })?;
+                chunk.push(parameter);
             }
         }
 
@@ -803,7 +848,15 @@ pub fn bulk_insert<'p>(
 
 #[cfg(test)]
 mod tests {
-    use super::bulk_rows_per_batch;
+    use super::{attach_bulk_conversion_context, bulk_rows_per_batch, fix_bulk_null_types};
+    use crate::parameter_conversion::{
+        FastParameterValue, TypedNull, python_to_single_fast_parameter,
+    };
+    use crate::py_parameters::Parameter;
+    use crate::types::{ConversionError, create_parameter_conversion_error};
+    use pyo3::exceptions::PyValueError;
+    use pyo3::prelude::*;
+    use tiberius::ToSql;
 
     #[test]
     fn bulk_chunking_respects_row_constructor_and_parameter_limits() {
@@ -811,5 +864,161 @@ mod tests {
         assert_eq!(bulk_rows_per_batch(2), 1_000);
         assert_eq!(bulk_rows_per_batch(3), 666);
         assert_eq!(bulk_rows_per_batch(2_000), 1);
+    }
+
+    #[test]
+    fn bulk_null_inference_preserves_explicit_tinyint_null_metadata() {
+        Python::initialize();
+        let mut flat_data = Python::attach(|py| {
+            let descriptor = Parameter::new(
+                py.None(),
+                Some("TINYINT".to_owned()),
+                "INPUT",
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("the test descriptor must be valid");
+            let descriptor = Py::new(py, descriptor).expect("the test descriptor must allocate");
+            let explicit = python_to_single_fast_parameter(descriptor.bind(py).as_any(), 0)
+                .expect("the typed NULL must convert");
+            let raw_integer = 42i64
+                .into_pyobject(py)
+                .expect("the raw integer must bind")
+                .into_any();
+            let inferred = python_to_single_fast_parameter(&raw_integer, 1)
+                .expect("the raw integer must convert");
+            vec![explicit, inferred]
+        });
+
+        fix_bulk_null_types(&mut flat_data, 1);
+
+        assert!(matches!(
+            flat_data[0].value,
+            FastParameterValue::Null(TypedNull::U8)
+        ));
+        assert_eq!(
+            flat_data[0]
+                .sql_parameter_type()
+                .expect("explicit SQL type metadata must remain present")
+                .declaration(),
+            "TINYINT"
+        );
+    }
+
+    #[test]
+    fn bulk_conversion_context_retains_error_identity_and_safe_metadata() {
+        Python::initialize();
+        let typed = create_parameter_conversion_error(
+            3,
+            "INT",
+            "wrong_value_kind",
+            "Python value has the wrong kind for the declared SQL type",
+        );
+        let original_pointer = Python::attach(|py| typed.value(py).as_ptr());
+        let typed = attach_bulk_conversion_context(typed, 1, 1, 3, true);
+
+        Python::attach(|py| {
+            let value = typed.value(py);
+            assert_eq!(value.as_ptr(), original_pointer);
+            assert!(typed.is_instance_of::<ConversionError>(py));
+            assert_eq!(
+                value
+                    .getattr("row_index")
+                    .unwrap()
+                    .extract::<usize>()
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                value
+                    .getattr("column_index")
+                    .unwrap()
+                    .extract::<usize>()
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                value
+                    .getattr("parameter_index")
+                    .unwrap()
+                    .extract::<usize>()
+                    .unwrap(),
+                3
+            );
+            assert_eq!(
+                value
+                    .getattr("sql_type")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "INT"
+            );
+            assert_eq!(
+                value
+                    .getattr("reason")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "wrong_value_kind"
+            );
+            assert!(
+                value
+                    .getattr("wire_sent")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap()
+            );
+            assert!(
+                value
+                    .getattr("connection_discarded")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap()
+            );
+        });
+
+        let raw = attach_bulk_conversion_context(
+            PyValueError::new_err("safe raw conversion failure"),
+            0,
+            0,
+            0,
+            false,
+        );
+        Python::attach(|py| {
+            let value = raw.value(py);
+            assert!(raw.is_instance_of::<PyValueError>(py));
+            assert_eq!(
+                value
+                    .getattr("sql_type")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "INFERRED"
+            );
+            assert_eq!(
+                value
+                    .getattr("reason")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "bulk_conversion_failed"
+            );
+            assert!(
+                !value
+                    .getattr("wire_sent")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap()
+            );
+            assert!(
+                !value
+                    .getattr("connection_discarded")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap()
+            );
+        });
     }
 }

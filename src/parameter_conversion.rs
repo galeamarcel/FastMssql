@@ -65,6 +65,10 @@ impl FastParameter {
         }
     }
 
+    pub(crate) fn has_explicit_sql_type(&self) -> bool {
+        self.sql_type.is_some()
+    }
+
     pub(crate) fn into_rpc_parts(
         self,
     ) -> (tiberius::ColumnData<'static>, Option<SqlParameterType>) {
@@ -163,10 +167,6 @@ impl tiberius::ToSql for FastParameter {
     fn sql_parameter_type(&self) -> Option<SqlParameterType> {
         self.sql_type.clone()
     }
-}
-
-pub fn python_to_fast_parameter(obj: &Bound<PyAny>) -> PyResult<FastParameter> {
-    python_to_fast_parameter_at(obj, 0)
 }
 
 pub(crate) fn python_to_fast_parameter_at(
@@ -1467,29 +1467,59 @@ fn append_parameter_descriptor(
                 return Err(parameter_count_error(result.len() + 1));
             }
             let parameter_index = result.len();
-            let converted = match parameter.sql_type.as_ref() {
-                Some(sql_type) => python_to_typed_fast_parameter(
-                    value,
-                    sql_type,
-                    parameter.direction,
-                    parameter_index,
-                )?,
-                None if parameter.direction == ParameterDirection::Input => {
-                    python_to_fast_parameter_at(value, parameter_index)?
-                }
-                None => {
-                    return Err(typed_conversion_error(
-                        parameter_index,
-                        "INFERRED",
-                        "unsupported_direction",
-                        "Only INPUT parameter direction is supported by query execution",
-                    ));
-                }
-            };
+            let converted =
+                parameter_descriptor_to_single_fast_parameter(parameter, parameter_index)?;
             result.push(converted);
             Ok(())
         }
     })
+}
+
+fn parameter_descriptor_to_single_fast_parameter(
+    parameter: &Parameter,
+    parameter_index: usize,
+) -> PyResult<FastParameter> {
+    let declaration = parameter
+        .sql_type
+        .as_ref()
+        .map_or_else(|| "INFERRED".to_owned(), SqlParameterType::declaration);
+    if parameter.direction != ParameterDirection::Input {
+        return Err(typed_conversion_error(
+            parameter_index,
+            &declaration,
+            "unsupported_direction",
+            "Only INPUT parameter direction is supported by query execution",
+        ));
+    }
+    if parameter.expanded {
+        return Err(typed_conversion_error(
+            parameter_index,
+            &declaration,
+            "expanded_not_supported",
+            "Expanded Parameter descriptors cannot represent one SQL value",
+        ));
+    }
+
+    Python::attach(|py| {
+        let value = parameter.value.bind(py);
+        match parameter.sql_type.as_ref() {
+            Some(sql_type) => {
+                python_to_typed_fast_parameter_value(value, sql_type, parameter_index)
+            }
+            None => python_to_fast_parameter_at(value, parameter_index),
+        }
+    })
+}
+
+pub(crate) fn python_to_single_fast_parameter(
+    obj: &Bound<PyAny>,
+    parameter_index: usize,
+) -> PyResult<FastParameter> {
+    if let Ok(parameter) = obj.extract::<Py<Parameter>>() {
+        parameter_descriptor_to_single_fast_parameter(&parameter.borrow(obj.py()), parameter_index)
+    } else {
+        python_to_fast_parameter_at(obj, parameter_index)
+    }
 }
 
 fn parameter_count_error(count: usize) -> PyErr {
