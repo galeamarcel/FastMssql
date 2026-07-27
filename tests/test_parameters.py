@@ -5,6 +5,8 @@ Tests the new parameter system that allows cleaner parameterized queries
 with optional type hints and method chaining.
 """
 
+from decimal import Decimal
+
 import pytest
 from conftest import Config
 
@@ -27,35 +29,150 @@ class TestParameter:
         """Test creating a parameter with value and SQL type."""
         param = Parameter("test", "VARCHAR")
         assert param.value == "test"
-        assert param.sql_type == "VARCHAR"
+        assert param.sql_type == "VARCHAR(8000)"
 
     def test_parameter_repr_without_type(self):
-        """Test string representation without type."""
+        """Parameter repr exposes metadata without exposing its value."""
         param = Parameter(123)
-        assert repr(param) == "Parameter(value=123)"
+        assert repr(param) == (
+            "Parameter(sql_type=None, direction='INPUT', expanded=False, "
+            "value=<redacted>)"
+        )
 
     def test_parameter_repr_with_type(self):
-        """Test string representation with type."""
+        """Typed parameter repr exposes only its safe declaration metadata."""
         param = Parameter("hello", "NVARCHAR")
-        assert repr(param) == "Parameter(value='hello', type=NVARCHAR)"
+        assert repr(param) == (
+            "Parameter(sql_type='NVARCHAR(4000)', direction='INPUT', "
+            "expanded=False, value=<redacted>)"
+        )
+
+    def test_parameter_repr_does_not_call_value_repr(self):
+        """Parameter repr must not execute arbitrary user representation code."""
+        secret = "ParameterReprSecret_MustNotLeak_2026"
+        calls = 0
+
+        class SideEffectValue:
+            def __repr__(self) -> str:
+                nonlocal calls
+                calls += 1
+                return secret
+
+        param = Parameter(SideEffectValue())
+        assert calls == 0
+
+        rendered = repr(param)
+
+        assert calls == 0
+        assert secret not in rendered
+        assert rendered == (
+            "Parameter(sql_type=None, direction='INPUT', expanded=False, "
+            "value=<redacted>)"
+        )
 
     def test_parameter_various_types(self):
         """Test parameter with various Python types."""
         # Test different value types
         test_cases = [
-            (None, None),
-            (True, None),
-            (False, None),
-            (42, "INT"),
-            (3.14, "FLOAT"),
-            ("string", "VARCHAR"),
-            (b"bytes", "VARBINARY"),
+            (None, None, None),
+            (True, None, None),
+            (False, None, None),
+            (42, "INT", "INT"),
+            (3.14, "FLOAT", "FLOAT(53)"),
+            ("string", "VARCHAR", "VARCHAR(8000)"),
+            (b"bytes", "VARBINARY", "VARBINARY(8000)"),
         ]
 
-        for value, sql_type in test_cases:
+        for value, sql_type, canonical_type in test_cases:
             param = Parameter(value, sql_type)
             assert param.value == value
-            assert param.sql_type == sql_type
+            assert param.sql_type == canonical_type
+
+    def test_parameter_descriptor_fields_are_canonical_and_read_only(self):
+        """The public descriptor exposes one canonical immutable contract."""
+        param = Parameter(
+            Decimal("12.3400"),
+            " decimal ( 19 , 4 ) ",
+            direction="input",
+            precision=19,
+            scale=4,
+            expanded=False,
+        )
+
+        assert param.value == Decimal("12.3400")
+        assert param.sql_type == "DECIMAL(19,4)"
+        assert param.direction == "INPUT"
+        assert param.precision == 19
+        assert param.scale == 4
+        assert param.length is None
+        assert param.expanded is False
+        assert param.is_expanded is False
+
+        for attribute, replacement in (
+            ("sql_type", "BIGINT"),
+            ("direction", "OUTPUT"),
+            ("precision", 18),
+            ("scale", 2),
+            ("length", 10),
+            ("expanded", True),
+            ("is_expanded", True),
+        ):
+            with pytest.raises(AttributeError):
+                setattr(param, attribute, replacement)
+
+    @pytest.mark.parametrize(
+        (
+            "declaration",
+            "metadata",
+            "canonical",
+            "precision",
+            "scale",
+            "length",
+        ),
+        [
+            ("float", {}, "FLOAT(53)", 53, None, None),
+            ("FLOAT(24)", {"precision": 24}, "FLOAT(24)", 24, None, None),
+            (
+                "numeric",
+                {"precision": 38, "scale": 12},
+                "NUMERIC(38,12)",
+                38,
+                12,
+                None,
+            ),
+            ("varchar", {}, "VARCHAR(8000)", None, None, 8000),
+            ("varchar(max)", {"length": "max"}, "VARCHAR(MAX)", None, None, "MAX"),
+            ("nvarchar", {}, "NVARCHAR(4000)", None, None, 4000),
+            ("varbinary", {}, "VARBINARY(8000)", None, None, 8000),
+            ("time", {}, "TIME(7)", None, 7, None),
+            ("datetime2(3)", {"scale": 3}, "DATETIME2(3)", None, 3, None),
+            (
+                "datetimeoffset",
+                {},
+                "DATETIMEOFFSET(7)",
+                None,
+                7,
+                None,
+            ),
+        ],
+    )
+    def test_parameter_supported_defaults_and_redundant_metadata(
+        self,
+        declaration,
+        metadata,
+        canonical,
+        precision,
+        scale,
+        length,
+    ):
+        """Defaults and identical keyword metadata resolve deterministically."""
+        param = Parameter(None, declaration, **metadata)
+
+        assert param.sql_type == canonical
+        assert param.precision == precision
+        assert param.scale == scale
+        assert param.length == length
+        assert param.direction == "INPUT"
 
     def test_parameter_automatic_expansion(self):
         """Test automatic iterable expansion for IN clauses."""
@@ -75,14 +192,48 @@ class TestParameter:
         assert param.is_expanded
         assert param.sql_type == "INT"
 
+    def test_parameter_expansion_override_and_alias(self):
+        """Explicit expansion validates the value and keeps the alias exact."""
+        expanded = Parameter((1, 2), "INT", expanded=True)
+        assert expanded.expanded is True
+        assert expanded.is_expanded is True
+
+        scalar = Parameter("scalar", "NVARCHAR(10)", expanded=False)
+        assert scalar.expanded is False
+        assert scalar.is_expanded is False
+
+        with pytest.raises(ValueError, match="expand"):
+            Parameter(1, "INT", expanded=True)
+        with pytest.raises(ValueError, match="expand"):
+            Parameter([1, 2], "INT", expanded=False)
+
+    @pytest.mark.parametrize(
+        ("supplied", "canonical"),
+        [
+            ("input", "INPUT"),
+            ("OUTPUT", "OUTPUT"),
+            ("input_output", "INPUT_OUTPUT"),
+            ("return_value", "RETURN_VALUE"),
+        ],
+    )
+    def test_parameter_direction_is_preserved_canonically(self, supplied, canonical):
+        """Future directions are descriptor state even before wire support."""
+        assert Parameter(1, "INT", direction=supplied).direction == canonical
+
     def test_parameter_automatic_expansion_repr(self):
-        """Test string representation of automatically expanded parameters."""
+        """Expanded parameter repr never exposes iterable contents."""
         values = [1, 2, 3]
         param = Parameter(values)
-        assert repr(param) == "Parameter(IN_values=[1, 2, 3])"
+        assert repr(param) == (
+            "Parameter(sql_type=None, direction='INPUT', expanded=True, "
+            "value=<redacted>)"
+        )
 
         param_with_type = Parameter(values, "INT")
-        assert repr(param_with_type) == "Parameter(IN_values=[1, 2, 3], type=INT)"
+        assert repr(param_with_type) == (
+            "Parameter(sql_type='INT', direction='INPUT', expanded=True, "
+            "value=<redacted>)"
+        )
 
     def test_parameter_automatic_iterable_detection(self):
         """Test automatic iterable detection for expansion."""
@@ -180,7 +331,7 @@ class TestParameters:
         params = Parameters().set("name", "John", "NVARCHAR")
         assert len(params) == 1
         assert params.named["name"].value == "John"
-        assert params.named["name"].sql_type == "NVARCHAR"
+        assert params.named["name"].sql_type == "NVARCHAR(4000)"
 
     def test_parameters_method_chaining(self):
         """Test method chaining with add() and set()."""
@@ -196,7 +347,7 @@ class TestParameters:
         assert params.positional[0].value == 1
         assert params.positional[0].sql_type == "INT"
         assert params.positional[1].value == "test"
-        assert params.positional[1].sql_type == "VARCHAR"
+        assert params.positional[1].sql_type == "VARCHAR(8000)"
 
         # Check named
         assert params.named["active"].value
@@ -219,6 +370,39 @@ class TestParameters:
         assert len(params) == 2
         assert params.positional[0] is param1
         assert params.positional[1] is param2
+
+    def test_parameters_add_and_set_forward_descriptor_metadata(self):
+        """Builder methods expose the complete Parameter constructor surface."""
+        params = Parameters().add(
+            Decimal("1.25"),
+            "DECIMAL",
+            precision=9,
+            scale=2,
+            expanded=False,
+        )
+
+        positional = params.positional[0]
+        assert positional.sql_type == "DECIMAL(9,2)"
+        assert positional.precision == 9
+        assert positional.scale == 2
+        assert positional.expanded is False
+        assert params.to_list() == [Decimal("1.25")]
+
+        params.set(
+            "payload",
+            "hello",
+            "NVARCHAR",
+            direction="OUTPUT",
+            length=20,
+            expanded=False,
+        )
+        named = params.named["payload"]
+        assert named.sql_type == "NVARCHAR(20)"
+        assert named.direction == "OUTPUT"
+        assert named.length == 20
+        assert named.expanded is False
+        with pytest.raises(ValueError, match="Named parameters are not supported"):
+            params.to_list()
 
     def test_parameters_repr(self):
         """Test string representation of Parameters."""

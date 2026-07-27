@@ -21,9 +21,12 @@ use crate::{
         codec::{self, IteratorJoin},
         stream::{QueryStream, TokenStream},
     },
-    BulkLoadRequest, ColumnFlag, SqlReadBytes, ToSql,
+    BulkLoadRequest, ColumnFlag, SqlParameterType, SqlReadBytes, ToSql,
 };
-use codec::{BatchRequest, ColumnData, PacketHeader, RpcParam, RpcProcId, TokenRpcRequest};
+use codec::{
+    BatchRequest, ColumnData, PacketHeader, RpcParam, RpcParameterMetadata, RpcProcId,
+    TokenRpcRequest,
+};
 use enumflags2::BitFlags;
 use futures_util::io::{AsyncRead, AsyncWrite};
 use futures_util::stream::TryStreamExt;
@@ -139,7 +142,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             Self::query_with_reset_baseline(query, self.connection.is_connection_reset_pending());
         let rpc_params = Self::rpc_params(query);
 
-        let params = params.iter().map(|s| s.to_sql());
+        let params = params
+            .iter()
+            .map(|value| (value.to_sql(), value.sql_parameter_type()));
         self.rpc_perform_query(RpcProcId::ExecuteSQL, rpc_params, params)
             .await?;
 
@@ -203,7 +208,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             Self::query_with_reset_baseline(query, self.connection.is_connection_reset_pending());
         let rpc_params = Self::rpc_params(query);
 
-        let params = params.iter().map(|p| p.to_sql());
+        let params = params
+            .iter()
+            .map(|value| (value.to_sql(), value.sql_parameter_type()));
         self.rpc_perform_query(RpcProcId::ExecuteSQL, rpc_params, params)
             .await?;
 
@@ -393,11 +400,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
                 name: Cow::Borrowed("stmt"),
                 flags: BitFlags::empty(),
                 value: ColumnData::String(Some(query.into())),
+                type_info: None,
+                parameter_metadata: None,
             },
             RpcParam {
                 name: Cow::Borrowed("params"),
                 flags: BitFlags::empty(),
                 value: ColumnData::I32(Some(0)),
+                type_info: None,
+                parameter_metadata: None,
             },
         ]
     }
@@ -406,24 +417,59 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         &'a mut self,
         proc_id: RpcProcId,
         mut rpc_params: Vec<RpcParam<'b>>,
-        params: impl Iterator<Item = ColumnData<'b>>,
+        params: impl Iterator<Item = (ColumnData<'b>, Option<SqlParameterType>)>,
     ) -> crate::Result<()>
     where
         'a: 'b,
     {
         let mut param_str = String::new();
 
-        for (i, param) in params.enumerate() {
+        let collation = self.connection.context().collation();
+        let utf8_support = self.connection.context().utf8_support();
+
+        for (i, (param, parameter_type)) in params.enumerate() {
             if i > 0 {
                 param_str.push(',')
             }
             param_str.push_str(&format!("@P{} ", i + 1));
-            param_str.push_str(&param.type_name());
+            let declaration = parameter_type
+                .as_ref()
+                .map(SqlParameterType::declaration)
+                .unwrap_or_else(|| param.type_name().into_owned());
+            param_str.push_str(&declaration);
+
+            let type_info = match parameter_type.as_ref() {
+                Some(parameter_type) => {
+                    if parameter_type.requires_utf8_support(collation) && !utf8_support {
+                        return Err(crate::Error::parameter_conversion(
+                            i,
+                            declaration,
+                            "metadata_error",
+                            "SQL Server did not acknowledge UTF-8 parameter support",
+                        ));
+                    }
+
+                    Some(parameter_type.type_info(collation).map_err(|_| {
+                        crate::Error::parameter_conversion(
+                            i,
+                            declaration.clone(),
+                            "metadata_error",
+                            "SQL parameter metadata is incompatible with the active session",
+                        )
+                    })?)
+                }
+                None => None,
+            };
 
             rpc_params.push(RpcParam {
                 name: Cow::Owned(format!("@P{}", i + 1)),
                 flags: BitFlags::empty(),
                 value: param,
+                type_info,
+                parameter_metadata: parameter_type.map(|_| RpcParameterMetadata {
+                    parameter_index: i,
+                    declaration,
+                }),
             });
         }
 

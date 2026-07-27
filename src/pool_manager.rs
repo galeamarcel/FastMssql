@@ -3,8 +3,8 @@ use crate::deadline::{DeadlineElapsed, OperationName, TimeoutPhase, deadline_fro
 use crate::pool_config::PyPoolConfig;
 use crate::timeout_config::PyTimeoutConfig;
 use crate::types::{
-    SqlError, TimeoutErrorMetadata, create_connection_error, create_operation_timeout_error,
-    create_sql_error,
+    ConversionError, SqlError, TimeoutErrorMetadata, create_connection_error,
+    create_operation_timeout_error, create_sql_error,
 };
 use bb8::Pool;
 use pyo3::prelude::*;
@@ -54,6 +54,14 @@ impl ConnectionDisposition {
                 severity
                     .map(Self::after_sql_server_severity)
                     .unwrap_or(Self::Broken)
+            } else if error.is_instance_of::<ConversionError>(py)
+                && error
+                    .value(py)
+                    .getattr("wire_sent")
+                    .and_then(|value| value.extract::<bool>())
+                    .is_ok_and(|wire_sent| !wire_sent)
+            {
+                Self::NeedsReset
             } else {
                 // I/O, TLS, protocol, conversion, runtime, or an unclassified
                 // internal error is conservatively unsafe to reuse.
@@ -679,7 +687,10 @@ pub async fn warmup_pool(
 
 #[cfg(test)]
 mod connection_disposition_tests {
-    use super::ConnectionDisposition;
+    use super::{ConnectionDisposition, python_error_allows_connection_reuse};
+    use crate::types::{ConversionError, create_parameter_conversion_error};
+    use pyo3::Python;
+    use pyo3::types::PyAnyMethods;
 
     #[test]
     fn nonfatal_sql_server_errors_need_reset_but_remain_synchronized() {
@@ -699,5 +710,45 @@ mod connection_disposition_tests {
                 ConnectionDisposition::Broken
             );
         }
+    }
+
+    #[test]
+    fn structured_pre_wire_parameter_errors_preserve_connection_reuse() {
+        Python::initialize();
+        let error = create_parameter_conversion_error(
+            0,
+            "VARCHAR(3)",
+            "length_overflow",
+            "SQL parameter value is incompatible with its declared type",
+        );
+
+        assert!(python_error_allows_connection_reuse(&error));
+        Python::attach(|py| {
+            let value = error.value(py);
+            assert!(
+                !value
+                    .getattr("wire_sent")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap()
+            );
+            assert!(
+                !value
+                    .getattr("connection_discarded")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap()
+            );
+            assert!(
+                !value
+                    .getattr("outcome_unknown")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap()
+            );
+        });
+
+        let generic = ConversionError::new_err("unclassified conversion failure");
+        assert!(!python_error_allows_connection_reuse(&generic));
     }
 }

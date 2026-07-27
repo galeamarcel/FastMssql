@@ -298,9 +298,26 @@ class ConversionError(Exception):
 
     Attributes:
         message: Human-readable error description.
+        batch_index: Zero-based batch item index when conversion failed during
+            batch preflight.
+        parameter_index: Zero-based index for a structured parameter error.
+        sql_type: Canonical declaration for a structured parameter error.
+        reason: Stable reason code for a structured parameter error.
+        retryable: False for deterministic parameter conversion errors.
+        wire_sent: False when parameter serialization failed before network I/O.
+        connection_discarded: False for a synchronized pre-wire failure.
+        outcome_unknown: False for a deterministic pre-wire failure.
     """
 
     message: str
+    batch_index: int
+    parameter_index: int
+    sql_type: str
+    reason: str
+    retryable: bool
+    wire_sent: bool
+    connection_discarded: bool
+    outcome_unknown: bool
     ...
 
 class SslConfig:
@@ -489,41 +506,83 @@ class QueryStream:
 
 class Parameter:
     """
-    Parameter object for SQL queries with optional type hints.
+    Immutable descriptor for an inferred or explicitly typed SQL parameter.
 
-    Use in parameter lists for parameterized queries. Parameters can specify explicit SQL types
-    for automatic conversion and validation.
+    Explicit declarations use a closed SQL Server scalar grammar and are
+    validated locally. Iterable values expand into one RPC parameter per item.
+
+    Supported declarations:
+        BIT; TINYINT; SMALLINT; INT; BIGINT; REAL; FLOAT[(n)];
+        DECIMAL(p,s); NUMERIC(p,s); CHAR(n); VARCHAR[(n|MAX)];
+        NCHAR(n); NVARCHAR[(n|MAX)]; BINARY(n); VARBINARY[(n|MAX)];
+        UNIQUEIDENTIFIER; DATE; TIME[(s)]; DATETIME; SMALLDATETIME;
+        DATETIME2[(s)]; DATETIMEOFFSET[(s)]; XML.
+
+    Defaults are FLOAT(53), VARCHAR(8000), NVARCHAR(4000),
+    VARBINARY(8000), and temporal scale 7. DECIMAL/NUMERIC and fixed-length
+    character/binary declarations require explicit metadata.
+
+    None is sent as a typed SQL NULL. Incompatible values raise
+    ConversionError with parameter_index, sql_type, reason, and
+    retryable=False; value contents are never included in the error or repr.
 
     Attributes:
-        value: The parameter value (any Python type that can be converted to SQL)
-        sql_type: Optional SQL Server type name (e.g., 'INT', 'VARCHAR', 'DATETIME2')
-        is_expanded: Whether this parameter is an iterable for IN clause expansion
+        value: Original Python value.
+        sql_type: Canonical SQL declaration, or None for inferred conversion.
+        direction: INPUT, OUTPUT, INPUT_OUTPUT, or RETURN_VALUE. Execution
+            currently supports INPUT only.
+        precision: FLOAT/DECIMAL/NUMERIC precision.
+        scale: DECIMAL/NUMERIC or temporal fractional-second scale.
+        length: Character/binary length as an integer or "MAX".
+        expanded: Whether the value expands into multiple parameters.
+        is_expanded: Compatibility alias for expanded.
     """
-
-    value: Any
-    sql_type: Optional[str]
-    is_expanded: bool
 
     def __init__(
         self,
         value: Any,
         sql_type: Optional[str] = None,
+        *,
+        direction: Literal["INPUT", "OUTPUT", "INPUT_OUTPUT", "RETURN_VALUE"] = "INPUT",
+        precision: Optional[int] = None,
+        scale: Optional[int] = None,
+        length: Optional[int | Literal["MAX", "max"]] = None,
+        expanded: Optional[bool] = None,
     ) -> None:
-        """
-        Create a new parameter with optional type specification.
-
-        Args:
-            value: The parameter value
-            sql_type: Optional SQL Server type name for explicit type conversion
-        """
+        """Create an inferred or explicitly typed parameter descriptor."""
         ...
+
+    @property
+    def value(self) -> Any: ...
+
+    @property
+    def sql_type(self) -> Optional[str]: ...
+
+    @property
+    def direction(self) -> Literal["INPUT", "OUTPUT", "INPUT_OUTPUT", "RETURN_VALUE"]: ...
+
+    @property
+    def precision(self) -> Optional[int]: ...
+
+    @property
+    def scale(self) -> Optional[int]: ...
+
+    @property
+    def length(self) -> Optional[int | Literal["MAX"]]: ...
+
+    @property
+    def expanded(self) -> bool: ...
+
+    @property
+    def is_expanded(self) -> bool: ...
 
 class Parameters:
     """
-    Collection of parameters for SQL queries with positional and named support.
+    Collection of parameter descriptors.
 
-    Supports both positional parameters (@P1, @P2, etc.) and named parameters (@name, @id, etc.).
-    Can be constructed with positional and keyword arguments, with optional type specifications.
+    Positional descriptors are accepted by SQL execution. Named descriptors
+    remain available for construction compatibility but are rejected by the
+    SQL Server wire conversion.
 
     Attributes:
         *args: List of Parameter objects in positional order
@@ -551,6 +610,12 @@ class Parameters:
         self,
         value: Any,
         sql_type: Optional[str] = None,
+        *,
+        direction: Literal["INPUT", "OUTPUT", "INPUT_OUTPUT", "RETURN_VALUE"] = "INPUT",
+        precision: Optional[int] = None,
+        scale: Optional[int] = None,
+        length: Optional[int | Literal["MAX", "max"]] = None,
+        expanded: Optional[bool] = None,
     ) -> Parameters:
         """
         Add a positional parameter and return self for chaining.
@@ -569,6 +634,12 @@ class Parameters:
         key: str,
         value: Any,
         sql_type: Optional[str] = None,
+        *,
+        direction: Literal["INPUT", "OUTPUT", "INPUT_OUTPUT", "RETURN_VALUE"] = "INPUT",
+        precision: Optional[int] = None,
+        scale: Optional[int] = None,
+        length: Optional[int | Literal["MAX", "max"]] = None,
+        expanded: Optional[bool] = None,
     ) -> Parameters:
         """
         Add or update a named parameter and return self for chaining.

@@ -2,8 +2,8 @@ use crate::tds::codec::TokenSspi;
 use crate::{
     client::Connection,
     tds::codec::{
-        TokenColMetaData, TokenDone, TokenEnvChange, TokenError, TokenFeatureExtAck, TokenInfo,
-        TokenLoginAck, TokenOrder, TokenReturnValue, TokenRow,
+        FeatureAck, TokenColMetaData, TokenDone, TokenEnvChange, TokenError, TokenFeatureExtAck,
+        TokenInfo, TokenLoginAck, TokenOrder, TokenReturnValue, TokenRow,
     },
     Error, SqlReadBytes, TokenType,
 };
@@ -169,17 +169,20 @@ where
     async fn get_env_change(&mut self) -> crate::Result<ReceivedToken> {
         let change = TokenEnvChange::decode(self.conn).await?;
 
-        match change {
+        match &change {
             TokenEnvChange::PacketSize(new_size, _) => {
-                self.conn.context_mut().set_packet_size(new_size);
+                self.conn.context_mut().set_packet_size(*new_size);
             }
             TokenEnvChange::BeginTransaction(desc) => {
-                self.conn.context_mut().set_transaction_descriptor(desc);
+                self.conn.context_mut().set_transaction_descriptor(*desc);
             }
             TokenEnvChange::CommitTransaction
             | TokenEnvChange::RollbackTransaction
             | TokenEnvChange::DefectTransaction => {
                 self.conn.context_mut().set_transaction_descriptor([0; 8]);
+            }
+            TokenEnvChange::SqlCollation { new, .. } => {
+                self.conn.context_mut().set_collation(*new);
             }
             _ => (),
         }
@@ -203,6 +206,12 @@ where
 
     async fn get_feature_ext_ack(&mut self) -> crate::Result<ReceivedToken> {
         let ack = TokenFeatureExtAck::decode(self.conn).await?;
+        if let Some(supported) = ack.features.iter().find_map(|feature| match feature {
+            FeatureAck::Utf8Support(supported) => Some(*supported),
+            _ => None,
+        }) {
+            self.conn.context_mut().set_utf8_support(supported);
+        }
         event!(
             Level::INFO,
             "FeatureExtAck with {} features",

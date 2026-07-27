@@ -78,7 +78,11 @@ impl<'a> Query<'a> {
         let rpc_params = Client::<S>::rpc_params(self.sql);
 
         client
-            .rpc_perform_query(RpcProcId::ExecuteSQL, rpc_params, self.params.into_iter())
+            .rpc_perform_query(
+                RpcProcId::ExecuteSQL,
+                rpc_params,
+                self.params.into_iter().map(|value| (value, None)),
+            )
             .await?;
 
         ExecuteResult::new(&mut client.connection).await
@@ -126,7 +130,11 @@ impl<'a> Query<'a> {
         let rpc_params = Client::<S>::rpc_params(self.sql);
 
         client
-            .rpc_perform_query(RpcProcId::ExecuteSQL, rpc_params, self.params.into_iter())
+            .rpc_perform_query(
+                RpcProcId::ExecuteSQL,
+                rpc_params,
+                self.params.into_iter().map(|value| (value, None)),
+            )
             .await?;
 
         let ts = TokenStream::new(&mut client.connection);

@@ -11,6 +11,7 @@ from sql_auth_strict.cases import (
     source_case_occurrences,
     spec_case_ids,
 )
+from sql_auth_strict import conftest as strict_conftest
 from sql_auth_strict.config import SqlAuthConfig
 from sql_auth_strict.conftest import redact_message
 from sql_auth_strict.operation_metrics_assertions import (
@@ -251,7 +252,7 @@ def test_report_generator_preserves_not_run_and_redacts(
     matrix = matrix_output.read_text(encoding="utf-8")
     report = report_output.read_text(encoding="utf-8")
     assert (
-        sum(line.startswith("| `") for line in matrix.splitlines()) == 337
+        sum(line.startswith("| `") for line in matrix.splitlines()) == 346
     )
     assert "| `ENV-001` | PASS |" in matrix
     assert "| `AUTH-001` | FAIL |" in matrix
@@ -319,10 +320,10 @@ def test_report_generator_can_require_complete_evidence(
     )
 
     assert completed.returncode == 1
-    assert "missing evidence for 337 case(s)" in completed.stderr
+    assert "missing evidence for 346 case(s)" in completed.stderr
     assert matrix_output.is_file()
     assert report_output.is_file()
-    assert "| NOT RUN | 337 |" in report_output.read_text(encoding="utf-8")
+    assert "| NOT RUN | 346 |" in report_output.read_text(encoding="utf-8")
 
 
 def test_config_redacts_password(monkeypatch) -> None:
@@ -333,13 +334,13 @@ def test_config_redacts_password(monkeypatch) -> None:
     assert "NeverPrintMe_2026!" not in repr(config)
 
 
-def test_approved_spec_contains_337_unique_case_ids() -> None:
+def test_approved_spec_contains_346_unique_case_ids() -> None:
     spec = ROOT / (
         "docs/superpowers/specs/"
         "2026-07-24-fastmssql-sql-auth-validation-design.md"
     )
     ids = spec_case_ids(spec)
-    assert len(ids) == 337
+    assert len(ids) == 346
 
 
 def test_framework_contract_is_wired_into_runner_and_report() -> None:
@@ -549,13 +550,45 @@ def test_resilience_and_load_cases_are_routed_to_their_runner_lanes() -> None:
                 "pytest.mark.resilience"
                 if case_id.startswith("RES-")
                 else "pytest.mark.load"
-                if case_id.startswith("LOAD-") or case_id == "OPMET-011"
+                if (
+                    case_id.startswith("LOAD-")
+                    or case_id in {"OPMET-011", "PARAM-033"}
+                )
                 else ""
             )
             if expected_marker and expected_marker not in decorators:
                 incorrectly_routed[case_id] = node.name
 
     assert incorrectly_routed == {}
+
+
+def test_load_metric_recorder_accepts_every_case_that_records_metrics(
+    monkeypatch,
+) -> None:
+    path = ROOT / "tests/sql_auth_strict/test_resilience_load.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    metric_case_ids = {
+        argument.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "record_load_metric"
+        for argument in node.args[:1]
+        if isinstance(argument, ast.Constant)
+        and isinstance(argument.value, str)
+    }
+    monkeypatch.setattr(strict_conftest, "_LOAD_METRICS", {})
+    recorder = strict_conftest.record_load_metric.__wrapped__()
+    rejected: dict[str, str] = {}
+
+    for case_id in sorted(metric_case_ids):
+        try:
+            recorder(case_id, contract_probe=True)
+        except ValueError as error:
+            rejected[case_id] = str(error)
+
+    assert metric_case_ids
+    assert rejected == {}
 
 
 def test_operation_metric_cases_are_routed_to_exact_runner_lanes() -> None:

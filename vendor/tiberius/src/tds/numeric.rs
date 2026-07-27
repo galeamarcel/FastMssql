@@ -28,11 +28,9 @@ impl Numeric {
     /// Creates a new Numeric value.
     ///
     /// # Panic
-    /// It will panic if the scale exceed 37.
+    /// It will panic if the scale exceeds SQL Server's maximum of 38.
     pub fn new_with_scale(value: i128, scale: u8) -> Self {
-        // scale cannot exceed 37 since a
-        // max precision of 38 is possible here.
-        assert!(scale < 38);
+        assert!(scale <= 38);
 
         Numeric { value, scale }
     }
@@ -67,19 +65,15 @@ impl Numeric {
 
     /// The precision of the `Number` as a number of digits.
     pub fn precision(self) -> u8 {
-        let mut result = 0;
-        let mut n = self.int_part();
+        let mut coefficient_digits = 0;
+        let mut coefficient = self.value;
 
-        while n != 0 {
-            n /= 10;
-            result += 1;
+        while coefficient != 0 {
+            coefficient /= 10;
+            coefficient_digits += 1;
         }
 
-        if result == 0 {
-            1 + self.scale()
-        } else {
-            result + self.scale()
-        }
+        coefficient_digits.max(self.scale()).max(1)
     }
 
     pub(crate) fn len(self) -> u8 {
@@ -89,6 +83,31 @@ impl Numeric {
             20..=28 => 13,
             _ => 17,
         }
+    }
+
+    pub(crate) fn encode_with_len(self, dst: &mut BytesMut, len: u8) -> crate::Result<()> {
+        if !matches!(len, 5 | 9 | 13 | 17) || self.len() > len {
+            return Err(Error::BulkInput(
+                "NUMERIC value exceeds the declared parameter precision".into(),
+            ));
+        }
+
+        dst.put_u8(len);
+        dst.put_u8(u8::from(self.value >= 0));
+
+        let value = self.value.unsigned_abs();
+        match len {
+            5 => dst.put_u32_le(value as u32),
+            9 => dst.put_u64_le(value as u64),
+            13 => {
+                dst.put_u64_le(value as u64);
+                dst.put_u32_le((value >> 64) as u32);
+            }
+            17 => dst.put_u128_le(value),
+            _ => unreachable!("validated numeric storage length"),
+        }
+
+        Ok(())
     }
 
     pub(crate) async fn decode<R>(src: &mut R, scale: u8) -> crate::Result<Option<Self>>
@@ -158,27 +177,7 @@ impl Numeric {
 
 impl Encode<BytesMut> for Numeric {
     fn encode(self, dst: &mut BytesMut) -> crate::Result<()> {
-        dst.put_u8(self.len());
-
-        if self.value < 0 {
-            dst.put_u8(0);
-        } else {
-            dst.put_u8(1);
-        }
-
-        let value = self.value().abs();
-
-        match self.len() {
-            5 => dst.put_u32_le(value as u32),
-            9 => dst.put_u64_le(value as u64),
-            13 => {
-                dst.put_u64_le(value as u64);
-                dst.put_u32_le((value >> 64) as u32)
-            }
-            _ => dst.put_u128_le(value as u128),
-        }
-
-        Ok(())
+        self.encode_with_len(dst, self.len())
     }
 }
 
@@ -332,6 +331,8 @@ mod bigdecimal_ {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
+    use bytes::{BufMut, BytesMut};
 
     #[test]
     fn numeric_eq() {
@@ -372,6 +373,35 @@ mod tests {
     fn calculates_precision_correctly() {
         let n = Numeric::new_with_scale(57705, 2);
         assert_eq!(5, n.precision());
+    }
+
+    #[test]
+    fn maximum_scale_is_valid_and_has_sql_server_precision() {
+        let smallest_positive = Numeric::new_with_scale(1, 38);
+        assert_eq!(38, smallest_positive.scale());
+        assert_eq!(38, smallest_positive.precision());
+
+        let zero = Numeric::new_with_scale(0, 38);
+        assert_eq!(38, zero.scale());
+        assert_eq!(38, zero.precision());
+    }
+
+    #[tokio::test]
+    async fn decodes_decimal_with_maximum_scale() {
+        let mut payload = BytesMut::with_capacity(18);
+        payload.put_u8(17);
+        payload.put_u8(1);
+        payload.put_u128_le(1);
+        let mut reader = payload.into_sql_read_bytes();
+
+        let decoded = Numeric::decode(&mut reader, 38)
+            .await
+            .expect("DECIMAL(38,38) payload must decode")
+            .expect("DECIMAL(38,38) payload must be non-null");
+
+        assert_eq!(1, decoded.value());
+        assert_eq!(38, decoded.scale());
+        assert_eq!(38, decoded.precision());
     }
 
     #[test]

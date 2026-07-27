@@ -1,8 +1,16 @@
 //! The XML containers
 use super::codec::Encode;
 use bytes::{BufMut, BytesMut};
-use std::borrow::BorrowMut;
 use std::sync::Arc;
+
+fn utf16_plp_byte_length(code_units: usize) -> crate::Result<u32> {
+    code_units
+        .checked_mul(2)
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .ok_or_else(|| {
+            crate::Error::BulkInput("XML parameter exceeds the TDS PLP chunk limit".into())
+        })
+}
 
 /// Provides information of the location for the schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,28 +98,52 @@ impl AsRef<str> for XmlData {
 
 impl Encode<BytesMut> for XmlData {
     fn encode(self, dst: &mut BytesMut) -> crate::Result<()> {
+        let byte_length = utf16_plp_byte_length(self.data.encode_utf16().count())?;
+
         // unknown size
         dst.put_u64_le(0xfffffffffffffffe_u64);
 
-        // first blob
-        let mut length = 0u32;
-        let len_pos = dst.len();
-
-        // writing the length later
-        dst.put_u32_le(length);
-
-        for chr in self.data.encode_utf16() {
-            length += 1;
-            dst.put_u16_le(chr);
+        if byte_length > 0 {
+            // first blob
+            dst.put_u32_le(byte_length);
+            for chr in self.data.encode_utf16() {
+                dst.put_u16_le(chr);
+            }
         }
 
         // PLP_TERMINATOR, no next blobs
         dst.put_u32_le(0);
 
-        let dst: &mut [u8] = dst.borrow_mut();
-        let mut dst = &mut dst[len_pos..];
-        dst.put_u32_le(length * 2);
-
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{utf16_plp_byte_length, XmlData};
+    use crate::tds::codec::Encode;
+    use bytes::BytesMut;
+
+    #[test]
+    fn xml_plp_length_rejects_values_that_do_not_fit_the_wire_counter() {
+        let first_unrepresentable = (u32::MAX as usize / 2) + 1;
+
+        assert!(utf16_plp_byte_length(first_unrepresentable).is_err());
+        assert_eq!(utf16_plp_byte_length(7).unwrap(), 14);
+    }
+
+    #[test]
+    fn empty_xml_uses_one_plp_terminator_and_no_empty_chunk() {
+        let mut encoded = BytesMut::new();
+
+        XmlData::new(String::new()).encode(&mut encoded).unwrap();
+
+        assert_eq!(
+            encoded.as_ref(),
+            [
+                0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // PLP_UNKNOWN
+                0, 0, 0, 0, // PLP_TERMINATOR
+            ]
+        );
     }
 }

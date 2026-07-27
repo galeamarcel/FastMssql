@@ -242,6 +242,12 @@ pub fn create_sql_error(err: TError, base: &'static str) -> PyErr {
                 exc
             })
         }
+        TError::ParameterConversion {
+            parameter_index,
+            sql_type,
+            reason,
+            message,
+        } => create_parameter_conversion_error(parameter_index, &sql_type, &reason, &message),
         _ => PyRuntimeError::new_err(format!("{base}: {err}")),
     }
 }
@@ -275,9 +281,35 @@ pub fn create_protocol_error(message: impl Into<String>) -> PyErr {
     })
 }
 
+pub(crate) fn create_parameter_conversion_error(
+    parameter_index: usize,
+    sql_type: &str,
+    reason: &str,
+    message: &str,
+) -> PyErr {
+    Python::attach(|py| {
+        let error = ConversionError::new_err(message.to_owned());
+        {
+            let value = error.value(py);
+            let _ = value.setattr("message", message);
+            let _ = value.setattr("parameter_index", parameter_index);
+            let _ = value.setattr("sql_type", sql_type);
+            let _ = value.setattr("reason", reason);
+            let _ = value.setattr("retryable", false);
+            let _ = value.setattr("wire_sent", false);
+            let _ = value.setattr("connection_discarded", false);
+            let _ = value.setattr("outcome_unknown", false);
+        }
+        error
+    })
+}
+
 #[cfg(test)]
 mod error_classification_tests {
-    use super::is_tls_io_failure;
+    use super::{ConversionError, create_sql_error, is_tls_io_failure};
+    use pyo3::Python;
+    use pyo3::types::PyAnyMethods;
+    use tiberius::error::Error as TError;
 
     #[test]
     fn certificate_and_handshake_io_messages_are_tls_failures() {
@@ -288,6 +320,77 @@ mod error_classification_tests {
         assert!(is_tls_io_failure("unknown issuer"));
         assert!(!is_tls_io_failure("Connection refused (os error 61)"));
         assert!(!is_tls_io_failure("connection reset by peer"));
+    }
+
+    #[test]
+    fn typed_driver_conversion_metadata_reaches_python_unchanged() {
+        Python::initialize();
+        let error = create_sql_error(
+            TError::ParameterConversion {
+                parameter_index: 7,
+                sql_type: "VARCHAR(4)".to_owned(),
+                reason: "encoding_error".to_owned(),
+                message: "SQL parameter value cannot use the active code page".to_owned(),
+            },
+            "Query execution failed",
+        );
+
+        Python::attach(|py| {
+            assert!(error.is_instance_of::<ConversionError>(py));
+            let value = error.value(py);
+            assert_eq!(
+                value
+                    .getattr("parameter_index")
+                    .unwrap()
+                    .extract::<usize>()
+                    .unwrap(),
+                7
+            );
+            assert_eq!(
+                value
+                    .getattr("sql_type")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "VARCHAR(4)"
+            );
+            assert_eq!(
+                value
+                    .getattr("reason")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "encoding_error"
+            );
+            assert!(
+                !value
+                    .getattr("retryable")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap()
+            );
+            assert!(
+                !value
+                    .getattr("wire_sent")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap()
+            );
+            assert!(
+                !value
+                    .getattr("connection_discarded")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap()
+            );
+            assert!(
+                !value
+                    .getattr("outcome_unknown")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap()
+            );
+        });
     }
 }
 

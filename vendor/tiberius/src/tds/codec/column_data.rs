@@ -301,10 +301,19 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                     || vlc.r#type() == VarLenType::BigVarChar =>
             {
                 if let Some(str) = opt {
-                    let mut encoder = vlc.collation().as_ref().unwrap().encoding()?.new_encoder();
+                    let collation = vlc.collation().ok_or_else(|| {
+                        crate::Error::Protocol(
+                            "ANSI parameter metadata is missing a negotiated collation".into(),
+                        )
+                    })?;
+                    let mut encoder = collation.encoding()?.new_encoder();
                     let len = encoder
                         .max_buffer_length_from_utf8_without_replacement(str.len())
-                        .unwrap();
+                        .ok_or_else(|| {
+                            crate::Error::BulkInput(
+                                "ANSI parameter is too large to encode safely".into(),
+                            )
+                        })?;
                     let mut bytes = Vec::with_capacity(len);
                     let (res, _) = encoder.encode_from_utf8_to_vec_without_replacement(
                         str.as_ref(),
@@ -315,7 +324,7 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                         return Err(crate::Error::Encoding("unrepresentable character".into()));
                     }
 
-                    if bytes.len() > vlc.len() {
+                    if vlc.len() < 0xffff && bytes.len() > vlc.len() {
                         return Err(crate::Error::BulkInput(
                             format!(
                                 "Encoded string length {} exceed column limit {}",
@@ -333,10 +342,11 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                         // unknown size
                         dst.put_u64_le(0xfffffffffffffffe);
 
-                        assert!(
-                            str.len() < 0xffffffff,
-                            "if str longer than this, need to implement multiple blobs"
-                        );
+                        if bytes.len() > u32::MAX as usize {
+                            return Err(crate::Error::BulkInput(
+                                "ANSI parameter exceeds the TDS PLP chunk limit".into(),
+                            ));
+                        }
 
                         dst.put_u32_le(bytes.len() as u32);
                         dst.extend_from_slice(bytes.as_slice());
@@ -366,7 +376,7 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
 
                         let length = dst.len() - len_pos - 2;
 
-                        if length > vlc.len() {
+                        if vlc.len() < 0xffff && length > vlc.len() {
                             return Err(crate::Error::BulkInput(
                                 format!(
                                     "Encoded string length {} exceed column limit {}",
@@ -384,10 +394,17 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                         // unknown size
                         dst.put_u64_le(0xfffffffffffffffe);
 
-                        assert!(
-                            str.len() < 0xffffffff,
-                            "if str longer than this, need to implement multiple blobs"
-                        );
+                        let encoded_len =
+                            str.encode_utf16().count().checked_mul(2).ok_or_else(|| {
+                                crate::Error::BulkInput(
+                                    "Unicode parameter is too large to encode safely".into(),
+                                )
+                            })?;
+                        if encoded_len > u32::MAX as usize {
+                            return Err(crate::Error::BulkInput(
+                                "Unicode parameter exceeds the TDS PLP chunk limit".into(),
+                            ));
+                        }
 
                         let len_pos = dst.len();
                         dst.put_u32_le(0u32);
@@ -397,17 +414,6 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                         }
 
                         let length = dst.len() - len_pos - 4;
-
-                        if length > vlc.len() {
-                            return Err(crate::Error::BulkInput(
-                                format!(
-                                    "Encoded string length {} exceed column limit {}",
-                                    length,
-                                    vlc.len()
-                                )
-                                .into(),
-                            ));
-                        }
 
                         if length > 0 {
                             // no next blob
@@ -484,7 +490,7 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                     || vlc.r#type() == VarLenType::BigVarBin =>
             {
                 if let Some(bytes) = opt {
-                    if bytes.len() > vlc.len() {
+                    if vlc.len() < 0xffff && bytes.len() > vlc.len() {
                         return Err(crate::Error::BulkInput(
                             format!(
                                 "Binary length {} exceed column limit {}",
@@ -501,7 +507,12 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                     } else {
                         // unknown size
                         dst.put_u64_le(0xfffffffffffffffe);
-                        dst.put_u32_le(bytes.len() as u32);
+                        let chunk_length = u32::try_from(bytes.len()).map_err(|_| {
+                            crate::Error::BulkInput(
+                                "Binary parameter exceeds the TDS PLP chunk limit".into(),
+                            )
+                        })?;
+                        dst.put_u32_le(chunk_length);
 
                         if !bytes.is_empty() {
                             dst.extend(bytes.into_owned());
@@ -594,6 +605,11 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                 if vlc.r#type() == VarLenType::Timen =>
             {
                 if let Some(time) = opt {
+                    if time.scale() != vlc.len() as u8 {
+                        return Err(crate::Error::BulkInput(
+                            "TIME value scale does not match parameter metadata".into(),
+                        ));
+                    }
                     dst.put_u8(time.len()?);
                     time.encode(dst)?;
                 } else {
@@ -609,13 +625,11 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
             (ColumnData::DateTime2(opt), Some(TypeInfo::VarLenSized(vlc)))
                 if vlc.r#type() == VarLenType::Datetime2 =>
             {
-                if let Some(mut dt2) = opt {
+                if let Some(dt2) = opt {
                     if dt2.time().scale() != vlc.len() as u8 {
-                        let time = dt2.time();
-                        let increments = (time.increments() as f64
-                            * 10_f64.powi(vlc.len() as i32 - time.scale() as i32))
-                            as u64;
-                        dt2 = DateTime2::new(dt2.date(), Time::new(increments, vlc.len() as u8));
+                        return Err(crate::Error::BulkInput(
+                            "DATETIME2 value scale does not match parameter metadata".into(),
+                        ));
                     }
                     dst.put_u8(dt2.time().len()? + 3);
                     dt2.encode(dst)?;
@@ -634,6 +648,11 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                 if vlc.r#type() == VarLenType::DatetimeOffsetn =>
             {
                 if let Some(dto) = opt {
+                    if dto.datetime2().time().scale() != vlc.len() as u8 {
+                        return Err(crate::Error::BulkInput(
+                            "DATETIMEOFFSET value scale does not match parameter metadata".into(),
+                        ));
+                    }
                     dst.put_u8(dto.datetime2().time().len()? + 5);
                     dto.encode(dst)?;
                 } else {
@@ -663,14 +682,27 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                 dst.put_u8(0);
                 xml.into_owned().encode(&mut *dst)?;
             }
-            (ColumnData::Numeric(opt), Some(TypeInfo::VarLenSizedPrecision { ty, scale, .. }))
-                if ty == &VarLenType::Numericn || ty == &VarLenType::Decimaln =>
-            {
+            (
+                ColumnData::Numeric(opt),
+                Some(TypeInfo::VarLenSizedPrecision {
+                    ty,
+                    size,
+                    precision,
+                    scale,
+                }),
+            ) if ty == &VarLenType::Numericn || ty == &VarLenType::Decimaln => {
                 if let Some(num) = opt {
                     if scale != &num.scale() {
-                        todo!("this still need some work, if client scale not aligned with server, we need to do conversion but will lose precision")
+                        return Err(crate::Error::BulkInput(
+                            "NUMERIC value scale does not match parameter metadata".into(),
+                        ));
                     }
-                    num.encode(&mut *dst)?;
+                    if num.precision() > *precision {
+                        return Err(crate::Error::BulkInput(
+                            "NUMERIC value exceeds the declared parameter precision".into(),
+                        ));
+                    }
+                    num.encode_with_len(&mut *dst, *size as u8)?;
                 } else {
                     dst.put_u8(0);
                 }
@@ -1407,5 +1439,96 @@ mod tests {
                 panic!("Expected: Error::BulkInput, got: {:?}", err);
             }
         }
+    }
+
+    #[test]
+    fn ansi_parameter_without_negotiated_collation_returns_error() {
+        let type_info = TypeInfo::VarLenSized(VarLenContext::new(VarLenType::BigVarChar, 20, None));
+        let mut buffer = BytesMut::new();
+        let mut buffer = BytesMutWithTypeInfo::new(&mut buffer).with_type_info(&type_info);
+
+        let result = ColumnData::String(Some("value".into())).encode(&mut buffer);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn numeric_parameter_scale_mismatch_returns_error() {
+        let type_info = TypeInfo::VarLenSizedPrecision {
+            ty: VarLenType::Numericn,
+            size: 9,
+            precision: 19,
+            scale: 2,
+        };
+        let mut buffer = BytesMut::new();
+        let mut buffer = BytesMutWithTypeInfo::new(&mut buffer).with_type_info(&type_info);
+
+        let result =
+            ColumnData::Numeric(Some(Numeric::new_with_scale(1234, 3))).encode(&mut buffer);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn numeric_parameter_uses_the_declared_storage_size() {
+        let type_info = TypeInfo::VarLenSizedPrecision {
+            ty: VarLenType::Decimaln,
+            size: 9,
+            precision: 19,
+            scale: 2,
+        };
+        let mut bytes = BytesMut::new();
+        let mut buffer = BytesMutWithTypeInfo::new(&mut bytes).with_type_info(&type_info);
+
+        ColumnData::Numeric(Some(Numeric::new_with_scale(1234, 2)))
+            .encode(&mut buffer)
+            .unwrap();
+
+        assert_eq!(bytes.as_ref(), &[9, 1, 0xd2, 0x04, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn max_parameter_types_accept_payloads_larger_than_the_plp_sentinel() {
+        let collation = Some(Collation::new(13_632_521, 52));
+        let cases = [
+            (
+                TypeInfo::VarLenSized(VarLenContext::new(
+                    VarLenType::BigVarChar,
+                    0xffff,
+                    collation,
+                )),
+                ColumnData::String(Some("a".repeat(70_000).into())),
+            ),
+            (
+                TypeInfo::VarLenSized(VarLenContext::new(VarLenType::NVarchar, 0xffff, collation)),
+                ColumnData::String(Some("a".repeat(40_000).into())),
+            ),
+        ];
+
+        for (type_info, value) in cases {
+            let mut bytes = BytesMut::new();
+            let mut buffer = BytesMutWithTypeInfo::new(&mut bytes).with_type_info(&type_info);
+            value.encode(&mut buffer).unwrap();
+        }
+
+        let type_info =
+            TypeInfo::VarLenSized(VarLenContext::new(VarLenType::BigVarBin, 0xffff, None));
+        let mut bytes = BytesMut::new();
+        let mut buffer = BytesMutWithTypeInfo::new(&mut bytes).with_type_info(&type_info);
+        ColumnData::Binary(Some(vec![0; 70_000].into()))
+            .encode(&mut buffer)
+            .unwrap();
+    }
+
+    #[cfg(feature = "tds73")]
+    #[test]
+    fn temporal_parameter_scale_mismatch_returns_error() {
+        let type_info = TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Timen, 3, None));
+        let mut buffer = BytesMut::new();
+        let mut buffer = BytesMutWithTypeInfo::new(&mut buffer).with_type_info(&type_info);
+
+        let result = ColumnData::Time(Some(Time::new(1234, 7))).encode(&mut buffer);
+
+        assert!(result.is_err());
     }
 }

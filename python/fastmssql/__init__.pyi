@@ -1,4 +1,9 @@
-"""Type stubs for FastMSSQL wrapper classes."""
+"""Type stubs for FastMSSQL wrapper classes.
+
+The re-exported ``Parameter`` surface includes closed SQL declarations,
+canonical metadata, typed NULL handling, bounded expansion, and INPUT-only
+execution semantics for the currently modeled direction field.
+"""
 
 from typing import Any, Coroutine, Dict, List, Literal, Optional, StrEnum, Tuple, TypedDict
 from .fastmssql import (

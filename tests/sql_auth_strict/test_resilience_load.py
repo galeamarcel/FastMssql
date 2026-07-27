@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator, Callable
 import fastmssql
 from fastmssql import (
     Connection,
+    Parameter,
     PoolConfig,
     ProtocolError,
     SqlConnectionError,
@@ -102,8 +103,7 @@ def _assert_pool_metric_invariants(stats: dict) -> None:
     )
     assert all(
         stats[key] >= 0
-        for key in POOL_STATS_KEYS
-        - {"connected", "min_idle", "get_wait_time_seconds"}
+        for key in POOL_STATS_KEYS - {"connected", "min_idle", "get_wait_time_seconds"}
     )
     assert math.isfinite(stats["get_wait_time_seconds"])
     assert stats["get_wait_time_seconds"] >= 0.0
@@ -255,9 +255,7 @@ async def test_pause_has_bounded_failure_and_unpause_recovers(
 
     recovered = _connection(sql_auth_config, max_size=1)
     try:
-        assert await asyncio.wait_for(
-            scalar(recovered, "SELECT 3"), timeout=3.0
-        ) == 3
+        assert await asyncio.wait_for(scalar(recovered, "SELECT 3"), timeout=3.0) == 3
     finally:
         await recovered.disconnect()
 
@@ -331,9 +329,7 @@ async def test_recreated_pool_works_after_restart(
     await connection.disconnect()
     recreated = _connection(sql_auth_config, max_size=1)
     try:
-        assert await asyncio.wait_for(
-            scalar(recreated, "SELECT 5"), timeout=3.0
-        ) == 5
+        assert await asyncio.wait_for(scalar(recreated, "SELECT 5"), timeout=3.0) == 5
     finally:
         await recreated.disconnect()
 
@@ -366,8 +362,7 @@ async def test_restart_does_not_falsely_commit_inflight_transaction(
         await transaction.execute(f"INSERT INTO {table} VALUES (1)")
         wait_task = asyncio.ensure_future(
             transaction.query(
-                "WAITFOR DELAY '00:00:30'; "
-                f"SELECT CAST(1 AS INT) AS value; -- {token}"
+                f"WAITFOR DELAY '00:00:30'; SELECT CAST(1 AS INT) AS value; -- {token}"
             )
         )
         await _wait_for_request(observer, token)
@@ -433,9 +428,7 @@ async def test_thousand_short_queries_at_concurrency_twenty(
 
     async def execute(value: int) -> int:
         async with semaphore:
-            return await scalar(
-                connection, "SELECT @P1 AS value", [value]
-            )
+            return await scalar(connection, "SELECT @P1 AS value", [value])
 
     try:
         started = time.monotonic()
@@ -561,10 +554,7 @@ async def test_bulk_insert_increasing_sizes_and_correctness(
     offset = 0
     try:
         for size in sizes:
-            rows = [
-                [offset + index, (offset + index) * 2]
-                for index in range(size)
-            ]
+            rows = [[offset + index, (offset + index) * 2] for index in range(size)]
             started = time.monotonic()
             affected = await owner_connection.bulk_insert(
                 raw_table, ["id", "value"], rows
@@ -594,9 +584,7 @@ async def test_rapid_lifecycle_does_not_grow_sql_sessions(
     record_load_metric,
 ) -> None:
     application_name = unique_sql_name("strict_load_lifecycle")
-    baseline = await _application_session_count(
-        sa_connection, application_name
-    )
+    baseline = await _application_session_count(sa_connection, application_name)
     started = time.monotonic()
     for cycle in range(250):
         connection = _connection(
@@ -610,9 +598,7 @@ async def test_rapid_lifecycle_does_not_grow_sql_sessions(
     deadline = time.monotonic() + 5.0
     observed = -1
     while time.monotonic() < deadline:
-        observed = await _application_session_count(
-            sa_connection, application_name
-        )
+        observed = await _application_session_count(sa_connection, application_name)
         if observed == baseline:
             break
         await asyncio.sleep(0.1)
@@ -672,17 +658,13 @@ async def test_five_hundred_mixed_operations(
         query_values, update_counts, transaction_values = await asyncio.gather(
             asyncio.gather(*(query_operation(value) for value in range(300))),
             asyncio.gather(*(update_operation(row_id) for row_id in range(100))),
-            asyncio.gather(
-                *(transaction_operation(value) for value in range(100))
-            ),
+            asyncio.gather(*(transaction_operation(value) for value in range(100))),
         )
         elapsed = time.monotonic() - started
         assert query_values == list(range(300))
         assert update_counts == [1] * 100
         assert transaction_values == list(range(100))
-        assert await scalar(
-            owner_connection, f"SELECT SUM(value) FROM {table}"
-        ) == 100
+        assert await scalar(owner_connection, f"SELECT SUM(value) FROM {table}") == 100
         record_load_metric(
             "LOAD-006",
             elapsed_seconds=elapsed,
@@ -704,16 +686,19 @@ async def test_post_load_smoke_query_and_pool_state(
         min_idle=2,
     )
     try:
-        assert await scalar(
-            connection,
-            """
+        assert (
+            await scalar(
+                connection,
+                """
             SELECT CASE
                 WHEN CAST(SERVERPROPERTY('Edition') AS NVARCHAR(128))
                      LIKE '%Developer%'
                 THEN 1 ELSE 0
             END
             """,
-        ) == 1
+            )
+            == 1
+        )
         values = await asyncio.gather(
             *(scalar(connection, "SELECT @P1", [value]) for value in range(20))
         )
@@ -780,9 +765,7 @@ async def test_concurrent_write_transactions_preserve_exact_state(
         committed = tuple(range(0, transaction_count, 2))
         sequential_wait_floor = transaction_count * wait_seconds
 
-        assert sorted(value for value, _ in outcomes) == list(
-            range(transaction_count)
-        )
+        assert sorted(value for value, _ in outcomes) == list(range(transaction_count))
         assert len({session_id for _, session_id in outcomes}) >= concurrency // 2
         assert elapsed < sequential_wait_floor * 0.5
         assert await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}") == len(
@@ -804,9 +787,7 @@ async def test_concurrent_write_transactions_preserve_exact_state(
             elapsed_seconds=elapsed,
             transaction_count=transaction_count,
             concurrency=concurrency,
-            distinct_session_count=len(
-                {session_id for _, session_id in outcomes}
-            ),
+            distinct_session_count=len({session_id for _, session_id in outcomes}),
             transactions_per_second=transaction_count / elapsed,
         )
     finally:
@@ -961,9 +942,7 @@ async def test_pool_metrics_remain_consistent_during_ten_thousand_queries(
         ticker = asyncio.create_task(tick())
         started = time.monotonic()
         worker_results = await asyncio.wait_for(
-            asyncio.gather(
-                *(worker(worker_id) for worker_id in range(worker_count))
-            ),
+            asyncio.gather(*(worker(worker_id) for worker_id in range(worker_count))),
             timeout=75.0,
         )
         elapsed = time.monotonic() - started
@@ -983,10 +962,7 @@ async def test_pool_metrics_remain_consistent_during_ten_thousand_queries(
         assert values == list(range(operation_count))
         final = await connection.pool_stats()
         _assert_pool_metric_invariants(final)
-        assert (
-            final["get_started"] - before["get_started"]
-            == operation_count
-        )
+        assert final["get_started"] - before["get_started"] == operation_count
         assert (
             final["get_direct"]
             - before["get_direct"]
@@ -1128,10 +1104,7 @@ async def test_operation_metrics_survive_ten_thousand_queries_and_scrapes(
         try:
             worker_results = await asyncio.wait_for(
                 asyncio.gather(
-                    *(
-                        worker(worker_id)
-                        for worker_id in range(worker_count)
-                    )
+                    *(worker(worker_id) for worker_id in range(worker_count))
                 ),
                 timeout=90.0,
             )
@@ -1146,9 +1119,7 @@ async def test_operation_metrics_survive_ten_thousand_queries_and_scrapes(
         elapsed = time.monotonic() - started
 
         values = sorted(
-            value
-            for worker_values in worker_results
-            for value in worker_values
+            value for worker_values in worker_results for value in worker_values
         )
         assert values == list(range(operation_count))
         final = await connection.operation_stats()
@@ -1183,12 +1154,8 @@ async def test_operation_metrics_survive_ten_thousand_queries_and_scrapes(
             maximum_in_flight=maximum_in_flight,
             maximum_connections=maximum_connections,
             queries_per_second=operation_count / elapsed,
-            query_histogram=final["operations"]["query"][
-                "duration_seconds_buckets"
-            ],
-            exact_outcomes={
-                key: delta[key] for key in OUTCOME_KEYS
-            },
+            query_histogram=final["operations"]["query"]["duration_seconds_buckets"],
+            exact_outcomes={key: delta[key] for key in OUTCOME_KEYS},
         )
     finally:
         stop.set()
@@ -1201,4 +1168,198 @@ async def test_operation_metrics_survive_ten_thousand_queries_and_scrapes(
         sa_connection,
         application_name,
         expected=0,
+    )
+
+
+@case("PARAM-033")
+@pytest.mark.load
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_thousand_concurrent_typed_operations_are_exact_and_pool_bounded(
+    sql_auth_config: SqlAuthConfig,
+    sa_connection: Connection,
+    unique_sql_name: Callable[[str], str],
+    record_load_metric,
+) -> None:
+    operation_count = 1_000
+    concurrency = 64
+    max_size = 8
+    application_name = unique_sql_name("strict_typed_load")
+    metrics_type = getattr(fastmssql, "OperationMetricsConfig")
+    connection = Connection(
+        server=sql_auth_config.host,
+        port=sql_auth_config.port,
+        database=sql_auth_config.database,
+        username=sql_auth_config.owner_user,
+        password=sql_auth_config.owner_password,
+        application_name=application_name,
+        ssl_config=SslConfig.development(),
+        pool_config=PoolConfig(
+            max_size=max_size,
+            min_idle=0,
+            max_lifetime_secs=None,
+            idle_timeout_secs=None,
+            connection_timeout_secs=3,
+            test_on_check_out=False,
+            retry_connection=False,
+        ),
+        operation_metrics_config=metrics_type(enabled=True),
+    )
+    semaphore = asyncio.Semaphore(concurrency)
+    stop = asyncio.Event()
+    application_in_flight = 0
+    maximum_application_in_flight = 0
+
+    async def execute(value: int) -> tuple[int, str, int]:
+        nonlocal application_in_flight, maximum_application_in_flight
+        async with semaphore:
+            application_in_flight += 1
+            maximum_application_in_flight = max(
+                maximum_application_in_flight,
+                application_in_flight,
+            )
+            try:
+                row = (
+                    await connection.query(
+                        """
+                        WAITFOR DELAY '00:00:00.002';
+                        SELECT
+                            @P1 AS value,
+                            CONVERT(
+                                VARCHAR(128),
+                                SQL_VARIANT_PROPERTY(@P1, 'BaseType')
+                            ) AS base_type,
+                            @@SPID AS session_id
+                        """,
+                        [Parameter(value, "INT")],
+                    )
+                ).fetchone()
+                return (
+                    row["value"],
+                    row["base_type"],
+                    row["session_id"],
+                )
+            finally:
+                application_in_flight -= 1
+
+    async def sample() -> tuple[int, int, int, int]:
+        samples = 0
+        maximum_operation_in_flight = 0
+        maximum_connections = 0
+        maximum_sessions = 0
+        while not stop.is_set():
+            operation_stats = await connection.operation_stats()
+            pool_stats = await connection.pool_stats()
+            session_count = await _application_session_count(
+                sa_connection,
+                application_name,
+            )
+            samples += 1
+            maximum_operation_in_flight = max(
+                maximum_operation_in_flight,
+                operation_stats["operations"]["query"]["in_flight"],
+            )
+            maximum_connections = max(
+                maximum_connections,
+                pool_stats["connections"],
+            )
+            maximum_sessions = max(maximum_sessions, session_count)
+            await asyncio.sleep(0.002)
+        return (
+            samples,
+            maximum_operation_in_flight,
+            maximum_connections,
+            maximum_sessions,
+        )
+
+    sampler: asyncio.Task | None = None
+    baseline_sessions = await _application_session_count(
+        sa_connection,
+        application_name,
+    )
+    assert baseline_sessions == 0
+
+    try:
+        assert await connection.connect() is True
+        before = await connection.operation_stats()
+        sampler = asyncio.create_task(sample())
+        started = time.monotonic()
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(
+                *(execute(value) for value in range(operation_count)),
+                return_exceptions=True,
+            ),
+            timeout=45.0,
+        )
+        elapsed = time.monotonic() - started
+        stop.set()
+        (
+            samples,
+            maximum_operation_in_flight,
+            maximum_connections,
+            maximum_sessions,
+        ) = await sampler
+        sampler = None
+
+        failures = [
+            outcome for outcome in outcomes if isinstance(outcome, BaseException)
+        ]
+        successes = [
+            outcome for outcome in outcomes if not isinstance(outcome, BaseException)
+        ]
+        assert len(outcomes) == operation_count
+        assert failures == []
+        assert len(successes) == operation_count
+        assert sorted(value for value, _, _ in successes) == list(
+            range(operation_count)
+        )
+        assert {base_type for _, base_type, _ in successes} == {"int"}
+
+        session_ids = {session_id for _, _, session_id in successes}
+        after = await connection.operation_stats()
+        query_delta = operation_delta(before, after, "query")
+        assert query_delta == {
+            "started": operation_count,
+            "completed": operation_count,
+            "succeeded": operation_count,
+            "errors": 0,
+            "timed_out": 0,
+            "cancelled": 0,
+            "outcome_unknown": 0,
+        }
+        assert after["operations"]["query"]["in_flight"] == 0
+
+        stats = await connection.pool_stats()
+        _assert_pool_metric_invariants(stats)
+        assert stats["connections"] == max_size
+        assert stats["active_connections"] == 0
+        assert len(session_ids) == max_size
+        assert samples > 0
+        assert 1 < maximum_application_in_flight <= concurrency
+        assert max_size <= maximum_operation_in_flight <= concurrency
+        assert maximum_connections == max_size
+        assert maximum_sessions == max_size
+
+        record_load_metric(
+            "PARAM-033",
+            elapsed_seconds=elapsed,
+            operations_per_second=operation_count / elapsed,
+            submitted=operation_count,
+            completed=len(outcomes),
+            succeeded=len(successes),
+            failed=len(failures),
+            maximum_in_flight=maximum_operation_in_flight,
+            physical_sessions=len(session_ids),
+            pool_max_size=max_size,
+        )
+    finally:
+        stop.set()
+        if sampler is not None:
+            await sampler
+        await connection.disconnect()
+
+    await wait_for_session_count(
+        sa_connection,
+        application_name,
+        expected=baseline_sessions,
     )

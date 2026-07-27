@@ -259,6 +259,7 @@ mod macros;
 mod client;
 mod from_sql;
 mod query;
+mod sql_parameter_type;
 mod sql_read_bytes;
 mod to_sql;
 
@@ -276,6 +277,7 @@ pub use query::Query;
 pub use result::*;
 pub use row::{Column, ColumnType, Row};
 pub use sql_browser::SqlBrowser;
+pub use sql_parameter_type::{SqlParameterKind, SqlParameterType};
 pub use tds::{
     codec::{BulkLoadRequest, ColumnData, ColumnFlag, IntoRow, TokenRow, TypeLength},
     numeric,
