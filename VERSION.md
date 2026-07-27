@@ -39,5 +39,21 @@ No release, package-version change, or artifact publication has occurred.
 - The design records the current first-result/buffered baseline and decomposes
   future protocol, streaming, lifecycle and RPC work into separate RED and
   feature branches.
+- Plan-time self-review strengthened the design with bounded consumer
+  acknowledgements before lease release, fail-closed active-result drops,
+  exact metadata units, privacy-safe token/raw-TDS diagnostics and an
+  isolation baseline before direct RPC on recycled sessions, plus
+  out-of-band terminal release when the row channel is full.
+- The same review fixed result-boundary look-ahead, transaction-guard
+  ownership, successful-retirement and nonfatal-error ACK semantics,
+  conservative SQL Server procedure/parameter identifier limits, and a
+  fixed-worker load model through 99,999 operations.
+- Read-only Docker probes reproduced missing TABNAME/COLINFO handling for
+  `FOR BROWSE` and a Rust panic on SQL_VARIANT metadata; the plan now inserts
+  a dedicated RED/fix token-safety pair with raw payload and panic-hook gates,
+  without claiming SQL_VARIANT support.
+- Added the executable TDD plan for the protocol-event, bounded-streaming,
+  lifecycle, RPC output, vendored fmt/clippy, load, wheel, hosted-CI and
+  live-audit branch chain.
 - This documentation change does not modify runtime behavior, package
   metadata, the displayed `0.7.7` version or release state.
