@@ -30,3 +30,14 @@ Changes currently integrated on `test/sql-auth-validation`:
   `30240874468`.
 
 No release, package-version change, or artifact publication has occurred.
+
+### Documentation-only design work
+
+- Added the approved enterprise resultsets, bounded async streaming and RPC
+  output design on branch `docs/resultsets-streaming-design`, based on
+  cumulative SHA `88ac9c00d3d80edbb84377fc1f812070b5cf289b`.
+- The design records the current first-result/buffered baseline and decomposes
+  future protocol, streaming, lifecycle and RPC work into separate RED and
+  feature branches.
+- This documentation change does not modify runtime behavior, package
+  metadata, the displayed `0.7.7` version or release state.
