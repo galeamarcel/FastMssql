@@ -1039,6 +1039,22 @@ def test_result_stream_isolated_wheel_gate_installs_test_dependencies() -> None:
     assert "env -u PYTHONPATH" in wheel_gate
 
 
+def test_hosted_installed_wheel_gate_installs_async_test_plugin() -> None:
+    workflow = (
+        ROOT / ".github/workflows/rust-unit-tests.yml"
+    ).read_text(encoding="utf-8")
+    start = workflow.index("- name: Install extension contract environment")
+    end = workflow.index(
+        "- name: Verify installed Python configuration contracts"
+    )
+    install_gate = workflow[start:end]
+
+    assert "pytest-asyncio==1.4.0" in install_gate, (
+        "hosted installed-wheel gate executes async result-stream contracts "
+        "and must install the pinned pytest plugin that runs them"
+    )
+
+
 def test_result_messages_redact_every_nonempty_password() -> None:
     assert redact_message(
         "owner=OwnerSecret readonly=ReadonlySecret",

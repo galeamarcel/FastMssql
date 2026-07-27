@@ -278,3 +278,14 @@ No release, package-version change, or artifact publication has occurred.
   timeout.
 - This verification-plan fix does not modify runtime behavior, package
   metadata, the displayed `0.7.7` version or release state.
+
+### RED hosted installed-wheel async dependency contract
+
+- Added a deterministic workflow contract requiring the hosted installed-wheel
+  environment to install the locked pytest plugin used by its asynchronous
+  result-stream cancellation test.
+- The contract reproduces GitHub Actions run `30281898838`, where wheel builds
+  and Rust suites passed but pytest rejected the async contract on Ubuntu and
+  macOS because `pytest-asyncio` was absent.
+- This test-only change does not modify runtime behavior, package metadata,
+  the displayed `0.7.7` version or release state.
