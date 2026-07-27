@@ -24,6 +24,11 @@ application SQL.
 **Source design:** `docs/checkout-reset-ddl-design` at
 `a1c222ba60dcf6ab75b95bccb37c6733631e8ce1`
 
+**Execution base:** resolve the exact
+`origin/docs/checkout-reset-ddl-design` HEAD after all plan corrections and
+record it before creating the RED worktree. It must contain
+`ffff9d21c4c5fe74aeb193e20d69f63bc5ca4de3` in ancestry.
+
 **Target repository:** `https://github.com/galeamarcel/FastMssql.git`
 
 **Publication boundary:** push only named branches to `origin`, which must
@@ -67,7 +72,8 @@ git remote get-url --push upstream
 
 Expected:
 
-- local source is exactly `a1c222ba60dcf6ab75b95bccb37c6733631e8ce1`;
+- local HEAD equals `origin/docs/checkout-reset-ddl-design`;
+- `ffff9d21c4c5fe74aeb193e20d69f63bc5ca4de3` is an ancestor;
 - worktree is clean;
 - both origin URLs are `https://github.com/galeamarcel/FastMssql.git`;
 - upstream fetch is Rivendael and upstream push is `DISABLED`.
@@ -95,7 +101,7 @@ Do not change runtime code in this task.
 git worktree add \
   -b test/checkout-reset-ddl \
   .worktrees/test-checkout-reset-ddl \
-  a1c222ba60dcf6ab75b95bccb37c6733631e8ce1
+  <docs/checkout-reset-ddl-design-head-sha>
 ```
 
 **Modify:**

@@ -55,6 +55,8 @@ No release, package-version change, or artifact publication has occurred.
 - Added the executable implementation plan with separate public RED,
   Tiberius compile-RED, runtime-fix and audit-status branches, exact Docker
   SQL-auth, timeout, isolated-wheel, graph and self-review gates.
+- Anchored the execution lineage to the exact design-plus-plan commit so every
+  later RED, fix and status branch retains both approved documents in ancestry.
 - Defined separate RED/fix/status branches, same-SPID SQL-auth isolation
   contracts, fault/deadline recovery, isolated-wheel gates and load profiles
   through the approved 99,999-operation ceiling.
