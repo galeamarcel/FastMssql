@@ -111,3 +111,21 @@ No release, package-version change, or artifact publication has occurred.
   and added database-independent Linux/macOS/Windows response API coverage.
 - This vendored-driver feature does not yet expose a new FastMssql Python API
   or change package metadata, the displayed `0.7.7` version or release state.
+
+### RED bounded async result-stream contracts
+
+- Added runtime, installed-package and stub contracts for immutable result
+  types, pooled `stream()`/`batch()` entry points, nested async-only iteration,
+  terminal summaries and honest buffered `QueryStream` compatibility.
+- Added SQL-auth reproductions for ordered and empty result sets, exact
+  metadata units, explicit set skipping, reset versus security retirement,
+  DONE/INFO separation, local concurrency errors and measured slow-consumer
+  RSS.
+- Added the required SHA-bound 1,000-operation profile at concurrency 64,
+  pool size 8 and event buffer 8, plus an opt-in fixed-worker path through
+  99,999 operations with separate admitted and scheduled latency evidence.
+- Added atomic pass/fail artifacts, stale-evidence rejection, report
+  rendering and the future installed-wheel gate contract.
+- This RED branch intentionally does not implement the new Python result API
+  and does not change package metadata, the displayed `0.7.7` version or
+  release state.

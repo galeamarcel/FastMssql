@@ -142,7 +142,8 @@ def test_hosted_gate_builds_extension_and_checks_configuration_contracts() -> No
         "tests/test_timeout_config_contract.py "
         "tests/test_lifecycle_contract.py "
         "tests/test_pool_observability_contract.py "
-        "tests/test_operation_metrics_contract.py -q"
+        "tests/test_operation_metrics_contract.py "
+        "tests/test_result_stream_contract.py -q"
         in normalized_workflow
     )
     assert (
@@ -154,4 +155,7 @@ def test_hosted_gate_builds_extension_and_checks_configuration_contracts() -> No
     )
     assert workflow.index("uv pip install") < workflow.index(
         "tests/test_pool_config_default_contract.py"
+    )
+    assert workflow.index("tests/test_operation_metrics_contract.py") < (
+        workflow.index("tests/test_result_stream_contract.py")
     )

@@ -427,7 +427,7 @@ evidence reference.
 - `TYPE-017`: unsupported SQL_VARIANT/spatial/hierarchyid/UDT behavior is
   explicit rather than silently converted to a wrong value.
 
-### RESULT — `FastRow` and `QueryStream`
+### RESULT — `FastRow`, buffered `QueryStream`, and bounded `ResultStream`
 
 - `RESULT-001`: row access by valid name and index.
 - `RESULT-002`: negative and out-of-range row indices.
@@ -444,6 +444,28 @@ evidence reference.
 - `RESULT-013`: empty result methods.
 - `RESULT-014`: documented sync versus async iterator behavior matches runtime.
 - `RESULT-015`: lazy-conversion and memory claims are measured, not inferred.
+- `RESULT-016`: three result sets are streamed in exact wire order.
+- `RESULT-017`: an empty middle result set retains exact declared metadata,
+  including Unicode code-unit lengths, byte lengths, MAX, precision, and
+  temporal scale.
+- `RESULT-018`: outer `ResultStream` and inner `ResultSet` iteration are
+  genuinely asynchronous; normal and early context exits preserve their
+  distinct completion contracts.
+- `RESULT-019`: a fixed-payload slow consumer proves the configured event
+  bound and records baseline, peak, final, and ceiling RSS without claiming
+  byte-chunked LOB streaming.
+- `RESULT-020`: ordinary EOF returns a resettable size-one pool lease, while
+  successfully drained security-context SQL returns its results and retires
+  the physical session before the next smoke query.
+- `RESULT-021`: `ResultSet.aclose()` skips only the active set, preserves an
+  empty following set, and reaches the terminal summary.
+- `RESULT-025`: concurrent consumers and invalid buffer sizes fail locally,
+  deterministically, and without exposing SQL text.
+- `RESULT-028`: DONE records, valid zero row counts, and informational
+  messages remain distinct from result rows.
+- `RESULT-029`: fresh SHA-bound evidence proves 1,000 exactly-once bounded
+  streams at concurrency 64 and pool size 8, with latency, pool, RSS,
+  process-CPU, SQL-session-CPU, event-loop, and post-load smoke invariants.
 
 ### BATCH — query batch, execute batch, and bulk insert
 
