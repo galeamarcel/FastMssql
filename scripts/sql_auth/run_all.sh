@@ -105,6 +105,12 @@ record tiberius-token-safety-sql-auth \
   --no-default-features \
   --features chrono,tds73,rustls \
   --test token_safety_sql_auth -- --test-threads=1
+record tiberius-response-sql-auth \
+  cargo test \
+  --manifest-path vendor/tiberius/Cargo.toml \
+  --no-default-features \
+  --features chrono,tds73,rustls \
+  --test response_events_sql_auth -- --test-threads=1
 
 export FASTMSSQL_TEST_CONNECTION_STRING="Server=${FASTMSSQL_SQL_AUTH_HOST},${FASTMSSQL_SQL_AUTH_PORT};Database=fastmssql_upstream_regression;User Id=${FASTMSSQL_SQL_AUTH_OWNER_USER};Password=${FASTMSSQL_SQL_AUTH_OWNER_PASSWORD};Encrypt=True;TrustServerCertificate=True"
 export FAST_MSSQL_TEST_DB_USER="${FASTMSSQL_SQL_AUTH_OWNER_USER}"

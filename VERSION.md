@@ -84,3 +84,14 @@ No release, package-version change, or artifact publication has occurred.
   code.
 - This fix does not modify package metadata, the displayed `0.7.7` version or
   release state.
+
+### RED response-event and trace-privacy contracts
+
+- Added database-independent API/encoder contracts and real SQL-auth
+  reproductions for complete TDS response events, named RPC output metadata,
+  signed return status, DONE_COUNT semantics and legacy QueryStream parity.
+- Added fail-closed source contracts for value-redacted response `Debug`,
+  token tracing and connection-buffer diagnostics.
+- This RED branch records required behavior only; it does not change runtime
+  response decoding, package metadata, the displayed `0.7.7` version or
+  release state.
