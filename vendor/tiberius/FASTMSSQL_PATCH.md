@@ -4,7 +4,7 @@ This directory is the minimal build source subset of the published `tiberius`
 crate version `0.12.3`, whose registry source records upstream commit
 `c34fab2e14c52ab74519d073d7a7b65bd023fc1a`.
 
-FastMssql temporarily carries two narrowly scoped patch sets.
+FastMssql temporarily carries four narrowly scoped patch sets.
 
 The TLS dependency migration includes:
 
@@ -32,6 +32,43 @@ The connection-pool safety patch adds protocol-level session reset support:
   COMMITTED`, because
   [MS-TDS section 2.2.3.1.2](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-tds/ce398f9a-7d47-4ede-8f36-9dd6fc21ca43)
   explicitly excludes transaction isolation level from `RESETCONNECTION`.
+
+The SQL numeric compatibility patch:
+
+- accepts SQL Server's complete scale range from 0 through 38;
+- derives precision as the maximum of coefficient digits, scale, and one;
+- avoids overstating sub-unit and zero values such as `1E-38` as precision
+  39;
+- covers the `DECIMAL(38,38)` wire payload and real SQL Server decoding path.
+
+The typed RPC parameter patch:
+
+- adds a closed, validated `SqlParameterType` representation; raw SQL type
+  text is never accepted by the TDS layer;
+- carries optional explicit declarations and TDS `TYPE_INFO` beside each
+  parameter while leaving the existing inferred `ToSql` path unchanged;
+- encodes integer width, float storage, precision/scale, character and binary
+  length, temporal scale, UUID, XML, and typed NULL metadata exactly;
+- emits `DATEN` `TYPE_INFO` without a duplicate value-length byte, keeping
+  every following RPC field aligned;
+- serializes exact numeric payloads using the storage width declared by
+  `DECIMAL(p,s)` or `NUMERIC(p,s)`, including zero-padding narrower values;
+- treats the `0xffff` character/binary length as the TDS PLP `MAX` sentinel
+  instead of an application payload ceiling;
+- checks typed character/binary and XML PLP chunk counters before narrowing
+  them to the 32-bit TDS wire length;
+- encodes empty XML as one PLP terminator rather than an empty chunk followed
+  by a second terminator that would shift the next RPC parameter;
+- tracks SQL Server's negotiated collation through `ENVCHANGE` tokens and
+  captures the initial LOGIN7 collation; a connection-pool reset restores
+  that baseline before deriving the reset request's ANSI parameter metadata;
+- advertises TDS 7.4 `UTF8_SUPPORT`, validates its `FEATUREEXTACK`, preserves
+  the negotiated capability across pool reset, and honors the collation
+  `fUTF8` flag for `_UTF8` database collations;
+- converts missing collation, incompatible metadata, and scale mismatches
+  into driver errors instead of `unwrap`, `todo!`, or malformed wire data.
+- marks a response pending only after the complete request payload encodes,
+  preserving connection synchronization after a local parameter error.
 
 No Tiberius fork has been created or published by the FastMssql fork owner.
 The path dependency keeps the reviewed source inside the FastMssql repository

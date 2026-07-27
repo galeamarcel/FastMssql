@@ -19,6 +19,7 @@ mod parameter_conversion;
 mod pool_config;
 mod pool_manager;
 mod py_parameters;
+mod sql_parameter_type;
 mod ssl_config;
 mod timeout_config;
 mod transaction;

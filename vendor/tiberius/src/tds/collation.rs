@@ -11,6 +11,8 @@ use std::fmt;
 
 use crate::error::Error;
 
+const UTF8_FLAG: u32 = 0x0400_0000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Collation {
     /// LCID ColFlags Version
@@ -37,9 +39,16 @@ impl Collation {
         self.info
     }
 
+    /// Whether the TDS collation carries the `fUTF8` flag.
+    pub fn is_utf8(&self) -> bool {
+        self.info & UTF8_FLAG != 0
+    }
+
     /// return an encoding for a given collation
     pub fn encoding(&self) -> crate::Result<&'static Encoding> {
-        let res = if self.sort_id == 0 {
+        let res = if self.is_utf8() {
+            Some(encoding_rs::UTF_8)
+        } else if self.sort_id == 0 {
             lcid_to_encoding(self.lcid())
         } else {
             sortid_to_encoding(self.sort_id)
@@ -386,6 +395,22 @@ pub fn sortid_to_encoding(sort_id: u8) -> Option<&'static Encoding> {
         216 => Some(encoding_rs::WINDOWS_1252),
         217 => Some(encoding_rs::WINDOWS_1252),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod utf8_tests {
+    use super::Collation;
+
+    #[test]
+    fn futf8_collation_uses_utf8_instead_of_the_legacy_lcid_code_page() {
+        let collation = Collation::new(0x0400_0409, 0);
+
+        assert!(collation.is_utf8());
+        assert_eq!(
+            collation.encoding().expect("UTF-8 collation is supported"),
+            encoding_rs::UTF_8
+        );
     }
 }
 

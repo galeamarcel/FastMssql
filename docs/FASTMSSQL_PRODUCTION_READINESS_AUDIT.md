@@ -1094,10 +1094,12 @@ attempt 1, a verificat exact SHA-ul
 Cargo au concluzia `success`.
 
 Diff-ul nu modifică `src/`, `python/` sau vendorul Tiberius. API-ul public,
-semanticile SQL, pool-ul și protocolul TDS sunt neschimbate. Repository-ul nu
-conține un `VERSION.md`; conform excepției aprobate pentru acest fix exclusiv
-de build/CI, nu a fost inventat unul și versiunea pachetului nu a fost
-modificată.
+semanticile SQL, pool-ul și protocolul TDS sunt neschimbate. La acel arbore,
+repository-ul nu conținea un `VERSION.md`; conform excepției aprobate pentru
+acel fix exclusiv de build/CI, nu a fost inventat unul și versiunea pachetului
+nu a fost modificată. Politica repository-ului introdusă ulterior cere acum
+`VERSION.md`; starea versiunii și candidatul următoarei versiuni sunt
+documentate acolo fără a modifica încă metadata pachetului.
 
 Statusul este `VERIFIED_FORK`. Toate branchurile și commiturile sunt numai în
 `galeamarcel/FastMssql`; push-ul upstream rămâne `DISABLED`. Rebase-ul pe

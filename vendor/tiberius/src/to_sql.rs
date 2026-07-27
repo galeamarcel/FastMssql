@@ -1,6 +1,7 @@
 use crate::{
     tds::{codec::ColumnData, Numeric},
     xml::XmlData,
+    SqlParameterType,
 };
 use std::borrow::Cow;
 use uuid::Uuid;
@@ -62,6 +63,15 @@ pub trait ToSql: Send + Sync {
     /// Convert to a value understood by the SQL Server. Conversion
     /// by-reference.
     fn to_sql(&self) -> ColumnData<'_>;
+
+    /// Return explicit, validated SQL Server RPC metadata for this value.
+    ///
+    /// The default keeps the existing inferred-type behavior. Driver adapters
+    /// can override it without exposing raw declaration text to the wire
+    /// encoder.
+    fn sql_parameter_type(&self) -> Option<SqlParameterType> {
+        None
+    }
 }
 
 /// A by-value conversion trait to a TDS type.

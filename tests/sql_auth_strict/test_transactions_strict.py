@@ -5,7 +5,15 @@ from collections.abc import Callable
 import time
 
 import fastmssql
-from fastmssql import Connection, PoolConfig, SqlError, SslConfig, Transaction
+from fastmssql import (
+    Connection,
+    Parameter,
+    Parameters,
+    PoolConfig,
+    SqlError,
+    SslConfig,
+    Transaction,
+)
 from fastmssql.fastmssql import Transaction as RustTransaction
 import pytest
 
@@ -47,8 +55,7 @@ class _RecordingUnknownCommitCore:
     async def commit(self) -> None:
         self.commit_calls += 1
         raise self._unknown_type(
-            "COMMIT completion was not confirmed; "
-            "the transaction outcome is unknown"
+            "COMMIT completion was not confirmed; the transaction outcome is unknown"
         )
 
     async def rollback(self) -> None:
@@ -99,9 +106,7 @@ def _state_contract_transaction(
     config: SqlAuthConfig,
     implementation: str,
 ):
-    transaction_type = (
-        Transaction if implementation == "public" else RustTransaction
-    )
+    transaction_type = Transaction if implementation == "public" else RustTransaction
     return transaction_type(
         config.connection_string(
             config.owner_user,
@@ -121,9 +126,7 @@ def _pooled_transaction_connection(
 ) -> Connection:
     connection_kwargs = {}
     if operation_metrics_config is not None:
-        connection_kwargs["operation_metrics_config"] = (
-            operation_metrics_config
-        )
+        connection_kwargs["operation_metrics_config"] = operation_metrics_config
     return Connection(
         server=server or config.host,
         port=port or config.port,
@@ -181,8 +184,9 @@ class _ScriptedRelayWriter:
 
 
 @pytest.mark.asyncio
-async def test_tcp_fault_proxy_expected_client_disconnect_is_one_shot_and_scoped(
-) -> None:
+async def test_tcp_fault_proxy_expected_client_disconnect_is_one_shot_and_scoped() -> (
+    None
+):
     proxy = DownstreamGateProxy("127.0.0.1", 1433)
     writer = _ScriptedRelayWriter()
 
@@ -193,26 +197,20 @@ async def test_tcp_fault_proxy_expected_client_disconnect_is_one_shot_and_scoped
     )
     with pytest.raises(ConnectionResetError, match="undeclared client"):
         await proxy._relay(
-            _ScriptedRelayReader(
-                ConnectionResetError(54, "undeclared client reset")
-            ),
+            _ScriptedRelayReader(ConnectionResetError(54, "undeclared client reset")),
             writer,
             downstream=False,
         )
 
     proxy.expect_client_disconnect()
     await proxy._relay(
-        _ScriptedRelayReader(
-            ConnectionResetError(54, "declared client reset")
-        ),
+        _ScriptedRelayReader(ConnectionResetError(54, "declared client reset")),
         writer,
         downstream=False,
     )
     with pytest.raises(ConnectionResetError, match="second client"):
         await proxy._relay(
-            _ScriptedRelayReader(
-                ConnectionResetError(54, "second client reset")
-            ),
+            _ScriptedRelayReader(ConnectionResetError(54, "second client reset")),
             writer,
             downstream=False,
         )
@@ -220,9 +218,7 @@ async def test_tcp_fault_proxy_expected_client_disconnect_is_one_shot_and_scoped
     proxy.expect_client_disconnect()
     with pytest.raises(ConnectionResetError, match="server reset"):
         await proxy._relay(
-            _ScriptedRelayReader(
-                ConnectionResetError(54, "server reset")
-            ),
+            _ScriptedRelayReader(ConnectionResetError(54, "server reset")),
             writer,
             downstream=True,
         )
@@ -233,9 +229,7 @@ async def test_tcp_fault_proxy_expected_client_disconnect_is_one_shot_and_scoped
     )
     with pytest.raises(ConnectionResetError, match="after client EOF"):
         await proxy._relay(
-            _ScriptedRelayReader(
-                ConnectionResetError(54, "reset after client EOF")
-            ),
+            _ScriptedRelayReader(ConnectionResetError(54, "reset after client EOF")),
             writer,
             downstream=False,
         )
@@ -256,9 +250,7 @@ async def test_tcp_fault_proxy_expected_client_disconnect_is_one_shot_and_scoped
     )
     with pytest.raises(ConnectionResetError, match="after write"):
         await proxy._relay(
-            _ScriptedRelayReader(
-                ConnectionResetError(54, "reset after write failure")
-            ),
+            _ScriptedRelayReader(ConnectionResetError(54, "reset after write failure")),
             writer,
             downstream=False,
         )
@@ -281,9 +273,7 @@ async def test_tcp_fault_proxy_expected_client_disconnect_is_one_shot_and_scoped
     )
     with pytest.raises(ConnectionResetError, match="after drain"):
         await proxy._relay(
-            _ScriptedRelayReader(
-                ConnectionResetError(54, "reset after drain failure")
-            ),
+            _ScriptedRelayReader(ConnectionResetError(54, "reset after drain failure")),
             writer,
             downstream=False,
         )
@@ -403,9 +393,7 @@ async def _wait_for_request(
         if (count > 0) is present:
             return
         await asyncio.sleep(0.02)
-    raise AssertionError(
-        f"request token {token!r} did not reach present={present}"
-    )
+    raise AssertionError(f"request token {token!r} did not reach present={present}")
 
 
 async def _wait_for_request_identity(
@@ -435,9 +423,7 @@ async def _wait_for_request_identity(
         if row is not None:
             return int(row[0]), str(row[1])
         await asyncio.sleep(0.02)
-    raise AssertionError(
-        f"request token {token!r} did not become active"
-    )
+    raise AssertionError(f"request token {token!r} did not become active")
 
 
 async def _wait_for_session_identity_absent(
@@ -463,8 +449,7 @@ async def _wait_for_session_identity_absent(
             return
         await asyncio.sleep(0.02)
     raise AssertionError(
-        "SQL Server session identity "
-        f"({session_id}, {connection_id}) did not disappear"
+        f"SQL Server session identity ({session_id}, {connection_id}) did not disappear"
     )
 
 
@@ -484,9 +469,7 @@ async def _wait_for_row_count(
         if count == expected:
             return
         await asyncio.sleep(0.01)
-    raise AssertionError(
-        f"row count in {table} did not reach {expected}"
-    )
+    raise AssertionError(f"row count in {table} did not reach {expected}")
 
 
 @case("TX-001")
@@ -668,20 +651,15 @@ async def test_transaction_lease_is_reset_before_cross_lease_reuse(
             "@key=N'fastmssql_tx_lease', @value=N'contaminated', "
             "@read_only=1"
         )
-        await first.execute(
-            "CREATE TABLE #fastmssql_tx_lease (value INT NOT NULL)"
-        )
-        await first.execute(
-            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
-        )
+        await first.execute("CREATE TABLE #fastmssql_tx_lease (value INT NOT NULL)")
+        await first.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
         await first.commit()
 
         await second.begin()
         second_session = await scalar(second, "SELECT @@SPID")
         context_value = await scalar(
             second,
-            "SELECT CONVERT(NVARCHAR(100), "
-            "SESSION_CONTEXT(N'fastmssql_tx_lease'))",
+            "SELECT CONVERT(NVARCHAR(100), SESSION_CONTEXT(N'fastmssql_tx_lease'))",
         )
         temp_object = await scalar(
             second,
@@ -739,8 +717,7 @@ async def test_cancelled_transaction_lease_is_retired_and_waiter_recovers(
         )
         query_task = asyncio.create_task(
             cancelled.simple_query(
-                "WAITFOR DELAY '00:00:05'; "
-                f"SELECT 1 AS value /* {token} */"
+                f"WAITFOR DELAY '00:00:05'; SELECT 1 AS value /* {token} */"
             )
         )
         await _wait_for_request(sa_connection, token, present=True)
@@ -811,9 +788,7 @@ async def test_pooled_commit_ack_loss_is_typed_and_retires_connection(
 ) -> None:
     table = quote_identifier(unique_sql_name("strict_commit_unknown_pool"))
     cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
-    await sa_connection.execute(
-        f"CREATE TABLE {table} (id INT NOT NULL PRIMARY KEY)"
-    )
+    await sa_connection.execute(f"CREATE TABLE {table} (id INT NOT NULL PRIMARY KEY)")
 
     proxy = DownstreamGateProxy(
         sql_auth_config.host,
@@ -878,13 +853,16 @@ async def test_pooled_commit_ack_loss_is_typed_and_retires_connection(
         after_commit = await connection.operation_stats()
         delta = operation_delta(before_commit, after_commit, "commit")
         assert delta["started"] == delta["completed"] == 1
-        assert {
-            key: delta[key] for key in OUTCOME_KEYS
-        } == zero_outcomes(outcome_unknown=1)
-        assert await scalar(
-            sa_connection,
-            f"SELECT COUNT(*) FROM {table} WHERE id = 1",
-        ) == 1
+        assert {key: delta[key] for key in OUTCOME_KEYS} == zero_outcomes(
+            outcome_unknown=1
+        )
+        assert (
+            await scalar(
+                sa_connection,
+                f"SELECT COUNT(*) FROM {table} WHERE id = 1",
+            )
+            == 1
+        )
 
         await asyncio.wait_for(waiting_begin, timeout=2.0)
         replacement_connection_id = await scalar(
@@ -925,9 +903,7 @@ async def test_direct_commit_ack_loss_is_typed_and_closes_socket(
 ) -> None:
     table = quote_identifier(unique_sql_name("strict_commit_unknown_direct"))
     cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
-    await sa_connection.execute(
-        f"CREATE TABLE {table} (id INT NOT NULL PRIMARY KEY)"
-    )
+    await sa_connection.execute(f"CREATE TABLE {table} (id INT NOT NULL PRIMARY KEY)")
 
     proxy = DownstreamGateProxy(
         sql_auth_config.host,
@@ -946,14 +922,17 @@ async def test_direct_commit_ack_loss_is_typed_and_closes_socket(
 
     try:
         await transaction.begin()
-        assert await scalar(
-            transaction,
-            """
+        assert (
+            await scalar(
+                transaction,
+                """
             SELECT encrypt_option
             FROM sys.dm_exec_connections
             WHERE session_id = @@SPID
             """,
-        ) == "TRUE"
+            )
+            == "TRUE"
+        )
         await transaction.execute(f"INSERT INTO {table} (id) VALUES (1)")
 
         proxy.pause_downstream()
@@ -966,10 +945,13 @@ async def test_direct_commit_ack_loss_is_typed_and_closes_socket(
         with pytest.raises(Exception) as captured:
             await asyncio.wait_for(commit_task, timeout=2.0)
         assert type(captured.value).__name__ == "CommitOutcomeUnknown"
-        assert await scalar(
-            sa_connection,
-            f"SELECT COUNT(*) FROM {table} WHERE id = 1",
-        ) == 1
+        assert (
+            await scalar(
+                sa_connection,
+                f"SELECT COUNT(*) FROM {table} WHERE id = 1",
+            )
+            == 1
+        )
         assert transaction.is_connected() is False
     finally:
         proxy.resume_downstream()
@@ -998,9 +980,7 @@ async def test_server_commit_rejection_remains_sql_error(
     transaction = connection.transaction()
 
     try:
-        await connection.execute(
-            f"CREATE TABLE {table} (id INT NOT NULL PRIMARY KEY)"
-        )
+        await connection.execute(f"CREATE TABLE {table} (id INT NOT NULL PRIMARY KEY)")
         await transaction.begin()
         with pytest.raises(SqlError) as statement_error:
             await transaction.simple_query(
@@ -1051,8 +1031,7 @@ async def test_cancelled_pooled_transaction_retires_without_explicit_close(
         )
         query_task = asyncio.create_task(
             cancelled.simple_query(
-                "WAITFOR DELAY '00:00:10'; "
-                f"SELECT 1 AS value /* {token} */"
+                f"WAITFOR DELAY '00:00:10'; SELECT 1 AS value /* {token} */"
             )
         )
         request_identity = await _wait_for_request_identity(
@@ -1193,10 +1172,13 @@ async def test_cancelled_direct_transaction_closes_and_rolls_back_without_close(
             timeout=2.0,
         )
         assert transaction.is_connected() is False
-        assert await scalar(
-            owner_connection,
-            f"SELECT COUNT(*) FROM {table} WHERE id = 1",
-        ) == 0
+        assert (
+            await scalar(
+                owner_connection,
+                f"SELECT COUNT(*) FROM {table} WHERE id = 1",
+            )
+            == 0
+        )
 
         await transaction.close()
         await transaction.close()
@@ -1218,9 +1200,7 @@ async def test_cancelled_commit_retires_lease_without_claiming_rollback(
 ) -> None:
     table = quote_identifier(unique_sql_name("strict_cancelled_commit"))
     cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
-    await sa_connection.execute(
-        f"CREATE TABLE {table} (id INT NOT NULL PRIMARY KEY)"
-    )
+    await sa_connection.execute(f"CREATE TABLE {table} (id INT NOT NULL PRIMARY KEY)")
 
     proxy = DownstreamGateProxy(
         sql_auth_config.host,
@@ -1284,10 +1264,13 @@ async def test_cancelled_commit_retires_lease_without_claiming_rollback(
             """,
         )
         assert replacement_connection_id != original_connection_id
-        assert await scalar(
-            sa_connection,
-            f"SELECT COUNT(*) FROM {table} WHERE id = 1",
-        ) == 1
+        assert (
+            await scalar(
+                sa_connection,
+                f"SELECT COUNT(*) FROM {table} WHERE id = 1",
+            )
+            == 1
+        )
         assert committing.is_connected() is False
         with pytest.raises(
             RuntimeError,
@@ -1331,18 +1314,12 @@ async def test_explicit_commit_and_rollback_persistence(
         await transaction.begin()
         await transaction.execute(f"INSERT INTO {table} VALUES (1)")
         await transaction.commit()
-        assert (
-            await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}")
-            == 1
-        )
+        assert await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}") == 1
 
         await transaction.begin()
         await transaction.execute(f"INSERT INTO {table} VALUES (2)")
         await transaction.rollback()
-        assert (
-            await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}")
-            == 1
-        )
+        assert await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}") == 1
         assert await scalar(owner_connection, f"SELECT id FROM {table}") == 1
     finally:
         await transaction.close()
@@ -1429,13 +1406,9 @@ async def test_repeated_transaction_state_errors(
         with pytest.raises(RuntimeError, match="already begun"):
             await committed.begin()
         await committed.commit()
-        with pytest.raises(
-            RuntimeError, match=r"already (?:been )?committed"
-        ):
+        with pytest.raises(RuntimeError, match=r"already (?:been )?committed"):
             await committed.commit()
-        with pytest.raises(
-            RuntimeError, match=r"already (?:been )?committed"
-        ):
+        with pytest.raises(RuntimeError, match=r"already (?:been )?committed"):
             await committed.rollback()
     finally:
         await committed.close()
@@ -1444,13 +1417,9 @@ async def test_repeated_transaction_state_errors(
     try:
         await rolled_back.begin()
         await rolled_back.rollback()
-        with pytest.raises(
-            RuntimeError, match=r"already (?:been )?rolled back"
-        ):
+        with pytest.raises(RuntimeError, match=r"already (?:been )?rolled back"):
             await rolled_back.rollback()
-        with pytest.raises(
-            RuntimeError, match=r"already (?:been )?rolled back"
-        ):
+        with pytest.raises(RuntimeError, match=r"already (?:been )?rolled back"):
             await rolled_back.commit()
     finally:
         await rolled_back.close()
@@ -1518,10 +1487,7 @@ async def test_sequential_reuse_preserves_dedicated_session(
         await transaction.execute(f"INSERT INTO {table} VALUES (2)")
         await transaction.rollback()
         assert second_session == first_session
-        assert (
-            await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}")
-            == 1
-        )
+        assert await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}") == 1
     finally:
         await transaction.close()
 
@@ -1549,9 +1515,7 @@ async def test_query_simple_query_and_execute_forwarding(
             )
             == 1
         )
-        raw = await transaction.simple_query(
-            "SELECT CAST(2 AS INT) AS raw_value"
-        )
+        raw = await transaction.simple_query("SELECT CAST(2 AS INT) AS raw_value")
         assert raw.fetchone()["raw_value"] == 2
         await transaction.rollback()
     finally:
@@ -1587,10 +1551,7 @@ async def test_query_and_execute_batch_forwarding(
         )
         assert [result.fetchone()["value"] for result in results] == [2, 2]
         await transaction.commit()
-        assert (
-            await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}")
-            == 2
-        )
+        assert await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}") == 2
     finally:
         await transaction.close()
 
@@ -1606,16 +1567,9 @@ async def test_local_temp_table_and_session_state(
         await transaction.execute(
             "CREATE TABLE #strict_tx_session (value INT NOT NULL)"
         )
-        await transaction.execute(
-            "INSERT INTO #strict_tx_session VALUES (41)"
-        )
+        await transaction.execute("INSERT INTO #strict_tx_session VALUES (41)")
         await transaction.simple_query("SET NOCOUNT ON")
-        assert (
-            await scalar(
-                transaction, "SELECT value FROM #strict_tx_session"
-            )
-            == 41
-        )
+        assert await scalar(transaction, "SELECT value FROM #strict_tx_session") == 41
         assert (
             await scalar(
                 transaction,
@@ -1646,8 +1600,7 @@ async def test_ddl_is_rolled_back(
         assert await scalar(transaction, "SELECT OBJECT_ID(@P1)", [raw_table])
         await transaction.rollback()
         assert (
-            await scalar(owner_connection, "SELECT OBJECT_ID(@P1)", [raw_table])
-            is None
+            await scalar(owner_connection, "SELECT OBJECT_ID(@P1)", [raw_table]) is None
         )
     finally:
         await transaction.close()
@@ -1670,13 +1623,9 @@ async def test_savepoint_behavior_through_raw_sql(
         await transaction.execute(f"INSERT INTO {table} VALUES (1)")
         await transaction.simple_query("SAVE TRANSACTION strict_savepoint")
         await transaction.execute(f"INSERT INTO {table} VALUES (2)")
-        await transaction.simple_query(
-            "ROLLBACK TRANSACTION strict_savepoint"
-        )
+        await transaction.simple_query("ROLLBACK TRANSACTION strict_savepoint")
         await transaction.commit()
-        rows = await owner_connection.query(
-            f"SELECT id FROM {table} ORDER BY id"
-        )
+        rows = await owner_connection.query(f"SELECT id FROM {table} ORDER BY id")
         assert [row["id"] for row in rows.rows()] == [1]
     finally:
         await transaction.close()
@@ -1769,9 +1718,7 @@ async def test_deterministic_deadlock_reports_victim_1205(
     await owner_connection.execute(
         f"CREATE TABLE {table} (id INT PRIMARY KEY, value INT NOT NULL)"
     )
-    await owner_connection.execute(
-        f"INSERT INTO {table} VALUES (1, 0), (2, 0)"
-    )
+    await owner_connection.execute(f"INSERT INTO {table} VALUES (1, 0), (2, 0)")
     first = transaction_factory()
     second = transaction_factory()
     try:
@@ -1794,9 +1741,7 @@ async def test_deterministic_deadlock_reports_victim_1205(
             if isinstance(outcome, BaseException)
         ]
         successes = [
-            outcome
-            for outcome in outcomes
-            if not isinstance(outcome, BaseException)
+            outcome for outcome in outcomes if not isinstance(outcome, BaseException)
         ]
         assert len(errors) == 1
         assert len(successes) == 1
@@ -1832,8 +1777,7 @@ async def test_cancellation_is_explicitly_closed_and_recoverable(
         await transaction.execute(f"INSERT INTO {table} VALUES (1)")
         wait_task = asyncio.create_task(
             transaction.query(
-                "WAITFOR DELAY '00:00:02'; "
-                f"SELECT CAST(1 AS INT) AS value; -- {token}"
+                f"WAITFOR DELAY '00:00:02'; SELECT CAST(1 AS INT) AS value; -- {token}"
             )
         )
         await _wait_for_request(sa_connection, token, present=True)
@@ -1843,10 +1787,7 @@ async def test_cancellation_is_explicitly_closed_and_recoverable(
 
         await asyncio.wait_for(transaction.close(), timeout=4.0)
         await _wait_for_request(sa_connection, token, present=False)
-        assert (
-            await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}")
-            == 0
-        )
+        assert await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}") == 0
 
         await transaction.begin()
         await transaction.execute(f"INSERT INTO {table} VALUES (2)")
@@ -1922,23 +1863,16 @@ async def test_concurrent_begin_has_exactly_one_atomic_winner(
         transaction_count = await scalar(transaction, "SELECT @@TRANCOUNT")
 
         successes = [
-            outcome
-            for outcome in outcomes
-            if not isinstance(outcome, BaseException)
+            outcome for outcome in outcomes if not isinstance(outcome, BaseException)
         ]
         failures = [
-            outcome
-            for outcome in outcomes
-            if isinstance(outcome, BaseException)
+            outcome for outcome in outcomes if isinstance(outcome, BaseException)
         ]
 
         assert successes == [None]
         assert len(failures) == 15
         assert all(isinstance(error, RuntimeError) for error in failures)
-        assert {
-            str(error)
-            for error in failures
-        } == {"Transaction has already begun"}
+        assert {str(error) for error in failures} == {"Transaction has already begun"}
         assert transaction_count == 1
     finally:
         await transaction.close()
@@ -1992,10 +1926,7 @@ async def test_concurrent_settlement_has_exactly_one_atomic_winner(
         await getattr(transaction, action)()
 
     actions = (first_action, second_action)
-    tasks = [
-        asyncio.create_task(settle(action))
-        for action in actions
-    ]
+    tasks = [asyncio.create_task(settle(action)) for action in actions]
     await asyncio.sleep(0)
     start.set()
 
@@ -2010,9 +1941,7 @@ async def test_concurrent_settlement_has_exactly_one_atomic_winner(
             if not isinstance(outcome, BaseException)
         ]
         failures = [
-            outcome
-            for outcome in outcomes
-            if isinstance(outcome, BaseException)
+            outcome for outcome in outcomes if isinstance(outcome, BaseException)
         ]
         persisted_rows = await scalar(
             owner_connection,
@@ -2024,12 +1953,145 @@ async def test_concurrent_settlement_has_exactly_one_atomic_winner(
         assert isinstance(failures[0], RuntimeError)
 
         winner = winners[0]
-        terminal_state = (
-            "committed" if winner == "commit" else "rolled back"
-        )
-        assert str(failures[0]) == (
-            f"Transaction has already been {terminal_state}"
-        )
+        terminal_state = "committed" if winner == "commit" else "rolled back"
+        assert str(failures[0]) == (f"Transaction has already been {terminal_state}")
         assert persisted_rows == (1 if winner == "commit" else 0)
     finally:
         await transaction.close()
+
+
+@case("PARAM-032")
+@pytest.mark.asyncio
+async def test_typed_conversion_is_shared_by_connection_transaction_and_batch(
+    owner_connection: Connection,
+    unique_sql_name: Callable[[str], str],
+    cleanup_registry: CleanupRegistry,
+) -> None:
+    table = quote_identifier(unique_sql_name("strict_typed_paths"))
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
+    await owner_connection.execute(
+        f"""
+        CREATE TABLE {table} (
+            id INT PRIMARY KEY,
+            source_value VARCHAR(20) NOT NULL
+        )
+        """
+    )
+
+    connection_row = (
+        await owner_connection.query(
+            """
+            SELECT
+                @P1 AS value,
+                CONVERT(
+                    VARCHAR(128),
+                    SQL_VARIANT_PROPERTY(@P1, 'BaseType')
+                ) AS base_type
+            """,
+            [Parameter(101, "INT")],
+        )
+    ).fetchone()
+    assert connection_row.to_dict() == {
+        "value": 101,
+        "base_type": "int",
+    }
+    assert (
+        await owner_connection.execute(
+            f"INSERT INTO {table} VALUES (@P1, @P2)",
+            Parameters(
+                Parameter(1, "INT"),
+                Parameter("connection", "VARCHAR(20)"),
+            ),
+        )
+        == 1
+    )
+
+    transaction = owner_connection.transaction()
+    try:
+        await transaction.begin()
+        transaction_row = (
+            await transaction.query(
+                """
+                SELECT
+                    @P1 AS value,
+                    CONVERT(
+                        VARCHAR(128),
+                        SQL_VARIANT_PROPERTY(@P1, 'BaseType')
+                    ) AS base_type
+                """,
+                [Parameter(102, "SMALLINT")],
+            )
+        ).fetchone()
+        assert transaction_row.to_dict() == {
+            "value": 102,
+            "base_type": "smallint",
+        }
+        assert (
+            await transaction.execute(
+                f"INSERT INTO {table} VALUES (@P1, @P2)",
+                [
+                    Parameter(2, "INT"),
+                    Parameter("transaction", "VARCHAR(20)"),
+                ],
+            )
+            == 1
+        )
+        await transaction.commit()
+    finally:
+        await transaction.close()
+
+    query_batch = await owner_connection.query_batch(
+        [
+            (
+                """
+                SELECT
+                    @P1 AS value,
+                    CONVERT(
+                        VARCHAR(128),
+                        SQL_VARIANT_PROPERTY(@P1, 'BaseType')
+                    ) AS base_type
+                """,
+                [Parameter(103, "TINYINT")],
+            ),
+            (
+                "SELECT @P1 AS value",
+                Parameters(Parameter("batch", "NVARCHAR(10)")),
+            ),
+        ]
+    )
+    assert query_batch[0].fetchone().to_dict() == {
+        "value": 103,
+        "base_type": "tinyint",
+    }
+    assert query_batch[1].fetchone()["value"] == "batch"
+
+    assert await owner_connection.execute_batch(
+        [
+            (
+                f"INSERT INTO {table} VALUES (@P1, @P2)",
+                [
+                    Parameter(3, "INT"),
+                    Parameter("batch-one", "VARCHAR(20)"),
+                ],
+            ),
+            (
+                f"INSERT INTO {table} VALUES (@P1, @P2)",
+                Parameters(
+                    Parameter(4, "INT"),
+                    Parameter("batch-two", "VARCHAR(20)"),
+                ),
+            ),
+        ]
+    ) == [1, 1]
+
+    rows = (
+        await owner_connection.query(
+            f"SELECT id, source_value FROM {table} ORDER BY id"
+        )
+    ).rows()
+    assert [row.to_dict() for row in rows] == [
+        {"id": 1, "source_value": "connection"},
+        {"id": 2, "source_value": "transaction"},
+        {"id": 3, "source_value": "batch-one"},
+        {"id": 4, "source_value": "batch-two"},
+    ]
