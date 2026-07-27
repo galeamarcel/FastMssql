@@ -4,7 +4,7 @@ This directory is the minimal build source subset of the published `tiberius`
 crate version `0.12.3`, whose registry source records upstream commit
 `c34fab2e14c52ab74519d073d7a7b65bd023fc1a`.
 
-FastMssql temporarily carries four narrowly scoped patch sets.
+FastMssql temporarily carries five narrowly scoped patch sets.
 
 The TLS dependency migration includes:
 
@@ -69,6 +69,21 @@ The typed RPC parameter patch:
   into driver errors instead of `unwrap`, `todo!`, or malformed wire data.
 - marks a response pending only after the complete request payload encodes,
   preserving connection synchronization after a local parameter error.
+
+The token-decoder safety patch:
+
+- recognizes TABNAME and COLINFO browse metadata emitted by `FOR BROWSE`;
+- consumes each USHORT-length payload exactly without retaining base-table
+  names or logging payload bytes;
+- replaces wildcard token-dispatch panics with an exhaustive match;
+- returns typed protocol errors for unsupported UDT and SQL_VARIANT metadata
+  instead of reaching `todo!` or unwinding a runtime worker;
+- lets the FastMssql boundary normalize those controlled typed errors to its
+  stable public metadata-decoding `ProtocolError`;
+- runs Clippy with every non-baseline warning denied while explicitly listing
+  the legacy lint categories already emitted by unchanged Tiberius 0.12.3 on
+  the pinned Rust 1.94 toolchain;
+- deliberately does not claim UDT or SQL_VARIANT value conversion support.
 
 No Tiberius fork has been created or published by the FastMssql fork owner.
 The path dependency keeps the reviewed source inside the FastMssql repository

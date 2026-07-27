@@ -288,6 +288,10 @@ impl TypeInfo {
                     size: 0xfffffffffffffffe_usize,
                 })
             }
+            Ok(VarLenType::Udt) => Err(Error::Protocol("unsupported column type: Udt".into())),
+            Ok(VarLenType::SSVariant) => {
+                Err(Error::Protocol("unsupported column type: SSVariant".into()))
+            }
             Ok(ty) => {
                 let len = match ty {
                     #[cfg(feature = "tds73")]
@@ -313,7 +317,11 @@ impl TypeInfo {
                     VarLenType::Image | VarLenType::Text | VarLenType::NText => {
                         src.read_u32_le().await? as usize
                     }
-                    _ => todo!("not yet implemented for {:?}", ty),
+                    VarLenType::Xml | VarLenType::Udt | VarLenType::SSVariant => {
+                        return Err(Error::Protocol(
+                            format!("unsupported column type: {:?}", ty).into(),
+                        ))
+                    }
                 };
 
                 let collation = match ty {

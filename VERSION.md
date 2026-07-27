@@ -69,3 +69,18 @@ No release, package-version change, or artifact publication has occurred.
   production decoder behavior on this RED branch.
 - This test-only change does not modify package metadata, the displayed
   `0.7.7` version or release state.
+
+### Panic-free Tiberius browse and unsupported metadata decoding
+
+- TABNAME and COLINFO browse payloads are consumed structurally and preserve
+  following rows/tokens without retaining base-table names.
+- UDT and SQL_VARIANT metadata now return typed protocol errors instead of
+  reaching a Rust panic path; value conversion remains explicitly unsupported.
+- The Rust-to-Python boundary preserves the existing stable metadata-decoding
+  `ProtocolError` contract, including query, batch and transaction paths.
+- Added vendored format, baseline-aware clippy, unit, real SQL-auth and hosted
+  desktop gates. Clippy denies every warning category except ten explicitly
+  listed Rust 1.94 diagnostics already present in unchanged Tiberius 0.12.3
+  code.
+- This fix does not modify package metadata, the displayed `0.7.7` version or
+  release state.

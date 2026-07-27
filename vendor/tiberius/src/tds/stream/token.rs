@@ -8,7 +8,7 @@ use crate::{
     Error, SqlReadBytes, TokenType,
 };
 use futures_util::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite},
     stream::{BoxStream, TryStreamExt},
 };
 use std::{convert::TryFrom, sync::Arc};
@@ -31,11 +31,30 @@ pub enum ReceivedToken {
     Sspi(TokenSspi),
     FeatureExtAck(TokenFeatureExtAck),
     Error(TokenError),
+    TableName(usize),
+    ColInfo(usize),
 }
 
 pub(crate) struct TokenStream<'a, S: AsyncRead + AsyncWrite + Unpin + Send> {
     conn: &'a mut Connection<S>,
     last_error: Option<Error>,
+}
+
+async fn consume_ushort_payload<R>(src: &mut R) -> crate::Result<usize>
+where
+    R: SqlReadBytes + Unpin,
+{
+    let byte_len = src.read_u16_le().await? as usize;
+    let mut remaining = byte_len;
+    let mut discard = [0_u8; 1024];
+
+    while remaining > 0 {
+        let chunk_len = remaining.min(discard.len());
+        src.read_exact(&mut discard[..chunk_len]).await?;
+        remaining -= chunk_len;
+    }
+
+    Ok(byte_len)
 }
 
 impl<'a, S> TokenStream<'a, S>
@@ -251,12 +270,21 @@ where
                 TokenType::ReturnValue => this.get_return_value().await?,
                 TokenType::Error => this.get_error().await?,
                 TokenType::Order => this.get_order().await?,
+                TokenType::TableName => {
+                    let byte_len = consume_ushort_payload(this.conn).await?;
+                    event!(Level::TRACE, token = "TABNAME", byte_len = byte_len);
+                    ReceivedToken::TableName(byte_len)
+                }
+                TokenType::ColInfo => {
+                    let byte_len = consume_ushort_payload(this.conn).await?;
+                    event!(Level::TRACE, token = "COLINFO", byte_len = byte_len);
+                    ReceivedToken::ColInfo(byte_len)
+                }
                 TokenType::EnvChange => this.get_env_change().await?,
                 TokenType::Info => this.get_info().await?,
                 TokenType::LoginAck => this.get_login_ack().await?,
                 TokenType::Sspi => this.get_sspi().await?,
                 TokenType::FeatureExtAck => this.get_feature_ext_ack().await?,
-                _ => panic!("Token {:?} unimplemented!", ty),
             };
 
             Ok(Some((token, this)))

@@ -5,6 +5,20 @@ readonly root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly env_file="${root_dir}/.env.sql-auth.local"
 readonly artifact_dir="${root_dir}/.artifacts/sql-auth"
 readonly container_name="fastmssql-sql-auth-dev"
+# Tiberius 0.12.3 predates Rust 1.94 and triggers these audited legacy lint
+# categories in unchanged vendored code. Keep every other warning denied.
+readonly tiberius_clippy_legacy_lints=(
+  -A clippy::doc_lazy_continuation
+  -A clippy::extra_unused_lifetimes
+  -A clippy::large_enum_variant
+  -A clippy::io_other_error
+  -A clippy::needless_lifetimes
+  -A clippy::legacy_numeric_constants
+  -A clippy::cast_enum_truncation
+  -A clippy::derivable_impls
+  -A clippy::manual_div_ceil
+  -A clippy::items_after_test_module
+)
 required_failures=0
 
 cd "${root_dir}"
@@ -66,6 +80,20 @@ record maturin-develop uv run maturin develop --release
 record cargo-fmt cargo fmt --check
 record cargo-clippy cargo clippy --all-targets -- -D warnings
 record cargo-test cargo test --locked
+record tiberius-fmt \
+  cargo fmt --manifest-path vendor/tiberius/Cargo.toml --check
+record tiberius-clippy \
+  cargo clippy \
+  --manifest-path vendor/tiberius/Cargo.toml \
+  --no-default-features \
+  --features chrono,tds73,rustls \
+  --all-targets -- -D warnings "${tiberius_clippy_legacy_lints[@]}"
+record tiberius-lib \
+  cargo test \
+  --manifest-path vendor/tiberius/Cargo.toml \
+  --no-default-features \
+  --features chrono,tds73,rustls \
+  --lib
 
 record compose-up \
   docker compose --env-file "${env_file}" \

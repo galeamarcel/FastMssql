@@ -176,6 +176,9 @@ fn is_tls_io_failure(message: &str) -> bool {
         || lower.contains("unknown issuer")
 }
 
+const DRIVER_METADATA_DECODE_ERROR: &str =
+    "SQL Server driver could not decode SQL Server result metadata";
+
 pub fn create_sql_error(err: TError, base: &'static str) -> PyErr {
     match err {
         TError::Server(s) => {
@@ -220,6 +223,11 @@ pub fn create_sql_error(err: TError, base: &'static str) -> PyErr {
         }
         TError::Protocol(msg) => {
             let message = msg.into_owned();
+            if let Some(column_type) = message.strip_prefix("unsupported column type: ") {
+                return create_protocol_error(format!(
+                    "{DRIVER_METADATA_DECODE_ERROR}: {column_type}"
+                ));
+            }
             Python::attach(|py| {
                 let exc = ProtocolError::new_err(format!("{base}: {message}"));
                 let _ = exc.value(py).setattr("message", message.as_str());
@@ -306,9 +314,9 @@ pub(crate) fn create_parameter_conversion_error(
 
 #[cfg(test)]
 mod error_classification_tests {
-    use super::{ConversionError, create_sql_error, is_tls_io_failure};
+    use super::{ConversionError, ProtocolError, create_sql_error, is_tls_io_failure};
     use pyo3::Python;
-    use pyo3::types::PyAnyMethods;
+    use pyo3::types::{PyAnyMethods, PyStringMethods};
     use tiberius::error::Error as TError;
 
     #[test]
@@ -389,6 +397,34 @@ mod error_classification_tests {
                     .unwrap()
                     .extract::<bool>()
                     .unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn unsupported_driver_metadata_keeps_the_stable_python_contract() {
+        Python::initialize();
+        let error = create_sql_error(
+            TError::Protocol("unsupported column type: SSVariant".into()),
+            "Query execution failed",
+        );
+
+        Python::attach(|py| {
+            assert!(error.is_instance_of::<ProtocolError>(py));
+            let value = error.value(py);
+            let rendered_value = value.str().unwrap();
+            let rendered = rendered_value.to_str().unwrap();
+            assert!(
+                rendered
+                    .starts_with("SQL Server driver could not decode SQL Server result metadata")
+            );
+            assert_eq!(
+                value
+                    .getattr("message")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "SQL Server driver could not decode SQL Server result metadata: SSVariant"
             );
         });
     }

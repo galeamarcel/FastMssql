@@ -22,6 +22,9 @@ uint_enum! {
         /// Used to inform the client by which columns the data is ordered.
         Order = 0xA9,
 
+        /// Describes base table names used by browse-mode column metadata.
+        TableName = 0xA4,
+
         /// Describes the column information in browse mode.
         ColInfo = 0xA5,
 
