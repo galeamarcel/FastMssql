@@ -4,20 +4,21 @@ Data auditului: 24 iulie 2026
 Fork auditat: `https://github.com/galeamarcel/FastMssql.git`  
 Branch: `test/sql-auth-validation`  
 Commit tehnic cumulativ:
-`450ea446b799cf2ce7e035c332c6ce3d5d1f0adc`
+`a9d5c2ab42de0f03051c771bb8942ee15dfe6e28`
 
 Ultima actualizare live: 27 iulie 2026
-Ultimul subsistem verificat: parametri SQL de intrare tipizați, implementați
-în `1909a72`, validați tehnic în `6b12f85` și integrați cumulativ în
-`450ea44`
-Ultimul contract de load pentru parametri: PARAM-033, 1.000/1.000 operații
-reușite, concurență maximă 64 și maximum 8 sesiuni pentru pool maxim 8
-Ultimul merge tehnic verificat: `test/sql-auth-validation` la `450ea44`
+Ultimul subsistem verificat: result sets multiple, streaming async bounded și
+RPC direct cu OUT/return status, implementate în `d829198`, `62e9d7c`,
+`5cad239` și `42b1268`, apoi integrate și reverificate cumulativ în `a9d5c2a`
+Ultimul contract de load pentru rezultate: RESULT-029, 1.000/1.000 operații
+reușite la concurență 64, pool maxim 8 și buffer 8; profilele opt-in
+10.000:128 și 99.999:200 au trecut cu pool maxim 32 și buffer 16
+Ultimul merge tehnic verificat: `test/sql-auth-validation` la `a9d5c2a`
 Ultimul gate hosted verificat: `rust-unit-tests.yml`, rularea
-[#30240874471](https://github.com/galeamarcel/FastMssql/actions/runs/30240874471)
-verde pe Linux, macOS și Windows la SHA-ul cumulativ `450ea44`
+[#30284587006](https://github.com/galeamarcel/FastMssql/actions/runs/30284587006)
+verde pe Linux, macOS și Windows la SHA-ul cumulativ `a9d5c2a`
 Ultimul gate dependency-security verificat: rularea
-[#30240874468](https://github.com/galeamarcel/FastMssql/actions/runs/30240874468)
+[#30284587019](https://github.com/galeamarcel/FastMssql/actions/runs/30284587019)
 verde la același SHA
 
 ## Concluzie
@@ -76,13 +77,31 @@ typed-null au contracte exacte; erorile de conversie sunt structurate și nu
 expun valoarea. Tipurile efective sunt probate cu `SQL_VARIANT_PROPERTY`, nu
 numai prin `CAST`.
 
+API-urile aditive `Connection.stream()`, `Connection.batch()` și echivalentele
+tranzacționale păstrează acum toate result seturile, inclusiv metadata unui set
+gol, prin iterație Python exclusiv async. Producătorul Rust deține lease-ul și
+folosește canale bounded pentru evenimente și confirmări de consum; conexiunea
+nu poate fi eliberată înainte ca ultimul eveniment livrat să fie confirmat.
+EOF normal permite reset/reuse, în timp ce abandonarea, timeoutul, conversia
+incertă și force shutdown retrag fail-closed sesiunea fizică.
+
+`Connection.callproc()` și `Transaction.callproc()` trimit RPC direct după
+numele procedurii și întorc același `ResultStream`. Statusul semnat,
+parametrii `OUTPUT`/`INPUT_OUTPUT` și slotul `RETURN_VALUE` sunt disponibile
+numai după consumarea completă a răspunsului; asocierea outputurilor folosește
+ordinalul și numele, nu ordinea de sosire a tokenilor. Calea de compatibilitate
+`query()`/`QueryStream` rămâne intenționat primul result set bufferizat și nu
+este prezentată drept streaming bounded.
+
 Toate defectele P0 de corectitudine identificate de acest audit, graceful
 lifecycle, observabilitatea pool/operații și parametrii tipizați de intrare
-sunt închise pe fork. Aceasta nu declară încă biblioteca complet enterprise
-production-ready: backpressure-ul explicit, tracing/OpenTelemetry, streamingul
-cu memorie limitată, multiple result sets, RPC cu OUT/return status,
-table-valued parameters, bulk TDS nativ, tipurile money exacte, named
-instances și proveniența artefactelor rămân cerințe P1/P2.
+sunt închise pe fork. Result seturile multiple, backpressure-ul explicit,
+streamingul bounded și RPC cu OUT/return status sunt de asemenea închise și
+verificate pe fork. Aceasta nu declară încă biblioteca complet enterprise
+production-ready: tracing/OpenTelemetry, table-valued parameters, bulk TDS
+nativ, tipurile money exacte, named instances, TDS 8, framework-urile pornite
+din wheel prin servere de proces reale și proveniența artefactelor rămân
+cerințe P1/P2.
 
 Auditul corectează explicit o concluzie anterioară: TDS `ATTENTION` nu este o
 condiție necesară pentru a termina sigur un request dacă driverul închide
@@ -2062,6 +2081,300 @@ Toate branchurile, commiturile, merge-ul și push-urile sunt numai în
 `galeamarcel/FastMssql`. Repository-ul original nu a primit branch, commit,
 push, PR sau release, iar push URL-ul său local rămâne `DISABLED`.
 
+## Result sets, streaming bounded și RPC direct — implementate și verificate
+
+Statusul este `VERIFIED_FORK` pentru suprafața definită de
+RESULT-016–RESULT-031 și RPC-001–RPC-011. Această stare acoperă API-ul aditiv,
+protocolul TDS vendorizat, ownership-ul lifecycle/tranzacție, SQL-auth real,
+wheel-ul instalat și gate-urile hosted. Nu înseamnă că TVP, MONEY/SMALLMONEY
+output, SQL_VARIANT, bulk TDS nativ sau întreaga bibliotecă sunt deja
+production-ready.
+
+### Baseline și cauza inițială
+
+Baseline-ul măsurat păstra numai `into_first_result()`. `query()` și
+`QueryStream` primeau toate rândurile primului result set într-un `Vec<Row>`
+înainte de a întoarce controlul în Python; obiectul rezultat era sincron,
+indexabil, resetabil și oferea `len()`, deci nu putea fi un stream wire-level
+bounded. Metadata unui `SELECT` gol nu ajungea la API, iar tokenii DONE, INFO,
+RETURNSTATUS și RETURNVALUE nu aveau un model complet la limita FastMssql.
+
+Probele SQL-auth read-only au găsit și două defecte Tiberius relevante înainte
+de noul API:
+
+- `FOR BROWSE` emitea TABNAME/COLINFO, dar dispatcherul trata TABNAME drept
+  token fără payload și desincroniza următorul token;
+- metadata SQL_VARIANT ajungea într-un `unimplemented!()` Rust și putea
+  declanșa panic în locul unei erori tipate.
+
+Fixul `c2d5d47` consumă structural TABNAME/COLINFO și transformă
+SQL_VARIANT/UDT neimplementat în eroare protocolară tipată. Acesta este
+panic-containment, nu suport SQL_VARIANT.
+
+### Arhitectura implementată
+
+Abordarea selectată este un producător Rust care deține conexiunea și citește
+evenimentele complete din Tiberius. Evenimentele owned trec printr-un canal
+`tokio::sync::mpsc` bounded către iteratoarele Python. Pentru fiecare metadata,
+rând sau terminal convertibil, consumatorul trimite exact o confirmare
+printr-un al doilea canal bounded. Producătorul nu citește peste creditul
+disponibil și nu eliberează lease-ul înainte de ACK-ul ultimului eveniment
+livrat.
+
+O singură anvelopă metadata pentru următorul result set poate rămâne în
+look-ahead pentru ca un set gol să fie observabil. DONE, INFO și outputurile
+au limite fixe separate. Confirmarea terminală de `ReleasedSuccess` sau
+`ReleasedRetired` este out-of-band, astfel încât un canal de rânduri plin nu
+poate ascunde timeoutul ori eliberarea resursei.
+
+Suprafața publică aditivă este:
+
+- `Connection.stream()` și `Transaction.stream()` pentru SQL parametrizat;
+- `Connection.batch()` și `Transaction.batch()` pentru batch direct;
+- `Connection.callproc()` și `Transaction.callproc()` pentru RPC direct;
+- `ResultStream` și `ResultSet`, ambele exclusiv async;
+- `ResultColumn`, `ResultDone`, `ResultMessage` și `ResultSummary`, toate
+  snapshoturi imutabile.
+
+Închiderea completă prin `finish()` produce summary și poate reutiliza
+conexiunea numai după reset. `ResultSet.aclose()` sare doar setul curent și
+continuă răspunsul. `ResultStream.aclose()`, ieșirea prematură din context sau
+drop-ul unui obiect activ abandonează răspunsul complet și retrage sesiunea.
+Calea legacy `query()` rămâne primul set bufferizat pentru compatibilitate;
+MARS și comenzi concurente pe aceeași sesiune nu au fost adăugate.
+
+### Istoricul TDD publicat exclusiv pe fork
+
+| Branch | SHA exact | Rol |
+|---|---|---|
+| `docs/resultsets-streaming-design` | `848b1d2b6d599538d34c5523d8140f7e8bace3ee` | specificație `4cb360a` și plan executabil |
+| `test/tiberius-token-safety` | `a376628e5594045ae5dac7f8e5d5115242396ffc` | reproduceri RED TABNAME/COLINFO și SQL_VARIANT |
+| `fix/tiberius-token-safety` | `c2d5d471e3b3680e1b84df3231032dd45f5c1b3e` | decoder panic-free |
+| `test/tiberius-response-events` | `426be99d80b6abd1c6936864846a122bb79d8bd6` | contracte RED pentru evenimente/RPC |
+| `feat/tiberius-response-events` | `d829198627c85346dbfbd1b948a9cde0d7bb26b7` | evenimente complete și named RPC vendorizat |
+| `test/resultsets-streaming` | `adca40c6fb8a845640d781aeaae3114330142c51` | contractele RED `ResultStream` |
+| `feat/resultsets-streaming` | `62e9d7cba1b5fcdfc51af55d886451eec71c68cf` | API async bounded |
+| `test/resultstream-lifecycle` | `b3f5942fd63febb75a93cdd5aace21ba01281b16` | contractele RED fail-closed |
+| `feat/resultstream-lifecycle` | `5cad2399192437489355c60c98e570873c8a4346` | lifecycle și ownership tranzacțional |
+| `test/rpc-output-results` | `e4d9c403f0d0844ab9a73935a2f282d380da672f` | contractele RED OUT/return |
+| `feat/rpc-output-results` | `42b1268e58d457df5e165fbf2d4f31e9e8f4d414` | `callproc()` direct |
+| `verify/resultsets-streaming-merge` | `a9d5c2ab42de0f03051c771bb8942ee15dfe6e28` | prima integrare `6690396`, apoi corecțiile de gate verificate |
+| `test/result-stream-stress-runner-config` | `7e47eec89051876134a64aa557bb81eb072e2e6d` | RED pentru configurarea stressului |
+| `fix/result-stream-stress-runner-config` | `e85e7cedd8c8188845c47fb73c2f004b6ddb8966` | forwarding pool/buffer |
+| `test/isolated-wheel-sql-auth-dependencies` | `f70a8899e5e78804196536fccd65b2e37afaeda5` | RED dependențe RESULT-030 |
+| `fix/isolated-wheel-sql-auth-dependencies` | `8f33ffbed4bd2f9ff63b8abeba242743ebc6bc1a` | dotenv și timeout în wheel gate |
+| `test/hosted-wheel-async-dependencies` | `a053a25164a32d1316eb683f0e05e7ef65ed27a1` | RED `pytest-asyncio` hosted |
+| `fix/hosted-wheel-async-dependencies` | `88a81d0128f26d842a3093b91b7d206b2025d069` | plugin async locked |
+| `test/tiberius-windows-auth-test-gates` | `16a6d308c1f4303713ec42d069ca41618c461d8c` | RED gate Windows/winauth |
+| `fix/tiberius-windows-auth-test-gates` | `1d4b7f9e791d5e09402ba427646515cec8f067b5` | gate test egal cu gate API |
+| `test/sql-auth-validation` | `a9d5c2ab42de0f03051c771bb8942ee15dfe6e28` | merge tehnic cumulativ final |
+
+Commiturile intermediare de merge `e45cfc7`, `6134c7f` și `0da2189` păstrează
+ancestry-ul complet al perechilor RED/FIX. Nu s-a făcut squash și niciunul
+dintre branchurile de mai sus nu a fost împins în repository-ul original.
+
+### Rezultate, metadata și RPC
+
+Tiberius a trecut 162/162 teste de bibliotecă, 7/7 probe SQL-auth pentru
+evenimentele de răspuns și 2/2 probe SQL-auth pentru token safety.
+TIB-RESULT-001–006/009 păstrează metadata/rândurile, seturile goale,
+DONE_COUNT, INFO, statusul semnat, ordinalul/numele/tipul outputului și
+compatibilitatea adaptorului vechi. Unitățile TIB-RESULT-007/008 verifică
+encodarea `US_VARCHAR` a numelui RPC și bitul ByRef numai pentru direcțiile
+output-capable.
+
+RESULT-016 a păstrat exact trei seturi în ordine, cu 1, 2 și 1 rânduri.
+RESULT-017 a păstrat setul gol din mijloc cu exact 10 coloane și metadata
+declarată pentru NCHAR/NVARCHAR/CHAR/VARCHAR, VARBINARY, tipurile MAX,
+DECIMAL(19,4) și DATETIME2(3), fără a deduce metadata din primul rând.
+RESULT-019 a consumat lent 2.048 rânduri a câte 32.768 bytes cu buffer 8:
+RSS a crescut de la 124.633.088 la un vârf de 125.272.064 bytes, adică
+638.976 bytes, sub gate-ul de 64 MiB.
+RESULT-021 a sărit numai setul curent și a păstrat următorul set gol.
+
+RESULT-028 a separat:
+
+- un count valid `2`;
+- un count valid `0`;
+- cel puțin un DONE fără `DONE_COUNT`, reprezentat prin `None`;
+- mesajele PRINT și RAISERROR severity 10;
+- absența return statusului și a outputurilor pentru un batch obișnuit.
+
+Nici summary-ul, nici reprezentările mesajelor nu includ textul mesajului în
+`repr`.
+
+RPC-001 a păstrat statusul semnat `-7`. RPC-002 a întors exact outputurile
+poziționale `{1: 14, 2: 12}` și statusul `17`. RPC-003 a validat 22 de sloturi
+scalare prin OUTPUT typed-null și INPUT_OUTPUT value-bearing: întregi,
+float/real, ANSI/Unicode fixed/variable, binary fixed/variable, Decimal, UUID,
+DATE/TIME, DATETIME/SMALLDATETIME/DATETIME2/DATETIMEOFFSET, XML și NULL.
+
+RPC-004 a livrat întâi trei result seturi de 1, 0 și 1 rânduri, inclusiv
+metadata setului gol, apoi statusul `4` și `{"answer": 44}`. RPC-005 a asociat
+corect NVARCHAR(MAX) de 5.000 caractere și VARBINARY(MAX) de 9.000 bytes,
+chiar când SQL Server a reordonat tokenii output. RPC-006 a distins statusul
+valid `0` de status absent. RPC-010 a executat 64 apeluri prin 16 workeri cu
+pool maxim 4, output și status exacte pentru fiecare ID și cel mult 4 sesiuni
+fizice.
+
+Cele 15 ID-uri centrale RESULT-016–029 și RESULT-031, plus RPC-001–011, sunt
+PASS în matricea exactă. RESULT-030 rămâne intenționat gate extern pentru
+wheel instalat, ca importul din sursă să nu poată masca o problemă de
+packaging.
+
+### Reset, retragere și ownership
+
+Dovezile SQL Server au identificat conexiunea prin perechea
+`(@@SPID, connection_id)`, nu numai prin SPID, deoarece SQL Server poate
+reutiliza imediat un număr de sesiune:
+
+- RESULT-020 a păstrat aceeași identitate după EOF normal și a observat
+  dispariția identității după SQL clasificat security-sensitive;
+- RESULT-022 a cerut ca `aclose()` prematur să elimine identitatea fizică
+  înainte ca pool-ul să revină la zero active și să creeze un replacement
+  diferit;
+- RESULT-023 a repetat aceeași dovadă pentru drop-ul răspunsului și al
+  result setului activ;
+- RESULT-024 a separat anularea unui receive încă neowned, care poate continua
+  sigur, de eroarea/conversia terminală incertă, care retrage transportul;
+- RESULT-026 a arătat că graceful shutdown așteaptă EOF, iar force shutdown
+  retrage sesiunea și întoarce metadata lifecycle tipată;
+- RESULT-027 a păstrat lease-ul tranzacțional până la EOF, a serializat
+  următoarea operație pe aceeași tranzacție și a dovedit rollback plus
+  dispariția sesiunii după close/drop/SQL security-sensitive, atât pooled cât
+  și direct;
+- RESULT-031 a ținut lease-ul activ după wire EOF până la ACK-ul conversiei,
+  iar timeoutul cu canal plin și conversia eșuată după EOF au produs o singură
+  eroare terminală și replacement fizic;
+- RPC-007 a verificat separat SQL error, anularea receive-ului și early close,
+  cu reset numai când răspunsul rămâne complet sincronizat și retirement în
+  cazurile incerte.
+
+Fiecare cale de retirement a așteptat absența identității originale în DMV,
+pool-ul a revenit la zero active, replacementul a fost diferit și smoke query
+a trecut. EOF normal și eroarea SQL nefatală complet drenată au demonstrat
+reuse/reset. Nu se încearcă reutilizarea unei conexiuni abandonate printr-un
+`ATTENTION` parțial; transportul este retras fail-closed.
+
+### Load bounded pe SQL Server real
+
+Runnerul complet a regenerat RESULT-029 pe SHA-ul exact `a9d5c2a`:
+
+| Operații | Concurență | Pool / buffer | Ops/s | Peak sesiuni | RSS growth | Event-loop ticks | Rezultat |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 1.000 | 64 | 8 / 8 | 3.161,56 | 8 | 17.743.872 B | 60 | PASS |
+
+Profilele opt-in au folosit workeri persistenți și coadă bounded:
+
+| Operații | Concurență | Pool / buffer | Ops/s | Peak sesiuni | RSS growth | Event-loop ticks | Rezultat |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 10.000 | 128 | 32 / 16 | 4.347,88 | 32 | 36.044.800 B | 407 | PASS |
+| 99.999 | 200 | 32 / 16 | 4.365,82 | 32 | 31.834.112 B | 4.029 | PASS |
+
+Toate cele 110.999 operații au avut ID-uri exacte, zero duplicate, zero
+lipsuri, zero failure/timeout, zero încălcări, RSS sub limita de 128 MiB,
+pool activ zero după quiescence și post-load smoke PASS. Percentilele
+admitted/scheduled, reconcilierea checkouturilor și digesturile ID sunt în
+[SQL_AUTH_RESULT_STREAM_STRESS_REPORT.md](SQL_AUTH_RESULT_STREAM_STRESS_REPORT.md).
+Aceste valori caracterizează driverul și hostul emulat; nu sunt un benchmark
+de capacitate SQL Server.
+
+### Wheel instalat și gate-uri complete
+
+Wheel-ul construit din SHA-ul tehnic exact este:
+
+```text
+.artifacts/result-stream-wheel/fastmssql-0.7.7-cp311-abi3-macosx_11_0_arm64.whl
+SHA-256 92a4a27b574eb25c1edc25ac1f38fa594c7e6245b81347bed346d7ba22586c38
+```
+
+Importul verificat a provenit din
+`.artifacts/result-stream-wheel-venv-a9d5c2a/lib/python3.13/site-packages/`,
+nu din checkout. Contractele statice instalate au trecut 37/37. Seturile,
+lifecycle-ul și RPC-ul pe MSSQL real din același wheel au trecut 34/34.
+Prima invocare SQL-auth a raportat intenționat 33/34 deoarece RESULT-029 a
+refuzat un path implicit inexistent după ce metrics fuseseră scrise într-un
+path extern explicit; reluarea cu
+`FASTMSSQL_RESULT_STREAM_STRESS_METRICS_PATH` setat la artefactul exact a
+trecut 34/34. Acesta este comportamentul anti-stale cerut, nu o excepție
+înghițită și nu un defect runtime.
+
+Orchestratorul complet de pe același SHA a trecut:
+
+```text
+FastMssql Rust                         71/71 PASS
+Tiberius vendored lib                162/162 PASS
+Tiberius response SQL-auth              7/7 PASS
+Tiberius token-safety SQL-auth          2/2 PASS
+strict SQL-auth                       386/386 PASS
+true-async                              16/16 PASS
+framework                               33/33 PASS
+resilience                                6/6 PASS
+load                                     12/12 PASS
+regresie originală locală          1.090/1.090 PASS
+matrice cerințe                         372/372 PASS
+```
+
+`uv sync --locked`, maturin release develop, Cargo fmt, Clippy
+`-D warnings`, raw Cargo și gate-urile Tiberius au trecut. Niciun lane local
+din raportul SQL-auth nu a raportat fail, error, skip sau not-run.
+
+### Reîncercarea hosted și defectele de harness
+
+Rularea hosted
+[#30281898838](https://github.com/galeamarcel/FastMssql/actions/runs/30281898838)
+a construit wheel-ul și a trecut Rust pe Ubuntu/macOS, dar contractul async
+instalat nu putea fi executat deoarece mediul izolat nu instala
+`pytest-asyncio`. Perechea `a053a25`/`88a81d0` a adăugat reproducerea și
+pluginul locked `pytest-asyncio==1.4.0`.
+
+Rularea următoare
+[#30283257883](https://github.com/galeamarcel/FastMssql/actions/runs/30283257883)
+a trecut Ubuntu și macOS, dar Windows a găsit șase erori Rust `E0599`:
+testele parserelor ADO.NET/JDBC erau gate-uite numai prin `windows`, deși
+API-urile `AuthMethod::Integrated/windows` sunt gate-uite prin
+`all(windows, feature = "winauth")`. Perechea `16a6d30`/`1d4b7f9` a aliniat
+numai gate-urile testelor cu gate-ul API; nu a activat Windows authentication
+în profilul SQL-auth/rustls.
+
+Rularea finală
+[#30284587006](https://github.com/galeamarcel/FastMssql/actions/runs/30284587006)
+este verde la SHA-ul exact `a9d5c2a`:
+
+- Ubuntu job `90039109278`;
+- macOS job `90039109224`;
+- Windows job `90039109347`.
+
+Fiecare job a trecut raw Cargo, 71 teste FastMssql, 162 teste Tiberius,
+2 contracte response API independente de DB, wheel build/install și cele 37
+de contracte Python instalate. Rularea
+[#30284587019](https://github.com/galeamarcel/FastMssql/actions/runs/30284587019)
+a trecut prin jobul `90039109247` politica RustSec care respinge
+vulnerabilități și warninguri.
+
+Cross-target-ul Windows local de pe macOS nu a fost pretins PASS: toolchainul
+Rust `x86_64-pc-windows-msvc` a fost instalat, dar buildul native TLS nu poate
+găsi headerele Windows SDK `assert.h`/`windows.h` pe hostul macOS. Jobul
+Windows hosted de mai sus este dovada autoritativă pentru acel sistem.
+
+### Limite rămase
+
+Acest subsistem nu implementează:
+
+- chunking byte-level pentru un singur rând/LOB ori un buget total în bytes
+  al canalului;
+- MARS sau execuție paralelă pe aceeași sesiune fizică;
+- TVP, MONEY/SMALLMONEY output, SQL_VARIANT, spatial, hierarchyid, CLR UDT
+  ori legacy LOB;
+- bulk copy TDS nativ și input bulk cu backpressure;
+- tracing/OpenTelemetry cu exporter;
+- framework-urile pornite prin Uvicorn/Gunicorn din wheel-ul instalat;
+- TDS 8, named instances ori publicarea artefactelor/release-ului.
+
+Publicarea oricărei părți în repository-ul original rămâne condiționată de o
+aprobare viitoare separată, reproducere nouă și rebase curat peste ancestry-ul
+original actual la acel moment.
+
 ## Corecții și nuanțări față de primul audit
 
 - Testul istoric cu 99.999 de operații a utilizat 100/200 de obiecte
@@ -2084,10 +2397,11 @@ push, PR sau release, iar push URL-ul său local rămâne `DISABLED`.
   Conexiunea anulată este acum eliminată automat. `ATTENTION` este necesar
   numai pentru o viitoare reutilizare sigură a aceleiași sesiuni, după drenarea
   `DONE_ATTN`, nu pentru terminarea requestului prin închiderea transportului.
-- O mare parte din suita strictă validează corect contractul curent, dar unele
-  teste codifică explicit limitări: stream sincron și bufferizat, respingerea
-  anumitor tipuri și eliminarea fusului orar. `PASS` nu înseamnă că acele
-  funcții sunt deja complete pentru producție.
+- RESULT-001–015 validează intenționat compatibilitatea legacy:
+  `QueryStream` rămâne sincron și bufferizat. RESULT-016–031 validează separat
+  noul `ResultStream` async bounded; un PASS al primului grup nu este folosit
+  ca dovadă pentru al doilea. Alte teste care cer respingerea tipurilor
+  nesuportate nu înseamnă că acele tipuri sunt implementate.
 
 ## Probleme P0 — blocaje înainte de producție critică
 
@@ -2156,9 +2470,10 @@ ConnectionPool
     └── SessionLease
           ├── query / execute
           ├── stream
+          ├── callproc
           ├── transaction
           ├── batch
-          └── bulk
+          ├── bulk
           └── disposition:
                 NeedsReset | Broken | CommitOutcomeUnknown
 ```
@@ -2181,7 +2496,9 @@ Această abstracție rezolvă simultan:
 dispozițiile `NeedsReset` și `Broken` sunt aplicate înainte de returnarea sau
 retragerea conexiunii. Deadline-urile fail-closed au fost generalizate
 ulterior în `feat/operation-timeouts`, iar graceful shutdown în
-`feat/lifecycle-state`; streamingul și bulk rămân lucru P1.
+`feat/lifecycle-state`. Streamingul bounded folosește acum același model de
+lease prin `feat/resultsets-streaming` și `feat/resultstream-lifecycle`; bulk
+TDS nativ rămâne lucru P1/P2 separat.
 
 Implementarea actuală relevantă este împărțită între
 [pool_manager.rs](../src/pool_manager.rs#L201),
@@ -2266,30 +2583,38 @@ nedeterministe după intrarea în `Committing`; conexiunea a fost deja eliminat�
 - Tracing/OpenTelemetry, exporterul, labels SQL și constructorul direct
   `Transaction(...)` rămân scope-uri separate.
 
-### Rezultate și streaming
+### Rezultate, streaming și RPC — `VERIFIED_FORK`
 
-FastMssql apelează în prezent `into_first_result()`, bufferizează rezultatul și
-păstrează numai primul result set.
+- `d829198` păstrează în Tiberius metadata, rows, DONE-family, INFO,
+  RETURNSTATUS și RETURNVALUE și encodează named RPC fără interpolarea
+  numelui procedurii.
+- `62e9d7c` adaugă `ResultStream`/`ResultSet` exclusiv async, canale
+  event/ACK bounded, metadata pentru seturi goale și summary terminal.
+- `5cad239` extinde ownership-ul la tranzacții și lifecycle: EOF/reset poate
+  reutiliza, iar close/drop/timeout/conversie incertă/force shutdown retrage
+  fail-closed transportul.
+- `42b1268` adaugă `callproc()` direct pentru `Connection` și `Transaction`,
+  cu INPUT/OUTPUT/INPUT_OUTPUT/RETURN_VALUE, asociere output după
+  ordinal+nume și status semnat.
+- RESULT-016–029/031 și RPC-001–011 sunt PASS pe SQL Server real; RESULT-030
+  este PASS din wheel instalat separat.
+- Stressul exact a trecut 1.000:64 cu pool/buffer 8/8, 10.000:128 și
+  99.999:200 cu pool/buffer 32/16, fără failure, timeout, ID lipsă, depășire
+  RSS sau depășire a pool-ului.
 
-Sunt necesare:
-
-- metadata chiar și pentru rezultate fără rânduri;
-- result sets multiple;
-- row counts și mesaje separate;
-- statusul și valorile OUT ale procedurilor stocate;
-- un `ResultStream` Python realmente async și cu memorie limitată;
-- închiderea anticipată a streamului, cu eliberarea sau eliminarea sigură a
-  lease-ului.
-
-Clasa curentă [QueryStream](../src/types.rs#L310) este un cursor sincron peste
-date deja bufferizate. Un stream real nu poate oferi `len`, reset și indexare
-fără bufferizare.
+Clasa legacy [QueryStream](../src/types.rs#L310) rămâne sincronă, indexabilă și
+bufferizată pentru compatibilitate. Nu este alias și nu este folosită ca
+dovadă pentru noul `ResultStream` wire-level bounded. Limita curentă este pe
+numărul evenimentelor; chunkingul în bytes al unui singur rând/LOB rămâne
+nesuportat.
 
 ### Parametri de intrare și tipuri SQL — `VERIFIED_FORK`
 
-Constatarea inițială este remediată pentru parametrii de **intrare**. Scope-ul
-nu include încă valorile OUT/return status, TVP, money fixed-point ori API-ul
-de rezultate multiple.
+Constatarea inițială este remediată pentru parametrii de **intrare**.
+Branchurile acestei secțiuni nu includeau valorile OUT/return status ori API-ul
+de rezultate multiple; acestea au fost implementate ulterior prin `42b1268`
+și `62e9d7c`. TVP și money fixed-point output rămân în continuare în afara
+scope-ului verificat.
 
 Baseline-ul măsurat read-only pe containerul SQL-auth, înainte de remediere,
 a fost:
@@ -2624,11 +2949,12 @@ mare.
 
 ## P2 — capabilități enterprise
 
-După stabilizarea nucleului:
+RPC/callproc cu status, parametri OUT și multiple result sets nu mai este
+restanță P2: scope-ul proiectat este `VERIFIED_FORK` prin `42b1268` și
+RPC-001–RPC-011. După această închidere, rămân:
 
 - TDS 8 și `Encrypt=Strict`;
 - TVP/Table-Valued Parameters;
-- RPC/callproc cu status, parametri OUT și multiple result sets;
 - TDS native bulk copy;
 - Always Encrypted;
 - failover partner, host list, multi-subnet și routing complet Azure;
@@ -2680,7 +3006,11 @@ funcție ar necesita lucru la nivelul driverului TDS:
 17. `feat/typed-parameter-descriptor` — **parametrii SQL de intrare tipizați,
     metadata TDS exactă, UTF-8/collation, privacy și load bounded finalizate
     și verificate hosted**
-18. `feat/resultsets-streaming`
+18. `feat/tiberius-response-events`, `feat/resultsets-streaming`,
+    `feat/resultstream-lifecycle` și `feat/rpc-output-results` —
+    **evenimentele TDS complete, result seturile multiple, streamingul async
+    bounded, ownership-ul fail-closed și RPC OUT/return finalizate și
+    verificate local, Docker, wheel și hosted**
 19. `feat/batch-bulk`
 20. `fix/named-instance`
 21. `test/production-framework-matrix`
@@ -2723,10 +3053,12 @@ upstream fără aprobarea explicită a proprietarului forkului.
   rollback sau retry automat;
 - [x] numărul sesiunilor tranzacționale nu depășește `pool.max_size`, inclusiv
   la 99.999 operații și concurență mai mare decât pool-ul;
-- [ ] streamingul menține memoria limitată și gestionează închiderea anticipată;
+- [x] streamingul menține credit de evenimente bounded, respectă limita RSS și
+  gestionează închiderea anticipată prin retirement fail-closed;
 - [x] `bool` este transmis ca BIT, tipurile declarate sunt respectate și un
   `datetime` aware este transmis ca DATETIMEOFFSET;
-- [ ] rezultatele multiple, cele goale și output parameters sunt păstrate;
+- [x] rezultatele multiple, cele goale, DONE/INFO, output parameters și return
+  status sunt păstrate;
 - [ ] matricea rulează prin servere reale Uvicorn/Gunicorn și din wheel-ul
   instalat.
 
@@ -2735,47 +3067,59 @@ upstream fără aprobarea explicită a proprietarului forkului.
 - Fork: `https://github.com/galeamarcel/FastMssql.git`
 - Branch cumulativ: `test/sql-auth-validation`
 - HEAD tehnic verificat:
-  `450ea446b799cf2ce7e035c332c6ce3d5d1f0adc`.
+  `a9d5c2ab42de0f03051c771bb8942ee15dfe6e28`.
 - `origin` indică forkul; remote-ul repository-ului original permite numai
   fetch și are push URL-ul `DISABLED`.
-- Merge-ul cumulativ `450ea44` include commitul tehnic `6b12f85`; arborele
-  său este bit-identic cu arborele testat, iar toate ramurile RED/fix/feature
-  de parametri sunt strămoși reali.
-- La acest arbore: FastMssql Rust `65/65`, Tiberius vendored `151/151`,
-  strict `346/346`, true-async `16/16`, framework `33/33`, resilience `6/6`,
-  load `12/12`, regresia originală locală `1.072/1.072` și exact `346/346`
+- Merge-ul cumulativ `a9d5c2a` păstrează ancestry-ul tuturor ramurilor
+  RED/fix/feature pentru token safety, response events, result streaming,
+  lifecycle, RPC și cele patru corecții de harness/hosted descoperite în
+  verificare.
+- La acest arbore: FastMssql Rust `71/71`, Tiberius vendored `162/162`,
+  Tiberius response SQL-auth `7/7`, token safety SQL-auth `2/2`, strict
+  `386/386`, true-async `16/16`, framework `33/33`, resilience `6/6`, load
+  `12/12`, regresia originală locală `1.090/1.090` și exact `372/372`
   ID-uri din specificație, toate PASS, fără fail, error, skip sau not-run.
-- Wheel-ul instalat izolat a trecut `192/192` contracte locale de parametri
-  și `82/82` teste SQL-auth reale pentru parametri și batch/bulk.
+- Wheel-ul ABI3 cu SHA-256
+  `92a4a27b574eb25c1edc25ac1f38fa594c7e6245b81347bed346d7ba22586c38`
+  a fost importat din site-packages izolat. Contractele statice au trecut
+  `37/37`, iar resultsets/lifecycle/RPC pe SQL Server real au trecut `34/34`.
+- RESULT-029 a executat 1.000 operații la concurență 64, pool 8 și buffer 8:
+  zero failure/timeout, maximum 8 SPID-uri concurente, RSS growth
+  17.743.872 bytes, 60 event-loop ticks și post-load smoke PASS.
+- Profilele result-stream opt-in `10.000:128` și `99.999:200` au trecut cu
+  pool 32, buffer 16, maximum 32 SPID-uri, RSS growth 36.044.800 și
+  31.834.112 bytes, respectiv 407 și 4.029 event-loop ticks.
 - PARAM-033 a executat 1.000 de operații tipizate, zero eșecuri, maximum 64
   in-flight și 8 sesiuni fizice pentru pool maxim 8.
 - OPMET-011 a executat 10.000 de operații cu 100 workeri, pool maxim 20,
   maximum 20 conexiuni fizice, maximum 100 operații in-flight,
-  `9.550,61 qps`, 2.649 snapshoturi, 18.011 event-loop ticks și exact 10.000
+  `10.868,13 qps`, 2.347 snapshoturi, 15.680 event-loop ticks și exact 10.000
   rezultate `succeeded`.
 - Stress-ul enterprise anterior rămâne valid în ancestry: profilele
   `10.000:100`, `99.999:100` și `99.999:200` au trecut atât persistent, cât
   și pooled, cu numărul exact de COMMIT/ROLLBACK, smoke PASS și zero sesiuni
   după teardown. Gate-ul separat de overhead a validat 599.994 operații.
 - La SHA-ul cumulativ exact, Linux/macOS/Windows sunt verzi prin
-  [#30240874471](https://github.com/galeamarcel/FastMssql/actions/runs/30240874471),
+  [#30284587006](https://github.com/galeamarcel/FastMssql/actions/runs/30284587006),
   iar RustSec este verde prin
-  [#30240874468](https://github.com/galeamarcel/FastMssql/actions/runs/30240874468).
+  [#30284587019](https://github.com/galeamarcel/FastMssql/actions/runs/30284587019).
 - Wheel-ul ABI3 a fost construit și instalat separat pe cele trei sisteme,
   iar contractele Python instalate, raw Cargo, `cargo fmt`, Clippy cu
   `-D warnings`, Ruff și `compileall` au trecut.
 - SQL-auth real a fost executat local pe containerul MSSQL aprobat;
   workflow-urile hosted validează Rust/wheel/contracts, nu pretind un SQL
   Server real.
-- Streamingul/resultseturile multiple, RPC OUT/return status, TVP, money
-  fixed-point, bulk TDS nativ, named instances și matricea cu servere web
-  reale rămân deschise în ordinea de implementare.
+- TVP, money fixed-point output, SQL_VARIANT, bulk TDS nativ, tracing,
+  named instances, TDS 8, provenance/SBOM și matricea cu servere web reale
+  pornite din wheel rămân deschise în ordinea de implementare.
 - Toate schimbările și dovezile au fost publicate exclusiv pe fork. Nu există
   push, PR sau release în repository-ul original.
 
-Starea de mai sus este rezultatul arborelui cumulativ exact `450ea44` înaintea
+Starea de mai sus este rezultatul arborelui cumulativ exact `a9d5c2a` înaintea
 acestui update documentar. Branchurile validate au fost integrate numai în
 fork.
 
-Pentru evidența testului de tranzacții concurente:
-[SQL_AUTH_TRANSACTION_STRESS_REPORT.md](SQL_AUTH_TRANSACTION_STRESS_REPORT.md).
+Rapoarte de stress:
+
+- [SQL_AUTH_RESULT_STREAM_STRESS_REPORT.md](SQL_AUTH_RESULT_STREAM_STRESS_REPORT.md)
+- [SQL_AUTH_TRANSACTION_STRESS_REPORT.md](SQL_AUTH_TRANSACTION_STRESS_REPORT.md)

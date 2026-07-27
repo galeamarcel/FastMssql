@@ -50,10 +50,10 @@ La data redactării:
 - `upstream/master`: `e45f301` — versiunea `v0.7.7`;
 - branch audit: `test/sql-auth-validation`;
 - snapshotul tehnic anterior acestui update documentar este
-  `5936cb5d6c6f1e7fd55e4d70fb28143cdbc7fd7a`;
-- feature-ul pool observability final este `8971066`, RED-ul final este
-  `1d530a6`, iar rapoartele SQL-auth au fost regenerate pe merge-ul tehnic
-  `5936cb5`;
+  `a9d5c2ab42de0f03051c771bb8942ee15dfe6e28`;
+- result events, streamingul bounded, lifecycle-ul fail-closed și RPC-ul
+  direct finale sunt `d829198`, `62e9d7c`, `5cad239` și `42b1268`; rapoartele
+  SQL-auth au fost regenerate pe merge-ul tehnic `a9d5c2a`;
 - unicul PR upstream deschis este draftul
   [#121 — Improve transactions behavior and safety](https://github.com/Rivendael/FastMssql/pull/121);
 - PR-ul #121 modifică masiv tranzacțiile și timeouturile, deci orice PR care
@@ -62,7 +62,9 @@ La data redactării:
   [FASTMSSQL_PRODUCTION_READINESS_AUDIT.md](../../FASTMSSQL_PRODUCTION_READINESS_AUDIT.md);
 - rezultatele testelor sunt în
   [SQL_AUTH_TEST_REPORT.md](../../SQL_AUTH_TEST_REPORT.md) și
-  [SQL_AUTH_TRANSACTION_STRESS_REPORT.md](../../SQL_AUTH_TRANSACTION_STRESS_REPORT.md).
+  [SQL_AUTH_TRANSACTION_STRESS_REPORT.md](../../SQL_AUTH_TRANSACTION_STRESS_REPORT.md);
+- stressul result-stream exact este în
+  [SQL_AUTH_RESULT_STREAM_STRESS_REPORT.md](../../SQL_AUTH_RESULT_STREAM_STRESS_REPORT.md).
 
 ## Strategia aleasă
 
@@ -2805,9 +2807,11 @@ fork, testată live și auditată.
 | PoolConfig defaults | PR-21, un singur profil pentru argumentele omise și calea implicită | `VERIFIED_FORK`; rebase curat, RED și gate wheel pe toate cele trei sisteme înainte de aprobarea upstream |
 | TDS session reset | PR-15, bit `RESETCONNECTION` | implementat/verificat pe fork; traseu Tiberius și aprobare înainte de upstream |
 | PyO3 build/test separation | elimină feature-ul permanent și folosește `maturin >= 1.9.4` pentru buildul extensiei | `VERIFIED_FORK`; rebase curat, RED și toate cele trei joburi hosted înainte de aprobarea upstream |
-| True async streaming | stream Python async cu backpressure | memorie limitată, early close, lease recovery |
+| Tiberius response/RPC | evenimente complete, token safety și named RPC | `VERIFIED_FORK`; rebase separat pe Tiberius actual, reproducere și aprobare explicită înainte de orice fork/PR |
+| True async streaming | stream Python async cu backpressure | `VERIFIED_FORK`; RESULT-016–031, stress până la 99.999 și wheel instalat; cere API Tiberius acceptat/pinuit |
+| Result lifecycle | ownership fail-closed pentru pool și tranzacție | `VERIFIED_FORK`; separare de API-ul de bază, DMV/timeout/shutdown reproduse pe ancestry originală proaspătă |
 | Typed parameters | tip/direction/precision/scale/length | wire metadata verificată prin SQL Server |
-| Stored procedures | RPC, OUT params, return status, result sets | fără pierdere de metadata/tokeni |
+| Stored procedures | RPC, OUT params, return status, result sets | `VERIFIED_FORK`; RPC-001–011 și wheel real trec; depinde de named-RPC/response events acceptate |
 | Native bulk | TDS bulk copy | subset de coloane, streaming input, atomicity contract |
 | Named instances | SQL Browser Tokio | instanță reală fără port explicit |
 | Operation timeouts | PR-22, connect/acquire/operation/transaction/rollback | `VERIFIED_FORK`; rebase curat, RED proaspăt, comparație cu #121, gate pe trei sisteme și aprobare separată înainte de upstream |
@@ -2819,6 +2823,35 @@ fork, testată live și auditată.
 | TDS 8 | `Encrypt=Strict` | necesită suport la nivel Tiberius/TDS |
 | Enterprise SQL types | TVP, sql_variant, spatial, hierarchyid, UDT | conversii simetrice și erori fără panic |
 | HA/failover | routing, host list, multi-subnet | fault injection și retry numai pentru operații sigure |
+
+### Candidate slices pentru result sets, streaming și RPC
+
+Aceste patru slice-uri sunt independent reviewable ca intenție și nu vor fi
+combinate într-un singur PR cumulativ. Ele au o ordine de dependență explicită;
+„independent” înseamnă diff și review separat, nu că un strat FastMssql poate
+funcționa fără API-ul protocolar pe care îl consumă.
+
+| Slice | Sursa verificată pe fork | Conținut minim | Exclus din candidat |
+|---|---|---|---|
+| RS-01 — Tiberius response-event/named-RPC | `c2d5d47`, `d829198` | TABNAME/COLINFO panic-free, stream owned pentru metadata/row/DONE/INFO/RETURNSTATUS/RETURNVALUE, ProcName `US_VARCHAR`, ByRef output, trace redaction | FastMssql Python API, pool/lifecycle, TVP, MONEY, SQL_VARIANT support, bulk |
+| RS-02 — FastMssql bounded `ResultStream` API | `62e9d7c` | `stream()`/`batch()`, nested async iterators, immutable metadata/summary, event+ACK backpressure, legacy `QueryStream` compatibility | tranzacție/lifecycle, `callproc()`, MARS, byte-chunked LOB, bulk |
+| RS-03 — fail-closed lifecycle/transaction ownership | `5cad239` | pooled/direct transaction streams, ACK-before-release, close/drop/cancel/timeout/shutdown retirement, DMV replacement evidence | response-token redesign, stored-procedure descriptor API, ATTENTION reuse |
+| RS-04 — stored-procedure OUT/return API | `42b1268` | direct `callproc()`, INPUT/OUTPUT/INPUT_OUTPUT/RETURN_VALUE, ordinal+nume, exact scalar conversion, result sets înaintea summary | TVP, MONEY/SMALLMONEY output, SQL_VARIANT, spatial/UDT, bulk |
+
+Înaintea fiecărui slice:
+
+1. se verifică ultima ancestry a repository-ului original relevant;
+2. se reproduce RED pe acea bază, fără a presupune că v0.7.7 a rămas
+   neschimbat;
+3. se reaplică numai diff-ul minim al slice-ului și testele sale;
+4. se repetă gate-urile locale, SQL-auth, wheel și hosted aplicabile;
+5. se prezintă diff-ul și dovezile lui Marcel Galea;
+6. se cere o aprobare nouă, explicită, înainte de branch public, fork
+   Tiberius, push sau PR către repository-ul original.
+
+Nu există în acest moment branch curat de PR pentru aceste slice-uri, nu a fost
+creat un fork Tiberius și nu a fost deschis niciun PR în repository-ul
+original.
 
 ### Regula pentru dependența Tiberius
 

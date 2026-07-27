@@ -18,16 +18,23 @@ Changes currently integrated on `test/sql-auth-validation`:
 - structured, privacy-safe conversion failures shared by connection,
   transaction, and batch paths;
 - local rejection when temporal rounding would cross into year 10000;
+- complete vendored-Tiberius metadata/row/DONE/INFO/return/output response
+  events with panic-free unsupported metadata handling;
+- bounded async `ResultStream` APIs for pooled and transactional SQL/batch,
+  including multiple and empty result sets and fail-closed lifecycle;
+- direct named `callproc()` with INPUT/OUTPUT/INPUT_OUTPUT/RETURN_VALUE,
+  exact scalar output conversion and terminal summaries;
 - deterministic SQL-auth, exact-wire, compatibility, and 1,000-operation
   concurrent load coverage;
 - load-metric contract coverage for the typed-parameter case `PARAM-033`;
 - regenerated SQL-auth matrix/report evidence tied to exact cumulative merge
-  `450ea446b799cf2ce7e035c332c6ce3d5d1f0adc`: 346/346 required
-  matrix cases, 16 async, 33 framework, 6 resilience, 12 load, and 1,072
+  `a9d5c2ab42de0f03051c771bb8942ee15dfe6e28`: 372/372 required
+  matrix cases, 386 strict, 16 async, 33 framework, 6 resilience, 12 load,
+  and 1,090
   original-local-regression tests pass;
 - hosted raw Cargo, Rust tests, wheel build/install contracts on Linux,
-  macOS, and Windows passed in run `30240874471`; RustSec passed in run
-  `30240874468`.
+  macOS, and Windows passed in run `30284587006`; RustSec passed in run
+  `30284587019`.
 
 No release, package-version change, or artifact publication has occurred.
 
@@ -321,3 +328,25 @@ No release, package-version change, or artifact publication has occurred.
   Windows-authentication test APIs.
 - This test-gating fix does not modify runtime behavior, package metadata,
   the displayed `0.7.7` version or release state.
+
+### Exact bounded-result and RPC verification status
+
+- Regenerated the strict SQL-auth matrix and report from the exact technical
+  SHA `a9d5c2ab42de0f03051c771bb8942ee15dfe6e28`: 372/372 requirement IDs,
+  386 strict tests, 16 async, 33 framework, 6 resilience, 12 load and 1,090
+  original-local-regression tests pass with no failures, errors or skips.
+- Recorded the required 1,000-operation result-stream profile and extended
+  10,000/99,999 profiles, all with exact IDs, bounded pool/event buffers,
+  bounded RSS, continued event-loop progress, zero timeout/failure and
+  post-load recovery.
+- Recorded the isolated ABI3 wheel hash and site-packages import, 37/37 static
+  installed contracts and 34/34 real-MSSQL result/lifecycle/RPC tests.
+- Recorded hosted run `30284587006` as green on Ubuntu, macOS and Windows at
+  the exact technical SHA and RustSec run `30284587019` as green at the same
+  SHA.
+- Updated the live production-readiness audit and the future original
+  repository PR roadmap with four independently reviewable candidate slices.
+  Publication remains forbidden without fresh original ancestry,
+  reproduction and a new explicit approval.
+- This status-only documentation change does not modify runtime behavior,
+  package metadata, the displayed `0.7.7` version or release state.
