@@ -416,6 +416,25 @@ class Transaction:
         """Return the buffered first result set for synchronous iteration."""
         ...
 
+    async def stream(
+        self,
+        sql: str,
+        params: list[Any] | Parameters | None = None,
+        *,
+        buffer_size: int = 64,
+    ) -> ResultStream:
+        """Stream every result set while retaining this transaction session."""
+        ...
+
+    async def batch(
+        self,
+        sql: str,
+        *,
+        buffer_size: int = 64,
+    ) -> ResultStream:
+        """Stream an unparameterized batch on this transaction session."""
+        ...
+
     def execute(
         self,
         sql: str,

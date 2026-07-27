@@ -6,9 +6,8 @@ use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
-use tiberius::{AuthMethod, Client, Config};
-use tokio::net::TcpStream;
-use tokio::sync::{Mutex as AsyncMutex, RwLock};
+use tiberius::{AuthMethod, Config};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, RwLock};
 
 use crate::azure_auth::PyAzureCredential;
 use crate::batch::{execute_batch_on_connection, parse_batch_items, query_batch_on_connection};
@@ -18,27 +17,29 @@ use crate::deadline::{
     run_until,
 };
 use crate::helpers::{
-    catch_driver_panic, execute_unparameterized_command, requires_direct_batch, wrap_query_stream,
+    catch_driver_panic, execute_unparameterized_command, requires_connection_retirement,
+    requires_direct_batch, wrap_query_stream,
 };
 use crate::lifecycle::{
     ConnectionLifecycle, ForceRequested, ForcedShutdownParticipant, LifecycleFailure,
     TransactionPermit, run_force_aware,
 };
-use crate::operation_metrics::{OperationMetricsRegistry, observe_operation};
+use crate::operation_metrics::{OperationMetricsRegistry, OperationObserver, observe_operation};
 use crate::parameter_conversion::{convert_parameters_to_fast, params_as_sql_refs};
 use crate::pool_config::PyPoolConfig;
 use crate::pool_manager::{
-    ConnectionPool, OwnedPooledConnection, acquire_owned_connection, connect_client_with_timeout,
-    ensure_pool_initialized_with_auth, python_error_allows_connection_reuse,
-    timeout_error_or_metadata_failure,
+    ConnectionPool, OwnedPooledConnection, TiberiusClient, acquire_owned_connection,
+    connect_client_with_timeout, ensure_pool_initialized_with_auth,
+    python_error_allows_connection_reuse, timeout_error_or_metadata_failure,
 };
+use crate::result_stream::{BufferSize, PyResultStream, ResultRequest};
 use crate::ssl_config::PySslConfig;
 use crate::timeout_config::PyTimeoutConfig;
 use crate::types::{
     SqlError, TimeoutErrorMetadata, create_commit_outcome_unknown, create_sql_error,
 };
 
-type SingleConnectionType = Client<tokio_util::compat::Compat<TcpStream>>;
+type SingleConnectionType = TiberiusClient;
 
 /// A transaction can use the legacy direct socket or an owned bb8 lease.
 ///
@@ -381,6 +382,145 @@ impl Drop for TransactionCancellationGuard {
             let mut session = session.lock().await;
             session.retire_cancelled_operation(epoch);
         });
+    }
+}
+
+pub(crate) struct TransactionResponseLease {
+    session: OwnedMutexGuard<TransactionSession>,
+    previous_state: TransactionState,
+    epoch: u64,
+    operation: OperationName,
+    deadline: Option<Deadline>,
+    retire_after_operation: bool,
+    completed: bool,
+}
+
+impl TransactionResponseLease {
+    fn new(
+        session: OwnedMutexGuard<TransactionSession>,
+        previous_state: TransactionState,
+        epoch: u64,
+        operation: OperationName,
+        deadline: Option<Deadline>,
+        retire_after_operation: bool,
+    ) -> Self {
+        Self {
+            session,
+            previous_state,
+            epoch,
+            operation,
+            deadline,
+            retire_after_operation,
+            completed: false,
+        }
+    }
+
+    pub(crate) fn deadline(&self) -> Option<Deadline> {
+        self.deadline
+    }
+
+    pub(crate) fn force_receiver(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.session.force_receiver()
+    }
+
+    pub(crate) fn client_mut(&mut self) -> PyResult<&mut TiberiusClient> {
+        self.session
+            .conn
+            .as_deref_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))
+    }
+
+    fn owns_current_operation(&self) -> bool {
+        self.session.operation_epoch == self.epoch
+            && self.session.state == TransactionState::Executing
+    }
+
+    pub(crate) fn complete_success(&mut self) -> bool {
+        if self.completed {
+            return self.session.state == TransactionState::Failed;
+        }
+
+        let mut connection_broken = self.retire_after_operation;
+        if !self.owns_current_operation() {
+            connection_broken = true;
+        } else if let Some(connection) = self.session.conn.as_mut() {
+            let result: PyResult<()> = Ok(());
+            connection.finish_operation(&result);
+            connection_broken |= !connection.is_reusable();
+        } else {
+            connection_broken = true;
+        }
+
+        if connection_broken {
+            self.session.retire_connection(None);
+            self.session.transition_to(TransactionState::Failed);
+        } else {
+            self.session.transition_to(self.previous_state);
+        }
+        self.completed = true;
+        connection_broken
+    }
+
+    pub(crate) fn complete_error(&mut self, error: &PyErr) -> bool {
+        if self.completed {
+            return self.session.state == TransactionState::Failed;
+        }
+
+        let mut connection_broken =
+            self.retire_after_operation || !python_error_allows_connection_reuse(error);
+        if !self.owns_current_operation() {
+            connection_broken = true;
+        } else if let Some(connection) = self.session.conn.as_mut() {
+            let result: PyResult<()> = Err(Python::attach(|py| error.clone_ref(py)));
+            let direct_retirement = connection.result_requires_direct_retirement(&result);
+            connection.finish_operation(&result);
+            connection_broken |= direct_retirement || !connection.is_reusable();
+        } else {
+            connection_broken = true;
+        }
+
+        if connection_broken {
+            self.session.retire_connection(None);
+            self.session.transition_to(TransactionState::Failed);
+        } else {
+            self.session.transition_to(self.previous_state);
+        }
+        self.completed = true;
+        connection_broken
+    }
+
+    pub(crate) fn fail(&mut self) {
+        self.fail_with_lifecycle(None);
+    }
+
+    fn fail_with_lifecycle(&mut self, failure: Option<LifecycleFailure>) {
+        if self.completed {
+            return;
+        }
+        self.session.retire_connection(failure);
+        self.session.transition_to(TransactionState::Failed);
+        self.completed = true;
+    }
+
+    pub(crate) fn fail_forced(&mut self) -> PyErr {
+        match self.session.forced_failure(self.operation, true) {
+            Some(failure) => {
+                self.fail_with_lifecycle(Some(failure));
+                failure.into_pyerr()
+            }
+            None => {
+                self.fail();
+                PyRuntimeError::new_err(
+                    "forced transaction result stream lost its lifecycle permit",
+                )
+            }
+        }
+    }
+}
+
+impl Drop for TransactionResponseLease {
+    fn drop(&mut self) {
+        self.fail();
     }
 }
 
@@ -752,6 +892,65 @@ impl Transaction {
 
                 wrap_query_stream(execution_result?)
             })
+            .await
+        })
+    }
+
+    #[pyo3(
+        signature = (sql, params=None, *, buffer_size = BufferSize::DEFAULT),
+        text_signature = "($self, sql, params=None, *, buffer_size=64)"
+    )]
+    pub(crate) fn stream<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        params: Option<&Bound<PyAny>>,
+        buffer_size: BufferSize,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let fast_parameters = convert_parameters_to_fast(params, py)?;
+        let retire_after_operation = requires_connection_retirement(&sql);
+        let handles = self.clone_handles();
+        let operation_metrics = self.operation_metrics.clone();
+
+        future_into_py(py, async move {
+            Self::start_result_stream(
+                handles,
+                operation_metrics,
+                OperationName::Query,
+                ResultRequest::Query {
+                    sql,
+                    parameters: fast_parameters.into_vec(),
+                },
+                retire_after_operation,
+                buffer_size.get(),
+            )
+            .await
+        })
+    }
+
+    #[pyo3(
+        signature = (sql, *, buffer_size = BufferSize::DEFAULT),
+        text_signature = "($self, sql, *, buffer_size=64)"
+    )]
+    pub(crate) fn batch<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        buffer_size: BufferSize,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let retire_after_operation = requires_connection_retirement(&sql);
+        let handles = self.clone_handles();
+        let operation_metrics = self.operation_metrics.clone();
+
+        future_into_py(py, async move {
+            Self::start_result_stream(
+                handles,
+                operation_metrics,
+                OperationName::QueryBatch,
+                ResultRequest::Batch { sql },
+                retire_after_operation,
+                buffer_size.get(),
+            )
             .await
         })
     }
@@ -1301,6 +1500,58 @@ impl Transaction {
             azure_credential: self.azure_credential.clone(),
             pool_source: self.pool_source.clone(),
             timeout_config: self.timeout_config.clone(),
+        }
+    }
+
+    async fn start_result_stream(
+        handles: TransactionHandles,
+        operation_metrics: Option<Arc<OperationMetricsRegistry>>,
+        operation: OperationName,
+        request: ResultRequest,
+        retire_after_operation: bool,
+        buffer_size: usize,
+    ) -> PyResult<Py<PyResultStream>> {
+        let observer = OperationObserver::start(operation_metrics, operation);
+        let startup = async {
+            let mut cancellation_guard =
+                TransactionCancellationGuard::new(Arc::clone(&handles.session));
+            let admitted_by_current_call = handles.ensure_connected(operation).await?;
+            let mut session = Arc::clone(&handles.session).lock_owned().await;
+            let (previous_state, epoch, deadline) = Self::begin_data_operation(
+                &mut session,
+                operation,
+                &handles.timeout_config,
+                admitted_by_current_call,
+            )?;
+            cancellation_guard.arm(epoch);
+            let lease = TransactionResponseLease::new(
+                session,
+                previous_state,
+                epoch,
+                operation,
+                deadline,
+                retire_after_operation,
+            );
+            Ok::<_, PyErr>((lease, cancellation_guard))
+        }
+        .await;
+
+        match startup {
+            Ok((lease, mut cancellation_guard)) => {
+                let stream = PyResultStream::spawn_transaction(
+                    lease,
+                    observer,
+                    request,
+                    operation,
+                    buffer_size,
+                );
+                cancellation_guard.disarm();
+                Python::attach(|py| Py::new(py, stream))
+            }
+            Err(error) => {
+                observer.error(&error);
+                Err(error)
+            }
         }
     }
 

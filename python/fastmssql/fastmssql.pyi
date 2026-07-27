@@ -196,6 +196,11 @@ class SqlError(Exception):
         code: SQL Server error number (e.g. 208 for object not found).
         message: Human-readable error message from the server.
         state: SQL Server error state byte.
+        severity: SQL Server error class/severity.
+
+        When this is a terminal ResultStream error, it also carries
+        operation, phase, retryable, wire_sent, connection_discarded, and
+        outcome_unknown metadata.
 
     Example::
 
@@ -208,6 +213,7 @@ class SqlError(Exception):
     code: int
     message: str
     state: int
+    severity: int
     ...
 
 class SqlConnectionError(Exception):
@@ -287,6 +293,10 @@ class ProtocolError(Exception):
 
     Attributes:
         message: Human-readable error description.
+
+        When this is a terminal ResultStream error, it also carries
+        operation, phase, retryable, wire_sent, connection_discarded, and
+        outcome_unknown metadata.
     """
 
     message: str
@@ -307,6 +317,10 @@ class ConversionError(Exception):
         wire_sent: False when parameter serialization failed before network I/O.
         connection_discarded: False for a synchronized pre-wire failure.
         outcome_unknown: False for a deterministic pre-wire failure.
+
+        A post-wire ResultStream conversion failure additionally carries
+        operation and phase, sets wire_sent and connection_discarded to True,
+        and remains outcome_unknown=False.
     """
 
     message: str
@@ -1017,14 +1031,18 @@ class Connection:
         params: list[Any] | Parameters | None = None,
         *,
         buffer_size: int = 64,
-    ) -> ResultStream: ...
+    ) -> ResultStream:
+        """Stream every result set on one retained pooled connection."""
+        ...
 
     async def batch(
         self,
         sql: str,
         *,
         buffer_size: int = 64,
-    ) -> ResultStream: ...
+    ) -> ResultStream:
+        """Stream an unparameterized batch on one retained pooled connection."""
+        ...
 
     def simple_query(
         self,
@@ -1200,6 +1218,25 @@ class Transaction:
         params: Optional[List[Any]] = None,
     ) -> Coroutine[Any, Any, QueryStream]:
         """Return the buffered first result set for synchronous iteration."""
+        ...
+
+    async def stream(
+        self,
+        sql: str,
+        params: list[Any] | Parameters | None = None,
+        *,
+        buffer_size: int = 64,
+    ) -> ResultStream:
+        """Stream every result set while retaining this transaction session."""
+        ...
+
+    async def batch(
+        self,
+        sql: str,
+        *,
+        buffer_size: int = 64,
+    ) -> ResultStream:
+        """Stream an unparameterized batch on this transaction session."""
         ...
 
     def simple_query(

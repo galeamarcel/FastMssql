@@ -172,3 +172,22 @@ No release, package-version change, or artifact publication has occurred.
 - This RED branch records required lifecycle behavior only; it does not
   change production runtime behavior, package metadata, the displayed
   `0.7.7` version or release state.
+
+### Fail-closed result-stream lifecycle and transaction streaming
+
+- Added bounded `stream()` and `batch()` support to pooled and direct
+  transactions while retaining the owned transaction-session mutex for the
+  complete SQL Server response.
+- Made cancelled and abandoned outer/inner receives preserve unowned events,
+  while cancellation after event ownership, full-response close/drop,
+  deadlines and forced shutdown retire uncertain physical sessions.
+- Added terminal stream metadata for SQL, protocol and post-wire conversion
+  failures, preserving safe reuse after fully drained nonfatal SQL errors and
+  fail-closed retirement for uncertain conversion/protocol paths.
+- Preserved transaction state after normal EOF or single-result-set close;
+  classified successful retirement and every uncertain terminal path instead
+  retire the transport, mark the transaction failed and reject later commit.
+- Added public wrapper/stub contracts and documentation for transaction
+  streaming and fail-closed resource-release semantics.
+- This feature does not change package metadata, the displayed `0.7.7`
+  version or release state.

@@ -27,6 +27,7 @@ create_exception!(crate::fastmssql, CommitOutcomeUnknown, PyException);
 create_exception!(crate::fastmssql, TlsError, PyException);
 create_exception!(crate::fastmssql, ProtocolError, PyException);
 create_exception!(crate::fastmssql, ConversionError, PyException);
+create_exception!(crate::fastmssql, ResultReceiveCancelled, PyException);
 
 const UNKNOWN_COMMIT_MESSAGE: &str =
     "COMMIT completion was not confirmed; the transaction outcome is unknown";

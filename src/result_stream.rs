@@ -1,15 +1,20 @@
 use crate::deadline::{DeadlineElapsed, OperationName, TimeoutPhase, deadline_from, run_until};
 use crate::helpers::catch_driver_panic;
-use crate::lifecycle::OperationPermit;
+use crate::lifecycle::{ForceRequested, OperationPermit, run_force_aware};
 use crate::operation_metrics::OperationObserver;
 use crate::parameter_conversion::{FastParameter, params_as_sql_refs};
-use crate::pool_manager::{PooledOperationGuard, timeout_error_or_metadata_failure};
+use crate::pool_manager::{
+    PooledOperationGuard, TiberiusClient, python_error_allows_connection_reuse,
+    timeout_error_or_metadata_failure,
+};
 use crate::result_types::{
     ColumnMetadataData, DoneResultData, PyColumnMetadata, PyResultSummary, ResultSummaryData,
     SqlMessageData,
 };
+use crate::transaction::TransactionResponseLease;
 use crate::types::{
-    ColumnInfo, PyFastRow, TimeoutErrorMetadata, create_protocol_error, create_sql_error,
+    ColumnInfo, PyFastRow, ResultReceiveCancelled, TimeoutErrorMetadata, create_protocol_error,
+    create_sql_error,
 };
 use futures_util::TryStreamExt;
 use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration, PyTypeError, PyValueError};
@@ -17,7 +22,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyTuple};
 use pyo3_async_runtimes::tokio::future_into_py;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
 use std::time::Duration;
 use tiberius::{ResponseEvent, ResponseMetadata, ResponseStream, Row};
@@ -26,6 +31,9 @@ use tokio::sync::{Mutex, mpsc, watch};
 const MAX_RESULT_SETS: usize = 1_024;
 const MAX_DONE_RECORDS: usize = 4_096;
 const MAX_INFO_MESSAGES: usize = 1_024;
+const RECEIVE_WAITING: u8 = 0;
+const RECEIVE_CONSUMED: u8 = 1;
+const RECEIVE_CANCEL_REQUESTED: u8 = 2;
 
 #[derive(Clone, Copy)]
 pub(crate) struct BufferSize(usize);
@@ -320,14 +328,14 @@ async fn drain_response(
 }
 
 async fn execute_request(
-    guard: &mut PooledOperationGuard<'static>,
+    client: &mut TiberiusClient,
     request: ResultRequest,
     channels: &mut ProducerChannels,
 ) -> Result<(), ProducerFailure> {
     match request {
         ResultRequest::Query { sql, parameters } => {
             let parameters = params_as_sql_refs(&parameters);
-            let response = guard
+            let response = client
                 .response_query(sql, &parameters)
                 .await
                 .map_err(|error| {
@@ -336,7 +344,7 @@ async fn execute_request(
             drain_response(response, channels).await
         }
         ResultRequest::Batch { sql } => {
-            let response = guard.response_batch(sql).await.map_err(|error| {
+            let response = client.response_batch(sql).await.map_err(|error| {
                 ProducerFailure::Failed(create_sql_error(error, "Result batch startup failed"))
             })?;
             drain_response(response, channels).await
@@ -383,6 +391,9 @@ async fn producer_body(
         }
         Ok(Err(ProducerFailure::Cancelled)) => ProducerCompletion::Cancelled,
         Ok(Err(ProducerFailure::Failed(error))) => {
+            let connection_discarded =
+                retire_after_operation || !python_error_allows_connection_reuse(&error);
+            let error = stream_error_with_metadata(error, operation, connection_discarded);
             guard.complete_error(&error, retire_after_operation);
             ProducerCompletion::Failed(error)
         }
@@ -390,6 +401,55 @@ async fn producer_body(
 
     drop(channels);
     drop(guard);
+    completion
+}
+
+async fn transaction_producer_body(
+    mut lease: TransactionResponseLease,
+    request: ResultRequest,
+    operation: OperationName,
+    mut channels: ProducerChannels,
+) -> ProducerCompletion {
+    let deadline = lease.deadline();
+    let force_receiver = lease.force_receiver();
+    let operation_result = async {
+        let client = match lease.client_mut() {
+            Ok(client) => client,
+            Err(error) => return Ok(Err(ProducerFailure::Failed(error))),
+        };
+        run_until(deadline, execute_request(client, request, &mut channels)).await
+    };
+    let result = match force_receiver {
+        Some(receiver) => run_force_aware(receiver, operation_result).await,
+        None => Ok(operation_result.await),
+    };
+
+    let completion = match result {
+        Err(ForceRequested) => ProducerCompletion::Failed(lease.fail_forced()),
+        Ok(Err(elapsed)) => {
+            lease.fail();
+            ProducerCompletion::Failed(operation_timeout_error(elapsed, operation))
+        }
+        Ok(Ok(Ok(()))) => {
+            if lease.complete_success() {
+                ProducerCompletion::Retired
+            } else {
+                ProducerCompletion::Success
+            }
+        }
+        Ok(Ok(Err(ProducerFailure::Cancelled))) => {
+            lease.fail();
+            ProducerCompletion::Cancelled
+        }
+        Ok(Ok(Err(ProducerFailure::Failed(error)))) => {
+            let connection_discarded = lease.complete_error(&error);
+            let error = stream_error_with_metadata(error, operation, connection_discarded);
+            ProducerCompletion::Failed(error)
+        }
+    };
+
+    drop(channels);
+    drop(lease);
     completion
 }
 
@@ -403,6 +463,45 @@ struct ProducerSupervisor {
     retire_after_operation: bool,
     channels: ProducerChannels,
     terminal: watch::Sender<TerminalRelease>,
+}
+
+struct TransactionProducerSupervisor {
+    observer: OperationObserver,
+    lease: TransactionResponseLease,
+    request: ResultRequest,
+    operation: OperationName,
+    channels: ProducerChannels,
+    terminal: watch::Sender<TerminalRelease>,
+}
+
+fn publish_completion(
+    observer: OperationObserver,
+    terminal: watch::Sender<TerminalRelease>,
+    completion: ProducerCompletion,
+) {
+    let terminal_state = match completion {
+        ProducerCompletion::Success => {
+            observer.success();
+            TerminalRelease::ReleasedSuccess
+        }
+        ProducerCompletion::Retired => {
+            observer.success();
+            TerminalRelease::ReleasedRetired
+        }
+        ProducerCompletion::Failed(error) => {
+            observer.error(&error);
+            TerminalRelease::ReleasedFailure(Arc::new(error))
+        }
+        ProducerCompletion::Cancelled => {
+            observer.cancel();
+            TerminalRelease::ReleasedRetired
+        }
+    };
+    terminal.send_replace(terminal_state);
+}
+
+fn panic_completion(error: PyErr, operation: OperationName) -> ProducerCompletion {
+    ProducerCompletion::Failed(stream_error_with_metadata(error, operation, true))
 }
 
 async fn supervise_producer(supervisor: ProducerSupervisor) {
@@ -431,28 +530,30 @@ async fn supervise_producer(supervisor: ProducerSupervisor) {
     .await
     {
         Ok(Ok(completion)) => completion,
-        Ok(Err(error)) | Err(error) => ProducerCompletion::Failed(error),
+        Ok(Err(error)) => ProducerCompletion::Failed(error),
+        Err(error) => panic_completion(error, operation),
     };
+    publish_completion(observer, terminal, completion);
+}
 
-    let terminal_state = match completion {
-        ProducerCompletion::Success => {
-            observer.success();
-            TerminalRelease::ReleasedSuccess
-        }
-        ProducerCompletion::Retired => {
-            observer.success();
-            TerminalRelease::ReleasedRetired
-        }
-        ProducerCompletion::Failed(error) => {
-            observer.error(&error);
-            TerminalRelease::ReleasedFailure(Arc::new(error))
-        }
-        ProducerCompletion::Cancelled => {
-            observer.cancel();
-            TerminalRelease::ReleasedRetired
-        }
+async fn supervise_transaction_producer(supervisor: TransactionProducerSupervisor) {
+    let TransactionProducerSupervisor {
+        observer,
+        lease,
+        request,
+        operation,
+        channels,
+        terminal,
+    } = supervisor;
+    let completion = match catch_driver_panic(transaction_producer_body(
+        lease, request, operation, channels,
+    ))
+    .await
+    {
+        Ok(completion) => completion,
+        Err(error) => panic_completion(error, operation),
     };
-    terminal.send_replace(terminal_state);
+    publish_completion(observer, terminal, completion);
 }
 
 struct ActiveSet {
@@ -477,6 +578,7 @@ struct SharedConsumer {
     acknowledgements: mpsc::Sender<ConsumerAck>,
     cancellation: watch::Sender<bool>,
     terminal: watch::Receiver<TerminalRelease>,
+    operation: OperationName,
     busy: AtomicBool,
     closed: AtomicBool,
     complete: AtomicBool,
@@ -571,6 +673,128 @@ impl Drop for ConsumerPermit {
     }
 }
 
+struct ReceiveCancellation {
+    shared: Arc<SharedConsumer>,
+    phase: AtomicU8,
+    sender: watch::Sender<bool>,
+}
+
+impl ReceiveCancellation {
+    fn new(shared: Arc<SharedConsumer>) -> (Arc<Self>, watch::Receiver<bool>) {
+        let (sender, receiver) = watch::channel(false);
+        (
+            Arc::new(Self {
+                shared,
+                phase: AtomicU8::new(RECEIVE_WAITING),
+                sender,
+            }),
+            receiver,
+        )
+    }
+
+    fn request(&self) {
+        let previous = self.phase.swap(RECEIVE_CANCEL_REQUESTED, Ordering::AcqRel);
+        if previous == RECEIVE_CONSUMED {
+            self.shared.cancel();
+        }
+        let _ = self.sender.send(true);
+    }
+
+    fn mark_consumed(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                RECEIVE_WAITING,
+                RECEIVE_CONSUMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn requested(&self) -> bool {
+        self.phase.load(Ordering::Acquire) == RECEIVE_CANCEL_REQUESTED
+    }
+}
+
+#[pyclass]
+struct PyReceiveCancellation {
+    control: Arc<ReceiveCancellation>,
+    armed: AtomicBool,
+}
+
+#[pymethods]
+impl PyReceiveCancellation {
+    fn cancel(&self) {
+        self.control.request();
+    }
+
+    fn disarm(&self) {
+        self.armed.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for PyReceiveCancellation {
+    fn drop(&mut self) {
+        if self.armed.swap(false, Ordering::AcqRel) {
+            self.control.request();
+        }
+    }
+}
+
+fn wrap_receive_awaitable<'py>(
+    py: Python<'py>,
+    awaitable: Bound<'py, PyAny>,
+    control: Arc<ReceiveCancellation>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let cancellation = Py::new(
+        py,
+        PyReceiveCancellation {
+            control: Arc::clone(&control),
+            armed: AtomicBool::new(true),
+        },
+    )?;
+    let package = py.import("fastmssql")?;
+    let helper = package.getattr("_await_result_stream_receive")?;
+    let observer = package.getattr("_observe_result_stream_receive")?;
+    if let Err(error) = awaitable.call_method1("add_done_callback", (observer,)) {
+        control.request();
+        return Err(error);
+    }
+    match helper.call1((awaitable, cancellation)) {
+        Ok(wrapped) => Ok(wrapped),
+        Err(error) => {
+            control.request();
+            Err(error)
+        }
+    }
+}
+
+fn receive_cancelled_error() -> PyErr {
+    ResultReceiveCancelled::new_err("result stream receive was cancelled")
+}
+
+async fn wait_for_receive_cancellation(receiver: &mut watch::Receiver<bool>) {
+    loop {
+        if *receiver.borrow_and_update() {
+            return;
+        }
+        if receiver.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+async fn lock_consumer_state<'a>(
+    shared: &'a Arc<SharedConsumer>,
+    cancellation: &mut watch::Receiver<bool>,
+) -> PyResult<tokio::sync::MutexGuard<'a, ConsumerState>> {
+    tokio::select! {
+        biased;
+        _ = wait_for_receive_cancellation(cancellation) => Err(receive_cancelled_error()),
+        state = shared.state.lock() => Ok(state),
+    }
+}
+
 fn local_closed_error() -> PyErr {
     PyRuntimeError::new_err("result stream was closed before normal completion")
 }
@@ -579,6 +803,30 @@ async fn receive_envelope(state: &mut ConsumerState) -> Option<ResponseEventEnve
     match state.pending_metadata.take() {
         Some(envelope) => Some(envelope),
         None => state.receiver.recv().await,
+    }
+}
+
+async fn receive_envelope_or_cancel(
+    state: &mut ConsumerState,
+    control: &Arc<ReceiveCancellation>,
+    cancellation: &mut watch::Receiver<bool>,
+) -> PyResult<Option<ResponseEventEnvelope>> {
+    let envelope = tokio::select! {
+        biased;
+        _ = wait_for_receive_cancellation(cancellation) => {
+            return Err(receive_cancelled_error());
+        }
+        envelope = receive_envelope(state) => envelope,
+    };
+    if let Some(envelope) = envelope {
+        if control.mark_consumed() {
+            Ok(Some(envelope))
+        } else {
+            state.pending_metadata = Some(envelope);
+            Err(receive_cancelled_error())
+        }
+    } else {
+        Ok(None)
     }
 }
 
@@ -625,6 +873,18 @@ async fn await_terminal(shared: &Arc<SharedConsumer>, allow_aborted: bool) -> Py
     }
 }
 
+async fn await_terminal_or_cancel(
+    shared: &Arc<SharedConsumer>,
+    allow_aborted: bool,
+    cancellation: &mut watch::Receiver<bool>,
+) -> PyResult<()> {
+    tokio::select! {
+        biased;
+        _ = wait_for_receive_cancellation(cancellation) => Err(receive_cancelled_error()),
+        result = await_terminal(shared, allow_aborted) => result,
+    }
+}
+
 fn ensure_usable(shared: &Arc<SharedConsumer>) -> PyResult<()> {
     if let Some(error) = shared.clone_failure() {
         return Err(error);
@@ -647,21 +907,62 @@ fn summary_object(shared: &Arc<SharedConsumer>) -> PyResult<Py<PyResultSummary>>
     Python::attach(|py| Py::new(py, PyResultSummary::from_data(summary)))
 }
 
+fn attach_stream_error_metadata(
+    error: &PyErr,
+    operation: OperationName,
+    connection_discarded: bool,
+) -> PyResult<()> {
+    Python::attach(|py| {
+        let value = error.value(py);
+        value.setattr("operation", operation.as_str())?;
+        value.setattr("phase", TimeoutPhase::Operation.as_str())?;
+        value.setattr("retryable", false)?;
+        value.setattr("wire_sent", true)?;
+        value.setattr("connection_discarded", connection_discarded)?;
+        value.setattr("outcome_unknown", false)?;
+        Ok(())
+    })
+}
+
+fn stream_error_with_metadata(
+    error: PyErr,
+    operation: OperationName,
+    connection_discarded: bool,
+) -> PyErr {
+    match attach_stream_error_metadata(&error, operation, connection_discarded) {
+        Ok(()) => error,
+        Err(metadata_failure) => {
+            Python::attach(|py| {
+                metadata_failure.set_cause(py, Some(error));
+            });
+            metadata_failure
+        }
+    }
+}
+
 fn conversion_failed(shared: &Arc<SharedConsumer>, sequence: u64, error: PyErr) -> PyErr {
+    let error = stream_error_with_metadata(error, shared.operation, true);
     let stored = shared.record_failure(Python::attach(|py| error.clone_ref(py)));
     let _ = shared.acknowledge(sequence, ConsumerAckKind::ConversionFailed, Some(stored));
     shared.cancel();
     error
 }
 
-async fn outer_next(shared: Arc<SharedConsumer>) -> PyResult<Py<PyResultSet>> {
+async fn outer_next(
+    shared: Arc<SharedConsumer>,
+    control: Arc<ReceiveCancellation>,
+    mut cancellation: watch::Receiver<bool>,
+) -> PyResult<Py<PyResultSet>> {
     let _permit = ConsumerPermit::acquire(&shared)?;
+    if control.requested() {
+        return Err(receive_cancelled_error());
+    }
     ensure_usable(&shared)?;
     if shared.complete.load(Ordering::Acquire) {
         return Err(PyStopAsyncIteration::new_err(""));
     }
 
-    let mut state = shared.state.lock().await;
+    let mut state = lock_consumer_state(&shared, &mut cancellation).await?;
     if let Some(active) = state.active_set.as_ref() {
         if !active.closed.load(Ordering::Acquire) {
             return Err(PyRuntimeError::new_err(
@@ -672,15 +973,16 @@ async fn outer_next(shared: Arc<SharedConsumer>) -> PyResult<Py<PyResultSet>> {
     }
     if shared.summary().is_some() {
         drop(state);
-        await_terminal(&shared, false).await?;
+        await_terminal_or_cancel(&shared, false, &mut cancellation).await?;
         return Err(PyStopAsyncIteration::new_err(""));
     }
 
-    let envelope = match receive_envelope(&mut state).await {
+    let envelope = match receive_envelope_or_cancel(&mut state, &control, &mut cancellation).await?
+    {
         Some(envelope) => envelope,
         None => {
             drop(state);
-            await_terminal(&shared, false).await?;
+            await_terminal_or_cancel(&shared, false, &mut cancellation).await?;
             return Err(PyStopAsyncIteration::new_err(""));
         }
     };
@@ -731,25 +1033,31 @@ async fn result_set_next(
     index: usize,
     column_info: Arc<ColumnInfo>,
     closed: Arc<AtomicBool>,
+    control: Arc<ReceiveCancellation>,
+    mut cancellation: watch::Receiver<bool>,
 ) -> PyResult<Py<PyFastRow>> {
     if closed.load(Ordering::Acquire) {
         return Err(PyStopAsyncIteration::new_err(""));
     }
     let _permit = ConsumerPermit::acquire(&shared)?;
+    if control.requested() {
+        return Err(receive_cancelled_error());
+    }
     ensure_usable(&shared)?;
-    let mut state = shared.state.lock().await;
+    let mut state = lock_consumer_state(&shared, &mut cancellation).await?;
     if state.active_set.as_ref().map(|active| active.index) != Some(index) {
         closed.store(true, Ordering::Release);
         return Err(PyStopAsyncIteration::new_err(""));
     }
 
-    let envelope = match receive_envelope(&mut state).await {
+    let envelope = match receive_envelope_or_cancel(&mut state, &control, &mut cancellation).await?
+    {
         Some(envelope) => envelope,
         None => {
             close_active_set(&mut state, index);
             closed.store(true, Ordering::Release);
             drop(state);
-            await_terminal(&shared, false).await?;
+            await_terminal_or_cancel(&shared, false, &mut cancellation).await?;
             return Err(PyStopAsyncIteration::new_err(""));
         }
     };
@@ -786,7 +1094,7 @@ async fn result_set_next(
             close_active_set(&mut state, index);
             closed.store(true, Ordering::Release);
             drop(state);
-            await_terminal(&shared, false).await?;
+            await_terminal_or_cancel(&shared, false, &mut cancellation).await?;
             Err(PyStopAsyncIteration::new_err(""))
         }
     }
@@ -795,6 +1103,60 @@ async fn result_set_next(
 #[cfg(test)]
 mod producer_channel_tests {
     use super::*;
+
+    #[test]
+    fn supervised_protocol_panics_are_fail_closed_metadata() {
+        Python::initialize();
+        let completion = panic_completion(
+            create_protocol_error("simulated result decoder panic"),
+            OperationName::Query,
+        );
+        let ProducerCompletion::Failed(error) = completion else {
+            panic!("driver panic must become a terminal stream failure");
+        };
+
+        Python::attach(|py| {
+            let value = error.value(py);
+            assert_eq!(
+                value
+                    .getattr("operation")
+                    .and_then(|item| item.extract::<String>())
+                    .expect("operation metadata"),
+                "query",
+            );
+            assert_eq!(
+                value
+                    .getattr("phase")
+                    .and_then(|item| item.extract::<String>())
+                    .expect("phase metadata"),
+                "operation",
+            );
+            assert!(
+                !value
+                    .getattr("retryable")
+                    .and_then(|item| item.extract::<bool>())
+                    .expect("retryable metadata")
+            );
+            assert!(
+                value
+                    .getattr("wire_sent")
+                    .and_then(|item| item.extract::<bool>())
+                    .expect("wire metadata")
+            );
+            assert!(
+                value
+                    .getattr("connection_discarded")
+                    .and_then(|item| item.extract::<bool>())
+                    .expect("discard metadata")
+            );
+            assert!(
+                !value
+                    .getattr("outcome_unknown")
+                    .and_then(|item| item.extract::<bool>())
+                    .expect("outcome metadata")
+            );
+        });
+    }
 
     #[tokio::test]
     async fn queued_conversion_failure_wins_over_later_cancellation() {
@@ -883,6 +1245,7 @@ mod producer_channel_tests {
             acknowledgements: ack_sender,
             cancellation: cancel_sender,
             terminal: terminal_receiver,
+            operation: OperationName::Query,
             busy: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             complete: AtomicBool::new(false),
@@ -1033,17 +1396,10 @@ pub struct PyResultStream {
 }
 
 impl PyResultStream {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn spawn(
-        guard: PooledOperationGuard<'static>,
-        permit: OperationPermit,
-        observer: OperationObserver,
-        request: ResultRequest,
+    fn initialize(
         operation: OperationName,
-        operation_timeout: Option<Duration>,
-        retire_after_operation: bool,
         buffer_size: usize,
-    ) -> Self {
+    ) -> (Self, ProducerChannels, watch::Sender<TerminalRelease>) {
         let (event_sender, event_receiver) = mpsc::channel::<ResponseEventEnvelope>(buffer_size);
         let (ack_sender, ack_receiver) = mpsc::channel::<ConsumerAck>(buffer_size);
         let (cancel_sender, cancel_receiver) = watch::channel(false);
@@ -1065,12 +1421,28 @@ impl PyResultStream {
             acknowledgements: ack_sender,
             cancellation: cancel_sender,
             terminal: terminal_receiver,
+            operation,
             busy: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             complete: AtomicBool::new(false),
             aborted: AtomicBool::new(false),
             published: StdMutex::new(PublishedState::default()),
         });
+        (Self { shared }, channels, terminal_sender)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn(
+        guard: PooledOperationGuard<'static>,
+        permit: OperationPermit,
+        observer: OperationObserver,
+        request: ResultRequest,
+        operation: OperationName,
+        operation_timeout: Option<Duration>,
+        retire_after_operation: bool,
+        buffer_size: usize,
+    ) -> Self {
+        let (stream, channels, terminal) = Self::initialize(operation, buffer_size);
 
         let _supervisor = pyo3_async_runtimes::tokio::get_runtime().spawn(supervise_producer(
             ProducerSupervisor {
@@ -1082,10 +1454,31 @@ impl PyResultStream {
                 operation_timeout,
                 retire_after_operation,
                 channels,
-                terminal: terminal_sender,
+                terminal,
             },
         ));
-        Self { shared }
+        stream
+    }
+
+    pub(crate) fn spawn_transaction(
+        lease: TransactionResponseLease,
+        observer: OperationObserver,
+        request: ResultRequest,
+        operation: OperationName,
+        buffer_size: usize,
+    ) -> Self {
+        let (stream, channels, terminal) = Self::initialize(operation, buffer_size);
+        let _supervisor = pyo3_async_runtimes::tokio::get_runtime().spawn(
+            supervise_transaction_producer(TransactionProducerSupervisor {
+                observer,
+                lease,
+                request,
+                operation,
+                channels,
+                terminal,
+            }),
+        );
+        stream
     }
 }
 
@@ -1097,7 +1490,12 @@ impl PyResultStream {
 
     fn __anext__<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let shared = Arc::clone(&self.shared);
-        future_into_py(py, async move { outer_next(shared).await })
+        let (control, cancellation) = ReceiveCancellation::new(Arc::clone(&shared));
+        let future_control = Arc::clone(&control);
+        let awaitable = future_into_py(py, async move {
+            outer_next(shared, future_control, cancellation).await
+        })?;
+        wrap_receive_awaitable(py, awaitable, control)
     }
 
     fn __aenter__<'p>(slf: Py<Self>, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
@@ -1183,9 +1581,20 @@ impl PyResultSet {
         let column_info = Arc::clone(&self.column_info);
         let closed = Arc::clone(&self.closed);
         let index = self.index;
-        future_into_py(py, async move {
-            result_set_next(shared, index, column_info, closed).await
-        })
+        let (control, cancellation) = ReceiveCancellation::new(Arc::clone(&shared));
+        let future_control = Arc::clone(&control);
+        let awaitable = future_into_py(py, async move {
+            result_set_next(
+                shared,
+                index,
+                column_info,
+                closed,
+                future_control,
+                cancellation,
+            )
+            .await
+        })?;
+        wrap_receive_awaitable(py, awaitable, control)
     }
 
     fn aclose<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {

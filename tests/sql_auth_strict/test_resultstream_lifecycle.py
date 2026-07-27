@@ -188,27 +188,6 @@ async def _wait_request(
     await wait_until(matches, timeout=timeout)
 
 
-async def _wait_lock_wait(
-    observer: Connection,
-    session_id: int,
-    *,
-    timeout: float = 4.0,
-) -> None:
-    async def lock_wait_visible() -> bool:
-        wait_type = await scalar(
-            observer,
-            """
-            SELECT wait_type
-            FROM sys.dm_exec_requests
-            WHERE session_id = @P1
-            """,
-            [session_id],
-        )
-        return isinstance(wait_type, str) and wait_type.startswith("LCK_M_")
-
-    await wait_until(lock_wait_visible, timeout=timeout)
-
-
 async def _wait_pool_active(
     connection: Connection,
     expected: int,
@@ -406,8 +385,6 @@ async def test_cancelled_receives_and_terminal_errors_are_fail_closed(
     sql_auth_config: SqlAuthConfig,
     owner_connection: Connection,
     sa_connection: Connection,
-    transaction_factory: Callable,
-    cleanup_registry: CleanupRegistry,
     unique_sql_name: Callable[[str], str],
 ) -> None:
     application_name = unique_sql_name(f"result_024_{scenario}")
@@ -417,7 +394,6 @@ async def test_cancelled_receives_and_terminal_errors_are_fail_closed(
     )
     response = None
     pending: asyncio.Future | None = None
-    blocker = None
     terminal_error_type: type[BaseException] | None = None
     try:
         await connection.connect()
@@ -449,35 +425,55 @@ async def test_cancelled_receives_and_terminal_errors_are_fail_closed(
             assert (await response.finish()).result_set_count == 1
             assert await _identity(connection) == original
 
-            table = quote_identifier(
-                unique_sql_name("result_024_cancelled_inner")
-            )
-            await owner_connection.execute(
-                f"""
-                CREATE TABLE {table} (
-                    id INT NOT NULL PRIMARY KEY,
-                    value INT NOT NULL
-                )
-                """
-            )
-            cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
-            await owner_connection.execute(
-                f"INSERT INTO {table} (id, value) VALUES (1, 24)"
-            )
-            blocker = transaction_factory()
-            await blocker.begin()
-            await blocker.execute(
-                f"UPDATE {table} SET value = value WHERE id = 1"
-            )
-
-            response = await _stream(
+            response = await _batch(
                 connection,
-                f"SELECT id, value FROM {table} WHERE id = @P1",
-                [1],
+                """
+                WAITFOR DELAY '00:00:01';
+                SELECT
+                    @@SPID AS session_id,
+                    CAST(240 AS INT) AS value;
+                """,
+                buffer_size=1,
+            )
+            abandoned_receive = response.__anext__()
+            await asyncio.sleep(0)
+            abandoned_receive.close()
+            abandoned_receive = None
+            gc.collect()
+            result_set = await response.__anext__()
+            assert await _rows(result_set) == [
+                {"session_id": original[0], "value": 240}
+            ]
+            assert (await response.finish()).result_set_count == 1
+            assert await _identity(connection) == original
+
+            response = await _batch(
+                connection,
+                """
+                    SELECT
+                        @@SPID AS session_id,
+                        CAST(0 AS INT) AS id,
+                        CAST(24 AS INT) AS value;
+                    RAISERROR(
+                        N'fastmssql result receive boundary',
+                        10,
+                        1
+                    ) WITH NOWAIT;
+                    WAITFOR DELAY '00:00:03';
+                SELECT
+                    @@SPID AS session_id,
+                    CAST(1 AS INT) AS id,
+                    CAST(24 AS INT) AS value;
+                """,
                 buffer_size=1,
             )
             result_set = await response.__anext__()
-            await _wait_lock_wait(sa_connection, original[0])
+            assert (await result_set.__anext__()).to_dict() == {
+                "session_id": original[0],
+                "id": 0,
+                "value": 24,
+            }
+            await _wait_request(sa_connection, original[0], present=True)
             pending = asyncio.ensure_future(result_set.__anext__())
             await asyncio.sleep(0)
             assert pending.done() is False
@@ -486,16 +482,16 @@ async def test_cancelled_receives_and_terminal_errors_are_fail_closed(
                 await pending
             pending = None
 
-            await blocker.rollback()
-            await blocker.close()
-            blocker = None
-            assert (await result_set.__anext__()).to_dict() == {
+            with pytest.raises(StopAsyncIteration):
+                await result_set.__anext__()
+            second_result_set = await response.__anext__()
+            assert (await second_result_set.__anext__()).to_dict() == {
+                "session_id": original[0],
                 "id": 1,
                 "value": 24,
             }
-            with pytest.raises(StopAsyncIteration):
-                await result_set.__anext__()
-            assert (await response.finish()).result_set_count == 1
+            assert await _rows(second_result_set) == []
+            assert (await response.finish()).result_set_count == 2
 
             response = await _batch(
                 connection,
@@ -604,8 +600,6 @@ async def test_cancelled_receives_and_terminal_errors_are_fail_closed(
         assert await scalar(connection, "SELECT 24") == 24
     finally:
         await _cancel(pending)
-        if blocker is not None:
-            await blocker.close()
         if response is not None and not response.closed:
             if scenario == "cancelled_receive":
                 response = None

@@ -126,6 +126,10 @@ fn fastmssql(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add("TlsError", py.get_type::<TlsError>())?;
         m.add("ProtocolError", py.get_type::<ProtocolError>())?;
         m.add("ConversionError", py.get_type::<ConversionError>())?;
+        m.add(
+            "_ResultReceiveCancelled",
+            py.get_type::<types::ResultReceiveCancelled>(),
+        )?;
     }
 
     m.add_function(wrap_pyfunction!(version, m)?)?;

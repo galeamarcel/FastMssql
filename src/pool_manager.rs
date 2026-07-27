@@ -19,7 +19,8 @@ use tokio_util::compat::TokioAsyncWriteCompatExt;
 // Custom connection manager
 // ──────────────────────────────────────────────────────────────────────────────
 
-type TiberiusClient = tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>;
+pub(crate) type TiberiusClient =
+    tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConnectionDisposition {

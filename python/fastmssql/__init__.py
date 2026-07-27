@@ -4,6 +4,8 @@ High-performance Rust-backed Python driver for SQL Server with async/await suppo
 connection pooling, SSL/TLS encryption, Azure Active Directory authentication, and parameterized queries.
 """
 
+import asyncio
+
 # Import from the compiled Rust module
 from .fastmssql import (
     Connection as _RustConnection,
@@ -38,6 +40,7 @@ from .fastmssql import (
     TlsError,
     TimeoutConfig,
     TypedNull,
+    _ResultReceiveCancelled,
     version,
 )
 from .fastmssql import (
@@ -45,6 +48,37 @@ from .fastmssql import (
 )
 
 from enum import StrEnum
+
+
+async def _await_result_stream_receive(awaitable, cancellation):
+    """Preserve receive state until Rust acknowledges Python cancellation."""
+    try:
+        return await asyncio.shield(awaitable)
+    except asyncio.CancelledError as cancelled:
+        cancellation.cancel()
+        while True:
+            try:
+                await asyncio.shield(awaitable)
+            except _ResultReceiveCancelled:
+                break
+            except asyncio.CancelledError as repeated_cancel:
+                if awaitable.cancelled():
+                    cancelled.__cause__ = repeated_cancel
+                    break
+            except BaseException as cleanup_error:
+                cancelled.__cause__ = cleanup_error
+                break
+            else:
+                break
+        raise cancelled
+    finally:
+        cancellation.disarm()
+
+
+def _observe_result_stream_receive(awaitable):
+    """Mark completion observed without changing what an awaiter receives."""
+    if not awaitable.cancelled():
+        awaitable.exception()
 
 
 class ApplicationIntent(StrEnum):
@@ -215,6 +249,18 @@ class Transaction:
     async def query(self, sql, params=None):
         """Execute a SELECT query that returns rows."""
         return await self._rust_conn.query(sql, params)
+
+    async def stream(self, sql, params=None, *, buffer_size=64):
+        """Stream all result sets while retaining this transaction session."""
+        return await self._rust_conn.stream(
+            sql,
+            params,
+            buffer_size=buffer_size,
+        )
+
+    async def batch(self, sql, *, buffer_size=64):
+        """Stream an unparameterized batch on this transaction session."""
+        return await self._rust_conn.batch(sql, buffer_size=buffer_size)
 
     async def execute(self, sql, params=None):
         """Execute an INSERT/UPDATE/DELETE/DDL command."""

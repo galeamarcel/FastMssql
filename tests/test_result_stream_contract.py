@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import ast
 import importlib
 import inspect
@@ -7,6 +8,7 @@ from pathlib import Path
 from types import ModuleType
 
 import fastmssql
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -320,6 +322,62 @@ def test_connection_publishes_exact_stream_and_batch_signatures() -> None:
         connection = _class(tree, "Connection")
         for name in STREAM_METHODS:
             _assert_stub_stream_signature(connection, name)
+
+
+def test_transaction_publishes_exact_stream_and_batch_signatures() -> None:
+    _, wrapper_stub, core_stub, _ = _package_files()
+    core = importlib.import_module("fastmssql.fastmssql")
+
+    for owner in (
+        fastmssql.Transaction,
+        core.Transaction,
+    ):
+        for name in STREAM_METHODS:
+            _assert_runtime_stream_signature(owner, name)
+
+    for path in (wrapper_stub, core_stub):
+        tree = _tree(path)
+        transaction = _class(tree, "Transaction")
+        for name in STREAM_METHODS:
+            _assert_stub_stream_signature(transaction, name)
+
+
+@pytest.mark.asyncio
+async def test_repeated_python_cancellation_waits_for_rust_receive_cleanup() -> None:
+    cleanup_release = asyncio.Event()
+    cancellation_started = asyncio.Event()
+
+    class CancellationControl:
+        cancel_calls = 0
+        disarm_calls = 0
+
+        def cancel(self) -> None:
+            self.cancel_calls += 1
+            cancellation_started.set()
+
+        def disarm(self) -> None:
+            self.disarm_calls += 1
+
+    control = CancellationControl()
+    inner = asyncio.create_task(cleanup_release.wait())
+    receive = asyncio.create_task(
+        fastmssql._await_result_stream_receive(inner, control)
+    )
+
+    await asyncio.sleep(0)
+    receive.cancel()
+    await cancellation_started.wait()
+    await asyncio.sleep(0)
+    receive.cancel()
+    await asyncio.sleep(0)
+
+    assert receive.done() is False
+    cleanup_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await receive
+    assert inner.done() is True
+    assert control.cancel_calls == 1
+    assert control.disarm_calls == 1
 
 
 def test_result_stream_and_result_set_are_async_only_protocols() -> None:
