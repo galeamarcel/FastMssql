@@ -52,6 +52,9 @@ No release, package-version change, or artifact publication has occurred.
   cancellation-safe checkout wrapper.
 - Selected an additive immediate-reset primitive in vendored Tiberius so
   first-statement module DDL is never prefixed or rewritten by the driver.
+- Added the executable implementation plan with separate public RED,
+  Tiberius compile-RED, runtime-fix and audit-status branches, exact Docker
+  SQL-auth, timeout, isolated-wheel, graph and self-review gates.
 - Defined separate RED/fix/status branches, same-SPID SQL-auth isolation
   contracts, fault/deadline recovery, isolated-wheel gates and load profiles
   through the approved 99,999-operation ceiling.
