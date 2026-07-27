@@ -19,7 +19,7 @@ use crate::pool_manager::{
 };
 use crate::timeout_config::PyTimeoutConfig;
 use crate::types::{TimeoutErrorMetadata, create_sql_error};
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyOverflowError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTypeMethods};
 use pyo3_async_runtimes::tokio::future_into_py;
@@ -535,6 +535,50 @@ fn fix_bulk_null_types(flat_data: &mut [FastParameter], col_count: usize) {
     }
 }
 
+fn convert_bulk_chunk(
+    data_rows: &Py<PyList>,
+    start: usize,
+    rows_per_batch: usize,
+    col_count: usize,
+    expected_row_count: usize,
+) -> PyResult<Vec<FastParameter>> {
+    Python::attach(|py| {
+        let rows = data_rows.bind(py);
+        if rows.len() != expected_row_count {
+            return Err(PyValueError::new_err(
+                "bulk_insert data_rows must not be resized while the operation is running",
+            ));
+        }
+        if start >= expected_row_count {
+            return Err(PyValueError::new_err(
+                "bulk_insert chunk offset is outside the captured input",
+            ));
+        }
+
+        let remaining = expected_row_count - start;
+        let end = start + rows_per_batch.min(remaining);
+        let mut chunk = Vec::with_capacity((end - start) * col_count);
+
+        for row_index in start..end {
+            let row = rows.get_item(row_index)?;
+            let row = row.cast::<PyList>()?;
+            if row.len() != col_count {
+                return Err(PyValueError::new_err(format!(
+                    "Row has {} values but {} columns specified",
+                    row.len(),
+                    col_count
+                )));
+            }
+            for value in row.iter() {
+                chunk.push(python_to_fast_parameter(&value)?);
+            }
+        }
+
+        fix_bulk_null_types(&mut chunk, col_count);
+        Ok(chunk)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn bulk_insert<'p>(
     pool: Arc<RwLock<Option<ConnectionPool>>>,
@@ -560,47 +604,7 @@ pub fn bulk_insert<'p>(
     // Respect both SQL Server limits: at most 1,000 row constructors in one
     // INSERT ... VALUES statement and a conservative 2,000 parameters.
     let rows_per_batch = bulk_rows_per_batch(col_count);
-    let chunk_capacity = rows_per_batch * col_count;
-
-    // Build owned chunks of at most `rows_per_batch` rows while still holding
-    // the GIL.  Each chunk is a self-contained Vec<FastParameter> so the async
-    // block can drop it immediately after its INSERT executes, keeping live
-    // memory proportional to one chunk rather than the entire dataset.
-    //
-    // Previously a single flat Vec was allocated for all rows up-front and kept
-    // alive until the very last await returned, doubling peak memory for large
-    // inputs.
-    let num_chunks = data_rows.len().div_ceil(rows_per_batch);
-    let mut chunks: Vec<Vec<FastParameter>> = Vec::with_capacity(num_chunks);
-    let mut current_chunk: Vec<FastParameter> = Vec::with_capacity(chunk_capacity);
-
-    for row in data_rows.iter() {
-        let row_list = row.cast::<PyList>()?;
-        if row_list.len() != col_count {
-            return Err(PyValueError::new_err(format!(
-                "Row has {} values but {} columns specified",
-                row_list.len(),
-                col_count
-            )));
-        }
-        for value in row_list.iter() {
-            current_chunk.push(python_to_fast_parameter(&value)?);
-        }
-
-        // Once the chunk holds a full batch worth of rows, fix its null types
-        // and move it to the chunks list, then start a fresh allocation.
-        if current_chunk.len() >= chunk_capacity {
-            fix_bulk_null_types(&mut current_chunk, col_count);
-            chunks.push(current_chunk);
-            current_chunk = Vec::with_capacity(chunk_capacity);
-        }
-    }
-
-    // Flush the final (possibly partial) chunk.
-    if !current_chunk.is_empty() {
-        fix_bulk_null_types(&mut current_chunk, col_count);
-        chunks.push(current_chunk);
-    }
+    let row_count = data_rows.len();
 
     // Validate and quote all identifiers before acquiring a lease or opening a
     // server-side transaction.
@@ -611,11 +615,31 @@ pub fn bulk_insert<'p>(
         .collect::<PyResult<Vec<_>>>()?
         .join(", ");
 
+    if row_count == 0 {
+        return future_into_py(py, async move { Ok(0u64) });
+    }
+
+    // Keep the concrete Python input alive without duplicating its cells.
+    // Conversion happens inside the returned awaitable, one SQL chunk at a
+    // time, after the previous chunk has been fully consumed.
+    let data_rows = data_rows.clone().unbind();
+
     future_into_py(py, async move {
         observe_operation(operation_metrics, OperationName::BulkInsert, async move {
             let permit = lifecycle.admit_operation(OperationName::BulkInsert, true)?;
             permit
                 .run(async move {
+                    let deadline =
+                        deadline_from(TimeoutPhase::Operation, timeout_config.operation_timeout);
+                    let mut start = 0usize;
+                    let mut chunk = convert_bulk_chunk(
+                        &data_rows,
+                        start,
+                        rows_per_batch,
+                        col_count,
+                        row_count,
+                    )?;
+
                     let pool_ref = ensure_pool_initialized_with_auth(
                         pool,
                         config,
@@ -635,8 +659,6 @@ pub fn bulk_insert<'p>(
                     })?;
                     let mut conn = PooledOperationGuard::new(pooled);
 
-                    let deadline =
-                        deadline_from(TimeoutPhase::Operation, timeout_config.operation_timeout);
                     let mut transaction_started = false;
                     let operation = run_until(
                         deadline,
@@ -651,9 +673,7 @@ pub fn bulk_insert<'p>(
 
                             let mut total_affected = 0u64;
 
-                            // Drain chunks via into_iter: each Vec<FastParameter> is moved
-                            // out and freed before the next request.
-                            for chunk in chunks {
+                            loop {
                                 let row_count_in_batch = chunk.len() / col_count;
                                 let mut sql = String::with_capacity(
                                     100 + row_count_in_batch * (col_count * 5),
@@ -681,16 +701,43 @@ pub fn bulk_insert<'p>(
                                     sql.push(')');
                                 }
 
-                                let mut params: SmallVec<[&dyn tiberius::ToSql; 128]> =
-                                    SmallVec::with_capacity(chunk.len());
-                                for parameter in &chunk {
-                                    params.push(parameter as &dyn tiberius::ToSql);
+                                {
+                                    let mut params: SmallVec<[&dyn tiberius::ToSql; 128]> =
+                                        SmallVec::with_capacity(chunk.len());
+                                    for parameter in &chunk {
+                                        params.push(parameter as &dyn tiberius::ToSql);
+                                    }
+
+                                    let result =
+                                        conn.execute(sql, &params).await.map_err(|error| {
+                                            create_sql_error(error, "Batch execution failed")
+                                        })?;
+                                    for affected in result.rows_affected() {
+                                        total_affected = total_affected
+                                            .checked_add(*affected)
+                                            .ok_or_else(|| {
+                                                PyOverflowError::new_err(
+                                                    "bulk_insert affected-row count overflowed u64",
+                                                )
+                                            })?;
+                                    }
                                 }
 
-                                let result = conn.execute(sql, &params).await.map_err(|error| {
-                                    create_sql_error(error, "Batch execution failed")
-                                })?;
-                                total_affected += result.rows_affected().iter().sum::<u64>();
+                                start += row_count_in_batch;
+                                if start >= row_count {
+                                    break;
+                                }
+                                // Rust evaluates an assignment's right-hand side before
+                                // dropping its previous left-hand value. Drop explicitly so
+                                // converted values from two chunks are never live together.
+                                drop(chunk);
+                                chunk = convert_bulk_chunk(
+                                    &data_rows,
+                                    start,
+                                    rows_per_batch,
+                                    col_count,
+                                    row_count,
+                                )?;
                             }
 
                             consume_simple_command(

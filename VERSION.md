@@ -38,6 +38,40 @@ Changes currently integrated on `test/sql-auth-validation`:
 
 No release, package-version change, or artifact publication has occurred.
 
+### Compatibility bulk bounded-buffering fix
+
+- Replaced eager whole-input conversion in `Connection.bulk_insert()` with an
+  owned `Py<PyList>` handle and one-chunk-at-a-time conversion inside the
+  returned awaitable.
+- The first chunk is converted before pool initialization; later chunks are
+  converted only after the previous SQL response is fully drained and its
+  converted values are explicitly dropped.
+- Empty input now returns `0` before lifecycle admission, pool initialization
+  or operation-metric accounting. Identifier validation remains local and
+  synchronous.
+- Captured the top-level input length and now reject any resize at each chunk
+  boundary. A preflight resize remains zero-I/O; a resize after `BEGIN`
+  follows the same full rollback path as a late value-conversion failure.
+- Preserved one atomic transaction across all compatibility chunks, added
+  checked `u64` affected-row aggregation, and retained timeout, cancellation,
+  rollback and connection-retirement behavior.
+- The exact final native build passes all 3 focused offline contracts, all 21
+  legacy batch parameter validations, all 22 strict SQL-auth batch/bulk cases,
+  3 focused deadline/operation-metric cases, all 71 FastMssql Rust tests, Rust
+  formatting and Clippy with warnings denied.
+- Real SQL-auth probes passed with exact affected/readback counts and a
+  post-load `SELECT 1`: at 1,000 rows RSS grew `8,732,672` bytes with
+  `0.000340333` seconds maximum event-loop stall; at 10,000 rows RSS grew
+  `28,803,072` bytes with `0.002861375` seconds stall; at 99,999 rows RSS grew
+  `45,203,456` bytes with `0.005358250` seconds stall. Every profile stayed
+  below the `67,108,864`-byte and `0.100`-second gates with no violations.
+- The maximum-profile RSS growth fell by `93,044,736` bytes from the unchanged
+  RED implementation (`138,248,192` to `45,203,456`) while preserving
+  99,999/99,999 affected and persisted rows.
+- The ABI3 CPython 3.13 editable wheel build/install succeeded from the exact
+  fix worktree. Package metadata, the displayed `0.7.7` version and release
+  state remain unchanged.
+
 ### Compatibility bulk bounded-buffering RED coverage
 
 - Added deterministic offline contracts requiring `bulk_insert()` method

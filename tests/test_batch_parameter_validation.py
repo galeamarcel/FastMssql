@@ -320,9 +320,9 @@ class TestBatchParameterEdgeCases:
 class TestBatchItemStructureValidation:
     """Validate batch item shape errors without needing a DB connection.
 
-    parse_batch_items() and the bulk_insert() column/row checks run synchronously
-    (before the async pool work), so a Connection built from keyword args is
-    sufficient – the pool is never actually opened.
+    parse_batch_items() runs synchronously. The bulk_insert() row checks run
+    inside the returned awaitable before first wire I/O, so a Connection built
+    from keyword args is still sufficient – the pool is never actually opened.
     """
 
     def _offline_conn(self):
