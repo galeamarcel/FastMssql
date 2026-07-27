@@ -10,7 +10,7 @@ yet applied to package metadata; release versioning remains a separate,
 explicit decision.
 
 Changes currently integrated in fork history through
-`deef315cc6be7b2c303040cca99a268aa201a28d`:
+`52c04c35a27dd6a79ccb5f54b15d7a0413a8965b`:
 
 - closed, validated SQL parameter descriptors with exact TDS metadata;
 - exact decimal, UUID, temporal, ANSI/Unicode, binary, XML, and typed-null
@@ -25,6 +25,9 @@ Changes currently integrated in fork history through
   including multiple and empty result sets and fail-closed lifecycle;
 - direct named `callproc()` with INPUT/OUTPUT/INPUT_OUTPUT/RETURN_VALUE,
   exact scalar output conversion and terminal summaries;
+- a safe ordered vendored-Tiberius bulk column-subset primitive with
+  pre-wire raw-identifier validation, exact metadata checks and a total
+  declaration formatter;
 - deterministic SQL-auth, exact-wire, compatibility, and 1,000-operation
   concurrent load coverage;
 - load-metric contract coverage for the typed-parameter case `PARAM-033`;
@@ -38,6 +41,24 @@ Changes currently integrated in fork history through
   `30284587019`.
 
 No release, package-version change, or artifact publication has occurred.
+
+### Tiberius bulk column-subset audit status
+
+- Updated the live production-readiness audit to the exact cumulative feature
+  SHA `52c04c35a27dd6a79ccb5f54b15d7a0413a8965b`.
+- Recorded the design, plan, RED and feature ancestry, the exact `E0432`/
+  `E0599` RED evidence and every fresh local/Docker verification count.
+- Classified the earlier localhost `Operation not permitted` result as a
+  sandbox-policy failure only after the explicitly approved retry passed all
+  `16/16` Tiberius integration tests.
+- Recorded that code-review-graph rebuilt successfully but `detect_changes`
+  exposed no node or flow for `vendor/tiberius`; its zero-risk result is
+  therefore not treated as evidence for this slice.
+- The batch/bulk program now has three of seven slices verified on the fork.
+  FastMssql native bulk exposure, iterable backpressure, `execute_many()` and
+  `query_many()` remain four separate open slices.
+- This documentation update does not change package metadata, the displayed
+  `0.7.7` version, release state or artifact-publication state.
 
 ### Tiberius bulk column-subset implementation
 
