@@ -52,6 +52,15 @@ No release, package-version change, or artifact publication has occurred.
   rows. This test-only change does not change runtime behavior, package
   metadata, the displayed `0.7.7` version or release state.
 
+### Native TDS bulk stress failure-reporting RED contract
+
+- Added a focused executable contract requiring an operation failure before
+  resource sampling to remain the primary reported failure instead of being
+  masked by arithmetic on unavailable RSS or event-loop metrics.
+- The expected RED is a `TypeError` from comparing `None` with a numeric
+  budget. This test-only change does not change runtime behavior, package
+  metadata, the displayed `0.7.7` version or release state.
+
 ### Native TDS bulk transaction fixture determinism
 
 - Made `BULK-011` verify transaction neutrality directly on the pinned
