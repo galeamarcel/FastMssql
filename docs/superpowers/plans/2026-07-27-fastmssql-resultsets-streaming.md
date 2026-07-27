@@ -2433,11 +2433,15 @@ UV_CACHE_DIR=/private/tmp/fastmssql-result-stream-wheel-cache \
 uv venv --python 3.13 .artifacts/result-stream-wheel-venv
 uv pip install \
   --python .artifacts/result-stream-wheel-venv/bin/python \
-  pytest==9.1.1 pytest-asyncio==1.4.0 psutil==7.2.2 \
+  pytest==9.1.1 pytest-asyncio==1.4.0 pytest-timeout==2.4.0 \
+  python-dotenv==1.2.2 psutil==7.2.2 \
   .artifacts/result-stream-wheel/*.whl
 .artifacts/result-stream-wheel-venv/bin/python \
   -m pytest --noconftest tests/test_result_stream_contract.py -q
 ```
+
+`python-dotenv` is required by the repository-level SQL-auth `conftest.py`;
+`pytest-timeout` activates its documented 30-second integration timeout.
 
 Then load SQL-auth variables and run the focused installed-wheel real-MSSQL
 result, lifecycle and RPC files with `PYTHONPATH` absent:
