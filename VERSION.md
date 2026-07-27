@@ -9,7 +9,8 @@ component represents a feature-level patch. It is documented here but is not
 yet applied to package metadata; release versioning remains a separate,
 explicit decision.
 
-Changes currently integrated on `test/sql-auth-validation`:
+Changes currently integrated in fork history through
+`dec2914874d35d04655305d41d7a21fde23c40da`:
 
 - closed, validated SQL parameter descriptors with exact TDS metadata;
 - exact decimal, UUID, temporal, ANSI/Unicode, binary, XML, and typed-null
@@ -37,6 +38,26 @@ Changes currently integrated on `test/sql-auth-validation`:
   `30284587019`.
 
 No release, package-version change, or artifact publication has occurred.
+
+### Live audit status for bounded compatibility bulk
+
+- Advanced the live production-readiness audit from cumulative ancestor
+  `a9d5c2ab42de0f03051c771bb8942ee15dfe6e28` to the exact technical tree
+  `dec2914874d35d04655305d41d7a21fde23c40da`.
+- Recorded the RED reproduction, one-chunk compatibility-bulk fix, exact
+  focused Rust/Python/SQL-auth verification and 1,000/10,000/99,999-row
+  resource profiles without claiming completion of the wider batch/bulk
+  program.
+- Separated the new local/Docker evidence from the last complete hosted
+  Linux/macOS/Windows and RustSec gates, which remain tied to ancestor
+  `a9d5c2a`, and kept the last full generated matrix at its evidenced
+  `372/372` state while identifying the two new focused cases in the
+  374-ID canonical specification.
+- Kept six remaining batch/bulk slices explicit: shared row conversion,
+  Tiberius column subsets, native TDS bulk, iterable backpressure,
+  `execute_many()` and bounded-concurrency `query_many()`.
+- This status-only documentation change does not modify runtime behavior,
+  package metadata, the displayed `0.7.7` version or release state.
 
 ### Compatibility bulk bounded-buffering fix
 
