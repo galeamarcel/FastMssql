@@ -249,3 +249,18 @@ def test_native_bulk_stress_harness_is_bounded_and_extended_is_explicit(
         "status": "contract",
     }
     assert list(evidence_path.parent.glob(".*.tmp")) == []
+
+
+def test_native_bulk_stress_builds_list_rows_for_the_list_only_api() -> None:
+    runner = ROOT / "scripts/sql_auth/native_bulk_stress.py"
+    namespace = runpy.run_path(str(runner))
+
+    rows = namespace["build_rows"](3)
+
+    assert rows == [
+        [0, "native-bulk-0", 0],
+        [1, "native-bulk-1", 1],
+        [2, "native-bulk-2", 2],
+    ]
+    assert isinstance(rows, list)
+    assert all(isinstance(row, list) for row in rows)
