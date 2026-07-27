@@ -59,10 +59,11 @@ maturin ABI3 wheels, and code-review-graph.
 
 The design spans seven sequentially dependent subsystems. This program plan
 locks their order and branch ancestry; each subsystem receives a separate
-executable plan before its RED branch is created. The first executable plan
-is:
+executable plan before its RED branch is created. Published executable plans
+are:
 
 - `docs/superpowers/plans/2026-07-27-fastmssql-bulk-bounded-buffering.md`
+- `docs/superpowers/plans/2026-07-27-fastmssql-bulk-row-descriptor-conversion.md`
 
 The later slice plans are added on their corresponding documentation gate,
 after the preceding implementation provides the exact interfaces they

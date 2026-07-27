@@ -39,6 +39,25 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Documentation-only typed bulk row conversion plan
+
+- Added the executable RED/fix/status plan for sharing the closed
+  non-expanded `Parameter` conversion path with compatibility bulk rows.
+- Locked zero-based global row, column and flattened parameter indexes,
+  privacy-safe error fields, truthful first/late
+  `wire_sent`/`connection_discarded` semantics, replacement-SPID recovery and
+  preservation of the original typed conversion exception.
+- Defined SQL-auth cases `BULK-003` through `BULK-005` for exact
+  numeric/temporal/UUID values, typed NULLs, expanded/non-input rejection,
+  late-chunk rollback and identifier/value redaction.
+- Required explicit typed NULLs to remain outside untyped column-null
+  inference and ordinary query/batch expansion behavior to remain unchanged.
+- Defined isolated documentation, RED, fix and live-status branches plus
+  focused Python/Rust/Docker/graph gates without claiming completion of the
+  wider batch/bulk program.
+- This plan-only change does not modify runtime behavior, package metadata,
+  the displayed `0.7.7` version or release state.
+
 ### Live audit status for bounded compatibility bulk
 
 - Advanced the live production-readiness audit from cumulative ancestor
