@@ -1,29 +1,29 @@
 # FastMssql — audit consolidat pentru utilizare în producție
 
-Data auditului: 24 iulie 2026  
+Data auditului: 28 iulie 2026<br>
 Fork auditat: `https://github.com/galeamarcel/FastMssql.git`  
-Branch: `docs/tiberius-bulk-column-subset-status`<br>
+Branch: `docs/native-bulk-insert-status`<br>
 Commit tehnic cumulativ:
-`52c04c35a27dd6a79ccb5f54b15d7a0413a8965b`
+`428bc7471f61376294a8cb0f43587e86dd76ed9d`
 
-Ultima actualizare live: 27 iulie 2026
-Ultimul subsistem verificat: primitiva vendorizată Tiberius pentru bulk pe un
-subset ordonat și sigur de coloane, cu designul la `35b5ad2`, planul la
-`85c5de7`, contractele RED la `549ea18` și implementarea cumulativă la
-`52c04c3`
-Ultimul contract de load pentru bulk: 1.000, 10.000 și 99.999 rânduri
-persistate exact, cu maximum RSS growth `45.203.456` bytes și maximum
-event-loop stall `0,005358250` secunde
+Ultima actualizare live: 28 iulie 2026
+Ultimul subsistem verificat: API-ul FastMssql list-only pentru bulk TDS nativ,
+cu designul și planul la `36cfca1`, contractul RED principal la `fe916b6`,
+contractele corrective până la `4897c93` și implementarea cumulativă la
+`428bc74`
+Ultimul contract de load pentru bulk TDS nativ: 1.000, 10.000 și 99.999
+rânduri persistate exact, cu maximum RSS growth `3.981.312` bytes în profilul
+extins, maximum event-loop stall `0,022436750` secunde în toate profilurile și
+zero erori/timeout-uri
 Ultimul contract de load pentru rezultate: RESULT-029, 1.000/1.000 operații
 reușite la concurență 64, pool maxim 8 și buffer 8; profilele opt-in
 10.000:128 și 99.999:200 au trecut cu pool maxim 32 și buffer 16
-Ultimul arbore tehnic verificat: `feat/tiberius-bulk-column-subset` la
-`52c04c3`
+Ultimul arbore tehnic verificat: `feat/native-bulk-insert` la `428bc74`
 Ultimul gate hosted verificat: `rust-unit-tests.yml`, rularea
 [#30284587006](https://github.com/galeamarcel/FastMssql/actions/runs/30284587006)
 verde pe Linux, macOS și Windows la strămoșul cumulativ `a9d5c2a`; slice-urile
-bulk de la `dec2914`, `deef315` și `52c04c3` sunt verificate local și pe MSSQL
-Docker, dar nu sunt încă reprezentate de un gate hosted nou
+bulk de la `dec2914`, `deef315`, `52c04c3` și `428bc74` sunt verificate local
+și pe MSSQL Docker, dar nu sunt încă reprezentate de un gate hosted nou
 Ultimul gate dependency-security verificat: rularea
 [#30284587019](https://github.com/galeamarcel/FastMssql/actions/runs/30284587019)
 verde la același strămoș `a9d5c2a`
@@ -119,15 +119,22 @@ identificatorii raw înainte de I/O, cere metadata numai pentru subsetul
 ordonat, respinge coloanele identity/computed/rowversion sau cu alte flaguri
 restricționate și construiește declarațiile `INSERT BULK` printr-un formatter
 total, fără ramuri panic. API-ul compatibility Tiberius
-`Client::bulk_insert(table)` nu a fost modificat. Această primitivă este
-fundamentul driverului, nu încă un API Python `native_bulk_insert()`.
+`Client::bulk_insert(table)` nu a fost modificat.
 
-Aceste rezultate închid primele trei dintre cele șapte slice-uri batch/bulk
+Peste această primitivă, FastMssql expune acum aditiv
+`Connection.native_bulk_insert()` și `Transaction.native_bulk_insert()`.
+Conversia este ghidată de metadata exactă a țintei, fiecare request bulk este
+finalizat sau conexiunea este retrasă, iar forma `Connection` păstrează un
+singur lease și o singură tranzacție SQL pentru toate chunk-urile. Forma
+tranzacțională nu face settlement și intră rollback-only după o eroare
+post-wire reutilizabilă. CHECK/foreign-key constraints, trigger-ele și
+NULL-ul explicit sunt păstrate; calea compatibility nu este redirecționată.
+
+Aceste rezultate închid primele patru dintre cele șapte slice-uri batch/bulk
 și nu declară încă biblioteca complet enterprise
 production-ready:
-tracing/OpenTelemetry, table-valued parameters, API-ul FastMssql bulk TDS
-nativ, iterable
-backpressure, `execute_many()`, `query_many()`, tipurile money exacte, named
+tracing/OpenTelemetry, table-valued parameters, iterable backpressure,
+`execute_many()`, `query_many()`, tipurile money exacte, named
 instances, TDS 8, framework-urile pornite din wheel prin servere de proces
 reale și proveniența artefactelor rămân
 cerințe P1/P2.
@@ -2821,8 +2828,7 @@ Rămân explicit deschise în zona tipurilor și a scrierilor bulk:
 
 - `MONEY`/`SMALLMONEY` fixed-point exact, TVP, `SQL_VARIANT`, spatial,
   hierarchyid, UDT și legacy LOB;
-- bulk TDS nativ, backpressure pentru iterator/async iterable și API-urile
-  many.
+- backpressure pentru iterator/async iterable și API-urile many.
 
 Pentru money exact, contractul recomandat rămâne `DECIMAL(19,4)`. Aceste
 excluderi nu redeschid parametrizarea de intrare verificată; aparțin
@@ -2830,7 +2836,7 @@ subsistemelor următoare.
 
 ### Batch și bulk
 
-Primele trei dintre cele șapte slice-uri aprobate sunt `VERIFIED_FORK`.
+Primele patru dintre cele șapte slice-uri aprobate sunt `VERIFIED_FORK`.
 `Connection.bulk_insert()` păstrează semantica compatibility
 `INSERT ... VALUES`, dar nu mai construiește toate chunk-urile înainte de
 primul `await`. Implementarea de la
@@ -2964,21 +2970,120 @@ nod sau flow pentru fișierele `vendor/tiberius`, astfel încât raportul său d
 risc zero pentru acest slice este artificial și nu este folosit drept dovadă
 de corectitudine.
 
+Al patrulea slice expune în FastMssql calea TDS nativă, fără să înlocuiască
+metoda compatibility:
+
+- designul și planul executabil sunt în commitul
+  `36cfca1fec6e5bf539760bd112eeb4c1caf40fd6`;
+- contractul RED principal este
+  `fe916b623e24a61e43e5153fc075a0557214cf04`;
+- corecțiile de fixture/stress și noua regresie de wire encoding sunt
+  `2ce5120`, `1143c3b`, `8889a8e`, `299be58` și `4897c93`;
+- implementarea cumulativă verificată este
+  `428bc7471f61376294a8cb0f43587e86dd76ed9d`.
+
+`Connection.native_bulk_insert(table, columns, rows, chunk_size=1000)`:
+
+1. acceptă numai o listă concretă de liste și limitează chunk-ul la
+   `1..10.000`; inputul gol întoarce `0` fără pool, SQL sau metrică;
+2. validează identificatorii raw înainte de I/O, apoi convertește fiecare
+   celulă după metadata exactă a coloanei țintă;
+3. păstrează un singur lease fizic și o singură tranzacție SQL pentru toate
+   chunk-urile, cu un singur deadline absolut;
+4. finalizează obligatoriu fiecare request bulk. O eroare locală înainte de
+   wire poate finaliza requestul gol și reutiliza conexiunea; o eroare de
+   encoding după începerea lui `send()` retrage imediat fluxul parțial;
+5. face rollback integral înainte de COMMIT, nu retrimite automat și
+   clasifică pierderea confirmării COMMIT drept rezultat necunoscut;
+6. cere `CHECK_CONSTRAINTS`, `FIRE_TRIGGERS` și `KEEP_NULLS`. XML folosește
+   metadata wire `NVARCHAR(MAX)` păstrând declarația țintă XML, soluție
+   probată pe SQL Server real;
+7. verifică exact numărul afectat per chunk și cumulativ, fără să includă
+   valori, SQL, tabel sau coloane în diagnosticele de conversie.
+
+Aceeași metodă pe un `Transaction` activ nu face COMMIT sau ROLLBACK.
+Succesul lasă tranzacția activă. O eroare post-wire cu protocol drenat o face
+rollback-only; o eroare cu sincronizare incertă retrage conexiunea și închide
+sesiunea fail-closed. `rollback()` și `close()` rămân căile de recuperare.
+
+Regresia finală `BULK-010` folosește `VARCHAR(1)` cu o collation UTF-8 și
+valoarea `é`. Lungimea logică trece conversia Python, dar cei doi bytes nu
+încap în ținta ANSI și Tiberius raportează eroarea numai după ce requestul
+wire a început. Implementarea inițială încerca apoi un ROLLBACK pe fluxul BCP
+nedrenat și atașa eroarea secundară „Bulk load data was expected but not
+sent”. Corecția clasifică acea conexiune drept nereutilizabilă imediat; testul
+probează zero rânduri, identitate fizică nouă și smoke ulterior.
+
+Verificarea exactă pe `428bc74` a trecut:
+
+| Gate | Rezultat |
+|---|---:|
+| FastMssql Rust | 81/81 PASS |
+| Tiberius vendored unit | 168/168 PASS |
+| `TIB-BULK-001`–`TIB-BULK-008` SQL-auth | 8/8 PASS |
+| `BULK-006`–`BULK-012` SQL-auth | 7/7 PASS |
+| regresie strictă batch + parametri + tranzacții | 132/132 PASS |
+| contracte offline native bulk + matrice | 34/34 PASS |
+| wheel instalat izolat, offline + SQL-auth | 15/15 PASS |
+
+Wheel-ul ABI3 a fost importat din propriul `site-packages`, cu `PYTHONPATH`
+eliminat, și are SHA-256
+`168a928c6a5f00c1defc6300936a00e7c5ac9a716fd05216763cba3be359fd7b`.
+Root/vendored fmt și Clippy cu warnings denied, Ruff, diff check și scanarea
+credentialelor au trecut. Artefactele `vendor/tiberius/Cargo.lock` și
+`vendor/tiberius/target` au fost mutate recuperabil în `/private/tmp`, nu
+comise.
+
+Profilele finale au fost generate de worktree-ul curat, pe SHA-ul exact:
+
+| Profil | Afectate/persistate | Throughput | p99 chunk-call | RSS growth | Stall maxim | Sesiuni |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1.000 / 100 | 1.000 / 1.000 | 15.304,96 rânduri/s | 4,082 ms | 1.720.320 B | 22,437 ms | 1 |
+| 10.000 / 1.000 | 10.000 / 10.000 | 185.139,04 rânduri/s | 12,802 ms | 1.425.408 B | 6,209 ms | 1 |
+| 99.999 / 1.000 | 99.999 / 99.999 | 188.627,78 rânduri/s | 13,389 ms | 3.981.312 B | 8,266 ms | 1 |
+
+Toate au avut zero erori, zero timeout-uri, identitate fizică stabilă,
+post-load smoke PASS și zero sesiuni după teardown. Raportul complet este
+[SQL_AUTH_NATIVE_BULK_STRESS_REPORT.md](SQL_AUTH_NATIVE_BULK_STRESS_REPORT.md).
+Datele acoperă input concret și nu sunt prezentate drept dovadă de
+backpressure iterable ori capacitate maximă SQL Server.
+
+Prima rulare a suitei complete sub `approve-for-me` a trecut cazul offline,
+apoi conexiunile localhost au expirat în acquire. SQL Server era healthy,
+fără sesiuni/blocaje; aceeași suită reluată cu acces localhost aprobat a
+trecut `7/7` în `1,39 s`. Acesta este un eșec de politică sandbox, nu un bug
+FastMssql. `uv`/`uvx` au necesitat aceeași escaladare din cauza accesului la
+API-ul macOS `system-configuration`.
+
+Graful a fost reconstruit exact pe `428bc74`: 159 fișiere, 3.306 noduri și
+41.682 muchii. `detect_changes` a raportat risc `0,85` și gap-uri statice
+pentru wrapper-ele native bulk; aceste gap-uri nu urmăresc apelurile prin
+extensia PyO3 și nu înlocuiesc probele wheel/SQL-auth de mai sus.
+`vendor/tiberius` rămâne în afara indexării structurale utile și a fost
+revizuit direct plus cele 176 de teste Rust/Tiberius.
+
+O observație QA separată rămâne `OPEN_REPRO_REQUIRED`: cu
+`PoolConfig(test_on_check_out=False)`, primul DDL care trebuie să fie prima
+instrucțiune din batch, de exemplu `CREATE TRIGGER`, poate întâlni prefixul de
+reset al lease-ului și poate fi respins de SQL Server. Configurația implicită
+consumă resetul prin checkout validation, iar cazul strict `SQL-019` trece.
+Observația nu este o regresie native bulk și va primi branch RED/fix separat
+înainte de orice modificare a resetului.
+
 API-urile trebuie separate:
 
 - `batch(sql)` — un batch TDS cu toate result set-urile;
 - `execute_many()` — execuții parametrizate;
 - `query_many(concurrency=...)` — operații independente cu concurență
   controlată;
-- native bulk copy — pentru throughput maxim;
+- `native_bulk_insert()` — bulk TDS nativ pentru throughput maxim;
 - mod bounded pentru iterator sau async iterable, cu backpressure.
 
-Primitiva Tiberius pentru subsetul de coloane este acum închisă și verificată,
-dar încă nu este expusă ca API FastMssql/Python și nu acceptă direct un
-iterator sau async iterable. Rămân patru slice-uri explicit deschise:
-API-ul FastMssql native bulk, backpressure pentru iterator/async iterable,
+Primitiva Tiberius și API-ul FastMssql list-only sunt acum închise și
+verificate. Calea nu acceptă direct un iterator sau async iterable. Rămân trei
+slice-uri explicit deschise: backpressure pentru iterator/async iterable,
 `execute_many()` și `query_many()` cu concurență bounded. Niciunul nu este
-declarat implementat prin rezultatele primelor trei slice-uri.
+declarat implementat prin rezultatele primelor patru slice-uri.
 
 ### Named instances
 
@@ -3115,7 +3220,6 @@ RPC-001–RPC-011. După această închidere, rămân:
 
 - TDS 8 și `Encrypt=Strict`;
 - TVP/Table-Valued Parameters;
-- TDS native bulk copy;
 - Always Encrypted;
 - failover partner, host list, multi-subnet și routing complet Azure;
 - savepoints și isolation ergonomics;
@@ -3171,11 +3275,11 @@ funcție ar necesita lucru la nivelul driverului TDS:
     **evenimentele TDS complete, result seturile multiple, streamingul async
     bounded, ownership-ul fail-closed și RPC OUT/return finalizate și
     verificate local, Docker, wheel și hosted**
-19. `feat/batch-bulk` — **în progres: bounded buffering și descriptorul comun
-    de conversie pentru calea compatibility sunt finalizate în `deef315`, iar
-    primitiva Tiberius pentru subsetul ordonat de coloane este finalizată în
-    `52c04c3`; API-ul FastMssql bulk TDS nativ, iterable backpressure,
-    `execute_many()` și `query_many()` rămân patru slice-uri separate**
+19. `feat/batch-bulk` — **în progres: bounded buffering, descriptorul comun
+    de conversie, primitiva Tiberius pentru subsetul ordonat și API-ul
+    FastMssql bulk TDS nativ list-only sunt finalizate până la `428bc74`;
+    iterable backpressure, `execute_many()` și `query_many()` rămân trei
+    slice-uri separate**
 20. `fix/named-instance`
 21. `test/production-framework-matrix`
 
@@ -3230,27 +3334,33 @@ upstream fără aprobarea explicită a proprietarului forkului.
 - [x] dependența vendorizată Tiberius acceptă un subset raw, explicit și
   ordonat de coloane bulk, îl validează înainte de I/O, respinge metadata
   restricționată și nu are o cale panic în formatterul declarațiilor;
-- [ ] bulk TDS nativ, backpressure pentru iterator/async iterable,
-  `execute_many()` și `query_many()` au contracte și gate-uri cumulative;
+- [x] API-ul FastMssql bulk TDS nativ list-only păstrează un lease/o
+  tranzacție pentru toate chunk-urile, convertește după metadata țintei,
+  finalizează sau retrage conexiunea fail-closed și trece profilele până la
+  99.999;
+- [ ] backpressure pentru iterator/async iterable, `execute_many()` și
+  `query_many()` au contracte și gate-uri cumulative;
 - [ ] matricea rulează prin servere reale Uvicorn/Gunicorn și din wheel-ul
   instalat.
 
 ## Starea verificată curentă
 
 - Fork: `https://github.com/galeamarcel/FastMssql.git`
-- Branch de status: `docs/tiberius-bulk-column-subset-status`
+- Branch de status: `docs/native-bulk-insert-status`
 - HEAD tehnic verificat:
-  `52c04c35a27dd6a79ccb5f54b15d7a0413a8965b`.
+  `428bc7471f61376294a8cb0f43587e86dd76ed9d`.
 - `origin` indică forkul; remote-ul repository-ului original permite numai
   fetch și are push URL-ul `DISABLED`.
-- Feature-ul cumulativ `52c04c3` păstrează ancestry-ul lui `a9d5c2a`, al
+- Feature-ul cumulativ `428bc74` păstrează ancestry-ul lui `a9d5c2a`, al
   designului enterprise batch/bulk și al ramurilor RED/fix pentru primele
   două slice-uri compatibility bulk. `test/bulk-bounded-buffering` este
   ancestor al `fix/bulk-bounded-buffering`, iar
   `test/bulk-row-descriptor-conversion` la `b283c5c` este ancestor al
   `fix/bulk-row-descriptor-conversion`. Designul `35b5ad2`, planul
   `85c5de7` și RED-ul `549ea18` sunt de asemenea în ancestry-ul feature-ului
-  Tiberius `52c04c3`.
+  Tiberius `52c04c3`. Designul/planul native bulk `36cfca1`, RED-ul principal
+  `fe916b6` și commiturile corrective `2ce5120`, `1143c3b`, `8889a8e`,
+  `299be58`, `4897c93` sunt toate strămoși ai feature-ului `428bc74`.
 - Strămoșul cumulativ `a9d5c2a` păstrează ancestry-ul tuturor ramurilor
   RED/fix/feature pentru token safety, response events, result streaming,
   lifecycle, RPC și cele patru corecții de harness/hosted descoperite în
@@ -3261,11 +3371,11 @@ upstream fără aprobarea explicită a proprietarului forkului.
   `386/386`, true-async `16/16`, framework `33/33`, resilience `6/6`, load
   `12/12`, regresia originală locală `1.090/1.090` și exact `372/372`
   ID-uri din specificație, toate PASS, fără fail, error, skip sau not-run.
-- Specificația canonică are acum `377` ID-uri unice. Contractele matricei au
-  trecut `26/26`, iar cazurile `BULK-001`–`BULK-005` au trecut în
+- Specificația canonică are acum `384` ID-uri unice. Contractele matricei au
+  trecut `26/26`, iar cazurile `BULK-001`–`BULK-012` au trecut în
   suitele focusate SQL-auth. Ultimul raport complet regenerat rămâne
   intenționat cel de `372/372` de la `a9d5c2a`; documentul nu îl prezintă
-  drept o rulare completă de `377/377` la `52c04c3`.
+  drept o rulare completă de `384/384` la `428bc74`.
 - Pe buildul nativ exact `deef315`: contractele offline descriptor au trecut
   `5/5`, offline bounded `3/3`, batch/bulk SQL-auth `25/25`, parametrii
   stricți `62/62`, validările legacy batch `21/21`, contractele matricei
@@ -3278,6 +3388,13 @@ upstream fără aprobarea explicită a proprietarului forkului.
   trecut `142/142`; wrapperul și extensia ABI3 s-au încărcat exact din
   worktree. Fmt, Clippy cu warnings denied, diff check și scanarea valorilor
   parolelor au trecut.
+- Pe feature-ul exact `428bc74`: FastMssql Rust `81/81`, Tiberius vendored
+  `168/168`, integrarea directă Tiberius native bulk `8/8`, FastMssql native
+  bulk SQL-auth `7/7`, regresia batch/parametri/tranzacții `132/132` și
+  contractele offline/matrice `34/34`, toate PASS. Wheel-ul instalat izolat a
+  trecut `8/8` offline și `7/7` pe MSSQL real, cu import din `site-packages`
+  și `PYTHONPATH` eliminat. Root/vendored fmt și Clippy, Ruff, diff check,
+  graful exact și scanarea credentialelor au trecut.
 - `BULK-003` a păstrat exact TINYINT, DECIMAL(19,4), DATE, TIME(7),
   DATETIME2(3), UNIQUEIDENTIFIER și NULL-urile tipizate. `BULK-004` a respins
   local descriptorii expanded/non-input, iar `BULK-005` a probat pozițiile
@@ -3287,6 +3404,16 @@ upstream fără aprobarea explicită a proprietarului forkului.
   rânduri; RSS growth a fost `8.732.672`, `28.803.072` și `45.203.456` bytes,
   iar stall-ul maxim `0,000340333`, `0,002861375` și `0,005358250` secunde.
   Toate profilele au trecut gate-urile și post-load smoke, fără încălcări.
+- Stress-ul native bulk pe worktree curat `428bc74` a persistat exact 1.000,
+  10.000 și 99.999 de rânduri în ambele probe. Throughputul apelului unic a
+  fost `15.304,96`, `185.139,04` și `188.627,78` rânduri/s; p99 pe
+  chunk-call a fost `4,082`, `12,802` și `13,389` ms; RSS growth `1.720.320`,
+  `1.425.408` și `3.981.312` bytes. Maximum o sesiune, zero
+  erori/timeout-uri, smoke PASS și zero sesiuni după teardown.
+- Wheel-ul native bulk are SHA-256
+  `168a928c6a5f00c1defc6300936a00e7c5ac9a716fd05216763cba3be359fd7b`.
+  Raportul complet este
+  [SQL_AUTH_NATIVE_BULK_STRESS_REPORT.md](SQL_AUTH_NATIVE_BULK_STRESS_REPORT.md).
 - Wheel-ul ABI3 cu SHA-256
   `92a4a27b574eb25c1edc25ac1f38fa594c7e6245b81347bed346d7ba22586c38`
   a fost importat din site-packages izolat. Contractele statice au trecut
@@ -3312,7 +3439,7 @@ upstream fără aprobarea explicită a proprietarului forkului.
   iar RustSec este verde prin
   [#30284587019](https://github.com/galeamarcel/FastMssql/actions/runs/30284587019).
 - Nu există încă o rulare hosted Linux/macOS/Windows sau RustSec pentru
-  `52c04c3`; acest gate rămâne obligatoriu la integrarea cumulativă a
+  `428bc74`; acest gate rămâne obligatoriu la integrarea cumulativă a
   programului batch/bulk și nu este inferat din verificarea locală.
 - Wheel-ul ABI3 a fost construit și instalat separat pe cele trei sisteme,
   iar contractele Python instalate, raw Cargo, `cargo fmt`, Clippy cu
@@ -3320,19 +3447,23 @@ upstream fără aprobarea explicită a proprietarului forkului.
 - SQL-auth real a fost executat local pe containerul MSSQL aprobat;
   workflow-urile hosted validează Rust/wheel/contracts, nu pretind un SQL
   Server real.
-- TVP, money fixed-point output, SQL_VARIANT, API-ul FastMssql bulk TDS nativ,
-  tracing, iterable backpressure, `execute_many()`,
+- TVP, money fixed-point output, SQL_VARIANT, tracing, iterable backpressure,
+  `execute_many()`,
   `query_many()`, named instances, TDS 8, provenance/SBOM și matricea cu
   servere web reale pornite din wheel rămân deschise în ordinea de
   implementare.
+- Observația `PoolConfig(test_on_check_out=False)` plus DDL care cere prima
+  instrucțiune în batch rămâne `OPEN_REPRO_REQUIRED` și va fi tratată
+  separat; nu este atribuită slice-ului native bulk.
 - Toate schimbările și dovezile au fost publicate exclusiv pe fork. Nu există
   push, PR sau release în repository-ul original.
 
-Starea de mai sus separă arborele tehnic cumulativ exact `52c04c3` de ultimul
+Starea de mai sus separă arborele tehnic cumulativ exact `428bc74` de ultimul
 gate complet local/hosted la strămoșul `a9d5c2a`. Branchurile validate au fost
 integrate și publicate numai în fork.
 
 Rapoarte de stress:
 
 - [SQL_AUTH_RESULT_STREAM_STRESS_REPORT.md](SQL_AUTH_RESULT_STREAM_STRESS_REPORT.md)
+- [SQL_AUTH_NATIVE_BULK_STRESS_REPORT.md](SQL_AUTH_NATIVE_BULK_STRESS_REPORT.md)
 - [SQL_AUTH_TRANSACTION_STRESS_REPORT.md](SQL_AUTH_TRANSACTION_STRESS_REPORT.md)

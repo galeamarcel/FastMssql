@@ -10,7 +10,7 @@ yet applied to package metadata; release versioning remains a separate,
 explicit decision.
 
 Changes currently integrated in fork history through
-`52c04c35a27dd6a79ccb5f54b15d7a0413a8965b`:
+`428bc7471f61376294a8cb0f43587e86dd76ed9d`:
 
 - closed, validated SQL parameter descriptors with exact TDS metadata;
 - exact decimal, UUID, temporal, ANSI/Unicode, binary, XML, and typed-null
@@ -41,6 +41,32 @@ Changes currently integrated in fork history through
   `30284587019`.
 
 No release, package-version change, or artifact publication has occurred.
+
+### Native TDS bulk insert audit status
+
+- Updated the live production-readiness audit to the exact cumulative feature
+  SHA `428bc7471f61376294a8cb0f43587e86dd76ed9d`.
+- Recorded the design/plan, principal RED contract, five corrective test
+  commits and final feature ancestry for the fourth of seven batch/bulk
+  slices.
+- Added the privacy-safe native-bulk stress report for clean-source profiles
+  of 1,000, 10,000 and 99,999 rows. Every primary/probe count was exact, with
+  one physical session, zero error/timeout, post-load smoke and zero teardown
+  sessions.
+- The 99,999-row profile recorded approximately 188,628 rows/second, p99
+  13.389 ms, RSS growth 3,981,312 bytes and maximum event-loop stall
+  8.266 ms under the explicit 64 MiB/100 ms/60 s budgets.
+- Recorded the final unit, SQL-auth, compatibility and isolated-wheel gates,
+  including the wheel SHA-256 and the graph's static PyO3/vendor indexing
+  limitations.
+- Classified the failed unapproved localhost run and `uv` macOS
+  system-configuration panic as sandbox-policy failures only after their
+  approved retries passed.
+- Recorded a separate `OPEN_REPRO_REQUIRED` observation for first-statement
+  DDL after a pending pool reset when `test_on_check_out=False`; it is not
+  classified as a native-bulk regression and will use its own RED/fix branch.
+- This documentation-only status change does not modify runtime behavior,
+  package metadata, the displayed `0.7.7` version or release state.
 
 ### Native TDS bulk insert implementation
 
