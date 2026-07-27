@@ -289,3 +289,13 @@ No release, package-version change, or artifact publication has occurred.
   macOS because `pytest-asyncio` was absent.
 - This test-only change does not modify runtime behavior, package metadata,
   the displayed `0.7.7` version or release state.
+
+### Hosted installed-wheel async test environment
+
+- Added locked `pytest-asyncio==1.4.0` installation to the hosted
+  Linux/macOS/Windows wheel-contract environment.
+- The asynchronous result-stream cancellation contract now executes under its
+  intended pytest plugin instead of failing during test dispatch after a
+  successful wheel build.
+- This CI-environment fix does not modify runtime behavior, package metadata,
+  the displayed `0.7.7` version or release state.
