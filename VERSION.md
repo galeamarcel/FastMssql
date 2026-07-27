@@ -42,6 +42,25 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Checkout reset and first-statement DDL design
+
+- Added the approved fail-closed design for completing mandatory pooled
+  session reset before application SQL when
+  `PoolConfig(test_on_check_out=False)`.
+- Separated the optional checkout health probe from mandatory cross-lease
+  session isolation while keeping reset inside bb8's acquisition timeout and
+  cancellation-safe checkout wrapper.
+- Selected an additive immediate-reset primitive in vendored Tiberius so
+  first-statement module DDL is never prefixed or rewritten by the driver.
+- Defined separate RED/fix/status branches, same-SPID SQL-auth isolation
+  contracts, fault/deadline recovery, isolated-wheel gates and load profiles
+  through the approved 99,999-operation ceiling.
+- The expected private reset round trip for reused leases with the optional
+  probe disabled is explicit and must be quantified; the default/health
+  enabled path retains one combined reset/health request.
+- This documentation-only change does not modify runtime behavior, package
+  metadata, the displayed `0.7.7` version or release state.
+
 ### Native TDS bulk insert audit status
 
 - Updated the live production-readiness audit to the exact cumulative feature
