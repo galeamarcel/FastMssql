@@ -264,3 +264,49 @@ def test_native_bulk_stress_builds_list_rows_for_the_list_only_api() -> None:
     ]
     assert isinstance(rows, list)
     assert all(isinstance(row, list) for row in rows)
+
+
+def test_native_bulk_stress_reports_unavailable_failure_metrics() -> None:
+    runner = ROOT / "scripts/sql_auth/native_bulk_stress.py"
+    namespace = runpy.run_path(str(runner))
+    metrics = {
+        "rows": 1_000,
+        "chunk_size": 250,
+        "errors": ["ConversionError"],
+        "timed_out": 0,
+        "primary_single_call": {
+            "affected_rows": None,
+            "persisted": None,
+            "physical_identity_stable": False,
+        },
+        "chunk_call_probe": {
+            "affected_rows": None,
+            "persisted": None,
+            "call_count": 0,
+            "physical_identity_stable": False,
+        },
+        "resources": {
+            "rss_growth_bytes": None,
+            "rss_growth_limit_bytes": 1024,
+            "event_loop_ticks": 0,
+            "maximum_event_loop_stall_seconds": None,
+            "event_loop_stall_limit_seconds": 0.1,
+            "maximum_sql_sessions": 0,
+        },
+        "pool": {
+            "maximum_size": 1,
+            "connections": 0,
+            "final_active_connections": 0,
+        },
+        "post_load_smoke": False,
+        "teardown_sessions": 0,
+    }
+
+    violations = namespace["profile_violations"](
+        metrics,
+        rss_growth_limit_bytes=1024,
+        event_loop_stall_limit_seconds=0.1,
+    )
+
+    assert "operation_error" in violations
+    assert "resource_metrics_unavailable" in violations
