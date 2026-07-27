@@ -9,7 +9,7 @@ component represents a feature-level patch. It is documented here but is not
 yet applied to package metadata; release versioning remains a separate,
 explicit decision.
 
-Changes currently verified on `verify/typed-parameter-merge`:
+Changes currently integrated on `test/sql-auth-validation`:
 
 - closed, validated SQL parameter descriptors with exact TDS metadata;
 - exact decimal, UUID, temporal, ANSI/Unicode, binary, XML, and typed-null
@@ -20,10 +20,13 @@ Changes currently verified on `verify/typed-parameter-merge`:
 - local rejection when temporal rounding would cross into year 10000;
 - deterministic SQL-auth, exact-wire, compatibility, and 1,000-operation
   concurrent load coverage;
-- load-metric contract coverage for the typed-parameter case `PARAM-033`.
+- load-metric contract coverage for the typed-parameter case `PARAM-033`;
 - regenerated SQL-auth matrix/report evidence tied to exact cumulative merge
-  `7a881c57ef2bbd08477271d2b58d7d5aaefd5b99`: 346/346 required
+  `450ea446b799cf2ce7e035c332c6ce3d5d1f0adc`: 346/346 required
   matrix cases, 16 async, 33 framework, 6 resilience, 12 load, and 1,072
-  original-local-regression tests pass.
+  original-local-regression tests pass;
+- hosted raw Cargo, Rust tests, wheel build/install contracts on Linux,
+  macOS, and Windows passed in run `30240874471`; RustSec passed in run
+  `30240874468`.
 
 No release, package-version change, or artifact publication has occurred.

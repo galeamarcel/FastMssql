@@ -3,23 +3,22 @@
 Data auditului: 24 iulie 2026  
 Fork auditat: `https://github.com/galeamarcel/FastMssql.git`  
 Branch: `test/sql-auth-validation`  
-Commit tehnic: `5936cb5d6c6f1e7fd55e4d70fb28143cdbc7fd7a`
+Commit tehnic cumulativ:
+`450ea446b799cf2ce7e035c332c6ce3d5d1f0adc`
 
-Ultima actualizare live: 26 iulie 2026
-Ultimul fix verificat: `feat/observability-metrics` la `8971066`, inclusiv
-contractul RED final `1d530a6` pentru schema și contabilitatea metricilor
-pool-ului
-Ultimul harness tranzacțional de load verificat: `8971066`, atât cu
-tranzacții directe persistente, cât și cu leasing prin pool
-Ultimul contract de readiness load verificat: LOAD-009 în `d891db8`
-Ultimul contract de observability load verificat: OBS-009 la `5936cb5`
-Ultimul merge tehnic verificat: `test/sql-auth-validation` la `5936cb5`
+Ultima actualizare live: 27 iulie 2026
+Ultimul subsistem verificat: parametri SQL de intrare tipizați, implementați
+în `1909a72`, validați tehnic în `6b12f85` și integrați cumulativ în
+`450ea44`
+Ultimul contract de load pentru parametri: PARAM-033, 1.000/1.000 operații
+reușite, concurență maximă 64 și maximum 8 sesiuni pentru pool maxim 8
+Ultimul merge tehnic verificat: `test/sql-auth-validation` la `450ea44`
 Ultimul gate hosted verificat: `rust-unit-tests.yml`, rularea
-[#30188491054](https://github.com/galeamarcel/FastMssql/actions/runs/30188491054)
-verde pe Linux, macOS și Windows la feature SHA `8971066`
+[#30240874471](https://github.com/galeamarcel/FastMssql/actions/runs/30240874471)
+verde pe Linux, macOS și Windows la SHA-ul cumulativ `450ea44`
 Ultimul gate dependency-security verificat: rularea
-[#30188798876](https://github.com/galeamarcel/FastMssql/actions/runs/30188798876)
-verde la același feature SHA
+[#30240874468](https://github.com/galeamarcel/FastMssql/actions/runs/30240874468)
+verde la același SHA
 
 ## Concluzie
 
@@ -70,13 +69,20 @@ epoca la disconnect/reconnect. OBS-001–OBS-010 includ saturație reală,
 timeout, anulare, `KILL`, lifetime/idle reaping și 10.000 de operații cu
 scraping concurent.
 
+Parametrii SQL de intrare au acum un descriptor închis și validat, iar tipul
+declarat controlează declarația `sp_executesql` și metadata TDS. `bool`,
+`Decimal`, `time`, `datetime` aware, UUID, ANSI/Unicode, binary, XML și
+typed-null au contracte exacte; erorile de conversie sunt structurate și nu
+expun valoarea. Tipurile efective sunt probate cu `SQL_VARIANT_PROPERTY`, nu
+numai prin `CAST`.
+
 Toate defectele P0 de corectitudine identificate de acest audit, graceful
-lifecycle și fundația de observabilitate a pool-ului sunt închise pe fork.
-Aceasta nu declară încă biblioteca complet enterprise production-ready:
-backpressure-ul explicit, metricile de durată/rezultat per operație,
-tracing/OpenTelemetry, streamingul cu memorie limitată, tipurile lipsă,
-multiple result sets/RPC și gate-urile de packaging prin servere reale rămân
-cerințe P1/P2.
+lifecycle, observabilitatea pool/operații și parametrii tipizați de intrare
+sunt închise pe fork. Aceasta nu declară încă biblioteca complet enterprise
+production-ready: backpressure-ul explicit, tracing/OpenTelemetry, streamingul
+cu memorie limitată, multiple result sets, RPC cu OUT/return status,
+table-valued parameters, bulk TDS nativ, tipurile money exacte, named
+instances și proveniența artefactelor rămân cerințe P1/P2.
 
 Auditul corectează explicit o concluzie anterioară: TDS `ATTENTION` nu este o
 condiție necesară pentru a termina sigur un request dacă driverul închide
@@ -1682,7 +1688,9 @@ Limitele curente sunt explicite:
 
 Observabilitatea duratei și rezultatului operațiilor a fost implementată ca
 un candidat independent, separat de tracing/OpenTelemetry și de adaptorul bb8.
-Următorul candidat enterprise este suportul parametrilor tipizați.
+Suportul parametrilor tipizați a fost implementat ulterior și este documentat
+în secțiunea `VERIFIED_FORK` de mai jos; următorul subsistem deschis este
+rezultatele multiple și streamingul bounded.
 
 Nu s-a creat niciun branch și niciun PR în repository-ul original pentru
 observability. `origin` rămâne `galeamarcel/FastMssql`, iar push URL-ul
@@ -2277,24 +2285,62 @@ Clasa curentă [QueryStream](../src/types.rs#L310) este un cursor sincron peste
 date deja bufferizate. Un stream real nu poate oferi `len`, reset și indexare
 fără bufferizare.
 
-### Parametri și tipuri SQL
+### Parametri de intrare și tipuri SQL — `VERIFIED_FORK`
 
-În forma curentă:
+Constatarea inițială este remediată pentru parametrii de **intrare**. Scope-ul
+nu include încă valorile OUT/return status, TVP, money fixed-point ori API-ul
+de rezultate multiple.
 
-- `Parameter(value, sql_type)` pierde `sql_type`;
-- `bool` ajunge pe wire ca BIGINT;
-- numerele Python ajung implicit BIGINT;
-- textele ajung implicit NVARCHAR;
-- `datetime` cu timezone este convertit la DATETIME2 și pierde offsetul;
-- `None` nu poate folosi tipul declarat;
-- `Decimal`, UUID și `time` nu au suport complet simetric;
-- `repr(Parameter)` poate expune valori sensibile.
+Baseline-ul măsurat read-only pe containerul SQL-auth, înainte de remediere,
+a fost:
 
-Implementarea relevantă se află în
-[parameter_conversion.rs](../src/parameter_conversion.rs#L43) și
-[py_parameters.rs](../src/py_parameters.rs#L112).
+| Python/API | Tip efectiv inițial |
+|---|---|
+| `True` | `bigint`, precizie 19, 8 bytes |
+| `7` | `bigint`, precizie 19, 8 bytes |
+| `Parameter(7, "INT")` | tot `bigint`, precizie 19, 8 bytes |
+| `"abc"` | `nvarchar`, max length 8.000 bytes |
+| `Parameter("abc", "VARCHAR(10)")` | tot `nvarchar`, max length 8.000 bytes |
+| `datetime` aware `+02:00` | `datetime2(7)`, offset pierdut |
+| `Decimal`, `time`, UUID input | unsupported sau asimetric |
+| `Parameter(None, sql_type=...)` | descriptorul nu controla wire type |
 
-Descriptorul de parametru trebuie să transporte:
+Cauzele confirmate în cod erau distincte:
+
+- `Parameters.to_list()` elimina descriptorii înainte de conversia wire;
+- `PyInt` era verificat înainte de `PyBool`, deși `bool` derivă din `int`;
+- extracția datetime naive preceda aware datetime și folosea
+  `naive_local()`;
+- conversia nu avea variante Python input pentru `Decimal`, `time` și UUID;
+- Tiberius deriva declarația `sp_executesql` numai din
+  `ColumnData::type_name()`, fără un tip structurat opțional;
+- `Parameter.__repr__()` apela `repr(value)` și putea expune secrete.
+
+Remedierea este urmărită prin branchuri RED/fix/feature separate:
+
+| Problemă | RED | Fix/feature și rezultat |
+|---|---|---|
+| `repr` sensibil | `test/parameter-repr-redaction` — `f873f69` | `fix/parameter-repr-redaction` — `7112a90` |
+| `bool` ca BIGINT | `test/bool-parameter-wire-type` — `dec1722` | `fix/bool-parameter-wire-type` — `e980964` |
+| NUMERIC scale 38 | `test/tiberius-numeric-scale-38` — `a4893fd` | `fix/tiberius-numeric-scale-38` — `61379e8` |
+| Python `Decimal` | `test/decimal-parameter-input` — `6281195` | `feat/decimal-parameter-input` — `6ddf798` |
+| Python `time` | `test/time-parameter-input` — `1a7ce83` | `feat/time-parameter-input` — `a2d7270` |
+| offset/range datetime | `test/datetimeoffset-parameter-preservation` — `63fb6db`; RED-urile funcționale `e5bf5ff`, `eb1671c`, `190a057` | `fix/datetimeoffset-parameter-preservation` — `b5a0520`, `2e2c589`; ancestry merge `5dbad1a` |
+| UUID simetric și redacție | `test/uuid-parameter-symmetry` — `bc0dc4e`, `8d793b1`; ancestry merge `12470e1` | `feat/uuid-parameter-symmetry` — `b53ed2e`; ancestry merge `0f0185e` |
+| descriptor end-to-end | `test/typed-parameter-descriptor` — `71e600b`; ancestry merge `06c8b67` | `feat/typed-parameter-descriptor` — implementare `1909a72`, dovadă `7e70e23`, ancestry merge `d8f79bd` |
+
+Designul aprobat este în `c7dc28b`. Două RED-uri fuseseră inițial
+cherry-pick-uri cu patch identic (`63fb6db`/`16615e8` și
+`8d793b1`/`b7e2956`). Merge-urile ancestry-only au reparat topologia fără
+nicio diferență de arbore; toate cele 17 muchii RED→fix/feature sunt acum
+strămoși reali.
+
+Implementarea centrală este în
+[parameter_conversion.rs](../src/parameter_conversion.rs),
+[py_parameters.rs](../src/py_parameters.rs),
+[sql_parameter_type.rs](../src/sql_parameter_type.rs) și extensia Tiberius
+locală [sql_parameter_type.rs](../vendor/tiberius/src/sql_parameter_type.rs).
+Descriptorul public păstrează read-only:
 
 ```text
 value
@@ -2304,10 +2350,131 @@ precision
 scale
 length
 expanded
+is_expanded
 ```
 
-Testele trebuie să verifice tipul transmis efectiv cu
-`SQL_VARIANT_PROPERTY`, nu numai rezultatul unui `CAST`.
+`sql_type` este acum declarația canonică efectivă. Parserul acceptă numai un
+enum închis și nu concatenează text arbitrar în `@params`:
+
+| Familie | Declarații explicite verificate |
+|---|---|
+| Boolean/integer | `BIT`, `TINYINT`, `SMALLINT`, `INT`, `BIGINT` |
+| Floating point | `REAL`, `FLOAT(n)`, `1 <= n <= 53` |
+| Exact numeric | `DECIMAL(p,s)`, `NUMERIC(p,s)`, până la `(38,38)` |
+| ANSI/Unicode | `CHAR(n)`, `VARCHAR(n/MAX)`, `NCHAR(n)`, `NVARCHAR(n/MAX)` |
+| Binary | `BINARY(n)`, `VARBINARY(n/MAX)` |
+| Identity | `UNIQUEIDENTIFIER` |
+| Temporal | `DATE`, `TIME(s)`, `DATETIME`, `SMALLDATETIME`, `DATETIME2(s)`, `DATETIMEOFFSET(s)` |
+| XML | `XML` |
+
+Maparea inferată stabilă este:
+
+| Python raw | SQL/TDS efectiv |
+|---|---|
+| `None` | compatibilitate legacy `TINYINT NULL`; pentru precizie se folosește `Parameter(None, ...)` |
+| `bool` | `BIT` |
+| `int` | `BIGINT`, cu validare signed 64-bit |
+| `float` | `FLOAT(53)`, numai valori finite |
+| `Decimal` | `NUMERIC(p,s)` minim și exact |
+| `str` | `NVARCHAR(4000)` sau `NVARCHAR(MAX)` |
+| `bytes`/`bytearray`/`memoryview` | `VARBINARY(8000)` sau `VARBINARY(MAX)` |
+| `date` | `DATE` |
+| `time` naive | `TIME(7)` |
+| `datetime` naive | `DATETIME2(7)` |
+| `datetime` aware | `DATETIMEOFFSET(7)`, cu offset păstrat |
+| `uuid.UUID` | `UNIQUEIDENTIFIER`, simetric și la citire |
+
+Int-ul raw rămâne deliberat BIGINT pentru a evita tipuri de plan dependente de
+valoare, iar stringul raw rămâne Unicode. Aplicația cere explicit `INT`,
+`VARCHAR` sau alt tip când schema o cere. Lungimile ANSI sunt validate în
+bytes după collation/code page negociat, Unicode în unități UTF-16 și binary
+în bytes. LOGIN7/FEATUREEXTACK `_UTF8`, schimbarea de collation, PLP/MAX,
+XML gol, typed-null, scale temporal 0–7, rotunjirea SMALLDATETIME și overflow
+după rotunjire sunt acoperite fără panic sau pierdere silențioasă.
+
+Validarea finală:
+
+- merge-ul local exact `7a881c5` a avut părinții `fa0ffa3` și `d8f79bd`;
+  commitul de dovadă a fost `6b12f85`, iar merge-ul cumulativ public este
+  `450ea44`;
+- arborele cumulativ și arborele tehnic sunt identice:
+  `586e0392f15cb061af898672f8a20d412a3bca2c`;
+- `cargo fmt`, Clippy cu `-D warnings` și FastMssql Rust `65/65`: PASS;
+- Tiberius vendored unit `151/151`: PASS;
+- SQL-auth Docker: strict `346/346`, async `16/16`, framework `33/33`,
+  resilience `6/6`, load `12/12`, original-local-regression `1.072/1.072`;
+- matricea are exact `346/346` ID-uri PASS, zero FAIL, ERROR, SKIP sau
+  `NOT RUN`;
+- wheel-ul ABI3 local, importat exclusiv din virtualenv, a trecut `192/192`
+  contracte locale și `82/82` teste SQL-auth reale (`62` parametri și `20`
+  batch/bulk);
+- RustSec local a scanat 219 dependențe cu zero vulnerabilități și zero
+  warninguri;
+- PARAM-033 a finalizat exact 1.000/1.000 operații tipizate, zero eșecuri,
+  maximum 64 in-flight, 8 sesiuni fizice pentru pool maxim 8 și
+  `1.603,34 ops/s`; acesta este un gate de corectitudine al driverului, nu un
+  benchmark al capacității SQL Server.
+
+Dovada hosted pe SHA-ul cumulativ `450ea44`:
+
+- workflow
+  [#30240874471](https://github.com/galeamarcel/FastMssql/actions/runs/30240874471):
+  [Linux](https://github.com/galeamarcel/FastMssql/actions/runs/30240874471/job/89897616550),
+  [macOS](https://github.com/galeamarcel/FastMssql/actions/runs/30240874471/job/89897616536)
+  și
+  [Windows](https://github.com/galeamarcel/FastMssql/actions/runs/30240874471/job/89897616593)
+  au trecut raw Cargo, testele Rust, build/install wheel și contractele
+  instalate;
+- workflow RustSec
+  [#30240874468](https://github.com/galeamarcel/FastMssql/actions/runs/30240874468),
+  [job #89897616354](https://github.com/galeamarcel/FastMssql/actions/runs/30240874468/job/89897616354):
+  PASS;
+- SHA-ul tehnic `6b12f85` trecuse independent aceleași gate-uri prin
+  [#30240238650](https://github.com/galeamarcel/FastMssql/actions/runs/30240238650)
+  și
+  [#30240249824](https://github.com/galeamarcel/FastMssql/actions/runs/30240249824).
+
+#### Traceabilitatea cerințelor explicite
+
+`H-CARGO` înseamnă workflow-ul final
+[#30240874471](https://github.com/galeamarcel/FastMssql/actions/runs/30240874471);
+el probează portabilitatea raw Cargo și build/install wheel, nu înlocuiește
+MSSQL real. `H-SEC` înseamnă RustSec
+[#30240874468](https://github.com/galeamarcel/FastMssql/actions/runs/30240874468).
+Comportamentul SQL este probat de artefactele locale Docker de la același
+arbore.
+
+| Cerință | Sursă principală | Focused RED observat | Focused GREEN | Caz MSSQL | SHA final | Artefact local | Hosted | Linie live |
+|---|---|---|---|---|---|---|---|---|
+| TP-01: `bool`→`BIT` | `parameter_conversion.rs` | PARAM-003 raporta `bigint` pentru ambele valori | PARAM-003 `True`/`False` PASS, int `1` rămâne BIGINT | PARAM-003 | `450ea44` | `strict-results.json`, `strict.xml` | H-CARGO, H-SEC | mapare inferată `bool`=`BIT`, **RESOLVED** |
+| TP-02: Decimal/time/UUID/date-time exacte | `parameter_conversion.rs`, `type_mapping.rs`, `vendor/tiberius/src/tds/numeric.rs` | `Unsupported type: Decimal`, `Unsupported type: time`, UUID input respins și output string | PARAM-006/013/014 și TYPE-004/013 PASS | PARAM-006, PARAM-013, PARAM-014 | `450ea44` | `strict-results.json`, wheel MSSQL `82/82` | H-CARGO, H-SEC | maparea Python raw, **RESOLVED** |
+| TP-03: păstrare offset aware datetime | `parameter_conversion.rs` | tip `datetime2`, offset eliminat | BaseType `datetimeoffset`, offset și instant UTC păstrate | PARAM-012 | `450ea44` | `strict-results.json`, `strict.xml` | H-CARGO, H-SEC | aware datetime=`DATETIMEOFFSET(7)`, **RESOLVED** |
+| TP-04: descriptorul controlează declarația/TDS | `sql_parameter_type.rs`, `py_parameters.rs`, Tiberius `rpc_request.rs` | keyworduri necunoscute și tipuri efective BIGINT/NVARCHAR | metadata canonică plus toate familiile explicite PASS | PARAM-025, PARAM-030, PARAM-032 | `450ea44` | `strict-results.json`, `SQL_AUTH_TEST_MATRIX.md` | H-CARGO, H-SEC | tabelul declarațiilor explicite, **RESOLVED** |
+| TP-05: metadata și `repr` privacy-safe | `py_parameters.rs` | `repr` evalua și includea sentinelul valorii | descriptor read-only; `repr` nu apelează valoarea și PARAM-031 PASS | PARAM-030, PARAM-031 | `450ea44` | `strict-results.json`, privacy scan | H-CARGO, H-SEC | câmpurile descriptorului, **RESOLVED** |
+| TP-06: declarații/valori invalide respinse local | `sql_parameter_type.rs`, `parameter_conversion.rs` | nu exista gramatica închisă și metadata incompatibilă | parser injection-shaped, range/kind/length și erori structurate PASS | PARAM-026, PARAM-028 | `450ea44` | `strict-results.json`, wheel local `192/192` | H-CARGO, H-SEC | enum închis și zero text arbitrar, **RESOLVED** |
+| TP-07: expansion păstrează tipul copilului | `py_parameters.rs`, `parameter_conversion.rs` | descriptorul era eliminat și copiii deveneau BIGINT | fiecare copil INT/SMALLINT, limita RPC 2.098 păstrată | PARAM-029 | `450ea44` | `strict-results.json`, `strict.xml` | H-CARGO, H-SEC | expansion tipizat, **RESOLVED** |
+| TP-08: aceeași conversie pe toate căile | `pool_manager.rs`, `batch.rs`, `parameter_conversion.rs` | connection/transaction/batch pierdeau descriptorul sau contextul erorii | query/execute, pool, tranzacție și batch folosesc același converter | PARAM-032 | `450ea44` | strict `346/346`, batch/parameter wheel `82/82` | H-CARGO, H-SEC | cale comună și batch context, **RESOLVED** |
+| TP-09: true-async și concurență bounded | calea async existentă plus `test_resilience_load.py` | contractul descriptor/load nu exista | 1.000/1.000, 0 fail, max in-flight 64, sesiuni 8/8 | PARAM-033 | `450ea44` | `load-results.json`, `load-metrics.json` | H-CARGO, H-SEC | PARAM-033, **RESOLVED** |
+| TP-10: probă a tipului efectiv | Tiberius `sql_parameter_type.rs`, `type_info.rs`, `rpc_request.rs` | `Parameter(INT/VARCHAR)` rămânea BIGINT/NVARCHAR | BaseType/Precision/Scale/MaxLength și probe semantice MAX/XML PASS | PARAM-025–PARAM-027 | `450ea44` | `strict-results.json`, matrice `346/346` | H-CARGO, H-SEC | `SQL_VARIANT_PROPERTY`/probe wire, **RESOLVED** |
+
+Scanarea tuturor celor patru parole SQL-auth locale și a sentinelurilor
+`MustNotLeak` în loguri, JSON, XML și rapoarte a trecut. `origin` este exact
+`https://github.com/galeamarcel/FastMssql.git`; push-ul către repository-ul
+original Rivendael este exact `DISABLED`. Local și fork au avut SHA cumulativ
+identic. Nu s-a publicat wheel/release și nu s-a creat PR extern.
+
+Rămân explicit deschise:
+
+- direcțiile `OUTPUT`, `INPUT_OUTPUT` și `RETURN_VALUE` sunt păstrate în
+  descriptor, dar execuția lor este respinsă local până la API-ul RPC/result;
+- result sets multiple, return status și OUT values;
+- `MONEY`/`SMALLMONEY` fixed-point exact, TVP, `SQL_VARIANT`, spatial,
+  hierarchyid, UDT și legacy LOB;
+- bulk TDS nativ, backpressure și streaming bounded.
+
+Pentru money exact, contractul recomandat rămâne `DECIMAL(19,4)`. Aceste
+excluderi nu redeschid parametrizarea de intrare verificată; aparțin
+subsistemelor următoare.
 
 ### Batch și bulk
 
@@ -2510,7 +2677,9 @@ funcție ar necesita lucru la nivelul driverului TDS:
 16. `feat/operation-metrics` — **metricile opt-in de durată/rezultat,
     histogramele bounded, privacy și stress-ul de 599.994 operații finalizate
     și verificate hosted**
-17. `feat/typed-parameters` — **următorul candidat**
+17. `feat/typed-parameter-descriptor` — **parametrii SQL de intrare tipizați,
+    metadata TDS exactă, UTF-8/collation, privacy și load bounded finalizate
+    și verificate hosted**
 18. `feat/resultsets-streaming`
 19. `feat/batch-bulk`
 20. `fix/named-instance`
@@ -2555,7 +2724,7 @@ upstream fără aprobarea explicită a proprietarului forkului.
 - [x] numărul sesiunilor tranzacționale nu depășește `pool.max_size`, inclusiv
   la 99.999 operații și concurență mai mare decât pool-ul;
 - [ ] streamingul menține memoria limitată și gestionează închiderea anticipată;
-- [ ] `bool` este transmis ca BIT, tipurile declarate sunt respectate și un
+- [x] `bool` este transmis ca BIT, tipurile declarate sunt respectate și un
   `datetime` aware este transmis ca DATETIMEOFFSET;
 - [ ] rezultatele multiple, cele goale și output parameters sunt păstrate;
 - [ ] matricea rulează prin servere reale Uvicorn/Gunicorn și din wheel-ul
@@ -2566,20 +2735,20 @@ upstream fără aprobarea explicită a proprietarului forkului.
 - Fork: `https://github.com/galeamarcel/FastMssql.git`
 - Branch cumulativ: `test/sql-auth-validation`
 - HEAD tehnic verificat:
-  `ecce84d3b1be65e591879f8dc2443a9058ddb581`.
+  `450ea446b799cf2ce7e035c332c6ce3d5d1f0adc`.
 - `origin` indică forkul; remote-ul repository-ului original permite numai
   fetch și are push URL-ul `DISABLED`.
-- Ultimele două merge-uri tehnice sunt clarificarea regresiei originale
-  locale, `eaacc504be8582e99edab4fd05633458b8190984`, și stabilizarea test-only
-  a waiterilor lifecycle,
-  `ecce84d3b1be65e591879f8dc2443a9058ddb581`.
-- Pentru cursa testului lifecycle, reproducătorul neschimbat a eșuat la
-  `1/200`; după sincronizarea exactă a celor doi receivers, verificările pe
-  FIX și pe merge au trecut separat `200/200`.
-- La acest arbore: FastMssql Rust `54/54`, strict `340/340`, true-async
-  `16/16`, framework `33/33`, resilience `6/6`, load `11/11`, regresia
-  originală locală `930/930` și exact `337/337` ID-uri din specificație,
-  toate PASS, fără skip sau not-run.
+- Merge-ul cumulativ `450ea44` include commitul tehnic `6b12f85`; arborele
+  său este bit-identic cu arborele testat, iar toate ramurile RED/fix/feature
+  de parametri sunt strămoși reali.
+- La acest arbore: FastMssql Rust `65/65`, Tiberius vendored `151/151`,
+  strict `346/346`, true-async `16/16`, framework `33/33`, resilience `6/6`,
+  load `12/12`, regresia originală locală `1.072/1.072` și exact `346/346`
+  ID-uri din specificație, toate PASS, fără fail, error, skip sau not-run.
+- Wheel-ul instalat izolat a trecut `192/192` contracte locale de parametri
+  și `82/82` teste SQL-auth reale pentru parametri și batch/bulk.
+- PARAM-033 a executat 1.000 de operații tipizate, zero eșecuri, maximum 64
+  in-flight și 8 sesiuni fizice pentru pool maxim 8.
 - OPMET-011 a executat 10.000 de operații cu 100 workeri, pool maxim 20,
   maximum 20 conexiuni fizice, maximum 100 operații in-flight,
   `9.550,61 qps`, 2.649 snapshoturi, 18.011 event-loop ticks și exact 10.000
@@ -2588,24 +2757,25 @@ upstream fără aprobarea explicită a proprietarului forkului.
   `10.000:100`, `99.999:100` și `99.999:200` au trecut atât persistent, cât
   și pooled, cu numărul exact de COMMIT/ROLLBACK, smoke PASS și zero sesiuni
   după teardown. Gate-ul separat de overhead a validat 599.994 operații.
-- La SHA-ul tehnic exact, Linux/macOS/Windows sunt verzi prin
-  [#30214510722](https://github.com/galeamarcel/FastMssql/actions/runs/30214510722),
+- La SHA-ul cumulativ exact, Linux/macOS/Windows sunt verzi prin
+  [#30240874471](https://github.com/galeamarcel/FastMssql/actions/runs/30240874471),
   iar RustSec este verde prin
-  [#30214510719](https://github.com/galeamarcel/FastMssql/actions/runs/30214510719).
+  [#30240874468](https://github.com/galeamarcel/FastMssql/actions/runs/30240874468).
 - Wheel-ul ABI3 a fost construit și instalat separat pe cele trei sisteme,
   iar contractele Python instalate, raw Cargo, `cargo fmt`, Clippy cu
   `-D warnings`, Ruff și `compileall` au trecut.
 - SQL-auth real a fost executat local pe containerul MSSQL aprobat;
   workflow-urile hosted validează Rust/wheel/contracts, nu pretind un SQL
   Server real.
-- Parametrii SQL tipizați, streamingul/resultseturile multiple, batch/bulk
-  enterprise, named instances și matricea cu servere web reale rămân deschise
-  în ordinea de implementare.
+- Streamingul/resultseturile multiple, RPC OUT/return status, TVP, money
+  fixed-point, bulk TDS nativ, named instances și matricea cu servere web
+  reale rămân deschise în ordinea de implementare.
 - Toate schimbările și dovezile au fost publicate exclusiv pe fork. Nu există
   push, PR sau release în repository-ul original.
 
-Starea de mai sus este rezultatul arborelui tehnic exact înaintea acestui
-update documentar. Branchurile validate au fost integrate numai în fork.
+Starea de mai sus este rezultatul arborelui cumulativ exact `450ea44` înaintea
+acestui update documentar. Branchurile validate au fost integrate numai în
+fork.
 
 Pentru evidența testului de tranzacții concurente:
 [SQL_AUTH_TRANSACTION_STRESS_REPORT.md](SQL_AUTH_TRANSACTION_STRESS_REPORT.md).
