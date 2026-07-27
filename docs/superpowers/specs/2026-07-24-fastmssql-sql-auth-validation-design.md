@@ -459,13 +459,34 @@ evidence reference.
   the physical session before the next smoke query.
 - `RESULT-021`: `ResultSet.aclose()` skips only the active set, preserves an
   empty following set, and reaches the terminal summary.
+- `RESULT-022`: complete `ResultStream.aclose()` waits for physical-session
+  retirement, returns the pool's active count to zero, and permits a clean
+  checkout on a different connection identity.
+- `RESULT-023`: dropping either an open `ResultStream` or its active
+  `ResultSet` cancels the complete response, eventually retires its physical
+  session, and leaves the pool usable.
+- `RESULT-024`: cancellation of a pending outer or inner `__anext__` does not
+  lose the unconsumed event; queued nonfatal SQL errors reset and reuse the
+  synchronized session, while post-wire conversion uncertainty retires it
+  with stable terminal classification.
 - `RESULT-025`: concurrent consumers and invalid buffer sizes fail locally,
   deterministically, and without exposing SQL text.
+- `RESULT-026`: graceful disconnect waits for a live response to finish,
+  while an expired shutdown budget force-cancels the producer, retires its
+  session, and reports exact typed lifecycle counts.
+- `RESULT-027`: pooled and direct transaction streams own the session for the
+  complete response; normal EOF and per-set close preserve the transaction,
+  while response retirement, close, or drop fails the transaction and rolls
+  back its open SQL transaction.
 - `RESULT-028`: DONE records, valid zero row counts, and informational
   messages remain distinct from result rows.
 - `RESULT-029`: fresh SHA-bound evidence proves 1,000 exactly-once bounded
   streams at concurrency 64 and pool size 8, with latency, pool, RSS,
   process-CPU, SQL-session-CPU, event-loop, and post-load smoke invariants.
+- `RESULT-031`: queued metadata and rows retain their lease until successful
+  consumer acknowledgement; a full queue cannot block timeout release, and
+  conversion failure after server EOF retires rather than reuses the
+  connection.
 
 ### BATCH — query batch, execute batch, and bulk insert
 

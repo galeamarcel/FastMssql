@@ -158,3 +158,17 @@ No release, package-version change, or artifact publication has occurred.
   atomic work when metrics are disabled.
 - This feature does not change package metadata, the displayed `0.7.7`
   version or release state.
+
+### RED fail-closed result-stream lifecycle contracts
+
+- Added real SQL-auth and DMV coverage for explicit close, dropped response
+  objects, cancellation-safe outer/inner receives, queued server errors and
+  post-wire conversion failure.
+- Added graceful/forced shutdown, pooled/direct transaction ownership and
+  consumer-acknowledgement-before-release contracts, including a full event
+  queue at operation timeout.
+- Registered the six lifecycle case groups in the strict SQL-auth design and
+  local runner.
+- This RED branch records required lifecycle behavior only; it does not
+  change production runtime behavior, package metadata, the displayed
+  `0.7.7` version or release state.
