@@ -42,6 +42,17 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Native TDS bulk transaction fixture determinism
+
+- Made `BULK-011` verify transaction neutrality directly on the pinned
+  transaction session with `@@TRANCOUNT = 1` and `XACT_STATE() = 1`.
+- Removed the pre-settlement cross-session table read, which blocks under
+  SQL Server `READ COMMITTED` when `READ_COMMITTED_SNAPSHOT` is disabled and
+  therefore tested a database isolation setting rather than driver behavior.
+- The post-rollback count remains the persistence proof. This test-only
+  correction does not change runtime behavior, package metadata, the
+  displayed `0.7.7` version or release state.
+
 ### Native TDS bulk insert RED coverage
 
 - Raised the canonical SQL-auth matrix from 377 to 384 unique IDs and added

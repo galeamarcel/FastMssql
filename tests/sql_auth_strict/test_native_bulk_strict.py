@@ -577,7 +577,8 @@ async def test_native_bulk_transaction_is_neutral_then_rollback_only(
             == 1
         )
         assert await scalar(transaction, f"SELECT COUNT(*) FROM {table}") == 1
-        assert await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}") == 0
+        assert await scalar(transaction, "SELECT @@TRANCOUNT") == 1
+        assert await scalar(transaction, "SELECT XACT_STATE()") == 1
 
         with pytest.raises(SqlError):
             await transaction.native_bulk_insert(
