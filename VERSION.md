@@ -246,3 +246,14 @@ No release, package-version change, or artifact publication has occurred.
   extended-profile configuration ineffective.
 - This test-only change does not modify runtime behavior, package metadata,
   the displayed `0.7.7` version or release state.
+
+### Configurable result-stream stress runner
+
+- The shell runner now forwards
+  `FASTMSSQL_RESULT_STREAM_STRESS_POOL_SIZE` and
+  `FASTMSSQL_RESULT_STREAM_STRESS_BUFFER_SIZE` to the Python stress program.
+- Defaults remain pool size 8 and event buffer size 8, while extended
+  verification can exercise the planned pool size 32 and buffer size 16
+  instead of silently using the defaults.
+- This test-harness fix does not modify package runtime behavior, package
+  metadata, the displayed `0.7.7` version or release state.
