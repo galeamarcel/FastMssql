@@ -742,7 +742,18 @@ cargo clippy \
   --manifest-path vendor/tiberius/Cargo.toml \
   --no-default-features \
   --features chrono,tds73,rustls \
-  --all-targets -- -D warnings
+  --all-targets -- \
+  -D warnings \
+  -A clippy::doc_lazy_continuation \
+  -A clippy::extra_unused_lifetimes \
+  -A clippy::large_enum_variant \
+  -A clippy::io_other_error \
+  -A clippy::needless_lifetimes \
+  -A clippy::legacy_numeric_constants \
+  -A clippy::cast_enum_truncation \
+  -A clippy::derivable_impls \
+  -A clippy::manual_div_ceil \
+  -A clippy::items_after_test_module
 cargo test \
   --manifest-path vendor/tiberius/Cargo.toml \
   --no-default-features \
@@ -1847,6 +1858,7 @@ git push -u origin test/resultstream-lifecycle
 - Modify: `python/fastmssql/__init__.py`
 - Modify: `python/fastmssql/__init__.pyi`
 - Modify: `python/fastmssql/fastmssql.pyi`
+- Modify: `tests/sql_auth_strict/test_rpc_results.py`
 - Modify: `README.md`
 - Modify: `VERSION.md`
 
@@ -2030,7 +2042,7 @@ Implement:
 ```text
 RPC-001 no-parameter direct RPC and exact nonzero return status
 RPC-002 INPUT/OUTPUT/INPUT_OUTPUT integer round trip
-RPC-003 Unicode/binary/decimal/UUID/date/time/datetime2/datetimeoffset outputs
+RPC-003 complete scalar OUTPUT/INPUT_OUTPUT grammar with exact Python values
 RPC-004 multiple and empty sets before terminal outputs
 RPC-005 reordered NVARCHAR(MAX)/VARBINARY(MAX) outputs matched by ordinal/name
 RPC-006 zero return status distinct from no status

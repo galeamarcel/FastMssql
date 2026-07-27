@@ -64,6 +64,65 @@ impl FastParameter {
             sql_type: Some(sql_type),
         }
     }
+
+    pub(crate) fn into_rpc_parts(
+        self,
+    ) -> (tiberius::ColumnData<'static>, Option<SqlParameterType>) {
+        use std::borrow::Cow;
+
+        let value = match self.value {
+            FastParameterValue::Null(value) => value.into_column_data(),
+            FastParameterValue::Bool(value) => tiberius::ColumnData::Bit(Some(value)),
+            FastParameterValue::U8(value) => tiberius::ColumnData::U8(Some(value)),
+            FastParameterValue::I16(value) => tiberius::ColumnData::I16(Some(value)),
+            FastParameterValue::I32(value) => tiberius::ColumnData::I32(Some(value)),
+            FastParameterValue::I64(value) => tiberius::ColumnData::I64(Some(value)),
+            FastParameterValue::F32(value) => tiberius::ColumnData::F32(Some(value)),
+            FastParameterValue::F64(value) => tiberius::ColumnData::F64(Some(value)),
+            FastParameterValue::String(value) => {
+                tiberius::ColumnData::String(Some(Cow::Owned(value)))
+            }
+            FastParameterValue::Bytes(value) => {
+                tiberius::ColumnData::Binary(Some(Cow::Owned(value)))
+            }
+            FastParameterValue::Xml(value) => tiberius::ColumnData::Xml(Some(Cow::Owned(value))),
+            FastParameterValue::Numeric(value) => tiberius::ColumnData::Numeric(Some(value)),
+            FastParameterValue::Date(value) => tiberius::ColumnData::Date(Some(tds_date(value))),
+            FastParameterValue::Time(value) => {
+                tiberius::ColumnData::Time(Some(scaled_tds_time(value, 7).0))
+            }
+            FastParameterValue::DateTime(value) => {
+                tiberius::ColumnData::DateTime2(Some(tiberius::time::DateTime2::new(
+                    tds_date(value.date()),
+                    scaled_tds_time(value.time(), 7).0,
+                )))
+            }
+            FastParameterValue::DateTimeOffset(value) => {
+                let utc = value.naive_utc();
+                let datetime = tiberius::time::DateTime2::new(
+                    tds_date(utc.date()),
+                    scaled_tds_time(utc.time(), 7).0,
+                );
+                let offset_minutes = (value.offset().local_minus_utc() / 60) as i16;
+                tiberius::ColumnData::DateTimeOffset(Some(tiberius::time::DateTimeOffset::new(
+                    datetime,
+                    offset_minutes,
+                )))
+            }
+            FastParameterValue::TdsDate(value) => tiberius::ColumnData::Date(Some(value)),
+            FastParameterValue::TdsTime(value) => tiberius::ColumnData::Time(Some(value)),
+            FastParameterValue::TdsDateTime(value) => tiberius::ColumnData::DateTime(Some(value)),
+            FastParameterValue::TdsSmallDateTime(value) => {
+                tiberius::ColumnData::SmallDateTime(Some(value))
+            }
+            FastParameterValue::TdsDateTime2(value) => tiberius::ColumnData::DateTime2(Some(value)),
+            FastParameterValue::TdsDateTimeOffset(value) => {
+                tiberius::ColumnData::DateTimeOffset(Some(value))
+            }
+            FastParameterValue::Uuid(value) => tiberius::ColumnData::Guid(Some(value)),
+        };
+        (value, self.sql_type)
+    }
 }
 
 impl tiberius::ToSql for FastParameter {
@@ -110,7 +169,7 @@ pub fn python_to_fast_parameter(obj: &Bound<PyAny>) -> PyResult<FastParameter> {
     python_to_fast_parameter_at(obj, 0)
 }
 
-fn python_to_fast_parameter_at(
+pub(crate) fn python_to_fast_parameter_at(
     obj: &Bound<PyAny>,
     parameter_index: usize,
 ) -> PyResult<FastParameter> {
@@ -201,6 +260,15 @@ fn python_to_typed_fast_parameter(
         ));
     }
 
+    python_to_typed_fast_parameter_value(obj, sql_type, parameter_index)
+}
+
+pub(crate) fn python_to_typed_fast_parameter_value(
+    obj: &Bound<PyAny>,
+    sql_type: &SqlParameterType,
+    parameter_index: usize,
+) -> PyResult<FastParameter> {
+    let declaration = sql_type.declaration();
     if obj.is_none() {
         return Ok(FastParameter::typed(
             FastParameterValue::Null(typed_null_for(sql_type)),
@@ -1605,6 +1673,31 @@ impl tiberius::ToSql for TypedNull {
             TypedNull::Date => tiberius::ColumnData::Date(None),
             TypedNull::DateTime2 => tiberius::ColumnData::DateTime2(None),
             TypedNull::DateTimeOffset => tiberius::ColumnData::DateTimeOffset(None),
+        }
+    }
+}
+
+impl TypedNull {
+    fn into_column_data(self) -> tiberius::ColumnData<'static> {
+        match self {
+            Self::U8 => tiberius::ColumnData::U8(None),
+            Self::I16 => tiberius::ColumnData::I16(None),
+            Self::I32 => tiberius::ColumnData::I32(None),
+            Self::I64 => tiberius::ColumnData::I64(None),
+            Self::F32 => tiberius::ColumnData::F32(None),
+            Self::F64 => tiberius::ColumnData::F64(None),
+            Self::Bit => tiberius::ColumnData::Bit(None),
+            Self::String => tiberius::ColumnData::String(None),
+            Self::Guid => tiberius::ColumnData::Guid(None),
+            Self::Binary => tiberius::ColumnData::Binary(None),
+            Self::Numeric => tiberius::ColumnData::Numeric(None),
+            Self::Xml => tiberius::ColumnData::Xml(None),
+            Self::DateTime => tiberius::ColumnData::DateTime(None),
+            Self::SmallDateTime => tiberius::ColumnData::SmallDateTime(None),
+            Self::Time => tiberius::ColumnData::Time(None),
+            Self::Date => tiberius::ColumnData::Date(None),
+            Self::DateTime2 => tiberius::ColumnData::DateTime2(None),
+            Self::DateTimeOffset => tiberius::ColumnData::DateTimeOffset(None),
         }
     }
 }

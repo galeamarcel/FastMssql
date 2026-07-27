@@ -282,18 +282,44 @@ async def test_scalar_output_types_preserve_exact_python_values(
         cleanup_registry,
         "rpc_003_types",
         """
+            @bit_value BIT OUTPUT,
+            @tinyint_value TINYINT OUTPUT,
+            @smallint_value SMALLINT OUTPUT,
+            @bigint_value BIGINT OUTPUT,
+            @real_value REAL OUTPUT,
+            @float_value FLOAT OUTPUT,
+            @char_value CHAR(5) OUTPUT,
+            @varchar_value VARCHAR(12) OUTPUT,
+            @nchar_value NCHAR(5) OUTPUT,
             @unicode_value NVARCHAR(30) OUTPUT,
+            @fixed_binary_value BINARY(4) OUTPUT,
             @binary_value VARBINARY(8) OUTPUT,
             @decimal_value DECIMAL(19, 4) OUTPUT,
             @uuid_value UNIQUEIDENTIFIER OUTPUT,
             @date_value DATE OUTPUT,
             @time_value TIME(6) OUTPUT,
+            @datetime_value DATETIME OUTPUT,
+            @smalldatetime_value SMALLDATETIME OUTPUT,
             @datetime2_value DATETIME2(3) OUTPUT,
-            @offset_value DATETIMEOFFSET(6) OUTPUT
+            @offset_value DATETIMEOFFSET(6) OUTPUT,
+            @xml_value XML OUTPUT,
+            @null_value INT OUTPUT
         AS
         BEGIN
             SET NOCOUNT ON;
+            SET @bit_value = 1;
+            SET @tinyint_value = 255;
+            SET @smallint_value = -32768;
+            SET @bigint_value = CAST(
+                '-9223372036854775808' AS BIGINT
+            );
+            SET @real_value = CAST(1.5 AS REAL);
+            SET @float_value = CAST(-1.25 AS FLOAT);
+            SET @char_value = 'abc';
+            SET @varchar_value = 'ansi';
+            SET @nchar_value = N'λ';
             SET @unicode_value = N'București 🚀';
+            SET @fixed_binary_value = 0x0102;
             SET @binary_value = 0x00FF1020;
             SET @decimal_value = CAST(
                 -1234567890.1200 AS DECIMAL(19, 4)
@@ -304,6 +330,12 @@ async def test_scalar_output_types_preserve_exact_python_values(
             );
             SET @date_value = DATEFROMPARTS(2024, 2, 29);
             SET @time_value = CAST('12:34:56.123456' AS TIME(6));
+            SET @datetime_value = CAST(
+                '2024-02-29T23:59:58' AS DATETIME
+            );
+            SET @smalldatetime_value = CAST(
+                '2024-02-29T23:58:00' AS SMALLDATETIME
+            );
             SET @datetime2_value = CAST(
                 '2024-02-29T23:59:58.123' AS DATETIME2(3)
             );
@@ -311,15 +343,70 @@ async def test_scalar_output_types_preserve_exact_python_values(
                 '2024-02-29T23:59:58.123456+05:30'
                 AS DATETIMEOFFSET(6)
             );
+            SET @xml_value = CONVERT(
+                XML,
+                N'<root attr="x">λ</root>'
+            );
+            SET @null_value = NULL;
             RETURN 3;
         END
         """,
     )
     params = Parameters(
         **{
+            "bit_value": Parameter(
+                None,
+                "BIT",
+                direction="OUTPUT",
+            ),
+            "tinyint_value": Parameter(
+                None,
+                "TINYINT",
+                direction="OUTPUT",
+            ),
+            "smallint_value": Parameter(
+                None,
+                "SMALLINT",
+                direction="OUTPUT",
+            ),
+            "bigint_value": Parameter(
+                None,
+                "BIGINT",
+                direction="OUTPUT",
+            ),
+            "real_value": Parameter(
+                None,
+                "REAL",
+                direction="OUTPUT",
+            ),
+            "float_value": Parameter(
+                None,
+                "FLOAT",
+                direction="OUTPUT",
+            ),
+            "char_value": Parameter(
+                None,
+                "CHAR(5)",
+                direction="OUTPUT",
+            ),
+            "varchar_value": Parameter(
+                None,
+                "VARCHAR(12)",
+                direction="OUTPUT",
+            ),
+            "nchar_value": Parameter(
+                None,
+                "NCHAR(5)",
+                direction="OUTPUT",
+            ),
             "@unicode_value": Parameter(
                 None,
                 "NVARCHAR(30)",
+                direction="OUTPUT",
+            ),
+            "fixed_binary_value": Parameter(
+                None,
+                "BINARY(4)",
                 direction="OUTPUT",
             ),
             "binary_value": Parameter(
@@ -347,6 +434,16 @@ async def test_scalar_output_types_preserve_exact_python_values(
                 "TIME(6)",
                 direction="OUTPUT",
             ),
+            "datetime_value": Parameter(
+                None,
+                "DATETIME",
+                direction="OUTPUT",
+            ),
+            "smalldatetime_value": Parameter(
+                None,
+                "SMALLDATETIME",
+                direction="OUTPUT",
+            ),
             "datetime2_value": Parameter(
                 None,
                 "DATETIME2(3)",
@@ -357,21 +454,38 @@ async def test_scalar_output_types_preserve_exact_python_values(
                 "DATETIMEOFFSET(6)",
                 direction="OUTPUT",
             ),
+            "xml_value": Parameter(
+                None,
+                "XML",
+                direction="OUTPUT",
+            ),
+            "null_value": Parameter(
+                None,
+                "INT",
+                direction="OUTPUT",
+            ),
         }
     )
 
-    response = await _callproc(owner_connection, procedure, params)
-    result_sets, summary = await _drain(response)
-
-    assert result_sets == []
-    assert summary.return_status == 3
-    assert summary.output_parameters == {
+    expected_outputs = {
+        "bit_value": True,
+        "tinyint_value": 255,
+        "smallint_value": -32768,
+        "bigint_value": -9223372036854775808,
+        "real_value": 1.5,
+        "float_value": -1.25,
+        "char_value": "abc  ",
+        "varchar_value": "ansi",
+        "nchar_value": "λ    ",
         "unicode_value": "București 🚀",
+        "fixed_binary_value": b"\x01\x02\x00\x00",
         "binary_value": b"\x00\xff\x10\x20",
         "decimal_value": Decimal("-1234567890.1200"),
         "uuid_value": UUID("00112233-4455-6677-8899-aabbccddeeff"),
         "date_value": date(2024, 2, 29),
         "time_value": time(12, 34, 56, 123456),
+        "datetime_value": datetime(2024, 2, 29, 23, 59, 58),
+        "smalldatetime_value": datetime(2024, 2, 29, 23, 58),
         "datetime2_value": datetime(2024, 2, 29, 23, 59, 58, 123000),
         "offset_value": datetime(
             2024,
@@ -383,7 +497,150 @@ async def test_scalar_output_types_preserve_exact_python_values(
             123456,
             tzinfo=timezone(timedelta(hours=5, minutes=30)),
         ),
+        "xml_value": '<root attr="x">λ</root>',
+        "null_value": None,
     }
+
+    response = await _callproc(owner_connection, procedure, params)
+    result_sets, summary = await _drain(response)
+
+    assert result_sets == []
+    assert summary.return_status == 3
+    assert summary.output_parameters == expected_outputs
+
+    input_output_params = Parameters(
+        **{
+            "bit_value": Parameter(
+                False,
+                "BIT",
+                direction="INPUT_OUTPUT",
+            ),
+            "tinyint_value": Parameter(
+                1,
+                "TINYINT",
+                direction="INPUT_OUTPUT",
+            ),
+            "smallint_value": Parameter(
+                -1,
+                "SMALLINT",
+                direction="INPUT_OUTPUT",
+            ),
+            "bigint_value": Parameter(
+                -(2**40),
+                "BIGINT",
+                direction="INPUT_OUTPUT",
+            ),
+            "real_value": Parameter(
+                0.5,
+                "REAL",
+                direction="INPUT_OUTPUT",
+            ),
+            "float_value": Parameter(
+                -0.5,
+                "FLOAT",
+                direction="INPUT_OUTPUT",
+            ),
+            "char_value": Parameter(
+                "input",
+                "CHAR(5)",
+                direction="INPUT_OUTPUT",
+            ),
+            "varchar_value": Parameter(
+                "input",
+                "VARCHAR(12)",
+                direction="INPUT_OUTPUT",
+            ),
+            "nchar_value": Parameter(
+                "λ",
+                "NCHAR(5)",
+                direction="INPUT_OUTPUT",
+            ),
+            "unicode_value": Parameter(
+                "intrare",
+                "NVARCHAR(30)",
+                direction="INPUT_OUTPUT",
+            ),
+            "fixed_binary_value": Parameter(
+                b"\x10\x20",
+                "BINARY(4)",
+                direction="INPUT_OUTPUT",
+            ),
+            "binary_value": Parameter(
+                b"\x00\x01",
+                "VARBINARY(8)",
+                direction="INPUT_OUTPUT",
+            ),
+            "decimal_value": Parameter(
+                Decimal("1.2500"),
+                "DECIMAL(19,4)",
+                direction="INPUT_OUTPUT",
+            ),
+            "uuid_value": Parameter(
+                UUID("ffeeddcc-bbaa-9988-7766-554433221100"),
+                "UNIQUEIDENTIFIER",
+                direction="INPUT_OUTPUT",
+            ),
+            "date_value": Parameter(
+                date(2020, 2, 29),
+                "DATE",
+                direction="INPUT_OUTPUT",
+            ),
+            "time_value": Parameter(
+                time(1, 2, 3, 456789),
+                "TIME(6)",
+                direction="INPUT_OUTPUT",
+            ),
+            "datetime_value": Parameter(
+                datetime(2020, 2, 29, 1, 2, 3),
+                "DATETIME",
+                direction="INPUT_OUTPUT",
+            ),
+            "smalldatetime_value": Parameter(
+                datetime(2020, 2, 29, 1, 2),
+                "SMALLDATETIME",
+                direction="INPUT_OUTPUT",
+            ),
+            "datetime2_value": Parameter(
+                datetime(2020, 2, 29, 1, 2, 3, 456000),
+                "DATETIME2(3)",
+                direction="INPUT_OUTPUT",
+            ),
+            "offset_value": Parameter(
+                datetime(
+                    2020,
+                    2,
+                    29,
+                    1,
+                    2,
+                    3,
+                    456789,
+                    tzinfo=timezone(timedelta(hours=-3, minutes=-30)),
+                ),
+                "DATETIMEOFFSET(6)",
+                direction="INPUT_OUTPUT",
+            ),
+            "xml_value": Parameter(
+                "<input/>",
+                "XML",
+                direction="INPUT_OUTPUT",
+            ),
+            "null_value": Parameter(
+                None,
+                "INT",
+                direction="INPUT_OUTPUT",
+            ),
+        }
+    )
+    second_response = await _callproc(
+        owner_connection,
+        procedure,
+        input_output_params,
+    )
+    second_sets, second_summary = await _drain(second_response)
+
+    assert second_sets == []
+    assert second_summary.return_status == 3
+    assert second_summary.output_parameters == expected_outputs
 
 
 @case("RPC-004")

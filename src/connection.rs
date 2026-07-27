@@ -26,6 +26,7 @@ use crate::pool_manager::{
     ConnectionPool, PooledOperationGuard, acquire_owned_operation_guard,
     ensure_pool_initialized_with_auth, map_pool_checkout_error, timeout_error_or_metadata_failure,
 };
+use crate::procedure::build_procedure_call;
 use crate::result_stream::{BufferSize, PyResultStream, ResultRequest};
 use crate::ssl_config::PySslConfig;
 use crate::timeout_config::PyTimeoutConfig;
@@ -559,6 +560,34 @@ impl PyConnection {
                 OperationName::QueryBatch,
                 ResultRequest::Batch { sql },
                 retire_after_operation,
+                buffer_size.get(),
+            )
+            .await
+        })
+    }
+
+    #[pyo3(
+        signature = (procedure, params=None, *, buffer_size = BufferSize::DEFAULT),
+        text_signature = "($self, procedure, params=None, *, buffer_size=64)"
+    )]
+    pub(crate) fn callproc<'p>(
+        &self,
+        py: Python<'p>,
+        procedure: String,
+        params: Option<&Bound<PyAny>>,
+        buffer_size: BufferSize,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let call = build_procedure_call(&procedure, params, py)?;
+        let handles = self.clone_handles();
+        let operation_metrics = self.operation_metrics.clone();
+
+        future_into_py(py, async move {
+            Self::start_result_stream(
+                handles,
+                operation_metrics,
+                OperationName::Query,
+                ResultRequest::Procedure(call),
+                false,
                 buffer_size.get(),
             )
             .await

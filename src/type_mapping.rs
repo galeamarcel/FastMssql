@@ -5,7 +5,7 @@ use pyo3::types::{
     PyByteArray, PyBytes, PyDict, PyFrozenSet, PyList, PyMemoryView, PySet, PyString, PyTuple,
 };
 use pyo3::{IntoPyObjectExt, Py, PyAny, prelude::*};
-use tiberius::{ColumnType, Row};
+use tiberius::{ColumnData, ColumnType, FromSql};
 
 use crate::types::ConversionError;
 
@@ -45,123 +45,9 @@ pub(crate) fn get_uuid_class(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
     Ok(cls.bind(py))
 }
 
-/// Macro to eliminate boilerplate for identical scalar type conversions.
-macro_rules! impl_handle_scalar {
-    ($name:ident, $t:ty, $lbl:expr) => {
-        #[inline(always)]
-        fn $name(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
-            match row.try_get::<$t, usize>(index) {
-                Ok(Some(val)) => Ok(val.into_pyobject(py)?.into_any().unbind()),
-                Ok(None) => Ok(py.None()),
-                Err(_) => Err(PyValueError::new_err(concat!(
-                    "Failed to convert column {} to ",
-                    $lbl
-                ))),
-            }
-        }
-    };
-}
-
-impl_handle_scalar!(handle_int1, u8, "INT1");
-impl_handle_scalar!(handle_int2, i16, "INT2");
-impl_handle_scalar!(handle_int4, i32, "INT4");
-impl_handle_scalar!(handle_int8, i64, "INT8");
-impl_handle_scalar!(handle_float4, f32, "FLOAT4");
-impl_handle_scalar!(handle_float8, f64, "FLOAT8");
-
-#[inline(always)]
-fn handle_nvarchar(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
-    match row.try_get::<&str, usize>(index) {
-        Ok(Some(val)) => Ok(val.into_pyobject(py)?.into_any().unbind()),
-        Ok(None) => Ok(py.None()),
-        Err(_) => Err(PyValueError::new_err(format!(
-            "Failed to convert column {} to NVARCHAR",
-            index
-        ))),
-    }
-}
-
-#[inline(always)]
-fn handle_varchar(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
-    match row.try_get::<&str, usize>(index) {
-        Ok(Some(val)) => Ok(val.into_pyobject(py)?.into_any().unbind()),
-        Ok(None) => Ok(py.None()),
-        Err(_) => Err(PyValueError::new_err(format!(
-            "Failed to convert column {} to VARCHAR",
-            index
-        ))),
-    }
-}
-
-#[inline(always)]
-fn handle_bit(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
-    match row.try_get::<bool, usize>(index) {
-        Ok(Some(val)) => val.into_py_any(py),
-        Ok(None) => Ok(py.None()),
-        Err(_) => Err(PyValueError::new_err(format!(
-            "Failed to convert column {} to BIT",
-            index
-        ))),
-    }
-}
-
-#[inline(always)]
-fn handle_binary(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
-    match row.try_get::<&[u8], usize>(index) {
-        Ok(Some(val)) => Ok(val.into_pyobject(py)?.into_any().unbind()),
-        Ok(None) => Ok(py.None()),
-        Err(_) => Err(PyValueError::new_err(format!(
-            "Failed to convert column {} to BINARY",
-            index
-        ))),
-    }
-}
-
 #[inline]
 fn money_is_exactly_representable(value: f64) -> bool {
     value.abs() <= 900_719_925_474.099_1_f64
-}
-
-#[inline(always)]
-fn handle_money(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
-    match row.try_get::<f64, usize>(index) {
-        Ok(Some(val)) => {
-            // Tiberius 0.12 decodes MONEY through f64. Above this magnitude,
-            // adjacent 0.0001 fixed-point values are no longer distinguishable,
-            // so returning Decimal would silently report a potentially different
-            // monetary amount.
-            if !money_is_exactly_representable(val) {
-                return Err(ConversionError::new_err(
-                    "MONEY value exceeds the exact conversion range; ".to_owned()
-                        + "CAST the expression AS DECIMAL(19,4) in SQL",
-                ));
-            }
-            let decimal_class = get_decimal_class(py)?;
-            let s = format!("{:.4}", val);
-            Ok(decimal_class.call1((s,))?.unbind())
-        }
-        Ok(None) => Ok(py.None()),
-        Err(_) => Err(PyValueError::new_err(format!(
-            "Failed to convert column {} to MONEY",
-            index
-        ))),
-    }
-}
-
-#[inline(always)]
-fn handle_money4(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
-    match row.try_get::<f64, usize>(index) {
-        Ok(Some(val)) => {
-            let decimal_class = get_decimal_class(py)?;
-            let s = format!("{:.4}", val);
-            Ok(decimal_class.call1((s,))?.unbind())
-        }
-        Ok(None) => Ok(py.None()),
-        Err(_) => Err(PyValueError::new_err(format!(
-            "Failed to convert column {} to MONEY4",
-            index
-        ))),
-    }
 }
 
 /// Convert a tiberius `Numeric` to the canonical decimal string accepted by
@@ -195,229 +81,121 @@ fn numeric_to_decimal_string(numeric: tiberius::numeric::Numeric) -> String {
 }
 
 #[inline(always)]
-fn handle_decimal(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
-    match row.try_get::<tiberius::numeric::Numeric, usize>(index) {
-        Ok(Some(numeric)) => {
-            let decimal_class = get_decimal_class(py)?;
-            let s = numeric_to_decimal_string(numeric);
-            Ok(decimal_class.call1((s,))?.unbind())
-        }
-        Ok(None) => Ok(py.None()),
-        Err(_) => Err(PyValueError::new_err(format!(
-            "Failed to convert column {} to DECIMAL",
-            index
-        ))),
-    }
-}
-
-#[inline(always)]
-fn handle_datetime(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
-    match row.try_get::<chrono::NaiveDateTime, usize>(index) {
-        Ok(Some(val)) => val.into_py_any(py),
-        Ok(None) => Ok(py.None()),
-        Err(_) => Err(PyValueError::new_err(format!(
-            "Failed to convert column {} to DATETIME",
-            index
-        ))),
-    }
-}
-
-#[inline(always)]
-fn handle_date(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
-    match row.try_get::<chrono::NaiveDate, usize>(index) {
-        Ok(Some(val)) => Ok(val.into_py_any(py)?),
-        Ok(None) => Ok(py.None()),
-        Err(_) => Err(PyValueError::new_err(format!(
-            "Failed to convert column {} to DATE",
-            index
-        ))),
-    }
-}
-
-#[inline(always)]
-fn handle_time(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
-    match row.try_get::<chrono::NaiveTime, usize>(index) {
-        Ok(Some(val)) => Ok(val.into_py_any(py)?),
-        Ok(None) => Ok(py.None()),
-        Err(_) => Err(PyValueError::new_err(format!(
-            "Failed to convert column {} to TIME",
-            index
-        ))),
-    }
-}
-
-#[inline(always)]
-fn handle_datetimeoffset(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
-    match row.try_get::<chrono::DateTime<chrono::FixedOffset>, usize>(index) {
-        Ok(Some(val)) => Ok(val.into_py_any(py)?),
-        Ok(None) => Ok(py.None()),
-        Err(_) => Err(PyValueError::new_err(format!(
-            "Failed to convert column {} to DATETIMEOFFSET",
-            index
-        ))),
-    }
-}
-
-#[inline(always)]
-fn handle_uuid(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
-    match row.try_get::<uuid::Uuid, usize>(index) {
-        Ok(Some(val)) => {
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("bytes", PyBytes::new(py, val.as_bytes()))?;
-            Ok(get_uuid_class(py)?.call((), Some(&kwargs))?.unbind())
-        }
-        Ok(None) => Ok(py.None()),
-        Err(_) => Err(PyValueError::new_err(format!(
-            "Failed to convert column {} to UUID",
-            index
-        ))),
-    }
-}
-
-#[inline(always)]
-fn handle_xml(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
-    match row.try_get::<&tiberius::xml::XmlData, usize>(index) {
-        Ok(Some(xml_data)) => {
-            let xml_str = xml_data.to_string();
-            Ok(xml_str.into_pyobject(py)?.into_any().unbind())
-        }
-        Ok(None) => Ok(py.None()),
-        Err(_) => Err(PyValueError::new_err(format!(
-            "Failed to convert column {} to XML",
-            index
-        ))),
-    }
-}
-
-#[inline(always)]
-fn handle_nchar(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
-    match row.try_get::<&str, usize>(index) {
-        Ok(Some(val)) => Ok(val.into_pyobject(py)?.into_any().unbind()),
-        Ok(None) => Ok(py.None()),
-        Err(_) => Err(PyValueError::new_err(format!(
-            "Failed to convert column {} to NCHAR",
-            index
-        ))),
-    }
-}
-
-/// Handle SQL Server's variable-length nullable integer type (`Intn`).
-/// Ordered by demographic likelihood (INT/INT4 and BIGINT/INT8 are statistically primary).
-#[inline(always)]
-fn handle_intn(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
-    // 4-byte: INT (Statistically most common database target)
-    if let Ok(Some(val)) = row.try_get::<i32, usize>(index) {
-        return Ok((val as i64).into_pyobject(py)?.into_any().unbind());
-    }
-    // 8-byte: BIGINT
-    if let Ok(Some(val)) = row.try_get::<i64, usize>(index) {
-        return Ok(val.into_pyobject(py)?.into_any().unbind());
-    }
-    // 2-byte: SMALLINT
-    if let Ok(Some(val)) = row.try_get::<i16, usize>(index) {
-        return Ok((val as i64).into_pyobject(py)?.into_any().unbind());
-    }
-    // 1-byte: TINYINT
-    if let Ok(Some(val)) = row.try_get::<u8, usize>(index) {
-        return Ok((val as i64).into_pyobject(py)?.into_any().unbind());
-    }
-
-    // Check for explicit SQL NULL execution across any variant match
-    if row
-        .try_get::<i32, usize>(index)
-        .map(|v| v.is_none())
-        .unwrap_or(false)
-        || row
-            .try_get::<i64, usize>(index)
-            .map(|v| v.is_none())
-            .unwrap_or(false)
-    {
-        return Ok(py.None());
-    }
-
-    Err(PyValueError::new_err(format!(
-        "Failed to convert column {} to integer",
-        index
-    )))
-}
-
-#[inline(always)]
-fn handle_floatn(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
-    // 8-byte: FLOAT
-    if let Ok(Some(val)) = row.try_get::<f64, usize>(index) {
-        return Ok(val.into_pyobject(py)?.into_any().unbind());
-    }
-    // 4-byte: REAL — widen to f64 for Python
-    if let Ok(Some(val)) = row.try_get::<f32, usize>(index) {
-        return Ok((val as f64).into_pyobject(py)?.into_any().unbind());
-    }
-
-    if row
-        .try_get::<f64, usize>(index)
-        .map(|v| v.is_none())
-        .unwrap_or(false)
-    {
-        return Ok(py.None());
-    }
-
-    Err(PyValueError::new_err(format!(
-        "Failed to convert column {} to floating-point",
-        index
-    )))
-}
-
-#[inline(always)]
-fn handle_fallback(row: &Row, index: usize, py: Python) -> PyResult<Py<PyAny>> {
-    match row.try_get::<&str, usize>(index) {
-        Ok(Some(val)) => Ok(val.into_pyobject(py)?.into_any().unbind()),
-        Ok(None) => Ok(py.None()),
-        Err(_) => Err(PyValueError::new_err(format!(
-            "Failed to convert column {}",
-            index
-        ))),
-    }
-}
-
-pub fn sql_to_python(
-    row: &Row,
-    index: usize,
+pub(crate) fn column_data_to_python(
+    value: &ColumnData<'static>,
     col_type: ColumnType,
-    py: Python,
+    py: Python<'_>,
 ) -> PyResult<Py<PyAny>> {
     match col_type {
-        ColumnType::Int4 => handle_int4(row, index, py),
-        ColumnType::Int8 => handle_int8(row, index, py),
-        ColumnType::Int1 => handle_int1(row, index, py),
-        ColumnType::Int2 => handle_int2(row, index, py),
-        ColumnType::Intn => handle_intn(row, index, py),
-        ColumnType::Float8 => handle_float8(row, index, py),
-        ColumnType::Float4 => handle_float4(row, index, py),
-        ColumnType::Floatn => handle_floatn(row, index, py),
-        ColumnType::NVarchar => handle_nvarchar(row, index, py),
-        ColumnType::NChar => handle_nchar(row, index, py),
-        ColumnType::BigVarChar | ColumnType::BigChar => handle_varchar(row, index, py),
-        ColumnType::Text => handle_varchar(row, index, py),
-        ColumnType::NText => handle_nvarchar(row, index, py),
-        ColumnType::Image => handle_binary(row, index, py),
-        ColumnType::Bit | ColumnType::Bitn => handle_bit(row, index, py),
-        ColumnType::Money => handle_money(row, index, py),
-        ColumnType::Money4 => handle_money4(row, index, py),
-        ColumnType::Decimaln | ColumnType::Numericn => handle_decimal(row, index, py),
+        ColumnType::Int1
+        | ColumnType::Int2
+        | ColumnType::Int4
+        | ColumnType::Int8
+        | ColumnType::Intn => match value {
+            ColumnData::U8(Some(value)) => (*value).into_py_any(py),
+            ColumnData::I16(Some(value)) => (*value).into_py_any(py),
+            ColumnData::I32(Some(value)) => (*value).into_py_any(py),
+            ColumnData::I64(Some(value)) => (*value).into_py_any(py),
+            ColumnData::U8(None)
+            | ColumnData::I16(None)
+            | ColumnData::I32(None)
+            | ColumnData::I64(None) => Ok(py.None()),
+            _ => Err(column_conversion_error("integer")),
+        },
+        ColumnType::Float4 | ColumnType::Float8 | ColumnType::Floatn => match value {
+            ColumnData::F32(Some(value)) => (*value as f64).into_py_any(py),
+            ColumnData::F64(Some(value)) => (*value).into_py_any(py),
+            ColumnData::F32(None) | ColumnData::F64(None) => Ok(py.None()),
+            _ => Err(column_conversion_error("floating-point")),
+        },
+        ColumnType::NVarchar
+        | ColumnType::NChar
+        | ColumnType::BigVarChar
+        | ColumnType::BigChar
+        | ColumnType::Text
+        | ColumnType::NText => match value {
+            ColumnData::String(Some(value)) => value.as_ref().into_py_any(py),
+            ColumnData::String(None) => Ok(py.None()),
+            _ => Err(column_conversion_error("string")),
+        },
+        ColumnType::Image | ColumnType::BigVarBin | ColumnType::BigBinary => match value {
+            ColumnData::Binary(Some(value)) => value.as_ref().into_py_any(py),
+            ColumnData::Binary(None) => Ok(py.None()),
+            _ => Err(column_conversion_error("binary")),
+        },
+        ColumnType::Bit | ColumnType::Bitn => match value {
+            ColumnData::Bit(Some(value)) => (*value).into_py_any(py),
+            ColumnData::Bit(None) => Ok(py.None()),
+            _ => Err(column_conversion_error("bit")),
+        },
+        ColumnType::Money | ColumnType::Money4 => match value {
+            ColumnData::F64(Some(value)) => {
+                if col_type == ColumnType::Money && !money_is_exactly_representable(*value) {
+                    return Err(ConversionError::new_err(
+                        "MONEY value exceeds the exact conversion range; \
+                         CAST the expression AS DECIMAL(19,4) in SQL",
+                    ));
+                }
+                get_decimal_class(py)?
+                    .call1((format!("{value:.4}"),))
+                    .map(Bound::unbind)
+            }
+            ColumnData::F64(None) => Ok(py.None()),
+            _ => Err(column_conversion_error("money")),
+        },
+        ColumnType::Decimaln | ColumnType::Numericn => match value {
+            ColumnData::Numeric(Some(value)) => get_decimal_class(py)?
+                .call1((numeric_to_decimal_string(*value),))
+                .map(Bound::unbind),
+            ColumnData::Numeric(None) => Ok(py.None()),
+            _ => Err(column_conversion_error("decimal")),
+        },
         ColumnType::Datetime | ColumnType::Datetimen | ColumnType::Datetime2 => {
-            handle_datetime(row, index, py)
+            from_column_data::<chrono::NaiveDateTime>(value, "datetime")?
+                .map_or_else(|| Ok(py.None()), |value| value.into_py_any(py))
         }
-        ColumnType::Datetime4 => handle_datetime(row, index, py),
-        ColumnType::Daten => handle_date(row, index, py),
-        ColumnType::Timen => handle_time(row, index, py),
-        ColumnType::DatetimeOffsetn => handle_datetimeoffset(row, index, py),
-        ColumnType::Guid => handle_uuid(row, index, py),
-        ColumnType::Xml => handle_xml(row, index, py),
-        ColumnType::SSVariant => handle_fallback(row, index, py),
-        ColumnType::BigVarBin => handle_binary(row, index, py),
-        ColumnType::BigBinary => handle_binary(row, index, py),
-        ColumnType::Udt => handle_fallback(row, index, py),
+        ColumnType::Datetime4 => from_column_data::<chrono::NaiveDateTime>(value, "smalldatetime")?
+            .map_or_else(|| Ok(py.None()), |value| value.into_py_any(py)),
+        ColumnType::Daten => from_column_data::<chrono::NaiveDate>(value, "date")?
+            .map_or_else(|| Ok(py.None()), |value| value.into_py_any(py)),
+        ColumnType::Timen => from_column_data::<chrono::NaiveTime>(value, "time")?
+            .map_or_else(|| Ok(py.None()), |value| value.into_py_any(py)),
+        ColumnType::DatetimeOffsetn => {
+            from_column_data::<chrono::DateTime<chrono::FixedOffset>>(value, "datetimeoffset")?
+                .map_or_else(|| Ok(py.None()), |value| value.into_py_any(py))
+        }
+        ColumnType::Guid => match value {
+            ColumnData::Guid(Some(value)) => {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("bytes", PyBytes::new(py, value.as_bytes()))?;
+                Ok(get_uuid_class(py)?.call((), Some(&kwargs))?.unbind())
+            }
+            ColumnData::Guid(None) => Ok(py.None()),
+            _ => Err(column_conversion_error("uniqueidentifier")),
+        },
+        ColumnType::Xml => match value {
+            ColumnData::Xml(Some(value)) => value.to_string().into_py_any(py),
+            ColumnData::Xml(None) => Ok(py.None()),
+            _ => Err(column_conversion_error("xml")),
+        },
+        ColumnType::SSVariant | ColumnType::Udt => match value {
+            ColumnData::String(Some(value)) => value.as_ref().into_py_any(py),
+            ColumnData::String(None) => Ok(py.None()),
+            _ => Err(column_conversion_error("unsupported metadata")),
+        },
         ColumnType::Null => Ok(py.None()),
     }
+}
+
+fn from_column_data<T>(value: &ColumnData<'static>, type_name: &'static str) -> PyResult<Option<T>>
+where
+    for<'a> T: FromSql<'a>,
+{
+    T::from_sql(value).map_err(|_| column_conversion_error(type_name))
+}
+
+fn column_conversion_error(type_name: &'static str) -> PyErr {
+    PyValueError::new_err(format!("Failed to convert SQL Server {type_name} value"))
 }
 
 pub fn is_expandable_iterable(obj: &Bound<PyAny>) -> PyResult<bool> {

@@ -1,3 +1,4 @@
+use crate::procedure::OutputKey;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 use std::sync::Arc;
@@ -253,12 +254,18 @@ impl PySqlMessage {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+pub(crate) struct OutputParameterData {
+    pub(crate) key: OutputKey,
+    pub(crate) value: Py<PyAny>,
+}
+
+#[derive(Default)]
 pub(crate) struct ResultSummaryData {
     pub(crate) result_set_count: usize,
     pub(crate) done: Vec<DoneResultData>,
     pub(crate) messages: Vec<SqlMessageData>,
     pub(crate) return_status: Option<i32>,
+    pub(crate) output_parameters: Vec<OutputParameterData>,
 }
 
 #[pyclass(name = "ResultSummary", frozen, from_py_object)]
@@ -310,8 +317,15 @@ impl PyResultSummary {
     }
 
     #[getter]
-    fn output_parameters(&self, py: Python<'_>) -> Py<PyDict> {
-        PyDict::new(py).unbind()
+    fn output_parameters(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let output = PyDict::new(py);
+        for parameter in &self.data.output_parameters {
+            match &parameter.key {
+                OutputKey::Name(name) => output.set_item(name, parameter.value.bind(py))?,
+                OutputKey::Position(index) => output.set_item(index, parameter.value.bind(py))?,
+            }
+        }
+        Ok(output.unbind())
     }
 
     fn __repr__(&self) -> String {

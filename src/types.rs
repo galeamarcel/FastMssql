@@ -494,33 +494,26 @@ impl PyFastRow {
         let num_columns = column_info.names.len();
         let mut values = Vec::with_capacity(num_columns);
 
-        // Eagerly convert all values in column order using cached column types
-        for i in 0..num_columns {
+        // Eagerly convert all values in column order using the same raw
+        // ColumnData converter used by stored-procedure output values.
+        for (index, (_, value)) in row.cells().enumerate() {
             let col_type = column_info
                 .column_types
-                .get(i)
+                .get(index)
                 .copied()
                 .ok_or_else(|| PyValueError::new_err("Column type not found"))?;
-            let value = Self::extract_value_direct(&row, i, col_type, py)?;
-            values.push(value);
+            values.push(type_mapping::column_data_to_python(value, col_type, py)?);
+        }
+        if values.len() != num_columns {
+            return Err(PyValueError::new_err(
+                "SQL Server row value count did not match column metadata",
+            ));
         }
 
         Ok(PyFastRow {
             values,
             column_info,
         })
-    }
-
-    /// Convert value directly from Tiberius to Python using centralized type mapping
-    /// Uses cached column type to avoid repeated lookups
-    #[inline]
-    fn extract_value_direct(
-        row: &Row,
-        index: usize,
-        col_type: ColumnType,
-        py: Python,
-    ) -> PyResult<Py<PyAny>> {
-        type_mapping::sql_to_python(row, index, col_type, py)
     }
 }
 

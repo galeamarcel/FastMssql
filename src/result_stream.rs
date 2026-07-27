@@ -7,16 +7,19 @@ use crate::pool_manager::{
     PooledOperationGuard, TiberiusClient, python_error_allows_connection_reuse,
     timeout_error_or_metadata_failure,
 };
+use crate::procedure::{ProcedureCall, ProcedureResponseState, RawProcedureSummary};
 use crate::result_types::{
-    ColumnMetadataData, DoneResultData, PyColumnMetadata, PyResultSummary, ResultSummaryData,
-    SqlMessageData,
+    ColumnMetadataData, DoneResultData, OutputParameterData, PyColumnMetadata, PyResultSummary,
+    ResultSummaryData, SqlMessageData,
 };
 use crate::transaction::TransactionResponseLease;
+use crate::type_mapping::column_data_to_python;
 use crate::types::{
     ColumnInfo, PyFastRow, ResultReceiveCancelled, TimeoutErrorMetadata, create_protocol_error,
     create_sql_error,
 };
 use futures_util::TryStreamExt;
+use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyTuple};
@@ -73,6 +76,7 @@ pub(crate) enum ResultRequest {
     Batch {
         sql: String,
     },
+    Procedure(ProcedureCall),
 }
 
 struct ResultSetMetadata {
@@ -84,7 +88,12 @@ struct ResultSetMetadata {
 enum ConversionEvent {
     Metadata(ResultSetMetadata),
     Row(Row),
-    RawSummary(ResultSummaryData),
+    RawSummary(RawSummaryData),
+}
+
+struct RawSummaryData {
+    summary: ResultSummaryData,
+    procedure: Option<RawProcedureSummary>,
 }
 
 struct ResponseEventEnvelope {
@@ -249,6 +258,7 @@ fn metadata_event(metadata: ResponseMetadata) -> ResultSetMetadata {
 async fn drain_response(
     mut response: ResponseStream<'_>,
     channels: &mut ProducerChannels,
+    mut procedure: Option<ProcedureResponseState>,
 ) -> Result<(), ProducerFailure> {
     let mut summary = ResultSummaryData::default();
 
@@ -314,16 +324,33 @@ async fn drain_response(
                 summary.messages.push(SqlMessageData::from(info));
             }
             ResponseEvent::ReturnStatus(status) => {
+                if procedure.is_some() && summary.return_status.is_some() {
+                    return Err(ProducerFailure::Failed(create_protocol_error(
+                        "stored procedure returned duplicate status tokens",
+                    )));
+                }
                 summary.return_status = Some(status);
             }
-            ResponseEvent::ReturnValue(_) => {
-                // stream() accepts INPUT parameters only. Direct RPC output
-                // values are modeled by the later callproc() API.
+            ResponseEvent::ReturnValue(value) => {
+                if let Some(procedure) = procedure.as_mut() {
+                    procedure
+                        .record_return_value(value)
+                        .map_err(ProducerFailure::Failed)?;
+                }
             }
         }
     }
 
-    channels.send(ConversionEvent::RawSummary(summary)).await?;
+    let procedure = procedure
+        .map(ProcedureResponseState::finish)
+        .transpose()
+        .map_err(ProducerFailure::Failed)?;
+    channels
+        .send(ConversionEvent::RawSummary(RawSummaryData {
+            summary,
+            procedure,
+        }))
+        .await?;
     channels.wait_for_all_acks().await
 }
 
@@ -341,13 +368,31 @@ async fn execute_request(
                 .map_err(|error| {
                     ProducerFailure::Failed(create_sql_error(error, "Result stream startup failed"))
                 })?;
-            drain_response(response, channels).await
+            drain_response(response, channels, None).await
         }
         ResultRequest::Batch { sql } => {
             let response = client.response_batch(sql).await.map_err(|error| {
                 ProducerFailure::Failed(create_sql_error(error, "Result batch startup failed"))
             })?;
-            drain_response(response, channels).await
+            drain_response(response, channels, None).await
+        }
+        ResultRequest::Procedure(call) => {
+            let (procedure, arguments, output_slots, return_slot) = call.into_parts();
+            let response = client
+                .response_rpc(procedure, arguments)
+                .await
+                .map_err(|error| {
+                    ProducerFailure::Failed(create_sql_error(
+                        error,
+                        "Stored procedure startup failed",
+                    ))
+                })?;
+            drain_response(
+                response,
+                channels,
+                Some(ProcedureResponseState::new(output_slots, return_slot)),
+            )
+            .await
         }
     }
 }
@@ -948,6 +993,50 @@ fn conversion_failed(shared: &Arc<SharedConsumer>, sequence: u64, error: PyErr) 
     error
 }
 
+fn convert_raw_summary(mut raw: RawSummaryData, py: Python<'_>) -> PyResult<ResultSummaryData> {
+    let Some(procedure) = raw.procedure else {
+        return Ok(raw.summary);
+    };
+
+    raw.summary.output_parameters = procedure
+        .output_values
+        .into_iter()
+        .map(|output| {
+            column_data_to_python(&output.value, output.column_type, py).map(|value| {
+                OutputParameterData {
+                    key: output.key,
+                    value,
+                }
+            })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+
+    if let Some(key) = procedure.return_key {
+        let status = raw.summary.return_status.ok_or_else(|| {
+            create_protocol_error("stored procedure response omitted its return status")
+        })?;
+        raw.summary.output_parameters.push(OutputParameterData {
+            key,
+            value: status.into_py_any(py)?,
+        });
+    }
+
+    Ok(raw.summary)
+}
+
+fn publish_raw_summary(
+    shared: &Arc<SharedConsumer>,
+    sequence: u64,
+    raw: RawSummaryData,
+) -> PyResult<()> {
+    let summary = match Python::attach(|py| convert_raw_summary(raw, py)) {
+        Ok(summary) => summary,
+        Err(error) => return Err(conversion_failed(shared, sequence, error)),
+    };
+    shared.publish_summary(summary);
+    shared.acknowledge(sequence, ConsumerAckKind::Converted, None)
+}
+
 async fn outer_next(
     shared: Arc<SharedConsumer>,
     control: Arc<ReceiveCancellation>,
@@ -1019,8 +1108,7 @@ async fn outer_next(
             Err(conversion_failed(&shared, sequence, error))
         }
         ConversionEvent::RawSummary(summary) => {
-            shared.publish_summary(summary);
-            shared.acknowledge(sequence, ConsumerAckKind::Converted, None)?;
+            publish_raw_summary(&shared, sequence, summary)?;
             drop(state);
             await_terminal(&shared, false).await?;
             Err(PyStopAsyncIteration::new_err(""))
@@ -1089,8 +1177,7 @@ async fn result_set_next(
             Err(PyStopAsyncIteration::new_err(""))
         }
         ConversionEvent::RawSummary(summary) => {
-            shared.publish_summary(summary);
-            shared.acknowledge(sequence, ConsumerAckKind::Converted, None)?;
+            publish_raw_summary(&shared, sequence, summary)?;
             close_active_set(&mut state, index);
             closed.store(true, Ordering::Release);
             drop(state);
@@ -1317,8 +1404,7 @@ async fn close_result_set(
                 return Ok(());
             }
             ConversionEvent::RawSummary(summary) => {
-                shared.publish_summary(summary);
-                shared.acknowledge(sequence, ConsumerAckKind::Converted, None)?;
+                publish_raw_summary(&shared, sequence, summary)?;
                 close_active_set(&mut state, index);
                 closed.store(true, Ordering::Release);
                 drop(state);
@@ -1355,8 +1441,7 @@ async fn finish_stream(shared: Arc<SharedConsumer>) -> PyResult<Py<PyResultSumma
                 shared.acknowledge(sequence, ConsumerAckKind::Discarded, None)?;
             }
             ConversionEvent::RawSummary(summary) => {
-                shared.publish_summary(summary);
-                shared.acknowledge(sequence, ConsumerAckKind::Converted, None)?;
+                publish_raw_summary(&shared, sequence, summary)?;
                 drop(state);
                 await_terminal(&shared, false).await?;
                 return summary_object(&shared);

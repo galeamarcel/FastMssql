@@ -122,6 +122,55 @@ Terminal SQL, protocol, and conversion errors exposed by a result stream carry
 `connection_discarded=False`; conversion or protocol uncertainty retires the
 connection. FastMssql never retries a response automatically.
 
+### Direct stored-procedure RPC
+
+Use `callproc()` for a stored procedure that has output parameters or a return
+status. FastMssql sends the validated procedure name as a native TDS RPC; it
+does not build an `EXEC` SQL string. `callproc()` is available on both
+`Connection` and a begun `Transaction`.
+
+```python
+from fastmssql import Parameter, Parameters
+
+params = Parameters(
+    order_id=Parameter(42, "INT"),
+    new_total=Parameter(
+        None,
+        "DECIMAL(19,4)",
+        direction="OUTPUT",
+    ),
+    status=Parameter(
+        None,
+        direction="RETURN_VALUE",
+    ),
+)
+
+response = await conn.callproc(
+    "dbo.reprice_order",
+    params,
+    buffer_size=64,
+)
+
+async with response:
+    async for result_set in response:
+        async for row in result_set:
+            await handle(row)
+
+summary = response.summary
+print(summary.return_status)
+print(summary.output_parameters["new_total"])
+print(summary.output_parameters["status"])
+```
+
+Named parameters may include one leading `@`; output dictionary keys omit it.
+Positional output keys are their original zero-based descriptor indices.
+`INPUT` may infer its SQL type. `OUTPUT` and `INPUT_OUTPUT` require an explicit
+SQL type, while `RETURN_VALUE` accepts only an omitted type or `INT` and is not
+sent as an RPC argument. Output values and the return status become available
+only after normal terminal completion. Invalid procedure names, parameter
+names, direction combinations, counts, and buffer sizes are rejected locally
+before pool checkout.
+
 The legacy `query()` and `simple_query()` methods remain synchronous-iteration
 compatibility APIs after awaiting them; they buffer the first result set.
 

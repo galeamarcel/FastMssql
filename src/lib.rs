@@ -18,6 +18,7 @@ mod operation_metrics_config;
 mod parameter_conversion;
 mod pool_config;
 mod pool_manager;
+mod procedure;
 mod py_parameters;
 mod result_stream;
 mod result_types;

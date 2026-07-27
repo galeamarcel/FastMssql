@@ -138,6 +138,14 @@ class Connection:
         """Stream every result set from an unparameterized SQL batch."""
         return await self._conn.batch(sql, buffer_size=buffer_size)
 
+    async def callproc(self, procedure, params=None, *, buffer_size=64):
+        """Call a named procedure by direct RPC and stream all results."""
+        return await self._conn.callproc(
+            procedure,
+            params,
+            buffer_size=buffer_size,
+        )
+
     async def __aenter__(self):
         await self._conn.__aenter__()
         return self
@@ -261,6 +269,14 @@ class Transaction:
     async def batch(self, sql, *, buffer_size=64):
         """Stream an unparameterized batch on this transaction session."""
         return await self._rust_conn.batch(sql, buffer_size=buffer_size)
+
+    async def callproc(self, procedure, params=None, *, buffer_size=64):
+        """Call a named procedure by direct RPC on this transaction."""
+        return await self._rust_conn.callproc(
+            procedure,
+            params,
+            buffer_size=buffer_size,
+        )
 
     async def execute(self, sql, params=None):
         """Execute an INSERT/UPDATE/DELETE/DDL command."""

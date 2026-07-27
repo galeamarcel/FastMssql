@@ -669,8 +669,8 @@ class Parameter:
     Attributes:
         value: Original Python value.
         sql_type: Canonical SQL declaration, or None for inferred conversion.
-        direction: INPUT, OUTPUT, INPUT_OUTPUT, or RETURN_VALUE. Execution
-            currently supports INPUT only.
+        direction: INPUT, OUTPUT, INPUT_OUTPUT, or RETURN_VALUE. ``callproc``
+            supports all four directions; query execution accepts INPUT.
         precision: FLOAT/DECIMAL/NUMERIC precision.
         scale: DECIMAL/NUMERIC or temporal fractional-second scale.
         length: Character/binary length as an integer or "MAX".
@@ -720,9 +720,10 @@ class Parameters:
     """
     Collection of parameter descriptors.
 
-    Positional descriptors are accepted by SQL execution. Named descriptors
-    remain available for construction compatibility but are rejected by the
-    SQL Server wire conversion.
+    Positional descriptors are accepted by SQL execution. ``callproc`` accepts
+    either positional or named descriptors and supports INPUT, OUTPUT,
+    INPUT_OUTPUT, and RETURN_VALUE; query execution accepts INPUT positional
+    descriptors.
 
     Attributes:
         *args: List of Parameter objects in positional order
@@ -1044,6 +1045,16 @@ class Connection:
         """Stream an unparameterized batch on one retained pooled connection."""
         ...
 
+    async def callproc(
+        self,
+        procedure: str,
+        params: list[Any] | Parameters | None = None,
+        *,
+        buffer_size: int = 64,
+    ) -> ResultStream:
+        """Call a named procedure by direct RPC and stream all results."""
+        ...
+
     def simple_query(
         self,
         sql: str,
@@ -1237,6 +1248,16 @@ class Transaction:
         buffer_size: int = 64,
     ) -> ResultStream:
         """Stream an unparameterized batch on this transaction session."""
+        ...
+
+    async def callproc(
+        self,
+        procedure: str,
+        params: list[Any] | Parameters | None = None,
+        *,
+        buffer_size: int = 64,
+    ) -> ResultStream:
+        """Call a named procedure by direct RPC on this transaction."""
         ...
 
     def simple_query(

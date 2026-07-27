@@ -209,3 +209,30 @@ No release, package-version change, or artifact publication has occurred.
 - This RED branch records required behavior only; it does not implement
   `callproc()`, change package metadata, alter the displayed `0.7.7` version,
   or publish a release.
+
+### Direct RPC output values and return status
+
+- Added `Connection.callproc()` and `Transaction.callproc()` as native named
+  TDS RPC entry points sharing the bounded `ResultStream` response and
+  fail-closed lease lifecycle.
+- Added closed local procedure/parameter identifier validation, positional or
+  named parameter modes, exact INPUT/OUTPUT/INPUT_OUTPUT/RETURN_VALUE rules,
+  the 2,100 encoded-argument limit, and pre-checkout rejection of invalid
+  descriptors.
+- Added ordinal-and-name output-token matching independent of wire arrival
+  order, exact scalar conversion shared with result rows, signed return-status
+  capture, and fresh string/integer output dictionaries after terminal ACK.
+- Added wrapper, stub and README contracts plus real SQL-auth coverage for
+  exact output types, multiple/empty result sets, MAX-value reordering,
+  transaction parity, connection disposition, recycled isolation and bounded
+  concurrent calls.
+- Expanded RPC-003 to exercise every supported scalar declaration through
+  both typed-NULL OUTPUT and value-bearing INPUT_OUTPUT encoding, including
+  fixed/variable ANSI, Unicode and binary types plus exact NULL handling.
+- Removed the last invariant `expect()` from output collection so a missing
+  token remains a typed, privacy-safe protocol error on every path.
+- Corrected the Task 11 vendored-Clippy command to reuse the repository's
+  audited ten-category Tiberius 0.12.3/Rust 1.94 legacy baseline while
+  continuing to deny every non-baseline warning.
+- This feature does not change package metadata, the displayed `0.7.7`
+  version or release state.

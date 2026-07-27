@@ -1,8 +1,9 @@
 """Type stubs for FastMSSQL wrapper classes.
 
 The re-exported ``Parameter`` surface includes closed SQL declarations,
-canonical metadata, typed NULL handling, bounded expansion, and INPUT-only
-execution semantics for the currently modeled direction field.
+canonical metadata, typed NULL handling, and bounded expansion. ``callproc``
+supports INPUT, OUTPUT, INPUT_OUTPUT, and RETURN_VALUE descriptors; ordinary
+query execution accepts INPUT descriptors.
 """
 
 from typing import Any, Coroutine, Dict, List, Literal, Optional, StrEnum, Tuple, TypedDict
@@ -238,6 +239,14 @@ class Connection:
         buffer_size: int = 64,
     ) -> ResultStream: ...
 
+    async def callproc(
+        self,
+        procedure: str,
+        params: list[Any] | Parameters | None = None,
+        *,
+        buffer_size: int = 64,
+    ) -> ResultStream: ...
+
     def simple_query(
         self,
         sql: str,
@@ -433,6 +442,16 @@ class Transaction:
         buffer_size: int = 64,
     ) -> ResultStream:
         """Stream an unparameterized batch on this transaction session."""
+        ...
+
+    async def callproc(
+        self,
+        procedure: str,
+        params: list[Any] | Parameters | None = None,
+        *,
+        buffer_size: int = 64,
+    ) -> ResultStream:
+        """Call a named procedure by direct RPC on this transaction."""
         ...
 
     def execute(
