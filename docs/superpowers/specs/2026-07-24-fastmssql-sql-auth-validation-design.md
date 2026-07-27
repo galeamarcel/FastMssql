@@ -543,6 +543,14 @@ Enterprise compatibility-bulk buffering:
   server activity and rolls back the full compatibility bulk transaction.
 - `BULK-002`: empty compatibility bulk returns zero without pool admission or
   operation-metric activity.
+- `BULK-003`: non-expanded INPUT `Parameter` descriptors and typed NULLs
+  preserve exact numeric, temporal and UUID values through compatibility
+  bulk.
+- `BULK-004`: expanded and non-input descriptors are rejected locally as
+  typed, privacy-safe conversion failures with global bulk positions.
+- `BULK-005`: a typed conversion failure beyond the first chunk reports
+  global positions and prior wire/retirement activity, leaks no
+  identifiers/value, and rolls back every earlier row.
 
 ### TX — dedicated transactions
 

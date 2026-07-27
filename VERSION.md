@@ -39,6 +39,28 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Typed bulk row conversion RED coverage
+
+- Added five deterministic offline contracts requiring compatibility bulk
+  cells to use the existing typed `Parameter` conversion family, reject
+  expansion/non-input directions and expose privacy-safe zero-based global
+  row, column and flattened parameter positions.
+- Added SQL-auth cases `BULK-003` through `BULK-005` for exact
+  numeric/temporal/UUID values, typed NULLs, local descriptor rejection and a
+  late second-chunk conversion failure with atomic rollback and replacement
+  session recovery.
+- Reproduced the intended defect on an exact unchanged native build: all five
+  offline contracts and all three new real-MSSQL cases failed with
+  `ValueError: Unsupported type: Parameter`.
+- The complete batch/bulk strict file proved the boundary precisely: all 22
+  predecessor cases passed and only the three new descriptor cases failed.
+- Raised the canonical SQL-auth specification from 374 to 377 unique IDs; all
+  26 matrix-contract tests pass without regenerating or overstating the last
+  complete 372-case evidence report.
+- This RED branch changes tests, canonical specification and version history
+  only; runtime behavior, package metadata, the displayed `0.7.7` version and
+  release state remain unchanged.
+
 ### Documentation-only typed bulk row conversion plan
 
 - Added the executable RED/fix/status plan for sharing the closed

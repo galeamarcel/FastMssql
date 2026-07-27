@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from datetime import date, datetime
+from datetime import date, datetime, time
+from decimal import Decimal
+from uuid import UUID
 
 from fastmssql import (
     Connection,
+    ConversionError,
     OperationMetricsConfig,
     Parameter,
     Parameters,
@@ -27,6 +30,28 @@ pytestmark = [pytest.mark.sql_auth_strict, pytest.mark.integration]
 
 def _bracket(value: str) -> str:
     return f"[{value.replace(']', ']]')}]"
+
+
+def _assert_bulk_conversion_error(
+    error: ConversionError,
+    *,
+    row_index: int,
+    column_index: int,
+    parameter_index: int,
+    sql_type: str,
+    reason: str,
+    wire_sent: bool,
+    connection_discarded: bool,
+) -> None:
+    assert error.row_index == row_index
+    assert error.column_index == column_index
+    assert error.parameter_index == parameter_index
+    assert error.sql_type == sql_type
+    assert error.reason == reason
+    assert error.retryable is False
+    assert error.wire_sent is wire_sent
+    assert error.connection_discarded is connection_discarded
+    assert error.outcome_unknown is False
 
 
 async def _wait_for_request(
@@ -868,3 +893,214 @@ async def test_empty_bulk_has_no_pool_or_metric_activity() -> None:
     snapshot = await connection.operation_stats()
     assert snapshot["operations"]["bulk_insert"]["started"] == 0
     assert snapshot["operations"]["bulk_insert"]["completed"] == 0
+
+
+@case("BULK-003")
+@pytest.mark.asyncio
+async def test_bulk_parameter_descriptors_round_trip_exact_values(
+    owner_connection: Connection,
+    unique_sql_name: Callable[[str], str],
+    cleanup_registry: CleanupRegistry,
+) -> None:
+    raw_table = unique_sql_name("strict_bulk_typed_rows")
+    table = quote_identifier(raw_table)
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
+    await owner_connection.execute(
+        f"""
+        CREATE TABLE {table} (
+            id INT PRIMARY KEY,
+            tiny_value TINYINT NULL,
+            amount DECIMAL(19,4) NULL,
+            calendar_date DATE NULL,
+            wall_time TIME(7) NULL,
+            occurred_at DATETIME2(3) NULL,
+            entity_id UNIQUEIDENTIFIER NULL
+        )
+        """
+    )
+
+    expected_amount = Decimal("123456789012345.6789")
+    expected_date = date(2024, 2, 29)
+    expected_time = time(12, 34, 56, 123456)
+    expected_datetime = datetime(2024, 2, 29, 12, 34, 56, 123000)
+    expected_uuid = UUID("12345678-1234-5678-9234-567812345678")
+    rows = [
+        [
+            Parameter(1, "INT"),
+            Parameter(7, "TINYINT"),
+            Parameter(expected_amount, "DECIMAL(19,4)"),
+            Parameter(expected_date, "DATE"),
+            Parameter(expected_time, "TIME(7)"),
+            Parameter(expected_datetime, "DATETIME2(3)"),
+            Parameter(expected_uuid, "UNIQUEIDENTIFIER"),
+        ],
+        [
+            Parameter(2, "INT"),
+            Parameter(None, "TINYINT"),
+            Parameter(None, "DECIMAL(19,4)"),
+            Parameter(None, "DATE"),
+            Parameter(None, "TIME(7)"),
+            Parameter(None, "DATETIME2(3)"),
+            Parameter(None, "UNIQUEIDENTIFIER"),
+        ],
+    ]
+
+    assert (
+        await owner_connection.bulk_insert(
+            raw_table,
+            [
+                "id",
+                "tiny_value",
+                "amount",
+                "calendar_date",
+                "wall_time",
+                "occurred_at",
+                "entity_id",
+            ],
+            rows,
+        )
+        == 2
+    )
+    returned = (
+        await owner_connection.query(
+            f"""
+            SELECT id, tiny_value, amount, calendar_date, wall_time,
+                   occurred_at, entity_id
+            FROM {table}
+            ORDER BY id
+            """
+        )
+    ).rows()
+    assert returned[0].to_dict() == {
+        "id": 1,
+        "tiny_value": 7,
+        "amount": expected_amount,
+        "calendar_date": expected_date,
+        "wall_time": expected_time,
+        "occurred_at": expected_datetime,
+        "entity_id": expected_uuid,
+    }
+    assert returned[1]["id"] == 2
+    assert all(
+        returned[1][column] is None
+        for column in (
+            "tiny_value",
+            "amount",
+            "calendar_date",
+            "wall_time",
+            "occurred_at",
+            "entity_id",
+        )
+    )
+
+
+@case("BULK-004")
+@pytest.mark.asyncio
+async def test_bulk_rejects_expanded_and_non_input_descriptors_locally(
+    owner_connection: Connection,
+    unique_sql_name: Callable[[str], str],
+    cleanup_registry: CleanupRegistry,
+) -> None:
+    raw_table = unique_sql_name("strict_bulk_descriptor_rejection")
+    table = quote_identifier(raw_table)
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
+    await owner_connection.execute(
+        f"CREATE TABLE {table} (id INT PRIMARY KEY, value INT NULL)"
+    )
+
+    with pytest.raises(ConversionError) as expanded:
+        await owner_connection.bulk_insert(
+            raw_table,
+            ["id", "value"],
+            [[0, 0], [1, Parameter([2, 3], "INT")]],
+        )
+    _assert_bulk_conversion_error(
+        expanded.value,
+        row_index=1,
+        column_index=1,
+        parameter_index=3,
+        sql_type="INT",
+        reason="expanded_not_supported",
+        wire_sent=False,
+        connection_discarded=False,
+    )
+
+    for direction in ("OUTPUT", "INPUT_OUTPUT", "RETURN_VALUE"):
+        with pytest.raises(ConversionError) as non_input:
+            await owner_connection.bulk_insert(
+                raw_table,
+                ["id", "value"],
+                [[1, Parameter(7, "INT", direction=direction)]],
+            )
+        _assert_bulk_conversion_error(
+            non_input.value,
+            row_index=0,
+            column_index=1,
+            parameter_index=1,
+            sql_type="INT",
+            reason="unsupported_direction",
+            wire_sent=False,
+            connection_discarded=False,
+        )
+
+    assert await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}") == 0
+
+
+@case("BULK-005")
+@pytest.mark.asyncio
+async def test_bulk_late_typed_failure_is_private_atomic_and_retires_session(
+    owner_connection: Connection,
+    sql_auth_config: SqlAuthConfig,
+    unique_sql_name: Callable[[str], str],
+    cleanup_registry: CleanupRegistry,
+) -> None:
+    table_sentinel = "MustNotLeakBulkTable"
+    column_sentinel = "MustNotLeakBulkColumn"
+    value_sentinel = "MustNotLeakBulkValue"
+    raw_table = unique_sql_name(table_sentinel)
+    table = quote_identifier(raw_table)
+    column = quote_identifier(column_sentinel)
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
+    await owner_connection.execute(
+        f"CREATE TABLE {table} (id INT PRIMARY KEY, {column} INT NOT NULL)"
+    )
+    rows: list[list[object]] = [[index, index] for index in range(1000)]
+    rows.append([1000, Parameter(value_sentinel, "INT")])
+
+    bulk_connection = _isolated_connection(sql_auth_config)
+    try:
+        await bulk_connection.connect()
+        original_spid = await scalar(bulk_connection, "SELECT @@SPID")
+
+        with pytest.raises(ConversionError) as captured:
+            await bulk_connection.bulk_insert(
+                raw_table,
+                ["id", column_sentinel],
+                rows,
+            )
+
+        _assert_bulk_conversion_error(
+            captured.value,
+            row_index=1000,
+            column_index=1,
+            parameter_index=2001,
+            sql_type="INT",
+            reason="wrong_value_kind",
+            wire_sent=True,
+            connection_discarded=True,
+        )
+        rendered = f"{captured.value!s}\n{captured.value!r}\n{vars(captured.value)!r}"
+        for sentinel in (
+            table_sentinel,
+            column_sentinel,
+            value_sentinel,
+            raw_table,
+        ):
+            assert sentinel not in rendered
+
+        assert await scalar(owner_connection, f"SELECT COUNT(*) FROM {table}") == 0
+        replacement_spid = await scalar(bulk_connection, "SELECT @@SPID")
+        assert replacement_spid != original_spid
+        assert await scalar(bulk_connection, "SELECT 1") == 1
+    finally:
+        await bulk_connection.disconnect()
