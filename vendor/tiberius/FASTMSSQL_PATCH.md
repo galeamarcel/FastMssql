@@ -4,7 +4,10 @@ This directory is the minimal build source subset of the published `tiberius`
 crate version `0.12.3`, whose registry source records upstream commit
 `c34fab2e14c52ab74519d073d7a7b65bd023fc1a`.
 
-FastMssql temporarily carries six narrowly scoped patch sets.
+FastMssql temporarily carries six implemented narrowly scoped patch sets.
+The `test/tiberius-bulk-column-subset` RED branch also records the required
+contract for a seventh patch; the method is intentionally absent until the
+descendant feature branch observes these tests fail.
 
 The TLS dependency migration includes:
 
@@ -104,6 +107,20 @@ The complete-response and direct-RPC patch:
 - makes token traces and connection diagnostics structural, with no SQL
   Server message, metadata name, row/output value, environment value,
   procedure name or raw-buffer payload.
+
+The pending bulk-column-subset contract requires:
+
+- an additive `Client::bulk_insert_columns(table, columns)` method while
+  preserving `Client::bulk_insert(table)`;
+- closed validation and bracket quoting for raw table and column identifiers;
+- exact requested metadata count and order;
+- typed rejection for identity, computed, rowversion and unsupported
+  metadata;
+- a total checked `INSERT BULK` declaration formatter with no panic path;
+- direct SQL-auth coverage for subsets, defaults, NULLs, hostile identifier
+  characters and post-rejection connection recovery.
+
+This RED branch does not claim that the primitive is implemented.
 
 No Tiberius fork has been created or published by the FastMssql fork owner.
 The path dependency keeps the reviewed source inside the FastMssql repository

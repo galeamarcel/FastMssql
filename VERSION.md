@@ -39,6 +39,23 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Tiberius bulk column-subset RED coverage
+
+- Added unit contracts for closed table/column identifier grammar, exact
+  metadata count/order, writable flags and a total checked declaration
+  formatter across every supported and rejected TDS metadata family.
+- Added direct SQL-auth cases `TIB-BULK-001` through `TIB-BULK-005` for
+  reordered subsets, defaults/NULLs, hostile identifier characters,
+  identity/computed/rowversion rejection, SQL_VARIANT panic safety and
+  pre-wire malformed input.
+- Registered the new direct-Tiberius SQL-auth target in the complete runner.
+- The expected RED is a compile-time missing-module/missing-method failure on
+  the unchanged vendored implementation; dependency, syntax or fixture
+  failures are not accepted as evidence.
+- This RED branch changes tests and status documentation only. It does not
+  implement the primitive, change package metadata, alter the displayed
+  `0.7.7` version or publish an artifact.
+
 ### Documentation-only Tiberius bulk column-subset plan
 
 - Added the task-by-task RED/feature/status plan for the approved vendored

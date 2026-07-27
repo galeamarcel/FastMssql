@@ -105,6 +105,12 @@ record tiberius-token-safety-sql-auth \
   --no-default-features \
   --features chrono,tds73,rustls \
   --test token_safety_sql_auth -- --test-threads=1
+record tiberius-bulk-column-subset-sql-auth \
+  cargo test \
+  --manifest-path vendor/tiberius/Cargo.toml \
+  --no-default-features \
+  --features chrono,tds73,rustls \
+  --test bulk_column_subset_sql_auth -- --test-threads=1
 record tiberius-response-sql-auth \
   cargo test \
   --manifest-path vendor/tiberius/Cargo.toml \

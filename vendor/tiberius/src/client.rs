@@ -1,4 +1,6 @@
 mod auth;
+#[cfg(test)]
+mod bulk_columns_tests;
 mod config;
 mod connection;
 
