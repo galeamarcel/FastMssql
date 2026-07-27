@@ -1,7 +1,13 @@
 use std::fmt::Debug;
 
-use futures_util::Stream;
-use tiberius::{ResponseDoneKind, ResponseEvent, ResponseLength, ResponseStream, RpcParameter};
+use futures_util::{
+    io::{AsyncRead, AsyncWrite},
+    Stream,
+};
+use tiberius::{
+    validate_bulk_insert_columns, BulkLoadRequest, ResponseDoneKind, ResponseEvent, ResponseLength,
+    ResponseStream, RpcParameter,
+};
 
 fn assert_send<T: Send>() {}
 fn assert_debug<T: Debug>() {}
@@ -10,6 +16,14 @@ fn assert_response_stream<'a>()
 where
     ResponseStream<'a>: Stream<Item = tiberius::Result<ResponseEvent>> + Send + Debug,
 {
+}
+
+#[allow(dead_code)]
+fn require_public_bulk_declarations<S>(request: &BulkLoadRequest<'_, S>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let _: tiberius::Result<Vec<String>> = request.column_declarations();
 }
 
 #[allow(dead_code)]
@@ -95,4 +109,13 @@ fn rpc_parameter_constructor_owns_all_request_inputs() {
 
     assert_send::<RpcParameter>();
     drop(parameter);
+}
+
+#[test]
+fn native_bulk_metadata_bridge_is_public_and_validates_without_io() {
+    validate_bulk_insert_columns("database.schema.target", &["first", "second"])
+        .expect("valid raw identifiers must pass without a client or wire I/O");
+
+    assert!(validate_bulk_insert_columns("[dbo].[target]", &["value"]).is_err());
+    assert!(validate_bulk_insert_columns("dbo.target", &[]).is_err());
 }

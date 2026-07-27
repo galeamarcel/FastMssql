@@ -552,6 +552,25 @@ Enterprise compatibility-bulk buffering:
   global positions and prior wire/retirement activity, leaks no
   identifiers/value, rolls back every earlier row, and recovers on a new
   physical `connection_id` even if SQL Server reuses the numeric SPID.
+- `BULK-006`: connection/transaction raw, wrapper and stub surfaces expose
+  concrete-list native TDS bulk with strict bounded chunk validation; empty
+  input returns zero without pool or operation-metric activity.
+- `BULK-007`: an ordered native subset omits identity/default columns,
+  preserves nullable values and returns the exact persisted row count.
+- `BULK-008`: raw values, matching input descriptors and typed NULLs convert
+  from exact target metadata across integer, floating, numeric, character,
+  binary, UUID, temporal and XML families.
+- `BULK-009`: identity, computed, rowversion, MONEY and SQL_VARIANT targets
+  fail with typed privacy-safe errors, no panic and immediate pool recovery.
+- `BULK-010`: a later native chunk conversion failure rolls back every
+  earlier chunk in the connection-owned transaction and leaves the pooled
+  connection reusable.
+- `BULK-011`: native bulk success on an active caller-owned transaction is
+  settlement-neutral; a reusable post-wire failure enters rollback-only,
+  rejects data and COMMIT, permits ROLLBACK and persists no rows.
+- `BULK-012`: cancellation or timeout during native bulk retires the physical
+  session, terminates the server request, restores pool capacity and permits
+  a post-fault smoke query.
 
 ### TX — dedicated transactions
 

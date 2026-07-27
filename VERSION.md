@@ -42,6 +42,30 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Native TDS bulk insert RED coverage
+
+- Raised the canonical SQL-auth matrix from 377 to 384 unique IDs and added
+  `BULK-006` through `BULK-012` for the exact public surface, ordered
+  subsets, target-guided values, restricted targets, multi-chunk rollback,
+  rollback-only transaction behavior and cancellation/timeout recovery.
+- Added offline raw/wrapper/stub/source contracts, seven Docker SQL-auth
+  contracts and public vendored-Tiberius metadata-bridge contracts without
+  changing production code.
+- The canonical matrix contract passes `26/26` with 384 unique IDs and
+  one-to-one strict-test attachment.
+- The observed vendored RED is exactly `E0432` for the absent public
+  `validate_bulk_insert_columns` function and `E0599` for the absent
+  `BulkLoadRequest::column_declarations()` method.
+- The exact unchanged extension was rebuilt from this worktree; its focused
+  offline contract fails `5/5` only for absent native-bulk surfaces/source,
+  and a real Docker SQL-auth table fixture reaches the same missing
+  `Connection.native_bulk_insert` `AttributeError` after successful DDL.
+- Ruff lint/format, vendored Cargo fmt and Python syntax gates pass. The
+  generated vendored `Cargo.lock` was moved recoverably to
+  `/private/tmp/fastmssql-native-red-lock-20260727/Cargo.lock`.
+- This RED-only change does not implement native bulk, change package
+  metadata, alter the displayed `0.7.7` version or publish an artifact.
+
 ### Documentation-only FastMssql native TDS bulk insert design and plan
 
 - Added the focused public/runtime design for list-bounded
