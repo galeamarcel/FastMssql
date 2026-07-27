@@ -39,6 +39,22 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Documentation-only Tiberius bulk column-subset design
+
+- Added the focused design for a safe additive
+  `Client::bulk_insert_columns(table, columns)` primitive in the vendored
+  Tiberius source while preserving `Client::bulk_insert(table)`.
+- Closed the raw-identifier grammar, exact metadata count/order checks,
+  writability flags, checked SQL type declarations, typed error behavior and
+  mandatory `BulkLoadRequest::finalize()` boundary.
+- Required a total formatter with no new-path `todo!()`, `unreachable!()` or
+  panic, plus unit and Docker SQL-auth coverage for subsets, defaults, NULLs,
+  hostile identifier characters and restricted/unsupported metadata.
+- Defined separate documentation, RED, feature and live-status branches,
+  all published only to the FastMssql fork.
+- This documentation-only design does not modify runtime behavior, package
+  metadata, the displayed `0.7.7` version or release state.
+
 ### Live audit status for typed bulk row conversion
 
 - Advanced the live production-readiness audit from bounded compatibility
