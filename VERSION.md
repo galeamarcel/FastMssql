@@ -39,6 +39,21 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Documentation-only Tiberius bulk column-subset plan
+
+- Added the task-by-task RED/feature/status plan for the approved vendored
+  Tiberius column-subset primitive.
+- Locked the exact Rust method/helper interfaces, exhaustive checked metadata
+  declarations, pre-wire identifier validation and exact ordered metadata
+  behavior.
+- Defined five direct Docker SQL-auth contracts for ordered subsets,
+  defaults/NULLs, hostile identifier characters, restricted columns,
+  unsupported metadata and connection recovery.
+- Required vendored/root Cargo, FastMssql regression, privacy, graph and
+  fork-only remote gates with observed RED ancestry.
+- This plan-only change does not modify runtime behavior, package metadata,
+  the displayed `0.7.7` version or release state.
+
 ### Documentation-only Tiberius bulk column-subset design
 
 - Added the focused design for a safe additive
