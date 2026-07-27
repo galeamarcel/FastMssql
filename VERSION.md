@@ -42,6 +42,25 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Checkout reset and first-statement DDL RED contract
+
+- Added real SQL-auth contracts requiring trigger, procedure, function and
+  view definitions to remain pristine after a reused one-connection lease
+  with the optional checkout probe disabled.
+- The same-SPID trigger contract contaminates transaction isolation first,
+  then requires `READ COMMITTED`, one exact trigger side effect and no physical
+  replacement after mandatory reset.
+- Added a deterministic downstream-gate contract requiring a stalled reset to
+  expire under the acquire deadline before the unique application write
+  reaches SQL Server, retire the uncertain session and recover on a new
+  physical identity.
+- Raised the canonical SQL-auth matrix from 384 to 387 unique IDs and aligned
+  its report/complete-evidence count contracts.
+- The expected source-baseline failures are SQL Server's first-statement DDL
+  rejection and an operation-phase rather than acquire-phase timeout.
+- This test-only change contains no runtime fix and does not modify package
+  metadata, the displayed `0.7.7` version or release state.
+
 ### Checkout reset and first-statement DDL design
 
 - Added the approved fail-closed design for completing mandatory pooled

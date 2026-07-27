@@ -19,7 +19,7 @@ import pytest
 
 from sql_auth_strict.cases import case
 from sql_auth_strict.config import SqlAuthConfig
-from sql_auth_strict.helpers import quote_identifier, scalar
+from sql_auth_strict.helpers import CleanupRegistry, quote_identifier, scalar
 
 
 pytestmark = [pytest.mark.sql_auth_strict, pytest.mark.integration]
@@ -1190,6 +1190,165 @@ async def test_impersonated_session_is_retired_before_next_checkout(
             assert restored["server_principal"] == baseline["server_principal"]
     finally:
         await sa_connection.execute(f"DROP USER IF EXISTS {quoted_user}")
+
+
+@case("POOL-024")
+@pytest.mark.asyncio
+async def test_disabled_checkout_probe_preserves_first_statement_trigger_batch(
+    sql_auth_config: SqlAuthConfig,
+    unique_sql_name: Callable[[str], str],
+    cleanup_registry: CleanupRegistry,
+) -> None:
+    source = quote_identifier(unique_sql_name("strict_reset_ddl_source"))
+    audit = quote_identifier(unique_sql_name("strict_reset_ddl_audit"))
+    trigger = quote_identifier(unique_sql_name("strict_reset_ddl_trigger"))
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {audit}")
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {source}")
+    cleanup_registry.add(f"DROP TRIGGER IF EXISTS {trigger}")
+
+    connection = _connection(
+        sql_auth_config,
+        PoolConfig(
+            max_size=1,
+            min_idle=1,
+            max_lifetime_secs=None,
+            idle_timeout_secs=None,
+            connection_timeout_secs=2,
+            test_on_check_out=False,
+            retry_connection=False,
+        ),
+    )
+
+    async with connection:
+        await connection.execute(
+            f"CREATE TABLE {source} (id INT PRIMARY KEY)"
+        )
+        await connection.execute(
+            f"CREATE TABLE {audit} (source_id INT NOT NULL)"
+        )
+        first_session = int(await scalar(connection, "SELECT @@SPID"))
+
+        contaminated = (
+            await connection.simple_query(
+                """
+                SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+                SELECT @@SPID AS session_id;
+                """
+            )
+        ).fetchone()
+        assert contaminated is not None
+        assert int(contaminated["session_id"]) == first_session
+
+        await connection.simple_query(
+            f"""
+            CREATE TRIGGER {trigger}
+            ON {source}
+            AFTER INSERT
+            AS
+            BEGIN
+                SET NOCOUNT ON;
+                INSERT INTO {audit} (source_id)
+                SELECT id FROM inserted;
+            END
+            """
+        )
+
+        assert (
+            await connection.execute(
+                f"INSERT INTO {source} (id) VALUES (24)"
+            )
+            == 1
+        )
+        observed = (
+            await connection.query(
+                f"""
+                SELECT
+                    @@SPID AS session_id,
+                    (
+                        SELECT transaction_isolation_level
+                        FROM sys.dm_exec_sessions
+                        WHERE session_id = @@SPID
+                    ) AS isolation_level,
+                    (SELECT COUNT(*) FROM {audit}) AS audit_count,
+                    (SELECT MIN(source_id) FROM {audit}) AS source_id
+                """
+            )
+        ).fetchone()
+        assert observed is not None
+        assert observed.to_dict() == {
+            "session_id": first_session,
+            "isolation_level": 2,
+            "audit_count": 1,
+            "source_id": 24,
+        }
+
+
+@case("POOL-025")
+@pytest.mark.parametrize("module_kind", ("procedure", "function", "view"))
+@pytest.mark.asyncio
+async def test_disabled_checkout_probe_preserves_module_definition_batches(
+    sql_auth_config: SqlAuthConfig,
+    unique_sql_name: Callable[[str], str],
+    cleanup_registry: CleanupRegistry,
+    module_kind: str,
+) -> None:
+    module = quote_identifier(
+        unique_sql_name(f"strict_reset_ddl_{module_kind}")
+    )
+    if module_kind == "procedure":
+        cleanup_registry.add(f"DROP PROCEDURE IF EXISTS {module}")
+        definition = f"""
+            CREATE PROCEDURE {module}
+            AS
+            BEGIN
+                SET NOCOUNT ON;
+                SELECT CAST(25 AS INT) AS value;
+            END
+        """
+        invocation = f"EXEC {module}"
+    elif module_kind == "function":
+        cleanup_registry.add(f"DROP FUNCTION IF EXISTS {module}")
+        definition = f"""
+            CREATE FUNCTION {module}()
+            RETURNS INT
+            AS
+            BEGIN
+                RETURN 25;
+            END
+        """
+        invocation = f"SELECT {module}() AS value"
+    else:
+        cleanup_registry.add(f"DROP VIEW IF EXISTS {module}")
+        definition = f"""
+            CREATE VIEW {module}
+            AS
+            SELECT CAST(25 AS INT) AS value
+        """
+        invocation = f"SELECT value FROM {module}"
+
+    connection = _connection(
+        sql_auth_config,
+        PoolConfig(
+            max_size=1,
+            min_idle=1,
+            max_lifetime_secs=None,
+            idle_timeout_secs=None,
+            connection_timeout_secs=2,
+            test_on_check_out=False,
+            retry_connection=False,
+        ),
+    )
+
+    async with connection:
+        first_session = int(await scalar(connection, "SELECT @@SPID"))
+        if module_kind == "procedure":
+            assert await connection.execute(definition) == 0
+        else:
+            await connection.simple_query(definition)
+
+        observed_session = int(await scalar(connection, "SELECT @@SPID"))
+        assert observed_session == first_session
+        assert int(await scalar(connection, invocation)) == 25
 
 
 @case("POOL-022")

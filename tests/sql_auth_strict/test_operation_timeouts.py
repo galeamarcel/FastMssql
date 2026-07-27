@@ -1199,3 +1199,94 @@ async def test_commit_unknown_and_rollback_close_timeouts_preserve_precedence(
         await closing.close()
         await close_connection.disconnect()
         await close_proxy.close()
+
+
+@case("TIME-011")
+@pytest.mark.asyncio
+async def test_checkout_reset_uses_acquire_deadline_before_application_sql(
+    sql_auth_config: SqlAuthConfig,
+    sa_connection: Connection,
+    unique_sql_name: Callable[[str], str],
+    cleanup_registry: CleanupRegistry,
+) -> None:
+    TimeoutConfig, error_type = timeout_api()
+    table = quote_identifier(
+        unique_sql_name("strict_reset_acquire_timeout")
+    )
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {table}")
+    await sa_connection.execute(f"CREATE TABLE {table} (id INT PRIMARY KEY)")
+
+    application_name = unique_sql_name("strict_reset_acquire")
+    proxy = DownstreamGateProxy(
+        sql_auth_config.host,
+        sql_auth_config.port,
+    )
+    await proxy.start()
+    connection = timeout_connection(
+        sql_auth_config,
+        host=proxy.host,
+        port=proxy.port,
+        pool_config=bounded_pool(max_size=1, min_idle=0),
+        timeout_config=TimeoutConfig(
+            acquire_timeout_secs=0.2,
+            operation_timeout_secs=0.6,
+        ),
+        application_name=application_name,
+    )
+    write_task: asyncio.Task | None = None
+    try:
+        first_session, first_connection_id = await _server_identity(connection)
+
+        proxy.pause_downstream()
+        proxy.expect_client_disconnect()
+        started = time.monotonic()
+        write_task = asyncio.ensure_future(
+            connection.execute(f"INSERT INTO {table} (id) VALUES (11)")
+        )
+        await proxy.wait_until_downstream_held()
+
+        with pytest.raises(error_type) as captured:
+            await write_task
+        elapsed = time.monotonic() - started
+        assert 0.1 <= elapsed < 0.5
+        assert_timeout(
+            captured.value,
+            phase="acquire",
+            operation="execute",
+            retryable=True,
+            discarded=False,
+            outcome_unknown=False,
+        )
+        assert captured.value.timeout_seconds == pytest.approx(0.2)
+
+        proxy.resume_downstream()
+        assert await _row_count(sa_connection, table) == 0
+        await wait_until(
+            lambda: _identity_absent(
+                sa_connection,
+                first_session,
+                first_connection_id,
+            )
+        )
+
+        second_session, second_connection_id = await _server_identity(connection)
+        assert (second_session, second_connection_id) != (
+            first_session,
+            first_connection_id,
+        )
+        assert await scalar(connection, "SELECT 11") == 11
+    finally:
+        proxy.resume_downstream()
+        if write_task is not None and not write_task.done():
+            write_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await write_task
+        await connection.disconnect()
+        await proxy.close()
+
+    await wait_until(
+        lambda: _application_sessions_absent(
+            sa_connection,
+            application_name,
+        )
+    )

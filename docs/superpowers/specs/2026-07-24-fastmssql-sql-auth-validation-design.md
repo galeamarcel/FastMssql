@@ -265,6 +265,11 @@ evidence reference.
 - `POOL-023`: scope-bound database-user impersonation inside dynamic SQL
   reverts before the operation completes and does not unnecessarily retire the
   physical session.
+- `POOL-024`: disabling the optional checkout probe still completes mandatory
+  reset before a first-statement trigger definition without replacing the
+  physical SQL Server session.
+- `POOL-025`: procedure, function and view definitions remain pristine after a
+  reused lease when the optional checkout probe is disabled.
 
 ### OBS — pool observability
 
@@ -800,6 +805,8 @@ violated. No marketing claim is declared proven from a single emulated host.
   timeout remains visible.
 - `TIME-010`: FastAPI and Flask-through-ASGI preserve typed errors and recover
   after 1,000 bounded operations.
+- `TIME-011`: a stalled mandatory checkout reset expires in the acquire phase,
+  retires the uncertain physical session and starts no application SQL.
 
 ### LIFE — connection lifecycle and graceful shutdown
 
