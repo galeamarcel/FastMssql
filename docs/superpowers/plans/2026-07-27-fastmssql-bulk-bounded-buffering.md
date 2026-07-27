@@ -112,7 +112,8 @@ Expected: both commands exit zero.
   `Connection.bulk_insert(table: str, columns: list[str], rows: list[list[Any]])`.
 - Produces:
   `test_bulk_insert_does_not_convert_cells_during_method_creation` and
-  `test_empty_bulk_insert_is_zero_io_and_zero_metric`.
+  `test_empty_bulk_insert_is_zero_io_and_zero_metric`, plus the self-review
+  contract `test_bulk_insert_rejects_resized_input_before_pool_activity`.
 
 - [ ] **Step 1: Write the conversion probe and timing test**
 
@@ -212,11 +213,36 @@ async def test_empty_bulk_insert_is_zero_io_and_zero_metric() -> None:
 Expected: FAIL with the unreachable endpoint because the unchanged method
 initializes/checks out the pool for an empty list.
 
-- [ ] **Step 5: Record the RED contract in `VERSION.md`**
+- [ ] **Step 5: Add the top-level resize contract found by self-review**
+
+Create an awaitable from a one-row list, append a second row before yielding
+control, then require:
+
+```python
+with pytest.raises(
+    ValueError,
+    match="bulk_insert data_rows must not be resized while the operation is running",
+):
+    await awaitable
+```
+
+The connection must remain unopened and the one admitted bulk operation must
+complete with exactly one `errors` outcome.
+
+- [ ] **Step 6: Observe the resize RED on the unchanged extension**
+
+Run the test with `PYTHONPATH=python` from the RED worktree so an editable
+install from another worktree cannot substitute its native module.
+
+Expected: FAIL with `OperationTimeoutError` in the acquire phase. That proves
+the unchanged implementation silently accepted the resized list and attempted
+pool work instead of rejecting it locally.
+
+- [ ] **Step 7: Record the RED contract in `VERSION.md`**
 
 Add a `Compatibility bulk bounded-buffering RED coverage` subsection stating
-that the branch adds tests only, both failures are observed on the unchanged
-implementation, and the displayed/package version remains `0.7.7`.
+that the branch adds tests only, all three failures are observed on the
+unchanged implementation, and the displayed/package version remains `0.7.7`.
 
 ### Task 3: Add the real SQL Server late-conversion RED
 
@@ -695,6 +721,7 @@ fn convert_bulk_chunk(
     start: usize,
     rows_per_batch: usize,
     col_count: usize,
+    expected_row_count: usize,
 ) -> PyResult<Vec<FastParameter>>;
 ```
 
@@ -706,10 +733,22 @@ fn convert_bulk_chunk(
     start: usize,
     rows_per_batch: usize,
     col_count: usize,
+    expected_row_count: usize,
 ) -> PyResult<Vec<FastParameter>> {
     Python::attach(|py| {
         let rows = data_rows.bind(py);
-        let end = start.saturating_add(rows_per_batch).min(rows.len());
+        if rows.len() != expected_row_count {
+            return Err(PyValueError::new_err(
+                "bulk_insert data_rows must not be resized while the operation is running",
+            ));
+        }
+        if start >= expected_row_count {
+            return Err(PyValueError::new_err(
+                "bulk_insert chunk offset is outside the captured input",
+            ));
+        }
+        let remaining = expected_row_count - start;
+        let end = start + rows_per_batch.min(remaining);
         let mut chunk = Vec::with_capacity((end - start) * col_count);
         for row_index in start..end {
             let row = rows.get_item(row_index)?;
@@ -757,6 +796,7 @@ let mut chunk = convert_bulk_chunk(
     start,
     rows_per_batch,
     col_count,
+    row_count,
 )?;
 ```
 
@@ -775,17 +815,21 @@ start += row_count_in_batch;
 if start >= row_count {
     break;
 }
+drop(chunk);
 chunk = convert_bulk_chunk(
     &data_rows,
     start,
     rows_per_batch,
     col_count,
+    row_count,
 )?;
 ```
 
-Build parameter references only for the current `chunk`. Use
-`checked_add()` for `total_affected`; overflow returns a local typed Python
-error and follows the existing rollback path.
+The explicit `drop(chunk)` is required because Rust evaluates an assignment's
+right-hand side before dropping its previous left-hand value. Build parameter
+references only for the current `chunk`. Use `checked_add()` for
+`total_affected`; overflow returns a local typed Python error and follows the
+existing rollback path.
 
 - [ ] **Step 5: Correct the validation-test explanation**
 
