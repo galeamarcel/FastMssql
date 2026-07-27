@@ -38,6 +38,30 @@ Changes currently integrated on `test/sql-auth-validation`:
 
 No release, package-version change, or artifact publication has occurred.
 
+### Documentation-only enterprise batch/bulk design
+
+- Added the approved enterprise design for bounded compatibility bulk,
+  explicit native TDS bulk copy, iterable backpressure, `execute_many()` and
+  bounded-concurrency `query_many()`.
+- The design preserves the existing `INSERT ... VALUES` semantics under
+  `bulk_insert()` and gives native bulk a separate API so trigger, identity,
+  default and computed-column behavior cannot change silently.
+- The executable plan decomposes the work into seven focused
+  RED/implementation branch pairs, followed by cumulative Docker, stress,
+  wheel, hosted-OS, RustSec and live-audit gates.
+- Added the first fully executable slice plan for bounded compatibility-bulk
+  conversion, including deterministic pre-await RED evidence, real SQL Server
+  late-conversion rollback, empty zero-I/O behavior, RSS/event-loop probes and
+  exact RED-to-fix ancestry.
+- Plan self-review fixed explicit-transaction settlement and rollback-only
+  behavior, and made operation-metric ownership exact: compatibility/native
+  bulk share the `bulk_insert` family while `execute_many` introduces the
+  versioned schema-2 key.
+- Baseline evidence on the design base is FastMssql Rust `71/71`, vendored
+  Tiberius `162/162` and real SQL-auth batch/bulk `20/20`.
+- This documentation change does not modify runtime behavior, package
+  metadata, the displayed `0.7.7` version or release state.
+
 ### Documentation-only design work
 
 - Added the approved enterprise resultsets, bounded async streaming and RPC
