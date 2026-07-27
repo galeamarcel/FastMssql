@@ -488,6 +488,32 @@ evidence reference.
   conversion failure after server EOF retires rather than reuses the
   connection.
 
+### RPC — direct stored procedures, output values, and return status
+
+- `RPC-001`: a direct named procedure with no parameters preserves its exact
+  signed nonzero return status without constructing an `EXEC` SQL string.
+- `RPC-002`: positional INPUT, OUTPUT, and INPUT_OUTPUT integers round-trip,
+  and output mappings are fresh snapshots keyed by original descriptor index.
+- `RPC-003`: Unicode, binary, decimal, UUID, date, time, DATETIME2, and
+  DATETIMEOFFSET outputs preserve exact Python values and types.
+- `RPC-004`: multiple and empty result sets remain in wire order before the
+  terminal output mapping and return status become available.
+- `RPC-005`: reordered NVARCHAR(MAX) and VARBINARY(MAX) output tokens match
+  their original validated names and positional ordinals, never arrival order.
+- `RPC-006`: return status zero remains an integer distinct from an absent
+  status, and an explicit RETURN_VALUE descriptor receives the same value.
+- `RPC-007`: nonfatal SQL errors, cancelled receives, and complete early close
+  each apply their exact reset-or-retire connection disposition.
+- `RPC-008`: positional/named modes, direction rules, parameter count, and
+  procedure/parameter identifier grammars are deterministic, injection-safe,
+  value-free, and validated before pool checkout.
+- `RPC-009`: pooled connection, pooled transaction, and direct compatibility
+  transaction paths preserve identical result/output/status behavior.
+- `RPC-010`: concurrent direct RPC calls preserve independent outputs without
+  exceeding the configured physical pool/session bound.
+- `RPC-011`: a recycled physical session returns to READ COMMITTED before a
+  named RPC; punctuation-bearing procedure input is rejected before checkout.
+
 ### BATCH — query batch, execute batch, and bulk insert
 
 - `BATCH-001`: empty/single/multiple query batches.

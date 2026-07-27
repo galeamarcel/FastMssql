@@ -191,3 +191,21 @@ No release, package-version change, or artifact publication has occurred.
   streaming and fail-closed resource-release semantics.
 - This feature does not change package metadata, the displayed `0.7.7`
   version or release state.
+
+### RED direct RPC output and return-status contracts
+
+- Added real SQL-auth procedure fixtures for direct RPC return status,
+  INPUT/OUTPUT/INPUT_OUTPUT values, exact scalar output types, multiple and
+  empty result sets, and reordered MAX output tokens.
+- Added fail-closed SQL error, receive-cancellation and early-close coverage,
+  conservative procedure/parameter identifier grammars, direction misuse,
+  pooled/direct transaction parity, bounded concurrent calls and recycled
+  READ COMMITTED isolation.
+- Added runtime/stub contracts for exact `callproc()` signatures, output
+  mapping key types, fresh-dictionary snapshots and complete direction
+  documentation.
+- Registered RPC-001..011 in the required local runner and raised the exact
+  central SQL-auth matrix total from 361 to 372.
+- This RED branch records required behavior only; it does not implement
+  `callproc()`, change package metadata, alter the displayed `0.7.7` version,
+  or publish a release.

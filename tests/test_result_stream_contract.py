@@ -32,6 +32,11 @@ STREAM_METHODS = {
         ("str",),
     ),
 }
+CALLPROC_METHOD = (
+    ("self", "procedure", "params"),
+    ("buffer_size",),
+    ("str", "list[Any] | Parameters | None"),
+)
 RESULT_PROPERTIES = {
     "ColumnMetadata": {
         "ordinal": "int",
@@ -170,6 +175,45 @@ def _assert_stub_stream_signature(
     assert tuple(
         argument.arg for argument in method.args.kwonlyargs
     ) == keyword_only
+    assert len(method.args.kw_defaults) == 1
+    assert ast.literal_eval(method.args.kw_defaults[0]) == 64
+    assert tuple(
+        ast.unparse(argument.annotation)
+        for argument in method.args.args[1:]
+    ) == annotations
+    assert ast.unparse(method.args.kwonlyargs[0].annotation) == "int"
+    assert ast.unparse(method.returns) == "ResultStream"
+
+
+def _assert_runtime_callproc_signature(owner: type) -> None:
+    positional, keyword_only, _ = CALLPROC_METHOD
+    signature = _runtime_method_signature(owner, "callproc")
+    assert tuple(signature.parameters) == positional + keyword_only
+    assert signature.parameters["self"].kind in {
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    }
+    assert all(
+        signature.parameters[item].kind
+        is inspect.Parameter.POSITIONAL_OR_KEYWORD
+        for item in positional[1:]
+    )
+    assert signature.parameters["params"].default is None
+    assert signature.parameters["buffer_size"].kind is (
+        inspect.Parameter.KEYWORD_ONLY
+    )
+    assert signature.parameters["buffer_size"].default == 64
+
+
+def _assert_stub_callproc_signature(class_node: ast.ClassDef) -> None:
+    positional, keyword_only, annotations = CALLPROC_METHOD
+    method = _method(class_node, "callproc", asynchronous=True)
+    assert tuple(argument.arg for argument in method.args.args) == positional
+    assert tuple(
+        argument.arg for argument in method.args.kwonlyargs
+    ) == keyword_only
+    assert len(method.args.defaults) == 1
+    assert ast.literal_eval(method.args.defaults[0]) is None
     assert len(method.args.kw_defaults) == 1
     assert ast.literal_eval(method.args.kw_defaults[0]) == 64
     assert tuple(
@@ -340,6 +384,62 @@ def test_transaction_publishes_exact_stream_and_batch_signatures() -> None:
         transaction = _class(tree, "Transaction")
         for name in STREAM_METHODS:
             _assert_stub_stream_signature(transaction, name)
+
+
+def test_connection_and_transaction_publish_exact_callproc_signatures() -> None:
+    _, wrapper_stub, core_stub, _ = _package_files()
+    core = importlib.import_module("fastmssql.fastmssql")
+
+    for owner in (
+        fastmssql.Connection,
+        core.Connection,
+        fastmssql.Transaction,
+        core.Transaction,
+    ):
+        _assert_runtime_callproc_signature(owner)
+
+    for path in (wrapper_stub, core_stub):
+        tree = _tree(path)
+        _assert_stub_callproc_signature(_class(tree, "Connection"))
+        _assert_stub_callproc_signature(_class(tree, "Transaction"))
+
+
+def test_stubs_document_direct_rpc_output_direction_contract() -> None:
+    _, wrapper_stub, core_stub, _ = _package_files()
+    core = importlib.import_module("fastmssql.fastmssql")
+    wrapper_tree = _tree(wrapper_stub)
+    core_tree = _tree(core_stub)
+    wrapper_documentation = (ast.get_docstring(wrapper_tree) or "").lower()
+    parameter_documentation = (
+        ast.get_docstring(_class(core_tree, "Parameter")) or ""
+    ).lower()
+    parameters_documentation = (
+        ast.get_docstring(_class(core_tree, "Parameters")) or ""
+    ).lower()
+
+    for documentation in (
+        wrapper_documentation,
+        parameter_documentation,
+        parameters_documentation,
+    ):
+        assert "callproc" in documentation
+        assert "output" in documentation
+        assert "input_output" in documentation
+        assert "return_value" in documentation
+        assert "input-only" not in documentation
+        assert "currently supports input only" not in documentation
+
+    wrapper_imports = _imported_names(wrapper_tree, "fastmssql")
+    wrapper_all = set(_all_names(wrapper_tree))
+    assert {"Parameter", "Parameters", "ResultSummary"} <= wrapper_imports
+    assert {"Parameter", "Parameters", "ResultSummary"} <= wrapper_all
+    assert fastmssql.Parameter is core.Parameter
+    assert fastmssql.Parameters is core.Parameters
+    _assert_property(
+        _class(core_tree, "ResultSummary"),
+        "output_parameters",
+        "dict[str | int, object]",
+    )
 
 
 @pytest.mark.asyncio
