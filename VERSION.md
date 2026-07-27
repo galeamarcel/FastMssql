@@ -49,9 +49,10 @@ No release, package-version change, or artifact publication has occurred.
 - Empty input now returns `0` before lifecycle admission, pool initialization
   or operation-metric accounting. Identifier validation remains local and
   synchronous.
-- Captured the top-level input length and now reject any resize at each chunk
-  boundary. A preflight resize remains zero-I/O; a resize after `BEGIN`
-  follows the same full rollback path as a late value-conversion failure.
+- Captured the top-level input length, revalidate it at each conversion
+  boundary, and reject any detected resize. A resize detected during first
+  preflight remains zero-I/O; one detected after `BEGIN` follows the same full
+  rollback path as a late value-conversion failure.
 - Preserved one atomic transaction across all compatibility chunks, added
   checked `u64` affected-row aggregation, and retained timeout, cancellation,
   rollback and connection-retirement behavior.
@@ -97,9 +98,9 @@ No release, package-version change, or artifact publication has occurred.
   SQL-auth cases remain green on the exact RED build.
 - Tightened the offline probe to one-second connect/acquire budgets so the RED
   reason is deterministic rather than a global pytest timeout.
-- This branch adds RED tests and execution-plan evidence only; it does not
-  change runtime behavior, package metadata, the displayed `0.7.7` version or
-  release state.
+- The RED branch adds tests and execution-plan evidence only; those commits do
+  not change runtime behavior, package metadata, the displayed `0.7.7` version
+  or release state.
 
 ### Documentation-only enterprise batch/bulk design
 
