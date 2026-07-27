@@ -571,6 +571,63 @@ asyncio.run(main())
 
 Parameters use positional placeholders: `@P1`, `@P2`, ... Provide values as a list in the same order.
 
+### Native TDS bulk insert
+
+Use `native_bulk_insert()` when rows should travel through SQL Server's native
+TDS bulk protocol rather than parameterized `INSERT ... VALUES` statements:
+
+```python
+async with Connection(conn_str) as conn:
+    affected = await conn.native_bulk_insert(
+        "dbo.events",
+        ["event_id", "payload", "bucket"],
+        [
+            [1, "created", 10],
+            [2, "updated", 20],
+        ],
+        chunk_size=1000,
+    )
+    assert affected == 2
+```
+
+This API is deliberately list-only in `0.7.7`: `rows` must be a concrete
+Python `list`, every row must also be a concrete `list`, and every row must
+have exactly one cell per requested column. Generators, async generators and
+other iterables are not accepted yet. `chunk_size` defaults to 1,000 and must
+be between 1 and 10,000. Empty input returns `0` without opening the pool or
+recording a bulk operation. Treat the input lists as immutable until the
+awaitable completes; resizing the top-level list is detected and rejected.
+
+Values are converted against the exact target metadata, including integer
+width, decimal precision/scale, ANSI or Unicode length, binary length, UUID,
+date/time family and scale, XML, and target-shaped NULLs. The native path
+enforces CHECK and foreign-key constraints, fires triggers, and preserves an
+explicit NULL; a target default applies only when that column is omitted.
+Identity, computed and rowversion targets are rejected. MONEY/SMALLMONEY,
+SQL_VARIANT, spatial/hierarchyid/CLR UDT and legacy LOB targets are not
+supported by this API.
+
+`Connection.native_bulk_insert()` retains one pooled physical connection and
+one SQL transaction across every chunk, then commits once. A reusable failure
+before COMMIT rolls the whole call back; uncertain protocol or timeout paths
+retire the physical connection and are never retried transparently.
+
+The same method is available on an active transaction and never settles it:
+
+```python
+async with conn.transaction() as transaction:
+    await transaction.native_bulk_insert(
+        "dbo.events",
+        ["event_id", "payload", "bucket"],
+        [[3, "deleted", 30]],
+    )
+```
+
+After a reusable post-wire failure, that transaction becomes rollback-only:
+data operations and COMMIT are rejected until ROLLBACK. The existing
+`bulk_insert()` method remains the compatibility path based on parameterized
+`INSERT ... VALUES`; it is not silently redirected to native bulk.
+
 ### Batch operations
 
 For high-throughput scenarios, use batch methods to reduce network round-trips:

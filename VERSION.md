@@ -42,6 +42,50 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Native TDS bulk insert implementation
+
+- Added explicit list-only `Connection.native_bulk_insert()` and
+  `Transaction.native_bulk_insert()` APIs over the ordered-column TDS bulk
+  primitive, with exact server-target-guided conversion and checked affected
+  counts.
+- The connection form keeps one pooled physical lease and one SQL transaction
+  across every chunk. The transaction form remains settlement-neutral and
+  enters an explicit rollback-only state after a reusable post-wire failure.
+- Added mandatory request finalization or fail-closed connection retirement,
+  one absolute operation deadline, cancellation/forced-shutdown handling and
+  privacy-safe global row/column/parameter diagnostics.
+- Local row-encoding failures discovered only after `send()` starts now
+  retire the partial bulk stream immediately instead of issuing cleanup SQL
+  on an undrained request.
+- Extended the additive ordered Tiberius path with constraint checking,
+  trigger firing, explicit-NULL preservation and XML-as-NVARCHAR(MAX) bulk
+  wire normalization while keeping compatibility `bulk_insert()` unchanged.
+- Added an atomic native-bulk stress harness. Real Docker SQL-auth profiles
+  passed for 1,000, 10,000 and the explicitly enabled 99,999 rows with exact
+  duplicate primary/probe persistence, one physical session, stable identity,
+  event-loop progress, bounded RSS and zero teardown sessions.
+- The 99,999-row primary call completed at approximately 165,430 rows/second
+  on the local validation host; the one-chunk transaction-call probe recorded
+  p99 approximately 23.1 ms, RSS growth 4,554,752 bytes and maximum event-loop
+  stall approximately 7.9 ms under explicit 64 MiB/100 ms/60 s budgets.
+- These measurements cover concrete list input only and do not claim iterable
+  backpressure, byte-level LOB streaming, `execute_many()` or `query_many()`.
+  Package metadata, the displayed `0.7.7` version and release state remain
+  unchanged.
+
+### Native TDS bulk wire-encoding retirement RED contract
+
+- Extended `BULK-010` with a real UTF-8 `VARCHAR(1)` boundary where one
+  Unicode character exceeds the target's encoded-byte capacity only inside
+  Tiberius row encoding.
+- Required a post-`send()` local encoding failure to retire the physical
+  connection immediately, without issuing cleanup SQL on the undrained bulk
+  stream or attaching a secondary cleanup error.
+- The regression also requires zero persisted rows, a replacement physical
+  identity and successful post-fault pool smoke. This test-only change does
+  not change runtime behavior, package metadata, the displayed `0.7.7`
+  version or release state.
+
 ### Native TDS bulk stress row-shape RED contract
 
 - Added a focused executable contract requiring the stress harness to build

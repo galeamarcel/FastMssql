@@ -88,7 +88,8 @@ FROM [db]]name].[dbo].[order]"
             .insert_query(&columns)
             .expect("validated declarations must produce a closed query"),
         "INSERT BULK [db]]name].[dbo].[order] \
-([select] int, [amount]]net] varchar(20), [literal.dot] nvarchar(20))"
+([select] int, [amount]]net] varchar(20), [literal.dot] nvarchar(20)) \
+WITH (CHECK_CONSTRAINTS, FIRE_TRIGGERS, KEEP_NULLS)"
     );
 }
 
@@ -183,7 +184,8 @@ fn only_explicitly_writable_unrestricted_columns_are_accepted() {
         target
             .insert_query(&[accepted])
             .expect("non-restrictive metadata flags must remain supported"),
-        "INSERT BULK [dbo].[target] ([value] int)"
+        "INSERT BULK [dbo].[target] ([value] int) \
+WITH (CHECK_CONSTRAINTS, FIRE_TRIGGERS, KEEP_NULLS)"
     );
 }
 
@@ -254,6 +256,15 @@ fn supported_metadata_has_exact_checked_declarations() {
                 scale: 4,
             },
             "numeric(19,4)",
+        ),
+        (
+            TypeInfo::VarLenSizedPrecision {
+                ty: VarLenType::Decimaln,
+                size: 17,
+                precision: 19,
+                scale: 4,
+            },
+            "decimal(19,4)",
         ),
         (
             TypeInfo::Xml {
@@ -348,8 +359,8 @@ fn invalid_or_unsupported_metadata_is_typed_and_never_panics() {
         },
         TypeInfo::VarLenSizedPrecision {
             ty: VarLenType::Numericn,
-            size: 13,
-            precision: 19,
+            size: 9,
+            precision: 20,
             scale: 4,
         },
         TypeInfo::VarLenSizedPrecision {

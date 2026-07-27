@@ -24,6 +24,10 @@ use crate::lifecycle::{
     ConnectionLifecycle, ForceRequested, ForcedShutdownParticipant, LifecycleFailure,
     TransactionPermit, run_force_aware,
 };
+use crate::native_bulk::{
+    PreparedNativeBulk, parse_native_chunk_size, prepare_native_bulk, run_native_bulk_chunks,
+    set_native_connection_discarded,
+};
 use crate::operation_metrics::{OperationMetricsRegistry, OperationObserver, observe_operation};
 use crate::parameter_conversion::{convert_parameters_to_fast, params_as_sql_refs};
 use crate::pool_config::PyPoolConfig;
@@ -132,6 +136,7 @@ enum TransactionState {
     Idle,
     Beginning,
     Active,
+    RollbackOnly,
     Executing,
     Committing,
     Committed,
@@ -156,6 +161,9 @@ impl TransactionState {
     fn ensure_connection_usable(self) -> PyResult<()> {
         match self {
             Self::Idle | Self::Active | Self::Committed | Self::RolledBack => Ok(()),
+            Self::RollbackOnly => Err(PyRuntimeError::new_err(
+                "Transaction is rollback-only; rollback required before reuse",
+            )),
             Self::Beginning
             | Self::Executing
             | Self::Committing
@@ -591,7 +599,13 @@ impl TransactionCommand {
                 Self::Begin,
                 TransactionState::Idle | TransactionState::Committed | TransactionState::RolledBack,
             )
-            | (Self::Commit | Self::Rollback, TransactionState::Active) => Ok(()),
+            | (Self::Commit | Self::Rollback, TransactionState::Active)
+            | (Self::Rollback, TransactionState::RollbackOnly) => Ok(()),
+            (Self::Begin | Self::Commit, TransactionState::RollbackOnly) => {
+                Err(PyRuntimeError::new_err(
+                    "Transaction is rollback-only; rollback required before reuse",
+                ))
+            }
             (Self::Begin, TransactionState::Active) => {
                 Err(PyRuntimeError::new_err("Transaction has already begun"))
             }
@@ -638,7 +652,7 @@ fn command_deadline(
     }
 }
 
-fn is_deterministic_commit_rejection(error: &PyErr) -> bool {
+pub(crate) fn is_deterministic_commit_rejection(error: &PyErr) -> bool {
     Python::attach(|py| {
         if !error.is_instance_of::<SqlError>(py) {
             return false;
@@ -1377,6 +1391,36 @@ impl Transaction {
         })
     }
 
+    #[pyo3(signature = (table, columns, rows, *, chunk_size = 1000))]
+    pub fn native_bulk_insert<'p>(
+        &self,
+        py: Python<'p>,
+        table: String,
+        columns: Vec<String>,
+        rows: &Bound<'p, PyList>,
+        #[pyo3(from_py_with = parse_native_chunk_size)] chunk_size: usize,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let input = prepare_native_bulk(table, columns, rows, chunk_size)?;
+        let session = Arc::clone(&self.session);
+        let timeout_config = self.timeout_config.clone();
+
+        if input.is_empty() {
+            return future_into_py(py, async move {
+                let mut session = session.lock().await;
+                Self::ensure_native_bulk_active(&mut session, &timeout_config)?;
+                Ok(0u64)
+            });
+        }
+
+        let operation_metrics = self.operation_metrics.clone();
+        future_into_py(py, async move {
+            observe_operation(operation_metrics, OperationName::BulkInsert, async move {
+                Self::execute_transaction_native_bulk(&session, &timeout_config, input).await
+            })
+            .await
+        })
+    }
+
     /// Release the direct socket or shared pool lease.
     pub fn close<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let session = Arc::clone(&self.session);
@@ -1399,7 +1443,10 @@ impl Transaction {
                 let mut close_result: PyResult<()> = Ok(());
 
                 if let Some(conn_ref) = conn.as_mut() {
-                    if previous_state == TransactionState::Active {
+                    if matches!(
+                        previous_state,
+                        TransactionState::Active | TransactionState::RollbackOnly
+                    ) {
                         conn_ref.begin_operation();
                         let deadline =
                             deadline_from(TimeoutPhase::Rollback, timeout_config.rollback_timeout);
@@ -1582,6 +1629,156 @@ impl Transaction {
                 Err(error)
             }
         }
+    }
+
+    fn ensure_native_bulk_active(
+        session: &mut TransactionSession,
+        timeout_config: &PyTimeoutConfig,
+    ) -> PyResult<Option<Deadline>> {
+        if let Some(error) = session.lifecycle_error() {
+            return Err(error);
+        }
+        match session.state {
+            TransactionState::Active => {}
+            TransactionState::RollbackOnly => {
+                return Err(PyRuntimeError::new_err(
+                    "Transaction is rollback-only; rollback required before reuse",
+                ));
+            }
+            TransactionState::Idle => {
+                return Err(PyRuntimeError::new_err("Transaction has not begun"));
+            }
+            TransactionState::Committed => {
+                return Err(PyRuntimeError::new_err(
+                    "Transaction has already been committed",
+                ));
+            }
+            TransactionState::RolledBack => {
+                return Err(PyRuntimeError::new_err(
+                    "Transaction has already been rolled back",
+                ));
+            }
+            TransactionState::Beginning
+            | TransactionState::Executing
+            | TransactionState::Committing
+            | TransactionState::RollingBack
+            | TransactionState::Failed
+            | TransactionState::Closing => {
+                return Err(PyRuntimeError::new_err(
+                    "Transaction state is indeterminate; call close() before reuse",
+                ));
+            }
+        }
+
+        if let Some(elapsed) = session.retire_expired_lifetime() {
+            return Err(transaction_timeout_error(
+                elapsed,
+                OperationName::BulkInsert,
+                false,
+            ));
+        }
+        if session.conn.is_none() {
+            return Err(PyRuntimeError::new_err("Connection is not established"));
+        }
+
+        Ok(earliest_deadline(
+            deadline_from(TimeoutPhase::Operation, timeout_config.operation_timeout),
+            session.lifetime_deadline,
+        ))
+    }
+
+    async fn execute_transaction_native_bulk(
+        session: &Arc<AsyncMutex<TransactionSession>>,
+        timeout_config: &PyTimeoutConfig,
+        input: PreparedNativeBulk,
+    ) -> PyResult<u64> {
+        let mut cancellation_guard = TransactionCancellationGuard::new(Arc::clone(session));
+        let mut session = session.lock().await;
+        let deadline = Self::ensure_native_bulk_active(&mut session, timeout_config)?;
+        session.authorize_data(OperationName::BulkInsert, true, false)?;
+
+        if let Some(connection) = session.conn.as_mut() {
+            connection.begin_operation();
+        }
+        let epoch = session.enter_in_flight(TransactionState::Executing);
+        cancellation_guard.arm(epoch);
+        let force_receiver = session.force_receiver();
+
+        let operation = match session.conn.as_mut() {
+            Some(connection) => {
+                run_with_optional_force(
+                    force_receiver,
+                    run_until(
+                        deadline,
+                        catch_driver_panic(run_native_bulk_chunks(connection, &input)),
+                    ),
+                )
+                .await
+            }
+            None => Ok(Ok(Ok(Err(crate::native_bulk::NativeBulkFailure {
+                error: PyRuntimeError::new_err("Connection is not established"),
+                any_row_sent: false,
+                protocol_reusable: false,
+            })))),
+        };
+
+        let result = match operation {
+            Err(ForceRequested) => {
+                let failure = session
+                    .forced_failure(OperationName::BulkInsert, true)
+                    .ok_or_else(|| {
+                        PyRuntimeError::new_err(
+                            "forced native bulk operation lost its lifecycle permit",
+                        )
+                    })?;
+                session.retire_connection(Some(failure));
+                session.transition_to(TransactionState::Failed);
+                Err(failure.into_pyerr())
+            }
+            Ok(Err(elapsed)) => {
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+                Err(transaction_timeout_error(
+                    elapsed,
+                    OperationName::BulkInsert,
+                    false,
+                ))
+            }
+            Ok(Ok(Err(driver_panic))) => {
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+                Err(driver_panic)
+            }
+            Ok(Ok(Ok(Ok(total)))) => {
+                if let Some(connection) = session.conn.as_mut() {
+                    let synchronized: PyResult<()> = Ok(());
+                    connection.finish_operation(&synchronized);
+                }
+                session.transition_to(TransactionState::Active);
+                Ok(total)
+            }
+            Ok(Ok(Ok(Err(failure)))) if failure.protocol_reusable => {
+                if let Some(connection) = session.conn.as_mut() {
+                    let synchronized: PyResult<()> = Ok(());
+                    connection.finish_operation(&synchronized);
+                }
+                set_native_connection_discarded(&failure.error, false);
+                if failure.any_row_sent {
+                    session.transition_to(TransactionState::RollbackOnly);
+                } else {
+                    session.transition_to(TransactionState::Active);
+                }
+                Err(failure.error)
+            }
+            Ok(Ok(Ok(Err(failure)))) => {
+                set_native_connection_discarded(&failure.error, true);
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+                Err(failure.error)
+            }
+        };
+        cancellation_guard.disarm();
+        result
     }
 
     fn begin_data_operation(
@@ -1952,6 +2149,44 @@ mod cancellation_retirement_tests {
 
         assert_eq!(session.state, TransactionState::Failed);
         assert!(session.conn.is_none());
+    }
+
+    #[test]
+    fn rollback_only_rejects_data_and_commit_but_permits_rollback() {
+        let data_error = TransactionState::RollbackOnly
+            .ensure_connection_usable()
+            .expect_err("rollback-only state must reject another data operation");
+        assert!(data_error.to_string().contains("rollback required"));
+
+        let commit_error = TransactionCommand::Commit
+            .validate(TransactionState::RollbackOnly)
+            .expect_err("rollback-only state must reject COMMIT");
+        assert!(commit_error.to_string().contains("rollback required"));
+
+        TransactionCommand::Rollback
+            .validate(TransactionState::RollbackOnly)
+            .expect("ROLLBACK must remain the recovery path");
+    }
+
+    #[test]
+    fn rollback_only_retains_the_transaction_lifetime_deadline() {
+        let lifetime = Deadline {
+            at: Instant::now() + Duration::from_secs(1),
+            timeout: Duration::from_secs(1),
+            phase: TimeoutPhase::Transaction,
+        };
+        let mut session = TransactionSession {
+            state: TransactionState::Active,
+            lifetime_deadline: Some(lifetime),
+            ..TransactionSession::default()
+        };
+
+        session.transition_to(TransactionState::RollbackOnly);
+
+        assert_eq!(
+            session.lifetime_deadline.map(|value| value.at),
+            Some(lifetime.at)
+        );
     }
 
     #[test]

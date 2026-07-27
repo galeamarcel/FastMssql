@@ -1522,6 +1522,68 @@ pub(crate) fn python_to_single_fast_parameter(
     }
 }
 
+pub(crate) fn python_to_target_column_data(
+    obj: &Bound<PyAny>,
+    target: &SqlParameterType,
+    parameter_index: usize,
+) -> PyResult<tiberius::ColumnData<'static>> {
+    let convert_value = |value: &Bound<PyAny>| {
+        if let Ok(typed_null) = value.extract::<TypedNull>() {
+            let expected = typed_null_for(target);
+            if typed_null != expected {
+                return Err(typed_conversion_error(
+                    parameter_index,
+                    &target.declaration(),
+                    "typed_null_mismatch",
+                    "TypedNull does not match the native bulk target type",
+                ));
+            }
+            return Ok(FastParameter::typed(
+                FastParameterValue::Null(typed_null),
+                target.clone(),
+            ));
+        }
+        python_to_typed_fast_parameter_value(value, target, parameter_index)
+    };
+
+    let parameter = if let Ok(parameter) = obj.extract::<Py<Parameter>>() {
+        let parameter = parameter.borrow(obj.py());
+        if parameter.direction != ParameterDirection::Input {
+            return Err(typed_conversion_error(
+                parameter_index,
+                &target.declaration(),
+                "unsupported_direction",
+                "Only INPUT Parameter descriptors are supported by native bulk insert",
+            ));
+        }
+        if parameter.expanded {
+            return Err(typed_conversion_error(
+                parameter_index,
+                &target.declaration(),
+                "expanded_not_supported",
+                "Expanded Parameter descriptors cannot represent one native bulk cell",
+            ));
+        }
+        if parameter
+            .sql_type
+            .as_ref()
+            .is_some_and(|declared| declared != target)
+        {
+            return Err(typed_conversion_error(
+                parameter_index,
+                &target.declaration(),
+                "target_type_mismatch",
+                "Parameter SQL type does not match the native bulk target type",
+            ));
+        }
+        convert_value(parameter.value.bind(obj.py()))?
+    } else {
+        convert_value(obj)?
+    };
+
+    Ok(parameter.into_rpc_parts().0)
+}
+
 fn parameter_count_error(count: usize) -> PyErr {
     PyValueError::new_err(format!(
         "Too many parameters: {count} provided, but FastMssql supports maximum 2,098 user \
@@ -1660,7 +1722,7 @@ fn expanded_item_to_fast_parameter(
 /// not possible for nulls when just using `None`. In such cases, SQL Server will complain about being unable to cast 'tinyint'
 /// to the desired data type.
 #[pyclass(name = "TypedNull", from_py_object)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypedNull {
     U8,
     I16,
@@ -1802,11 +1864,15 @@ impl TypedNull {
 #[cfg(test)]
 mod typed_parameter_tests {
     use super::{
-        datetime_to_tds_datetime, datetime_to_tds_datetime2, datetime_to_tds_smalldatetime,
-        rescale_decimal_digits, scaled_tds_time,
+        TypedNull, datetime_to_tds_datetime, datetime_to_tds_datetime2,
+        datetime_to_tds_smalldatetime, python_to_target_column_data, rescale_decimal_digits,
+        scaled_tds_time,
     };
+    use crate::py_parameters::{Parameter, ParameterDirection};
     use chrono::{NaiveDate, NaiveTime};
-    use pyo3::Python;
+    use pyo3::types::PyAnyMethods;
+    use pyo3::{IntoPyObjectExt, Py, PyResult, Python};
+    use tiberius::{ColumnData, SqlParameterType};
 
     #[test]
     fn decimal_rescaling_rounds_half_away_from_zero() {
@@ -1879,5 +1945,142 @@ mod typed_parameter_tests {
 
         assert_eq!(rounds_down.seconds_fragments(), 12 * 60 + 34);
         assert_eq!(rounds_up.seconds_fragments(), 12 * 60 + 35);
+    }
+
+    #[test]
+    fn native_bulk_raw_integer_uses_the_exact_target_wire_width() -> PyResult<()> {
+        Python::attach(|py| {
+            let value = 7_i64.into_py_any(py)?;
+
+            assert!(matches!(
+                python_to_target_column_data(value.bind(py), &SqlParameterType::tiny_int(), 0)?,
+                ColumnData::U8(Some(7))
+            ));
+            assert!(matches!(
+                python_to_target_column_data(value.bind(py), &SqlParameterType::small_int(), 0)?,
+                ColumnData::I16(Some(7))
+            ));
+            assert!(matches!(
+                python_to_target_column_data(value.bind(py), &SqlParameterType::int(), 0)?,
+                ColumnData::I32(Some(7))
+            ));
+            assert!(matches!(
+                python_to_target_column_data(value.bind(py), &SqlParameterType::big_int(), 0)?,
+                ColumnData::I64(Some(7))
+            ));
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn native_bulk_numeric_and_time_values_keep_the_target_scale() -> PyResult<()> {
+        Python::attach(|py| {
+            let decimal = py
+                .import("decimal")?
+                .getattr("Decimal")?
+                .call1(("12.3456",))?;
+            let numeric = python_to_target_column_data(
+                &decimal,
+                &SqlParameterType::decimal(19, 4).expect("valid decimal target"),
+                0,
+            )?;
+            let ColumnData::Numeric(Some(numeric)) = numeric else {
+                panic!("DECIMAL target must produce numeric TDS data");
+            };
+            assert_eq!(numeric.value(), 123_456);
+            assert_eq!(numeric.scale(), 4);
+
+            let time = py
+                .import("datetime")?
+                .getattr("time")?
+                .call1((12, 34, 56, 123_500))?;
+            let time = python_to_target_column_data(
+                &time,
+                &SqlParameterType::time(3).expect("valid time target"),
+                1,
+            )?;
+            let ColumnData::Time(Some(time)) = time else {
+                panic!("TIME target must produce time TDS data");
+            };
+            assert_eq!(time.increments(), 45_296_124);
+            assert_eq!(time.scale(), 3);
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn native_bulk_descriptor_type_mismatch_is_typed_and_redacted() -> PyResult<()> {
+        Python::attach(|py| {
+            let sensitive = "do-not-leak-this-value".into_py_any(py)?;
+            let parameter = Py::new(
+                py,
+                Parameter {
+                    value: sensitive,
+                    sql_type: Some(SqlParameterType::big_int()),
+                    direction: ParameterDirection::Input,
+                    expanded: false,
+                },
+            )?;
+
+            let error = python_to_target_column_data(
+                parameter.bind(py).as_any(),
+                &SqlParameterType::int(),
+                17,
+            )
+            .expect_err("BIGINT descriptor must not be reinterpreted as an INT target");
+
+            assert_eq!(
+                error
+                    .value(py)
+                    .getattr("parameter_index")?
+                    .extract::<usize>()?,
+                17
+            );
+            assert_eq!(
+                error.value(py).getattr("sql_type")?.extract::<String>()?,
+                "INT"
+            );
+            assert_eq!(
+                error.value(py).getattr("reason")?.extract::<String>()?,
+                "target_type_mismatch"
+            );
+            assert!(!error.to_string().contains("do-not-leak-this-value"));
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn native_bulk_typed_null_must_match_the_target_wire_family() -> PyResult<()> {
+        Python::attach(|py| {
+            let typed_null = Py::new(py, TypedNull::I64)?;
+            let error = python_to_target_column_data(
+                typed_null.bind(py).as_any(),
+                &SqlParameterType::int(),
+                4,
+            )
+            .expect_err("BIGINT TypedNull must not silently become an INT NULL");
+
+            assert_eq!(
+                error.value(py).getattr("reason")?.extract::<String>()?,
+                "typed_null_mismatch"
+            );
+            assert_eq!(
+                error.value(py).getattr("sql_type")?.extract::<String>()?,
+                "INT"
+            );
+            assert!(matches!(
+                python_to_target_column_data(
+                    typed_null.bind(py).as_any(),
+                    &SqlParameterType::big_int(),
+                    4
+                )?,
+                ColumnData::I64(None)
+            ));
+
+            Ok(())
+        })
     }
 }

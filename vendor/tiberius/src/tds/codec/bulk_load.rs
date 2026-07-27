@@ -3,7 +3,9 @@ use futures_util::io::{AsyncRead, AsyncWrite};
 use tracing::{event, Level};
 
 use crate::{
-    client::Connection, sql_read_bytes::SqlReadBytes, BytesMutWithDataColumns, ExecuteResult,
+    client::{bulk_columns::checked_bulk_type_declaration, Connection},
+    sql_read_bytes::SqlReadBytes,
+    BytesMutWithDataColumns, ExecuteResult,
 };
 
 use super::{
@@ -21,15 +23,53 @@ where
     packet_id: u8,
     buf: BytesMut,
     columns: Vec<MetaDataColumn<'a>>,
+    target_declarations: Option<Vec<String>>,
 }
 
 impl<'a, S> BulkLoadRequest<'a, S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    /// Returns checked, type-only declarations for the exact target columns.
+    ///
+    /// The returned values are derived from server metadata and never contain
+    /// table names, column names, SQL fragments, or row values.
+    pub fn column_declarations(&self) -> crate::Result<Vec<String>> {
+        if let Some(declarations) = &self.target_declarations {
+            return Ok(declarations.clone());
+        }
+
+        self.columns
+            .iter()
+            .map(|column| checked_bulk_type_declaration(&column.base.ty))
+            .collect()
+    }
+
     pub(crate) fn new(
         connection: &'a mut Connection<S>,
         columns: Vec<MetaDataColumn<'a>>,
+    ) -> crate::Result<Self> {
+        Self::new_inner(connection, columns, None)
+    }
+
+    pub(crate) fn new_with_target_declarations(
+        connection: &'a mut Connection<S>,
+        columns: Vec<MetaDataColumn<'a>>,
+        target_declarations: Vec<String>,
+    ) -> crate::Result<Self> {
+        if target_declarations.len() != columns.len() {
+            return Err(crate::Error::Protocol(
+                "bulk target declaration count does not match wire metadata".into(),
+            ));
+        }
+
+        Self::new_inner(connection, columns, Some(target_declarations))
+    }
+
+    fn new_inner(
+        connection: &'a mut Connection<S>,
+        columns: Vec<MetaDataColumn<'a>>,
+        target_declarations: Option<Vec<String>>,
     ) -> crate::Result<Self> {
         let packet_id = connection.context_mut().next_packet_id();
         let mut buf = BytesMut::new();
@@ -45,6 +85,7 @@ where
             packet_id,
             buf,
             columns,
+            target_declarations,
         };
 
         Ok(this)

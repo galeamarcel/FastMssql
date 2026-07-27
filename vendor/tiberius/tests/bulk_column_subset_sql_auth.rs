@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use futures_util::FutureExt;
-use tiberius::{error::Error, AuthMethod, Client, Config, IntoRow};
+use tiberius::{error::Error, xml::XmlData, AuthMethod, Client, Config, IntoRow};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use uuid::Uuid;
@@ -402,4 +402,267 @@ async fn tib_bulk_005_malformed_identifiers_are_pre_wire_bulk_input() -> Result<
     let too_many = vec!["value"; (u16::MAX as usize) + 1];
     expect_bulk_input(&mut client, "dbo.never_used", &too_many).await?;
     smoke_query(&mut client).await
+}
+
+#[tokio::test]
+async fn tib_bulk_006_real_target_declarations_cover_native_input_types() -> Result<()> {
+    let suffix = Uuid::new_v4().simple().to_string();
+    let raw_table = format!("fastmssql_tib_bulk_types_{suffix}");
+    let qualified = format!("dbo.{}", quote_identifier(&raw_table));
+    let table_argument = format!("dbo.{raw_table}");
+    let create_sql = format!(
+        "
+        CREATE TABLE {qualified} (
+            bit_value BIT NULL,
+            tiny_value TINYINT NULL,
+            small_value SMALLINT NULL,
+            int_value INT NULL,
+            big_value BIGINT NULL,
+            real_value REAL NULL,
+            float_value FLOAT NULL,
+            decimal_value DECIMAL(19,4) NULL,
+            varchar_value VARCHAR(20) NULL,
+            nvarchar_value NVARCHAR(20) NULL,
+            binary_value VARBINARY(20) NULL,
+            guid_value UNIQUEIDENTIFIER NULL,
+            date_value DATE NULL,
+            time_value TIME(3) NULL,
+            datetime_value DATETIME NULL,
+            small_datetime_value SMALLDATETIME NULL,
+            datetime2_value DATETIME2(3) NULL,
+            offset_value DATETIMEOFFSET(3) NULL,
+            xml_value XML NULL
+        )
+        "
+    );
+    let cleanup_sql = format!("DROP TABLE IF EXISTS {qualified}");
+    let mut client = connect_sql_auth("FastMssql TIB-BULK-006").await?;
+    drain_batch(&mut client, &create_sql).await?;
+
+    let primary = async {
+        for (column, expected) in [
+            ("bit_value", "bit"),
+            ("tiny_value", "tinyint"),
+            ("small_value", "smallint"),
+            ("int_value", "int"),
+            ("big_value", "bigint"),
+            ("real_value", "real"),
+            ("float_value", "float"),
+            ("decimal_value", "decimal(19,4)"),
+            ("varchar_value", "varchar(20)"),
+            ("nvarchar_value", "nvarchar(20)"),
+            ("binary_value", "varbinary(20)"),
+            ("guid_value", "uniqueidentifier"),
+            ("date_value", "date"),
+            ("time_value", "time(3)"),
+            ("datetime_value", "datetime"),
+            ("small_datetime_value", "smalldatetime"),
+            ("datetime2_value", "datetime2(3)"),
+            ("offset_value", "datetimeoffset(3)"),
+            ("xml_value", "xml"),
+        ] {
+            let request = client
+                .bulk_insert_columns(&table_argument, &[column])
+                .await
+                .with_context(|| format!("native target declaration {expected} was rejected"))?;
+            anyhow::ensure!(
+                request.column_declarations()? == [expected],
+                "native target declaration {expected} changed"
+            );
+            anyhow::ensure!(
+                request
+                    .finalize()
+                    .await
+                    .with_context(|| {
+                        format!("empty native target declaration {expected} failed")
+                    })?
+                    .total()
+                    == 0,
+                "empty native target declaration request affected rows"
+            );
+        }
+        smoke_query(&mut client).await
+    }
+    .await;
+
+    drop(client);
+    settle_with_cleanup(primary, "FastMssql TIB-BULK-006 cleanup", &cleanup_sql).await
+}
+
+#[tokio::test]
+async fn tib_bulk_007_xml_target_uses_supported_bcp_wire_type_and_inserts_data() -> Result<()> {
+    let suffix = Uuid::new_v4().simple().to_string();
+    let raw_table = format!("fastmssql_tib_bulk_xml_{suffix}");
+    let qualified = format!("dbo.{}", quote_identifier(&raw_table));
+    let table_argument = format!("dbo.{raw_table}");
+    let create_sql = format!("CREATE TABLE {qualified} (xml_value XML NULL)");
+    let cleanup_sql = format!("DROP TABLE IF EXISTS {qualified}");
+    let mut client = connect_sql_auth("FastMssql TIB-BULK-007").await?;
+    drain_batch(&mut client, &create_sql).await?;
+
+    let primary = async {
+        let mut request = client
+            .bulk_insert_columns(&table_argument, &["xml_value"])
+            .await?;
+        anyhow::ensure!(
+            request.column_declarations()? == ["xml"],
+            "the target declaration must remain XML"
+        );
+        request
+            .send(XmlData::new("<root attribute=\"value\">text</root>").into_row())
+            .await?;
+        anyhow::ensure!(
+            request.finalize().await?.total() == 1,
+            "XML bulk request must report one row"
+        );
+
+        let row = client
+            .simple_query(format!(
+                "SELECT CONVERT(NVARCHAR(MAX), xml_value) AS xml_value FROM {qualified}"
+            ))
+            .await?
+            .into_row()
+            .await?
+            .context("XML bulk fixture returned no row")?;
+        let xml_value: Option<&str> = row.get("xml_value");
+        anyhow::ensure!(
+            xml_value == Some("<root attribute=\"value\">text</root>"),
+            "XML bulk value did not round-trip"
+        );
+        smoke_query(&mut client).await
+    }
+    .await;
+
+    drop(client);
+    settle_with_cleanup(primary, "FastMssql TIB-BULK-007 cleanup", &cleanup_sql).await
+}
+
+#[tokio::test]
+async fn tib_bulk_008_safe_options_preserve_database_invariants() -> Result<()> {
+    let suffix = Uuid::new_v4().simple().to_string();
+    let raw_parent = format!("fastmssql_tib_bulk_parent_{suffix}");
+    let raw_target = format!("fastmssql_tib_bulk_safe_{suffix}");
+    let raw_audit = format!("fastmssql_tib_bulk_audit_{suffix}");
+    let raw_default = format!("df_fastmssql_tib_bulk_safe_{suffix}");
+    let raw_check = format!("ck_fastmssql_tib_bulk_safe_{suffix}");
+    let raw_foreign_key = format!("fk_fastmssql_tib_bulk_safe_{suffix}");
+    let raw_trigger = format!("tr_fastmssql_tib_bulk_safe_{suffix}");
+    let parent = format!("dbo.{}", quote_identifier(&raw_parent));
+    let target = format!("dbo.{}", quote_identifier(&raw_target));
+    let audit = format!("dbo.{}", quote_identifier(&raw_audit));
+    let table_argument = format!("dbo.{raw_target}");
+    let create_sql = format!(
+        "
+        CREATE TABLE {parent} (id INT PRIMARY KEY);
+        CREATE TABLE {audit} (target_id INT NOT NULL);
+        CREATE TABLE {target} (
+            id INT PRIMARY KEY,
+            parent_id INT NOT NULL,
+            explicit_null INT NULL
+                CONSTRAINT {} DEFAULT (73),
+            checked_value INT NOT NULL
+                CONSTRAINT {} CHECK (checked_value > 0),
+            CONSTRAINT {} FOREIGN KEY (parent_id) REFERENCES {parent}(id)
+        );
+        INSERT INTO {parent} (id) VALUES (1);
+        ",
+        quote_identifier(&raw_default),
+        quote_identifier(&raw_check),
+        quote_identifier(&raw_foreign_key),
+    );
+    let trigger_sql = format!(
+        "CREATE TRIGGER {} ON {target} AFTER INSERT AS
+        BEGIN
+            SET NOCOUNT ON;
+            INSERT INTO {audit} (target_id) SELECT id FROM inserted;
+        END",
+        quote_identifier(&raw_trigger),
+    );
+    let cleanup_sql =
+        format!("DROP TABLE IF EXISTS {target}; DROP TABLE IF EXISTS {parent}; DROP TABLE IF EXISTS {audit}");
+    let mut client = connect_sql_auth("FastMssql TIB-BULK-008").await?;
+    drain_batch(&mut client, &create_sql).await?;
+    drain_batch(&mut client, &trigger_sql).await?;
+
+    let primary = async {
+        let mut request = client
+            .bulk_insert_columns(
+                &table_argument,
+                &["id", "parent_id", "explicit_null", "checked_value"],
+            )
+            .await?;
+        request
+            .send((1_i32, 1_i32, Option::<i32>::None, 1_i32).into_row())
+            .await?;
+        anyhow::ensure!(
+            request.finalize().await?.total() == 1,
+            "safe bulk request must report one row"
+        );
+
+        let row = client
+            .simple_query(format!(
+                "
+                SELECT
+                    (SELECT explicit_null FROM {target} WHERE id = 1)
+                        AS explicit_null,
+                    (SELECT COUNT(*) FROM {audit}) AS audit_count,
+                    (SELECT COUNT(*) FROM sys.foreign_keys
+                     WHERE parent_object_id = OBJECT_ID(N'{target}')
+                       AND is_not_trusted = 1) AS untrusted_foreign_keys,
+                    (SELECT COUNT(*) FROM sys.check_constraints
+                     WHERE parent_object_id = OBJECT_ID(N'{target}')
+                       AND is_not_trusted = 1) AS untrusted_checks
+                "
+            ))
+            .await?
+            .into_row()
+            .await?
+            .context("safe bulk fixture returned no row")?;
+        let explicit_null: Option<i32> = row.get("explicit_null");
+        let audit_count: Option<i32> = row.get("audit_count");
+        let untrusted_foreign_keys: Option<i32> = row.get("untrusted_foreign_keys");
+        let untrusted_checks: Option<i32> = row.get("untrusted_checks");
+        anyhow::ensure!(explicit_null.is_none(), "explicit NULL used its default");
+        anyhow::ensure!(audit_count == Some(1), "insert trigger did not fire");
+        anyhow::ensure!(
+            untrusted_foreign_keys == Some(0),
+            "foreign key became untrusted"
+        );
+        anyhow::ensure!(untrusted_checks == Some(0), "check became untrusted");
+
+        for (id, parent_id, checked_value) in [(2_i32, 999_i32, 1_i32), (3, 1, -1)] {
+            let invalid = async {
+                let mut request = client
+                    .bulk_insert_columns(
+                        &table_argument,
+                        &["id", "parent_id", "explicit_null", "checked_value"],
+                    )
+                    .await?;
+                request
+                    .send((id, parent_id, Option::<i32>::None, checked_value).into_row())
+                    .await?;
+                request.finalize().await
+            }
+            .await;
+            anyhow::ensure!(invalid.is_err(), "invalid constrained row was accepted");
+            smoke_query(&mut client).await?;
+        }
+
+        let row = client
+            .simple_query(format!("SELECT COUNT(*) AS row_count FROM {target}"))
+            .await?
+            .into_row()
+            .await?
+            .context("safe bulk fixture returned no count")?;
+        let row_count: Option<i32> = row.get("row_count");
+        anyhow::ensure!(
+            row_count == Some(1),
+            "constraint failures changed persisted rows"
+        );
+        Ok(())
+    }
+    .await;
+
+    drop(client);
+    settle_with_cleanup(primary, "FastMssql TIB-BULK-008 cleanup", &cleanup_sql).await
 }

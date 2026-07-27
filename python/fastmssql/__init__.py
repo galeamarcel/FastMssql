@@ -146,6 +146,22 @@ class Connection:
             buffer_size=buffer_size,
         )
 
+    async def native_bulk_insert(
+        self,
+        table,
+        columns,
+        rows,
+        *,
+        chunk_size=1000,
+    ):
+        """Upload concrete rows through SQL Server's native TDS bulk path."""
+        return await self._conn.native_bulk_insert(
+            table,
+            columns,
+            rows,
+            chunk_size=chunk_size,
+        )
+
     async def __aenter__(self):
         await self._conn.__aenter__()
         return self
@@ -245,7 +261,7 @@ class Transaction:
         self._TRANSACTION_BEGUN = False
         self._TRANSACTION_COMMITTED = False
         self._TRANSACTION_ROLLEDBACK = False
-    
+
     def _validate_transaction_flags(self):
         if not self._TRANSACTION_BEGUN:
             raise RuntimeError("Transaction has not begun")
@@ -286,6 +302,22 @@ class Transaction:
         """Execute multiple commands in sequence on this connection."""
         return await self._rust_conn.execute_batch(commands)
 
+    async def native_bulk_insert(
+        self,
+        table,
+        columns,
+        rows,
+        *,
+        chunk_size=1000,
+    ):
+        """Upload concrete rows inside the caller's active transaction."""
+        return await self._rust_conn.native_bulk_insert(
+            table,
+            columns,
+            rows,
+            chunk_size=chunk_size,
+        )
+
     async def query_batch(self, queries):
         """Execute multiple SELECT queries in sequence on this connection."""
         return await self._rust_conn.query_batch(queries)
@@ -308,7 +340,7 @@ class Transaction:
         # If previous transaction completed, reset flags to allow reuse
         if self._TRANSACTION_COMMITTED or self._TRANSACTION_ROLLEDBACK:
             self._reset_transaction_flags()
-        
+
         if self._TRANSACTION_BEGUN:
             raise RuntimeError("Transaction has already begun")
         await self._rust_conn.begin()

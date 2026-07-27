@@ -2,7 +2,10 @@ use std::{borrow::Cow, collections::HashSet};
 
 use crate::{
     error::Error,
-    tds::codec::{ColumnFlag, FixedLenType, MetaDataColumn, TypeInfo, VarLenType},
+    tds::{
+        codec::{ColumnFlag, FixedLenType, MetaDataColumn, TypeInfo, VarLenContext, VarLenType},
+        Collation,
+    },
 };
 
 const MAX_IDENTIFIER_UTF16: usize = 128;
@@ -117,14 +120,42 @@ impl BulkInsertColumns {
         }
 
         Ok(format!(
-            "INSERT BULK {} ({})",
+            "INSERT BULK {} ({}) WITH (CHECK_CONSTRAINTS, FIRE_TRIGGERS, KEEP_NULLS)",
             self.quoted_table,
             declarations.join(", ")
         ))
     }
 }
 
-pub(super) fn checked_bulk_type_declaration(ty: &TypeInfo) -> crate::Result<String> {
+pub(super) fn normalize_ordered_bulk_wire_metadata(
+    columns: &mut [MetaDataColumn<'static>],
+    collation: Option<Collation>,
+) -> crate::Result<()> {
+    if !columns
+        .iter()
+        .any(|column| matches!(&column.base.ty, TypeInfo::Xml { .. }))
+    {
+        return Ok(());
+    }
+
+    let collation = collation.ok_or_else(|| {
+        protocol_error("bulk XML wire metadata requires a negotiated server collation")
+    })?;
+
+    for column in columns {
+        if matches!(&column.base.ty, TypeInfo::Xml { .. }) {
+            column.base.ty = TypeInfo::VarLenSized(VarLenContext::new(
+                VarLenType::NVarchar,
+                MAX_TYPE_LENGTH,
+                Some(collation),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn checked_bulk_type_declaration(ty: &TypeInfo) -> crate::Result<String> {
     match ty {
         TypeInfo::FixedLen(ty) => fixed_type_declaration(*ty),
         TypeInfo::VarLenSized(context) => {
@@ -360,8 +391,11 @@ fn numeric_declaration(
         29..=38 => 17,
         _ => return Err(bulk_input("invalid bulk numeric precision")),
     };
-    if size != expected_size {
-        return Err(bulk_input("invalid bulk numeric storage width"));
+    if !matches!(size, 5 | 9 | 13 | 17) || size < expected_size {
+        return Err(bulk_input(format!(
+            "invalid bulk numeric storage width {size} for precision {precision}; \
+             expected at least {expected_size}"
+        )));
     }
     Ok(format!("{name}({precision},{scale})"))
 }

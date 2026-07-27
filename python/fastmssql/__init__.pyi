@@ -312,6 +312,17 @@ class Connection:
         """
         ...
 
+    def native_bulk_insert(
+        self,
+        table: str,
+        columns: list[str],
+        rows: list[list[Any]],
+        *,
+        chunk_size: int = 1000,
+    ) -> Coroutine[Any, Any, int]:
+        """Upload a concrete row list through the native TDS bulk path."""
+        ...
+
     def query_batch(
         self,
         queries: List[str] | List[Tuple[str, Optional[List[Any]]]],
@@ -467,6 +478,17 @@ class Transaction:
         commands: List[Tuple[str, Optional[List[Any]]]],
     ) -> Coroutine[Any, Any, List[int]]:
         """Execute multiple commands in sequence on this connection."""
+        ...
+
+    def native_bulk_insert(
+        self,
+        table: str,
+        columns: list[str],
+        rows: list[list[Any]],
+        *,
+        chunk_size: int = 1000,
+    ) -> Coroutine[Any, Any, int]:
+        """Upload concrete rows inside the active transaction."""
         ...
 
     def query_batch(

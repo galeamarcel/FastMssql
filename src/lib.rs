@@ -13,6 +13,7 @@ mod deadline;
 mod helpers;
 mod lifecycle;
 mod lifecycle_config;
+mod native_bulk;
 mod operation_metrics;
 mod operation_metrics_config;
 mod parameter_conversion;

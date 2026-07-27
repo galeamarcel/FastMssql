@@ -109,13 +109,23 @@ The bulk-column-subset patch:
 
 - an additive `Client::bulk_insert_columns(table, columns)` method while
   preserving `Client::bulk_insert(table)`;
+- a public, no-I/O identifier validator and a read-only
+  `BulkLoadRequest::column_declarations()` bridge that exposes checked
+  type-only target declarations without identifiers or values;
 - closed validation and bracket quoting for raw table and column identifiers;
 - requests only the selected metadata and preserves exact requested order;
 - typed rejection for identity, computed, rowversion and unsupported
   metadata;
 - a total checked `INSERT BULK` declaration formatter with no panic path;
+- `CHECK_CONSTRAINTS`, `FIRE_TRIGGERS` and `KEEP_NULLS` on the additive
+  ordered-column path, so constraints remain trusted, triggers run and
+  explicit NULLs are not replaced by defaults;
+- XML target declarations remain visible as XML to FastMssql while the bulk
+  COLMETADATA/value wire pair is normalized to NVARCHAR(MAX), as required by
+  [MS-TDS XMLTYPE](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-tds/ab4a7d62-cd1f-4db1-b67d-ecae58f493e3);
 - direct SQL-auth coverage for subsets, defaults, NULLs, hostile identifier
-  characters and post-rejection connection recovery.
+  characters, XML, constraint/trigger semantics and post-rejection
+  connection recovery.
 
 No Tiberius fork has been created or published by the FastMssql fork owner.
 The path dependency keeps the reviewed source inside the FastMssql repository

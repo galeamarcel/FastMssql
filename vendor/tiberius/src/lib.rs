@@ -270,7 +270,7 @@ mod tds;
 
 mod sql_browser;
 
-pub use client::{AuthMethod, Client, Config};
+pub use client::{validate_bulk_insert_columns, AuthMethod, Client, Config};
 pub(crate) use error::Error;
 pub use from_sql::{FromSql, FromSqlOwned};
 pub use query::Query;

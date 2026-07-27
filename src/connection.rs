@@ -16,6 +16,9 @@ use crate::helpers::{
 };
 use crate::lifecycle::ConnectionLifecycle;
 use crate::lifecycle_config::{ConnectionLifecycleState, PyLifecycleConfig};
+use crate::native_bulk::{
+    connection_native_bulk_insert, parse_native_chunk_size, prepare_native_bulk,
+};
 use crate::operation_metrics::{
     OperationMetricsRegistry, OperationMetricsSnapshot, OperationObserver, observe_operation,
 };
@@ -950,6 +953,30 @@ impl PyConnection {
             table_name,
             columns,
             data_rows,
+        )
+    }
+
+    #[pyo3(signature = (table, columns, rows, *, chunk_size = 1000))]
+    pub fn native_bulk_insert<'p>(
+        &self,
+        py: Python<'p>,
+        table: String,
+        columns: Vec<String>,
+        rows: &Bound<'p, PyList>,
+        #[pyo3(from_py_with = parse_native_chunk_size)] chunk_size: usize,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let input = prepare_native_bulk(table, columns, rows, chunk_size)?;
+        let handles = self.clone_handles();
+        connection_native_bulk_insert(
+            handles.pool,
+            handles.config,
+            handles.pool_config,
+            handles.timeout_config,
+            handles.lifecycle,
+            handles.azure_credential,
+            self.operation_metrics.clone(),
+            py,
+            input,
         )
     }
 

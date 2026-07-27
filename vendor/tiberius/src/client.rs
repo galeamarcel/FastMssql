@@ -1,5 +1,5 @@
 mod auth;
-mod bulk_columns;
+pub(crate) mod bulk_columns;
 #[cfg(test)]
 mod bulk_columns_tests;
 mod config;
@@ -14,7 +14,9 @@ mod tls;
 mod tls_stream;
 
 pub use auth::*;
-use bulk_columns::BulkInsertColumns;
+use bulk_columns::{
+    checked_bulk_type_declaration, normalize_ordered_bulk_wire_metadata, BulkInsertColumns,
+};
 pub use config::*;
 pub(crate) use connection::*;
 
@@ -27,6 +29,12 @@ use crate::{
     },
     BulkLoadRequest, ColumnFlag, SqlParameterType, SqlReadBytes, ToSql,
 };
+
+/// Validates the raw table and ordered column identifiers accepted by
+/// [`Client::bulk_insert_columns`] without performing any network I/O.
+pub fn validate_bulk_insert_columns(table: &str, columns: &[&str]) -> crate::Result<()> {
+    BulkInsertColumns::new(table, columns).map(|_| ())
+}
 use codec::{
     BatchRequest, ColumnData, PacketHeader, RpcParam, RpcParameterMetadata, RpcProcId, RpcStatus,
     TokenRpcRequest,
@@ -517,8 +525,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             )
             .await?;
 
-        let columns = target.validate_metadata(resultset_count, columns)?;
+        let mut columns = target.validate_metadata(resultset_count, columns)?;
         let query = target.insert_query(&columns)?;
+        let target_declarations = columns
+            .iter()
+            .map(|column| checked_bulk_type_declaration(&column.base.ty))
+            .collect::<crate::Result<Vec<_>>>()?;
+        normalize_ordered_bulk_wire_metadata(&mut columns, self.connection.context().collation())?;
 
         self.connection.flush_stream().await?;
         let req = BatchRequest::new(query, self.connection.context().transaction_descriptor());
@@ -528,7 +541,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         let token_stream = TokenStream::new(&mut self.connection);
         token_stream.flush_done().await?;
 
-        BulkLoadRequest::new(&mut self.connection, columns)
+        BulkLoadRequest::new_with_target_declarations(
+            &mut self.connection,
+            columns,
+            target_declarations,
+        )
     }
 
     /// Closes this database connection explicitly.

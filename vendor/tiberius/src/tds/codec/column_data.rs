@@ -677,6 +677,15 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                     dst.put_u64_le(0xffffffffffffffff_u64);
                 }
             }
+            (ColumnData::Xml(opt), Some(TypeInfo::VarLenSized(vlc)))
+                if vlc.r#type() == VarLenType::NVarchar && vlc.len() == 0xffff =>
+            {
+                if let Some(xml) = opt {
+                    xml.into_owned().encode(dst)?;
+                } else {
+                    dst.put_u64_le(0xffffffffffffffff_u64);
+                }
+            }
             (ColumnData::Xml(Some(xml)), None) => {
                 dst.put_u8(VarLenType::Xml as u8);
                 dst.put_u8(0);

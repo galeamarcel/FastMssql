@@ -495,7 +495,7 @@ async def test_native_bulk_restricted_and_unsupported_targets_are_private(
 
 @case("BULK-010")
 @pytest.mark.asyncio
-async def test_native_bulk_late_conversion_rolls_back_and_reuses_connection(
+async def test_native_bulk_late_failures_choose_reuse_or_immediate_retirement(
     sql_auth_config: SqlAuthConfig,
     owner_connection: Connection,
     unique_sql_name: Callable[[str], str],
@@ -551,6 +551,43 @@ async def test_native_bulk_late_conversion_rolls_back_and_reuses_connection(
         assert await scalar(connection, "SELECT 1") == 1
     finally:
         await connection.disconnect()
+
+    raw_utf8_table = unique_sql_name("native_bulk_utf8_overflow")
+    utf8_table = quote_identifier(raw_utf8_table)
+    cleanup_registry.add(f"DROP TABLE IF EXISTS {utf8_table}")
+    await owner_connection.execute(
+        f"""
+        CREATE TABLE {utf8_table} (
+            id INT NOT NULL PRIMARY KEY,
+            encoded_value VARCHAR(1)
+                COLLATE Latin1_General_100_CI_AS_SC_UTF8 NOT NULL
+        )
+        """
+    )
+
+    encoding_connection = _isolated_connection(sql_auth_config)
+    try:
+        await encoding_connection.connect()
+        original_identity = await _physical_identity(encoding_connection)
+        with pytest.raises(ConversionError) as captured:
+            await encoding_connection.native_bulk_insert(
+                raw_utf8_table,
+                ["id", "encoded_value"],
+                [[1, "é"]],
+                chunk_size=1,
+            )
+
+        error = captured.value
+        assert error.reason == "bulk_encoding_failed"
+        assert error.wire_sent is True
+        assert error.connection_discarded is True
+        assert error.outcome_unknown is False
+        assert error.__cause__ is None
+        assert await scalar(owner_connection, f"SELECT COUNT(*) FROM {utf8_table}") == 0
+        assert await _physical_identity(encoding_connection) != original_identity
+        assert await scalar(encoding_connection, "SELECT 1") == 1
+    finally:
+        await encoding_connection.disconnect()
 
 
 @case("BULK-011")
