@@ -104,6 +104,21 @@ def test_sql_auth_runner_uses_locked_cargo_tests() -> None:
     assert "record cargo-test cargo test\n" not in runner
 
 
+def test_hosted_gate_runs_database_independent_vendored_tests() -> None:
+    workflow = _read_required(WORKFLOW)
+    normalized_workflow = " ".join(workflow.replace("\\", " ").split())
+    vendored_unit_gate = (
+        "cargo test --manifest-path vendor/tiberius/Cargo.toml "
+        "--no-default-features --features chrono,tds73,rustls --lib"
+    )
+
+    assert normalized_workflow.count(vendored_unit_gate) == 1
+    assert "token_safety_sql_auth" not in workflow
+    assert workflow.index("cargo test --locked") < workflow.index(
+        "--manifest-path vendor/tiberius/Cargo.toml"
+    )
+
+
 def test_hosted_gate_builds_extension_and_checks_configuration_contracts() -> None:
     workflow = _read_required(WORKFLOW)
 

@@ -265,3 +265,58 @@ where
         Box::pin(stream)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::IoErrorKind;
+    use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
+    use bytes::BytesMut;
+
+    #[tokio::test]
+    async fn tib_safe_003_tabname_payload_preserves_the_next_token() {
+        let mut source = BytesMut::from(&[3, 0, 0x11, 0x22, 0x33, 0xfd][..]).into_sql_read_bytes();
+
+        let consumed = consume_ushort_payload(&mut source)
+            .await
+            .expect("valid TABNAME payload must be consumed");
+
+        assert_eq!(consumed, 3);
+        assert_eq!(
+            source.read_u8().await.expect("next token must remain"),
+            0xfd
+        );
+    }
+
+    #[tokio::test]
+    async fn tib_safe_003_colinfo_payload_preserves_the_next_token() {
+        let mut source = BytesMut::from(&[2, 0, 0x44, 0x55, 0xd1][..]).into_sql_read_bytes();
+
+        let consumed = consume_ushort_payload(&mut source)
+            .await
+            .expect("valid COLINFO payload must be consumed");
+
+        assert_eq!(consumed, 2);
+        assert_eq!(
+            source.read_u8().await.expect("next token must remain"),
+            0xd1
+        );
+    }
+
+    #[tokio::test]
+    async fn tib_safe_003_truncated_browse_payload_is_typed_io_error() {
+        let mut source = BytesMut::from(&[3, 0, 0x11, 0x22][..]).into_sql_read_bytes();
+
+        let error = consume_ushort_payload(&mut source)
+            .await
+            .expect_err("truncated browse payload must fail");
+
+        assert!(matches!(
+            error,
+            Error::Io {
+                kind: IoErrorKind::UnexpectedEof,
+                ..
+            }
+        ));
+    }
+}
