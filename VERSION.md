@@ -268,3 +268,13 @@ No release, package-version change, or artifact publication has occurred.
   timeout is active in the isolated environment.
 - This test-only change does not modify runtime behavior, package metadata,
   the displayed `0.7.7` version or release state.
+
+### Executable isolated-wheel SQL-auth gate
+
+- Corrected the RESULT-030 installation command to include the locked
+  `python-dotenv` dependency required by the root SQL-auth conftest.
+- Added the locked `pytest-timeout` plugin so the isolated test run enforces,
+  rather than merely documents, the repository's 30-second integration
+  timeout.
+- This verification-plan fix does not modify runtime behavior, package
+  metadata, the displayed `0.7.7` version or release state.
