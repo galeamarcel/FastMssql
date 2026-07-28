@@ -734,8 +734,8 @@ async with Connection(conn_str, pool_config=PoolConfig.high_throughput()) as con
 
 Default pool (if omitted or constructed with `PoolConfig()`):
 `max_size=15`, `min_idle=3`, `max_lifetime_secs=1800`,
-`idle_timeout_secs=300`, `connection_timeout_secs=30`,
-`test_on_check_out=None` (health probe enabled).
+`idle_timeout_secs=300`, `connection_timeout_secs=30`.
+`test_on_check_out=None` enables the health probe.
 
 Every physical session is reset before cross-lease reuse, regardless of
 `test_on_check_out`. Setting it to `False` disables only the optional health
