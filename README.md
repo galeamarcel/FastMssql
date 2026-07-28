@@ -699,7 +699,8 @@ config = PoolConfig(
     min_idle=5,               # keep at least this many idle
     max_lifetime_secs=3600,   # recycle connections after 1h
     idle_timeout_secs=600,    # close idle connections after 10m
-    connection_timeout_secs=30
+    connection_timeout_secs=30,
+    test_on_check_out=None,   # None/True: health probe; False: skip probe only
 )
 ```
 
@@ -733,11 +734,20 @@ async with Connection(conn_str, pool_config=PoolConfig.high_throughput()) as con
 
 Default pool (if omitted or constructed with `PoolConfig()`):
 `max_size=15`, `min_idle=3`, `max_lifetime_secs=1800`,
-`idle_timeout_secs=300`, `connection_timeout_secs=30`.
+`idle_timeout_secs=300`, `connection_timeout_secs=30`,
+`test_on_check_out=None` (health probe enabled).
 
-Explicit values always win. `None` leaves the corresponding FastMssql bb8
-override unset; it does not by itself guarantee an unlimited timeout. To
-retain the historical direct-constructor field profile explicitly:
+Every physical session is reset before cross-lease reuse, regardless of
+`test_on_check_out`. Setting it to `False` disables only the optional health
+query. A clean new lease then needs no probe, while a reused lease may incur a
+private reset round trip that is fully consumed before application SQL starts.
+With `None` or `True`, the health query is enabled and a required reset is
+combined with that query when possible. Application SQL is never used to
+carry the reset.
+
+Explicit values always win. For duration and retry settings, `None` leaves the
+corresponding FastMssql bb8 override unset; it does not by itself guarantee an
+unlimited timeout. To retain the historical direct-constructor field profile:
 
 ```python
 legacy_direct_profile = PoolConfig(

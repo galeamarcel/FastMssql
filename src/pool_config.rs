@@ -219,7 +219,10 @@ impl PyPoolConfig {
         Ok(())
     }
 
-    /// Get whether to test connections on check out
+    /// Get whether the optional checkout health probe is configured.
+    ///
+    /// `None` and `Some(true)` enable the probe. `Some(false)` skips only the
+    /// probe; mandatory cross-lease session reset remains active.
     #[getter]
     pub fn test_on_check_out(&self) -> Option<bool> {
         self.test_on_check_out

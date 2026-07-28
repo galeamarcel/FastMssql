@@ -721,13 +721,15 @@ async def test_forced_write_has_unknown_outcome_and_is_not_retried(
         assert await connection.connect() is True
         assert await scalar(connection, "SELECT 10") == 10
         assert proxy.accepted_connections == 1
-        proxy.pause_downstream()
         proxy.expect_client_disconnect()
         write = asyncio.ensure_future(
             connection.execute(
                 f"""
                 INSERT INTO {table} (business_key, attempt)
-                VALUES (@P1, @P2)
+                VALUES (@P1, @P2);
+                WAITFOR DELAY '00:00:01';
+                RAISERROR(N'fastmssql downstream gate', 0, 1) WITH NOWAIT;
+                WAITFOR DELAY '00:00:05';
                 """,
                 [10, 1],
             )
@@ -748,6 +750,7 @@ async def test_forced_write_has_unknown_outcome_and_is_not_retried(
             )
 
         await wait_until(row_applied_once, timeout=3.0)
+        proxy.pause_downstream()
         await proxy.wait_until_downstream_held()
         assert write.done() is False
 

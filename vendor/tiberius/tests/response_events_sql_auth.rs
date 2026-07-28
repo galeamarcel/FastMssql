@@ -733,7 +733,7 @@ async fn tib_reset_001_immediate_reset_preserves_next_ddl_batch() -> Result<()> 
             .await?
             .context("baseline session-state query returned no row")?;
         let baseline_session_id = baseline
-            .get::<i32, _>("session_id")
+            .get::<i16, _>("session_id")
             .context("baseline session_id is NULL")?;
         let baseline_database = baseline
             .get::<&str, _>("database_name")
@@ -743,7 +743,7 @@ async fn tib_reset_001_immediate_reset_preserves_next_ddl_batch() -> Result<()> 
             .get::<i32, _>("options_mask")
             .context("baseline options_mask is NULL")?;
         let baseline_date_first = baseline
-            .get::<i32, _>("date_first")
+            .get::<u8, _>("date_first")
             .context("baseline date_first is NULL")?;
         let baseline_language = baseline
             .get::<&str, _>("language_name")
@@ -837,7 +837,7 @@ async fn tib_reset_001_immediate_reset_preserves_next_ddl_batch() -> Result<()> 
             .await?
             .context("restored session-state query returned no row")?;
         anyhow::ensure!(
-            restored.get::<i32, _>("session_id") == Some(baseline_session_id),
+            restored.get::<i16, _>("session_id") == Some(baseline_session_id),
             "immediate reset replaced the physical SQL Server session"
         );
         anyhow::ensure!(
@@ -849,7 +849,7 @@ async fn tib_reset_001_immediate_reset_preserves_next_ddl_batch() -> Result<()> 
             "immediate reset did not restore @@OPTIONS"
         );
         anyhow::ensure!(
-            restored.get::<i32, _>("date_first") == Some(baseline_date_first),
+            restored.get::<u8, _>("date_first") == Some(baseline_date_first),
             "immediate reset did not restore @@DATEFIRST"
         );
         anyhow::ensure!(

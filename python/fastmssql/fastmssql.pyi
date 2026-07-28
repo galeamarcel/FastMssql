@@ -23,7 +23,9 @@ class PoolConfig:
         max_lifetime_secs: Maximum connection lifetime in seconds (default: 1800; None leaves the FastMssql override unset)
         idle_timeout_secs: Idle connection timeout in seconds (default: 300; None leaves the FastMssql override unset)
         connection_timeout_secs: Pool acquisition timeout in seconds (default: 30; None leaves the FastMssql override unset)
-        test_on_check_out: Whether to test connections when checking out (default: None)
+        test_on_check_out: Whether to run the optional checkout health probe
+            (default: None, which enables the probe). False disables only the
+            probe; mandatory cross-lease session reset always remains active.
         retry_connection: Whether to retry connection attempts (default: None)
 
     Performance Note:

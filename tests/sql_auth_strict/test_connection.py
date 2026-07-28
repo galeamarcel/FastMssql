@@ -10,10 +10,8 @@ from fastmssql import (
     Connection,
     OperationTimeoutError,
     PoolConfig,
-    ProtocolError,
     SqlConnectionError,
     SslConfig,
-    TlsError,
     TimeoutConfig,
 )
 import pytest
@@ -113,14 +111,18 @@ async def _application_session_rows(
         await observer.query(
             """
             SELECT
-                session_id,
-                login_name,
-                DB_NAME(database_id) AS database_name,
-                program_name
-            FROM sys.dm_exec_sessions
-            WHERE program_name = @P1
-              AND session_id <> @@SPID
-            ORDER BY session_id
+                sessions.session_id,
+                sessions.login_name,
+                DB_NAME(sessions.database_id) AS database_name,
+                sessions.program_name,
+                CONVERT(NVARCHAR(36), connections.connection_id)
+                    AS connection_id
+            FROM sys.dm_exec_sessions AS sessions
+            INNER JOIN sys.dm_exec_connections AS connections
+                ON connections.session_id = sessions.session_id
+            WHERE sessions.program_name = @P1
+              AND sessions.session_id <> @@SPID
+            ORDER BY sessions.session_id
             """,
             [application_name],
         )
@@ -144,6 +146,27 @@ async def _wait_for_application_session_count(
     raise AssertionError(
         f"expected {expected} session(s) for {application_name!r}, "
         f"observed {len(rows)}"
+    )
+
+
+async def _wait_for_application_connection_absence(
+    observer: Connection,
+    application_name: str,
+    connection_id: str,
+    *,
+    timeout: float = 3.0,
+) -> list:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        rows = await _application_session_rows(observer, application_name)
+        if all(str(row["connection_id"]) != connection_id for row in rows):
+            return rows
+        await asyncio.sleep(0.02)
+    rows = await _application_session_rows(observer, application_name)
+    raise AssertionError(
+        f"connection {connection_id!r} for {application_name!r} was not "
+        "retired; "
+        f"observed {[str(row['connection_id']) for row in rows]}"
     )
 
 
@@ -614,7 +637,7 @@ async def test_async_context_validates_before_body_entry() -> None:
 
 @case("CONN-024")
 @pytest.mark.asyncio
-async def test_ping_retires_killed_connection_then_recovers_explicitly(
+async def test_ping_retires_killed_connection_before_application_sql(
     sql_auth_config: SqlAuthConfig,
     sa_connection: Connection,
     unique_sql_name: Callable[[str], str],
@@ -635,17 +658,11 @@ async def test_ping_retires_killed_connection_then_recovers_explicitly(
         assert await connection.connect() is True
         first_session_id, first_connection_id = await _pool_identity(connection)
         await sa_connection.execute(f"KILL {first_session_id}")
-        await _wait_for_application_session_count(
+        await _wait_for_application_connection_absence(
             sa_connection,
             application_name,
-            expected=0,
+            first_connection_id,
         )
-
-        with pytest.raises((SqlConnectionError, ProtocolError, TlsError)):
-            await connection.ping()
-        failed_stats = await connection.pool_stats()
-        assert failed_stats["active_connections"] == 0
-        assert failed_stats["connections"] == 0
 
         assert await connection.ping() is True
         second_session_id, second_connection_id = await _pool_identity(connection)
@@ -716,7 +733,7 @@ async def test_ping_timeout_retires_partial_tds_response(
         ssl_config=SslConfig.development(),
         pool_config=PoolConfig(
             max_size=1,
-            min_idle=0,
+            min_idle=1,
             connection_timeout_secs=1,
             test_on_check_out=False,
             retry_connection=False,
@@ -727,8 +744,13 @@ async def test_ping_timeout_retires_partial_tds_response(
         ),
     )
     try:
-        assert await connection.connect() is True
-        _, first_connection_id = await _pool_identity(connection)
+        assert await connection.connect(validate=False) is True
+        first_session_rows = await _wait_for_application_session_count(
+            sa_connection,
+            application_name,
+            expected=1,
+        )
+        first_connection_id = str(first_session_rows[0]["connection_id"])
         proxy.pause_downstream()
         started = time.monotonic()
         with pytest.raises(SqlConnectionError) as captured:
@@ -743,10 +765,10 @@ async def test_ping_timeout_retires_partial_tds_response(
         assert 0.8 <= elapsed < 2.0
         await proxy.wait_until_downstream_held()
         proxy.resume_downstream()
-        await _wait_for_application_session_count(
+        await _wait_for_application_connection_absence(
             sa_connection,
             application_name,
-            expected=0,
+            first_connection_id,
         )
 
         assert await connection.ping() is True

@@ -1292,9 +1292,10 @@ async def test_disabled_checkout_probe_preserves_module_definition_batches(
     cleanup_registry: CleanupRegistry,
     module_kind: str,
 ) -> None:
-    module = quote_identifier(
+    module_name = quote_identifier(
         unique_sql_name(f"strict_reset_ddl_{module_kind}")
     )
+    module = f"dbo.{module_name}"
     if module_kind == "procedure":
         cleanup_registry.add(f"DROP PROCEDURE IF EXISTS {module}")
         definition = f"""

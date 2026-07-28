@@ -61,12 +61,6 @@ impl TransactionConnection {
         matches!(self, Self::Pooled(_))
     }
 
-    fn prepare_for_checkout(&mut self) {
-        if let Self::Pooled(connection) = self {
-            connection.prepare_for_checkout();
-        }
-    }
-
     /// Mark the TDS stream unsafe before the request's first await. If Python
     /// cancels the future, no completion path can accidentally restore it.
     fn begin_operation(&mut self) {
@@ -2029,7 +2023,7 @@ impl Transaction {
         }
 
         let mut lifecycle_permit = None;
-        let mut connection = if let Some(source) = pool_source {
+        let connection = if let Some(source) = pool_source {
             let participant = Arc::new(TransactionShutdownParticipant {
                 session: Arc::downgrade(&session_handle),
             });
@@ -2080,7 +2074,6 @@ impl Transaction {
             TransactionConnection::Direct(direct)
         };
 
-        connection.prepare_for_checkout();
         session.conn = Some(connection);
         let admitted_by_current_call = lifecycle_permit.is_some();
         session.lifecycle_permit = lifecycle_permit;

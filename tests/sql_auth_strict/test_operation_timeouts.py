@@ -555,6 +555,9 @@ async def test_timed_out_parameterized_write_is_not_retried_and_reconciles(
             )
                 INSERT INTO {business} (business_key, value)
                 VALUES (@business_key, @value);
+            WAITFOR DELAY '00:00:01';
+            RAISERROR(N'fastmssql downstream gate', 0, 1) WITH NOWAIT;
+            WAITFOR DELAY '00:00:05';
         END
         """
     )
@@ -569,7 +572,7 @@ async def test_timed_out_parameterized_write_is_not_retried_and_reconciles(
         pool_config=bounded_pool(),
         timeout_config=TimeoutConfig(
             acquire_timeout_secs=1.0,
-            operation_timeout_secs=0.2,
+            operation_timeout_secs=2.0,
         ),
         application_name=unique_sql_name("strict_timeout_write"),
     )
@@ -577,7 +580,6 @@ async def test_timed_out_parameterized_write_is_not_retried_and_reconciles(
     try:
         await connection.connect()
         assert await scalar(connection, "SELECT 5") == 5
-        proxy.pause_downstream()
         proxy.expect_client_disconnect()
         write_task = asyncio.ensure_future(
             connection.execute(
@@ -597,7 +599,9 @@ async def test_timed_out_parameterized_write_is_not_retried_and_reconciles(
                 == 1
             )
 
-        await wait_until(business_row_is_durable, timeout=1.0)
+        await wait_until(business_row_is_durable, timeout=1.5)
+        proxy.pause_downstream()
+        await proxy.wait_until_downstream_held()
         with pytest.raises(error_type) as captured:
             await write_task
         assert_timeout(

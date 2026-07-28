@@ -42,6 +42,35 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Immediate checkout reset and pristine application batches
+
+- Added an additive vendored-Tiberius `Client::reset_connection()` primitive
+  that sends and fully drains RESETCONNECTION plus the required
+  `READ COMMITTED` baseline before returning.
+- Added an explicit checkout-action matrix that separates mandatory session
+  reset from the optional health probe.
+- The internal bb8 checkout hook now remains enabled for every policy:
+  `Clean + False` performs no wire I/O, `NeedsReset + False` performs a private
+  reset, and the enabled policy combines reset with validation when required.
+- Removed deferred reset arming from application and pooled-transaction paths,
+  so trigger, procedure, function and view definitions remain pristine.
+- Schema-qualified the module-DDL regression fixtures so the scalar-function
+  invocation reaches the reset assertion instead of relying on a default
+  schema lookup.
+- Checkout reset and validation are fail-closed under the acquisition
+  deadline; cancellation or timeout leaves the physical session broken and
+  prevents application SQL from starting.
+- A killed idle session is now rejected and replaced by the private checkout
+  reset before `ping()` sends application SQL; the readiness call succeeds on
+  the replacement without retrying an already-started application request.
+- Post-wire timeout and forced-shutdown fixtures now let the private checkout
+  reset finish before gating a later application response, preserving their
+  exact operation-phase and unknown-outcome assertions.
+- Documented that `test_on_check_out=False` disables only the optional health
+  probe and that a reused lease may therefore incur a private reset round trip.
+- This runtime fix does not modify package metadata, the displayed `0.7.7`
+  version or release state.
+
 ### Immediate Tiberius reset RED contract
 
 - Added a no-skip real SQL-auth Tiberius contract requiring an explicit

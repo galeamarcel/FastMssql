@@ -104,6 +104,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         self.connection.reset_connection_on_next_request();
     }
 
+    /// Resets the SQL Server session immediately and fully consumes the reset
+    /// response before returning.
+    ///
+    /// Unlike [`Client::reset_connection_on_next_request`], this method never
+    /// leaves reset SQL to be combined with a later application batch.
+    pub async fn reset_connection(&mut self) -> crate::Result<()> {
+        self.connection.flush_stream().await?;
+        self.connection.reset_connection_on_next_request();
+        self.complete_pending_connection_reset().await
+    }
+
     /// Executes SQL statements in the SQL Server, returning the number rows
     /// affected. Useful for `INSERT`, `UPDATE` and `DELETE` statements. The
     /// `query` can define the parameter placement by annotating them with
@@ -324,7 +335,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         params: Vec<RpcParameter>,
     ) -> crate::Result<ResponseStream<'a>> {
         self.connection.flush_stream().await?;
-        self.reset_session_for_named_rpc().await?;
+        self.complete_pending_connection_reset().await?;
 
         let collation = self.connection.context().collation();
         let utf8_support = self.connection.context().utf8_support();
@@ -569,7 +580,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         Cow::Owned(prefixed)
     }
 
-    async fn reset_session_for_named_rpc(&mut self) -> crate::Result<()> {
+    async fn complete_pending_connection_reset(&mut self) -> crate::Result<()> {
         if !self.connection.is_connection_reset_pending() {
             return Ok(());
         }

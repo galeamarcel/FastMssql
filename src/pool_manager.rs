@@ -72,6 +72,27 @@ impl ConnectionDisposition {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckoutAction {
+    Ready,
+    Reset,
+    Validate { reset: bool },
+    Reject,
+}
+
+fn checkout_action(
+    disposition: ConnectionDisposition,
+    validate_on_checkout: bool,
+) -> CheckoutAction {
+    match (disposition, validate_on_checkout) {
+        (ConnectionDisposition::Clean, false) => CheckoutAction::Ready,
+        (ConnectionDisposition::NeedsReset, false) => CheckoutAction::Reset,
+        (ConnectionDisposition::Clean, true) => CheckoutAction::Validate { reset: false },
+        (ConnectionDisposition::NeedsReset, true) => CheckoutAction::Validate { reset: true },
+        (ConnectionDisposition::Broken, _) => CheckoutAction::Reject,
+    }
+}
+
 pub(crate) fn python_error_allows_connection_reuse(error: &PyErr) -> bool {
     ConnectionDisposition::after_python_error(error) != ConnectionDisposition::Broken
 }
@@ -100,13 +121,6 @@ impl ManagedConnection {
     pub(crate) fn mark_needs_reset(&mut self) {
         if self.disposition != ConnectionDisposition::Broken {
             self.disposition = ConnectionDisposition::NeedsReset;
-        }
-    }
-
-    pub(crate) fn prepare_for_checkout(&mut self) {
-        if self.disposition == ConnectionDisposition::NeedsReset {
-            self.client.reset_connection_on_next_request();
-            self.mark_clean();
         }
     }
 
@@ -163,6 +177,7 @@ pub enum PoolConnectionError {
     Timeout {
         timeout: Duration,
     },
+    Unusable,
 }
 
 impl fmt::Display for PoolConnectionError {
@@ -185,6 +200,9 @@ impl fmt::Display for PoolConnectionError {
                 "physical connection timed out after {} seconds",
                 timeout.as_secs_f64()
             ),
+            PoolConnectionError::Unusable => {
+                write!(f, "physical connection is not safe for checkout")
+            }
         }
     }
 }
@@ -237,6 +255,9 @@ impl From<PoolConnectionError> for pyo3::PyErr {
                     outcome_unknown: false,
                 },
             ),
+            PoolConnectionError::Unusable => {
+                create_connection_error("Physical connection is not safe for checkout")
+            }
         }
     }
 }
@@ -362,6 +383,8 @@ pub struct AzureConnectionManager {
     azure_credential: Option<Arc<PyAzureCredential>>,
     /// One budget covering credential refresh, TCP, TLS, login, and routing.
     connect_timeout: Option<Duration>,
+    /// Whether checkout performs the optional SQL Server health probe.
+    validate_on_checkout: bool,
 }
 
 impl AzureConnectionManager {
@@ -369,11 +392,13 @@ impl AzureConnectionManager {
         base_config: Config,
         azure_credential: Option<Arc<PyAzureCredential>>,
         connect_timeout: Option<Duration>,
+        validate_on_checkout: bool,
     ) -> Self {
         Self {
             base_config,
             azure_credential,
             connect_timeout,
+            validate_on_checkout,
         }
     }
 }
@@ -393,18 +418,33 @@ impl bb8::ManageConnection for AzureConnectionManager {
     }
 
     async fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
-        // A checkout validation query is itself the next application request,
-        // so it must carry RESETCONNECTION before inspecting the connection.
-        conn.prepare_for_checkout();
-        // Cancellation during validation must not return a partially consumed
-        // reset/health response to the pool.
-        conn.mark_unusable();
-        conn.simple_query("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION; SELECT 1")
-            .await?
-            .into_results()
-            .await?;
-        conn.mark_clean();
-        Ok(())
+        match checkout_action(conn.disposition, self.validate_on_checkout) {
+            CheckoutAction::Ready => Ok(()),
+            CheckoutAction::Reset => {
+                // Cancellation during the private reset must retire the
+                // partially reset physical session.
+                conn.mark_unusable();
+                conn.client.reset_connection().await?;
+                conn.mark_clean();
+                Ok(())
+            }
+            CheckoutAction::Validate { reset } => {
+                if reset {
+                    conn.client.reset_connection_on_next_request();
+                }
+                // The health response must reach terminal completion before
+                // the lease can be exposed to application SQL.
+                conn.mark_unusable();
+                conn.client
+                    .simple_query("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION; SELECT 1")
+                    .await?
+                    .into_results()
+                    .await?;
+                conn.mark_clean();
+                Ok(())
+            }
+            CheckoutAction::Reject => Err(PoolConnectionError::Unusable),
+        }
     }
 
     /// Returns whether a cancelled pooled operation made this client unsafe to
@@ -425,8 +465,7 @@ pub(crate) struct PooledOperationGuard<'a> {
 }
 
 impl<'a> PooledOperationGuard<'a> {
-    pub(crate) fn new(mut connection: bb8::PooledConnection<'a, AzureConnectionManager>) -> Self {
-        connection.prepare_for_checkout();
+    pub(crate) fn new(connection: bb8::PooledConnection<'a, AzureConnectionManager>) -> Self {
         Self {
             connection,
             completed: false,
@@ -560,14 +599,20 @@ pub async fn establish_pool(
     timeout_config: &PyTimeoutConfig,
     operation: OperationName,
 ) -> PyResult<ConnectionPool> {
+    let validate_on_checkout = pool_config.test_on_check_out.unwrap_or(true);
     let manager = AzureConnectionManager::new(
         base_config.clone(),
         azure_credential,
         timeout_config.connect_timeout,
+        validate_on_checkout,
     );
     let mut builder = Pool::builder()
         .max_size(pool_config.max_size)
-        .connection_timeout(timeout_config.acquire_timeout);
+        .connection_timeout(timeout_config.acquire_timeout)
+        // Mandatory cross-lease reset is implemented in the manager hook.
+        // This hook must remain active even when the optional health probe is
+        // disabled through PoolConfig.
+        .test_on_check_out(true);
 
     if let Some(min) = pool_config.min_idle {
         builder = builder.min_idle(Some(min));
@@ -577,9 +622,6 @@ pub async fn establish_pool(
     }
     if let Some(to) = pool_config.idle_timeout {
         builder = builder.idle_timeout(Some(to));
-    }
-    if let Some(test) = pool_config.test_on_check_out {
-        builder = builder.test_on_check_out(test);
     }
     if let Some(retry) = pool_config.retry_connection {
         builder = builder.retry_connection(retry);
@@ -716,10 +758,39 @@ pub async fn warmup_pool(
 
 #[cfg(test)]
 mod connection_disposition_tests {
-    use super::{ConnectionDisposition, python_error_allows_connection_reuse};
+    use super::{
+        CheckoutAction, ConnectionDisposition, checkout_action,
+        python_error_allows_connection_reuse,
+    };
     use crate::types::{ConversionError, create_parameter_conversion_error};
     use pyo3::Python;
     use pyo3::types::PyAnyMethods;
+
+    #[test]
+    fn checkout_action_matrix_keeps_reset_mandatory_and_health_optional() {
+        assert_eq!(
+            checkout_action(ConnectionDisposition::Clean, false),
+            CheckoutAction::Ready
+        );
+        assert_eq!(
+            checkout_action(ConnectionDisposition::NeedsReset, false),
+            CheckoutAction::Reset
+        );
+        assert_eq!(
+            checkout_action(ConnectionDisposition::Clean, true),
+            CheckoutAction::Validate { reset: false }
+        );
+        assert_eq!(
+            checkout_action(ConnectionDisposition::NeedsReset, true),
+            CheckoutAction::Validate { reset: true }
+        );
+        for validate_on_checkout in [false, true] {
+            assert_eq!(
+                checkout_action(ConnectionDisposition::Broken, validate_on_checkout),
+                CheckoutAction::Reject
+            );
+        }
+    }
 
     #[test]
     fn nonfatal_sql_server_errors_need_reset_but_remain_synchronized() {
