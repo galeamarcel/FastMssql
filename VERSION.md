@@ -42,6 +42,23 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Immediate Tiberius reset RED contract
+
+- Added a no-skip real SQL-auth Tiberius contract requiring an explicit
+  `Client::reset_connection()` call to send and fully drain RESETCONNECTION
+  before the next application request.
+- The test contaminates isolation, session context, database, session options,
+  context info and a local temporary object, then requires the same SPID and
+  complete login-baseline restoration.
+- The first application batch after reset is a trigger definition; the test
+  fires it and verifies one exact side effect.
+- Cleanup uses an independent SQL-auth client and combines primary, panic and
+  cleanup failures without swallowing any error.
+- The expected source-baseline failure is a compiler error because the
+  additive async reset method does not exist yet.
+- This test-only change contains no runtime fix and does not modify package
+  metadata, the displayed `0.7.7` version or release state.
+
 ### Checkout reset and first-statement DDL RED contract
 
 - Added real SQL-auth contracts requiring trigger, procedure, function and

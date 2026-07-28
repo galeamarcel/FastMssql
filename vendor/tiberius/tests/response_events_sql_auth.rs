@@ -689,3 +689,258 @@ async fn tib_result_009_query_stream_adapter_contract_is_unchanged() -> Result<(
 
     Ok(())
 }
+
+#[tokio::test]
+async fn tib_reset_001_immediate_reset_preserves_next_ddl_batch() -> Result<()> {
+    let mut client = connect_sql_auth("FastMssql TIB-RESET-001").await?;
+    let suffix = Uuid::new_v4().simple();
+    let source = format!("dbo.[fastmssql_tib_reset_source_{suffix}]");
+    let audit = format!("dbo.[fastmssql_tib_reset_audit_{suffix}]");
+    let trigger = format!("dbo.[fastmssql_tib_reset_trigger_{suffix}]");
+
+    let primary_result = AssertUnwindSafe(async {
+        drain_batch(
+            &mut client,
+            &format!(
+                "
+                CREATE TABLE {source} (id INT PRIMARY KEY);
+                CREATE TABLE {audit} (source_id INT NOT NULL);
+                "
+            ),
+        )
+        .await?;
+
+        let baseline = client
+            .simple_query(
+                "
+                SELECT
+                    @@SPID AS session_id,
+                    DB_NAME() AS database_name,
+                    @@OPTIONS AS options_mask,
+                    @@DATEFIRST AS date_first,
+                    @@LANGUAGE AS language_name,
+                    @@LOCK_TIMEOUT AS lock_timeout_ms,
+                    CONVERT(VARCHAR(256), CONTEXT_INFO(), 2) AS context_info,
+                    session_state.transaction_isolation_level,
+                    session_state.deadlock_priority,
+                    session_state.date_format
+                FROM sys.dm_exec_sessions AS session_state
+                WHERE session_state.session_id = @@SPID
+                ",
+            )
+            .await?
+            .into_row()
+            .await?
+            .context("baseline session-state query returned no row")?;
+        let baseline_session_id = baseline
+            .get::<i32, _>("session_id")
+            .context("baseline session_id is NULL")?;
+        let baseline_database = baseline
+            .get::<&str, _>("database_name")
+            .context("baseline database_name is NULL")?
+            .to_owned();
+        let baseline_options = baseline
+            .get::<i32, _>("options_mask")
+            .context("baseline options_mask is NULL")?;
+        let baseline_date_first = baseline
+            .get::<i32, _>("date_first")
+            .context("baseline date_first is NULL")?;
+        let baseline_language = baseline
+            .get::<&str, _>("language_name")
+            .context("baseline language_name is NULL")?
+            .to_owned();
+        let baseline_lock_timeout = baseline
+            .get::<i32, _>("lock_timeout_ms")
+            .context("baseline lock_timeout_ms is NULL")?;
+        let baseline_context_info = baseline.get::<&str, _>("context_info").map(str::to_owned);
+        let baseline_isolation = baseline
+            .get::<i16, _>("transaction_isolation_level")
+            .context("baseline transaction_isolation_level is NULL")?;
+        let baseline_deadlock_priority = baseline
+            .get::<i32, _>("deadlock_priority")
+            .context("baseline deadlock_priority is NULL")?;
+        let baseline_date_format = baseline
+            .get::<&str, _>("date_format")
+            .context("baseline date_format is NULL")?
+            .to_owned();
+
+        drain_batch(
+            &mut client,
+            "
+            SET LANGUAGE French;
+            SET DATEFIRST 3;
+            SET DATEFORMAT ymd;
+            SET LOCK_TIMEOUT 731;
+            SET DEADLOCK_PRIORITY HIGH;
+            SET NOCOUNT ON;
+            SET XACT_ABORT ON;
+            SET ANSI_NULLS OFF;
+            SET ANSI_WARNINGS OFF;
+            SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+            USE tempdb;
+            SET CONTEXT_INFO 0x464153544D5353514C;
+            EXEC sys.sp_set_session_context
+                @key = N'fastmssql_tib_reset_001',
+                @value = N'contaminated',
+                @read_only = 1;
+            CREATE TABLE #fastmssql_tib_reset_001 (value INT NOT NULL);
+            ",
+        )
+        .await?;
+
+        client.reset_connection().await?;
+
+        drain_batch(
+            &mut client,
+            &format!(
+                "
+                CREATE TRIGGER {trigger}
+                ON {source}
+                AFTER INSERT
+                AS
+                BEGIN
+                    SET NOCOUNT ON;
+                    INSERT INTO {audit} (source_id)
+                    SELECT id FROM inserted;
+                END
+                "
+            ),
+        )
+        .await?;
+
+        let restored = client
+            .simple_query(
+                "
+                SELECT
+                    @@SPID AS session_id,
+                    DB_NAME() AS database_name,
+                    @@OPTIONS AS options_mask,
+                    @@DATEFIRST AS date_first,
+                    @@LANGUAGE AS language_name,
+                    @@LOCK_TIMEOUT AS lock_timeout_ms,
+                    CONVERT(VARCHAR(256), CONTEXT_INFO(), 2) AS context_info,
+                    CONVERT(
+                        NVARCHAR(128),
+                        SESSION_CONTEXT(N'fastmssql_tib_reset_001')
+                    ) AS session_context_value,
+                    OBJECT_ID(N'tempdb..#fastmssql_tib_reset_001')
+                        AS temp_object_id,
+                    session_state.transaction_isolation_level,
+                    session_state.deadlock_priority,
+                    session_state.date_format
+                FROM sys.dm_exec_sessions AS session_state
+                WHERE session_state.session_id = @@SPID
+                ",
+            )
+            .await?
+            .into_row()
+            .await?
+            .context("restored session-state query returned no row")?;
+        anyhow::ensure!(
+            restored.get::<i32, _>("session_id") == Some(baseline_session_id),
+            "immediate reset replaced the physical SQL Server session"
+        );
+        anyhow::ensure!(
+            restored.get::<&str, _>("database_name") == Some(baseline_database.as_str()),
+            "immediate reset did not restore the login database"
+        );
+        anyhow::ensure!(
+            restored.get::<i32, _>("options_mask") == Some(baseline_options),
+            "immediate reset did not restore @@OPTIONS"
+        );
+        anyhow::ensure!(
+            restored.get::<i32, _>("date_first") == Some(baseline_date_first),
+            "immediate reset did not restore @@DATEFIRST"
+        );
+        anyhow::ensure!(
+            restored.get::<&str, _>("language_name") == Some(baseline_language.as_str()),
+            "immediate reset did not restore @@LANGUAGE"
+        );
+        anyhow::ensure!(
+            restored.get::<i32, _>("lock_timeout_ms") == Some(baseline_lock_timeout),
+            "immediate reset did not restore @@LOCK_TIMEOUT"
+        );
+        anyhow::ensure!(
+            restored.get::<&str, _>("context_info") == baseline_context_info.as_deref(),
+            "immediate reset did not clear CONTEXT_INFO"
+        );
+        anyhow::ensure!(
+            restored.get::<&str, _>("session_context_value").is_none(),
+            "immediate reset did not clear SESSION_CONTEXT"
+        );
+        anyhow::ensure!(
+            restored.get::<i32, _>("temp_object_id").is_none(),
+            "immediate reset did not remove the local temporary table"
+        );
+        anyhow::ensure!(
+            restored.get::<i16, _>("transaction_isolation_level") == Some(baseline_isolation),
+            "immediate reset did not restore transaction isolation"
+        );
+        anyhow::ensure!(
+            restored.get::<i32, _>("deadlock_priority") == Some(baseline_deadlock_priority),
+            "immediate reset did not restore deadlock priority"
+        );
+        anyhow::ensure!(
+            restored.get::<&str, _>("date_format") == Some(baseline_date_format.as_str()),
+            "immediate reset did not restore date format"
+        );
+
+        drain_batch(
+            &mut client,
+            &format!("INSERT INTO {source} (id) VALUES (1)"),
+        )
+        .await?;
+        let side_effect = client
+            .simple_query(format!(
+                "
+                SELECT
+                    COUNT(*) AS audit_count,
+                    MIN(source_id) AS source_id
+                FROM {audit}
+                "
+            ))
+            .await?
+            .into_row()
+            .await?
+            .context("trigger audit query returned no row")?;
+        anyhow::ensure!(
+            side_effect.get::<i32, _>("audit_count") == Some(1),
+            "trigger did not produce exactly one side effect"
+        );
+        anyhow::ensure!(
+            side_effect.get::<i32, _>("source_id") == Some(1),
+            "trigger side effect did not preserve the inserted identity"
+        );
+
+        Ok::<(), anyhow::Error>(())
+    })
+    .catch_unwind()
+    .await;
+
+    let cleanup_result = cleanup_batch(
+        "FastMssql TIB-RESET-001 cleanup",
+        &format!(
+            "
+            DROP TRIGGER IF EXISTS {trigger};
+            DROP TABLE IF EXISTS {source};
+            DROP TABLE IF EXISTS {audit};
+            "
+        ),
+    )
+    .await;
+
+    match primary_result {
+        Ok(Ok(())) => cleanup_result.context("failed to remove immediate-reset fixtures"),
+        Ok(Err(error)) => match cleanup_result {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(error.context(format!(
+                "immediate reset failed and fixture cleanup also failed: {cleanup_error:#}"
+            ))),
+        },
+        Err(_) => {
+            cleanup_result
+                .context("response panicked and immediate-reset fixture cleanup failed")?;
+            anyhow::bail!("immediate reset response processing panicked")
+        }
+    }
+}
