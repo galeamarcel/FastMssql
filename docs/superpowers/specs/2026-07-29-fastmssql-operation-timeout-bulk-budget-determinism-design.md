@@ -1,8 +1,8 @@
-# FastMssql Operation-Timeout Bulk-Budget Determinism Design
+# FastMssql Compatibility-Bulk Timeout Phase-Boundary Design
 
-**Status:** approved for inline execution by Marcel Galea's standing
-authorization; specification, plan and implementation self-review are
-mandatory.
+**Status:** corrected after second-audit self-review; approved for inline
+execution by Marcel Galea's standing authorization. Specification, plan and
+implementation self-review remain mandatory.
 
 **Date:** 29 July 2026
 
@@ -16,54 +16,47 @@ remains fetch-only and its push URL stays `DISABLED`.
 
 ## Objective
 
-Make the existing SQL-auth contract `TIME-006` deterministic without
-weakening what it proves:
+Restore the approved phase boundary for the legacy compatibility
+`Connection.bulk_insert()` path and make `TIME-006` prove it
+deterministically:
 
-- one `bulk_insert()` call uses one absolute operation deadline across all
-  compatibility chunks;
-- the first 1,000-row request completes;
-- the second request begins but cannot complete before the shared deadline;
-- a third request never begins;
-- the timed-out transaction is rolled back and its physical connection is
-  discarded with an unknown operation outcome;
-- resetting the timeout independently for every chunk would still be detected.
+- `acquire_timeout_secs` exclusively bounds lazy pool initialization,
+  checkout and checkout validation/reset;
+- `operation_timeout_secs` begins only after a lease is acquired and
+  immediately before the first SQL request await;
+- one operation deadline then covers `BEGIN`, every generated
+  `INSERT ... VALUES` chunk and `COMMIT`;
+- the deadline never resets per chunk;
+- expiry after wire activity retires the connection, reports an unknown
+  outcome and leaves zero committed rows.
 
-The correction is test-only. It does not change a production timeout,
-deadline boundary, conversion path, pool operation, SQL statement, public API
-or error classification.
+This is a compatibility-bulk runtime correction plus a deterministic
+real-MSSQL regression test. It is not merely a test-timing adjustment.
 
-## Measured reproduction
+## Evidence progression
 
-The complete runner on the exact execute-many candidate reached the strict
-lane and reported:
+The complete execute-many gate first reported:
 
 ```text
-423 passed
-1 failed
+SQL-auth strict: 423 passed, 1 failed
 ```
 
-The only failure was:
+The only failure was canonical `TIME-006`. It observed one compatibility bulk
+request where the test required exactly two. The captured public error
+remained:
 
 ```text
-tests/sql_auth_strict/test_operation_timeouts.py::
-test_batch_and_bulk_share_one_absolute_operation_budget
-```
-
-The failing assertion expected two observed bulk request identities and
-received one. The captured public error remained the intended typed
-`OperationTimeoutError`:
-
-```text
+OperationTimeoutError
 phase=operation
 operation=bulk_insert
 timeout_seconds=0.250000
 retryable=false
-discarded=true
+connection_discarded=true
 outcome_unknown=true
 ```
 
-An unchanged isolated rerun failed once and passed once. A bounded diagnostic
-loop then failed on iteration four after three passes. At that failure:
+An unchanged focused rerun failed once and passed once. A diagnostic loop
+failed on iteration four after three passes. At the captured failure:
 
 ```text
 elapsed_seconds=0.25245849997736514
@@ -71,204 +64,284 @@ observed_bulk_request_identities=1
 input_rows=4001
 ```
 
-No execute-many contract failed. Generated runner artifacts were copied
-outside the repository before tracked reports were restored, and the
-execute-many worktree remained clean.
+The first hypothesis classified this only as stale 160/250 ms test geometry
+after bounded conversion. That diagnosis was incomplete.
+
+The second audit correlated the implementation with the approved timeout
+specification and implementation plan. Both require:
+
+```text
+pool acquisition first
+operation deadline created after checkout
+one deadline around BEGIN, all bulk chunks and COMMIT
+```
+
+The current source instead creates the operation deadline before:
+
+1. conversion of the first bounded chunk;
+2. lazy pool initialization;
+3. pool checkout;
+4. creation of the pooled-operation guard.
+
+The initial test-only correction is therefore superseded by this corrected
+design. The published Git history remains intact; corrective documentation is
+added through ordinary descendant commits.
+
+## Contract conflict found by self-review
+
+The foundational operation-timeout design states that no phase borrows unused
+time from another and that the operation deadline starts after acquisition.
+Its bulk implementation step likewise says to create the deadline after pool
+checkout.
+
+The later bounded-buffering plan moved first-chunk conversion into the awaited
+operation to keep memory proportional to one chunk and first-chunk failures
+zero-I/O. In the same edit it moved `deadline_from(Operation, ...)` before
+conversion and acquisition, saying preflight should reduce the operation
+budget. That instruction conflicts with the already approved public phase
+boundary and with the separate acquire timeout.
+
+The conflict is resolved as follows:
+
+- preserve bounded one-chunk conversion and first-chunk zero-I/O validation;
+- preserve lazy pool initialization and normal acquire-timeout handling;
+- restore the compatibility API's foundational post-checkout operation
+  deadline;
+- keep later-chunk conversion inside that one deadline because it occurs
+  between SQL chunks;
+- add a deterministic test that prevents acquire wait from consuming the
+  operation phase again.
+
+This resolution is deliberately scoped to compatibility
+`Connection.bulk_insert()`.
+
+Native bulk iterable and `execute_many()` are not silently changed here.
+Their later approved API designs explicitly define one public-method or
+sequence deadline covering producer work and acquisition. Those distinct
+contracts require their own design change if they are ever reconsidered.
 
 ## Root cause
 
-`TIME-006` was written when compatibility bulk conversion happened before the
-awaited operation. Its original geometry is:
+Commit `adb66370456856a88e320d83c247704f6951b11e` correctly replaced eager
+whole-input conversion with one bounded chunk. Before that commit,
+compatibility bulk performed:
 
 ```text
-trigger WAITFOR per chunk = 0.160 seconds
-absolute operation budget = 0.250 seconds
-headroom before the first request must finish = 0.090 seconds
+pre-convert input
+initialize/acquire pool
+create operation deadline
+BEGIN -> chunks -> COMMIT
 ```
 
-The later bounded-buffering correction intentionally moved the following work
-inside the awaited operation and after creation of the absolute deadline:
-
-1. conversion and type inference for the first 1,000-row chunk;
-2. lazy pool initialization;
-3. pool checkout;
-4. `BEGIN TRANSACTION`;
-5. construction and TDS encoding of the first `INSERT ... VALUES` request.
-
-This ordering is production behavior required by bounded conversion and the
-single absolute deadline. Under ordinary local scheduling the work usually
-fits in 90 ms, so the first request completes and the sampler observes the
-second. Under a slower scheduling interval the first request begins but its
-160 ms trigger delay reaches the 250 ms deadline before completion. The
-runtime still enforces the correct absolute deadline, but the test's exact-two
-precondition is no longer guaranteed by its original margin.
-
-The failure is therefore a deterministic-contract defect in the test
-geometry, not evidence that the production deadline resets per chunk and not
-an execute-many runtime defect.
-
-## Selected design
-
-Retain the same real SQL Server trigger, 4,001-row input, five compatibility
-chunks, independent DMV sampler and exact request-count assertion. Change only
-the bulk timing geometry:
+After that commit it performs:
 
 ```text
-trigger WAITFOR per chunk = 0.500 seconds
-absolute operation budget = 0.850 seconds
-pre-first-request headroom = 0.350 seconds
-two complete trigger waits = 1.000 seconds
+create operation deadline
+convert first chunk
+initialize/acquire pool
+BEGIN -> chunks -> COMMIT
 ```
 
-The inequalities intentionally differ:
+The first-chunk conversion move is required. The deadline move is not.
+
+With a 250 ms operation budget and 160 ms trigger delay, only 90 ms remains
+for all work preceding completion of the first request. A cold or delayed
+pool path can consume enough of that operation budget that the first request,
+not the second, reaches the deadline. More importantly, a saturated pool can
+consume the entire operation deadline while still remaining within its
+separate acquire budget. The method then acquires a lease and immediately
+raises a phase-`operation` timeout before application SQL begins.
+
+That behavior violates phase separation and can discard a healthy lease even
+though the operation phase should not have started.
+
+## Deterministic RED contract
+
+Extend the bulk half of existing canonical `TIME-006`; do not allocate a new
+matrix ID.
+
+Use:
 
 ```text
-0.500 + 0.350 = 0.850
-0.850 < 2 * 0.500
+pool max_size                 1
+acquire timeout               2.0 seconds
+operation timeout             0.85 seconds
+trigger delay per chunk       0.50 seconds
+input rows                    4,001
+compatibility chunk size      1,000
+total potential requests      5
 ```
 
-Consequently:
+The test:
 
-- the first request may spend up to 350 ms in conversion, pool setup,
-  checkout, transaction start and wire preparation and still complete;
-- after the first 500 ms trigger delay, the second request begins;
-- even with zero setup overhead, two complete trigger delays require at least
-  one second, which exceeds the 850 ms absolute deadline;
-- the third request cannot begin;
-- a reset-per-chunk implementation would still complete all five requests
-  because each 500 ms trigger delay is below a fresh 850 ms budget.
+1. begins a holder Transaction on the same size-one pool;
+2. starts the real `bulk_insert()` task and the independent DMV sampler;
+3. waits until `pool_stats()["pending_gets"] == 1`, proving conversion has
+   completed and the bulk call is blocked in checkout;
+4. keeps the lease occupied for 0.95 seconds, longer than the 0.85 second
+   operation budget but shorter than the 2.0 second acquire budget;
+5. proves the bulk task is still pending, then rolls back/closes the holder;
+6. awaits the bulk timeout;
+7. requires exactly two observed bulk requests, typed fail-closed timeout
+   metadata and zero rows after rollback.
 
-The elapsed-time guard becomes:
+On the unchanged implementation, the operation deadline is already expired
+when checkout finishes. The call therefore submits zero bulk requests and the
+exact-two assertion fails deterministically.
+
+After the fix, the operation deadline begins only after checkout:
+
+- the first 500 ms request completes;
+- the second begins;
+- two complete trigger waits need at least one second and cannot fit into the
+  shared 850 ms operation budget;
+- the third never begins;
+- a reset-per-chunk implementation would allow all five requests because each
+  500 ms delay fits within a fresh 850 ms timer.
+
+Measure the post-release operation phase separately and require:
 
 ```text
-0.70 <= elapsed_seconds < 1.50
+0.70 <= operation_phase_elapsed_seconds < 1.50
 ```
 
-The lower bound detects an operation that times out before the intended
-second-request phase. The upper bound remains deliberately wider than the
-configured deadline to tolerate cancellation and cleanup scheduling while
-still detecting an unbounded or reset-per-chunk execution.
+This avoids treating the intentional 0.95 second acquire wait as operation
+time while retaining bounded cleanup tolerance.
+
+## Runtime correction
+
+In `src/batch.rs::bulk_insert`, keep:
+
+```text
+first-chunk conversion
+pool initialization
+pool checkout
+PooledOperationGuard construction
+```
+
+in their current order. Move only:
+
+```rust
+let deadline =
+    deadline_from(TimeoutPhase::Operation, timeout_config.operation_timeout);
+```
+
+from before first-chunk conversion to immediately after
+`PooledOperationGuard::new(pooled)` and before `run_until(...)`.
+
+Do not move conversion after checkout. First-chunk shape/type errors must
+remain local, zero-I/O and zero-lease. Do not create another deadline for
+later chunks. The existing loop continues to convert each later chunk inside
+the original `run_until` future.
 
 ## Approaches considered
 
-### Approach A — widen the timing margins and keep exact two, selected
+### Approach A — restore post-checkout deadline and add saturated-pool RED,
+selected
 
-This preserves every semantic assertion while accommodating the bounded
-pre-wire work now covered by the deadline. It changes no production code and
-continues to distinguish one absolute budget from a per-chunk reset.
+This matches the approved phase contract, proves it deterministically and
+keeps bounded conversion, atomicity, retirement and exact-two semantics.
 
-### Approach B — accept one or two observed requests
+### Approach B — widen only the trigger/deadline timing
 
-Rejected because `1 <= requests <= 2` would allow the test to pass without
-proving that the second request started. That would weaken the explicit
-cross-chunk deadline contract.
+Rejected after the second audit. It would make the intermittent test pass
+while leaving acquire wait charged to the operation phase.
 
-### Approach C — pre-connect the pool without changing the timing geometry
+### Approach C — accept one or two requests
 
-Rejected as the sole correction because it removes only most initialization
-cost. First-chunk conversion, checkout, transaction start, SQL construction,
-wire encoding and scheduler delay would still compete for the same 90 ms.
-It would also make the proof depend on a warmed-pool precondition that the
-production operation does not require.
+Rejected because it would stop proving that the second request begins and
+would hide both phase-boundary regression and per-chunk deadline reset.
 
-### Approach D — add a production test hook or external SQL coordination gate
+### Approach D — pre-connect without saturating the pool
 
-Rejected because the existing trigger and independent DMV observer already
-exercise the real wire path. A new runtime hook would expand production
-surface solely to stabilize a test, while a multi-connection coordination
-protocol would add more failure modes than the bounded timing relation.
+Rejected because it avoids the violated boundary instead of proving it.
+It would make the test dependent on a warmed pool and could not distinguish
+whether acquire wait consumes operation time.
 
-## Separate reproduction and fix
+### Approach E — move first-chunk conversion after checkout
 
-Branch topology:
+Rejected because first-chunk conversion errors would acquire a lease
+needlessly and break the established zero-I/O preflight contract.
+
+## Branch topology
 
 ```text
 docs/operation-timeout-bulk-budget-determinism-design
-  -> test/operation-timeout-bulk-budget-determinism
-     -> fix/operation-timeout-bulk-budget-determinism
+  -> test/compatibility-bulk-operation-deadline-boundary
+     -> fix/compatibility-bulk-operation-deadline-boundary
         -> feat/execute-many
 ```
 
-The test branch adds an opt-in bounded runner:
-
-```text
-scripts/test_operation_timeout_bulk_budget_determinism.sh
-```
-
-It repeatedly runs the unchanged `TIME-006` node against Docker SQL Server
-with SQL authentication. The default is 20 iterations; accepted overrides are
-integers from 1 through 100. It exits at the first failure and prints the
-captured pytest output. It remains outside the normal runner.
-
-The fix branch changes only:
-
-- the bulk trigger delay from 160 ms to 500 ms;
-- the bulk operation timeout from 250 ms to 850 ms;
-- the bulk elapsed guard from `0.18..0.75` to `0.70..1.50`;
-- the explanatory comment;
-- `VERSION.md`.
-
-The batch half of `TIME-006`, the request sampler, row count, chunk count,
-exact-two assertion, timeout metadata assertions and rollback proof remain
-unchanged.
+The test branch adds the deterministic saturated-pool extension and the
+bounded opt-in repeated runner. The fix branch changes the single runtime
+deadline placement and `VERSION.md`. Both branches are published only on the
+fork.
 
 ## Acceptance gates
 
-The correction is accepted only when all of the following pass on the exact
+The correction is accepted only when all of the following pass on one exact
 fix commit:
 
 ```text
-shell syntax and invalid-bound tests for the opt-in runner       PASS
-focused TIME-006                                                PASS
-opt-in TIME-006 repetition                              20/20 PASS
+unchanged runtime + saturated-pool TIME-006                     RED
+focused corrected TIME-006                                     PASS
+opt-in TIME-006 repetition                             20/20 PASS
 complete test_operation_timeouts.py                            PASS
+compatibility bulk bounded/descriptor suites                    PASS
 complete SQL-auth strict lane                                  PASS
 complete scripts/sql_auth/run_all.sh                            PASS
 execute-many canonical matrix                           407/407 PASS
 execute-many stress sync/async at 1,000/10,000/99,999           PASS
 isolated ABI3 wheel and SQL-auth smoke                           PASS
-Ruff, compileall, diff and credential scans                      PASS
-code-review graph exact at candidate SHA                         PASS
+root/vendored Rust, Ruff, compileall and diff checks             PASS
+exact code-review graph and direct source review                 PASS
+credential/generated-artifact/fork-boundary scans                PASS
 ```
 
-Observed counts from the final run are authoritative. No failure, skip,
-swallowed exception, stale editable extension or deselection of a required
-case is accepted.
+Observed final counts are authoritative. No required failure, skip,
+deselection, swallowed exception, stale editable extension or ancestor-only
+result is accepted.
 
 ## Non-goals
 
 This correction does not:
 
-- change timeout configuration defaults or documented public semantics;
-- move the absolute deadline or exclude conversion/setup work from it;
-- change compatibility bulk chunk size, atomicity or SQL generation;
-- change connection retirement, retryability or outcome-unknown policy;
-- change execute-many behavior or claim that feature complete;
-- add sleeps, retries or request-count tolerance to production code;
+- change timeout defaults or public exception fields;
+- change the separate acquire timeout implementation;
+- change compatibility chunk size, SQL generation or transaction atomicity;
+- remove later-chunk conversion from the one absolute operation budget;
+- change native bulk iterable or execute-many deadline semantics;
+- add a retry, sleep or tolerance to production code;
 - publish a wheel, release, upstream PR or original-repository branch;
-- alter the displayed package version `0.7.7`.
+- alter displayed package version `0.7.7`.
 
-## Self-review record
+## Self-review correction record
 
-The design was checked against the current `TIME-006` source, the current
-compatibility bulk implementation, the bounded-buffering history and the
-captured failing state.
+The corrected design was checked against:
 
-Corrections made during self-review:
+- the foundational timeout specification and implementation plan;
+- the bounded compatibility-bulk plan and commit `adb6637`;
+- current `src/batch.rs`;
+- current pool observability counters;
+- the exact full-runner and diagnostic failure states;
+- explicit later native-bulk iterable and execute-many deadline contracts.
 
-1. The exact-two request assertion is preserved; a one-or-two tolerance was
-   rejected as semantically weaker.
-2. The trigger delay and deadline were increased together so the first
-   request gains headroom while two complete requests remain mathematically
-   outside the absolute budget.
-3. The deadline continues to include first-chunk conversion and pool setup;
-   no warmed-pool exception is introduced.
-4. The repeated gate is bounded and opt-in, so normal suite cost increases
-   only by the single corrected `TIME-006` execution.
-5. The correction requires the complete runner because that runner exposed
-   the defect.
-6. Runtime behavior and the execute-many candidate remain unchanged until
-   the test-only fix is proven on a separate branch.
+Corrections made:
 
-The specification contains no placeholder, ambiguous runtime change,
+1. The first test-only diagnosis was withdrawn before any test or runtime fix
+   commit.
+2. The conflicting approved documents are surfaced explicitly rather than
+   blended silently.
+3. The foundational acquire/operation phase boundary remains authoritative
+   for compatibility bulk.
+4. The RED test uses `pending_gets == 1`, not scheduler sleeps, to prove the
+   call reached checkout before the controlled hold begins.
+5. The acquire hold exceeds the operation timeout but remains below the
+   acquire timeout, making the old boundary fail deterministically.
+6. Exact-two requests, five-chunk reset detection, fail-closed metadata and
+   rollback remain mandatory.
+7. Native bulk iterable and execute-many are excluded because their later
+   approved designs explicitly choose broader sequence deadlines.
+
+The specification contains no placeholder, ambiguous phase ownership,
 unbounded loop or authorization for an original-repository write.

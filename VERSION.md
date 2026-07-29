@@ -45,37 +45,40 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
-### TIME-006 bulk absolute-budget determinism plan
+### Compatibility-bulk timeout phase-boundary corrected plan
 
-- Added the executable design/test/fix lineage for the intermittent
-  compatibility-bulk request-count race found while gating `execute_many()`.
-- Required a bounded opt-in Docker SQL-auth runner on the unchanged test
-  branch, followed by a test-only 500/850 ms correction that retains exactly
-  two observed requests and 20 consecutive repetitions.
-- Required the complete execute-many runner, sync/async stress through 99.999
-  sets, isolated ABI3 wheel, graph/source/credential review and fork-only
-  evidence to restart from the exact corrected candidate.
-- Kept `query_many()` and enterprise features 20/21 open and prohibited any
-  runtime change, upstream write, release or wheel publication.
-- This documentation-only plan changes no runtime, public API, displayed
-  `0.7.7` version, release state or package metadata.
+- Corrected the initial test-only hypothesis after correlating `TIME-006`,
+  the foundational timeout specification and bounded-buffering commit
+  `adb6637`.
+- Required a deterministic RED that holds a size-one pool beyond the
+  operation budget but within the acquire budget and waits for the exact
+  `pending_gets == 1` precondition.
+- Limited the runtime fix to moving the existing compatibility-bulk deadline
+  after checkout, while preserving pre-acquire first-chunk conversion and one
+  deadline across `BEGIN`, later conversion, all chunks and `COMMIT`.
+- Retained exact-two request observation, 20 consecutive SQL-auth
+  repetitions, complete execute-many gates and fork-only publication.
+- This documentation-only plan correction changes no runtime, public API,
+  displayed `0.7.7` version, release state or package metadata.
 
-### TIME-006 bulk absolute-budget determinism design
+### Compatibility-bulk timeout phase-boundary corrected design
 
-- Recorded the intermittent strict-runner failure in which the unchanged
-  `TIME-006` observed one rather than exactly two compatibility bulk requests,
-  while retaining the intended typed operation-timeout classification.
-- Traced the stale 90 ms margin to bounded first-chunk conversion, lazy pool
-  setup, checkout, transaction start and wire preparation now occurring
-  inside the one absolute operation deadline.
-- Selected a test-only 500/850 ms trigger/deadline geometry that gives the
-  first request 350 ms of setup headroom but makes two complete trigger waits
-  mathematically exceed the shared deadline.
-- Preserved the exact-two request count, five-chunk reset detector, rollback,
-  discard and outcome-unknown assertions; no one-or-two tolerance or warmed
-  pool precondition is introduced.
-- This documentation-only design changes no runtime, public API, displayed
-  `0.7.7` version, release state or package metadata.
+- Recorded that the 160/250 ms intermittent failure exposed more than a stale
+  test margin: compatibility `bulk_insert()` currently creates its operation
+  deadline before first-chunk conversion and pool acquisition.
+- Resolved the conflict between the foundational post-checkout operation
+  boundary and the later bounded-buffering instruction in favor of separate
+  acquire and operation phases for the compatibility API.
+- Specified a size-one saturated-pool RED with acquire/operation/hold values
+  `2.0/0.85/0.95` seconds and a 500 ms trigger, making the unchanged runtime
+  expire before application SQL and the corrected runtime observe exactly
+  two requests.
+- Kept native bulk iterable and `execute_many()` out of scope because their
+  later approved sequence designs explicitly include acquisition in broader
+  public-method deadlines.
+- The first test-only diagnosis was corrected through descendant commits,
+  without rewriting published history; no runtime changes occur in this
+  documentation commit.
 
 ### Execute-many security-retirement characterization
 
