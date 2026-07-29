@@ -264,11 +264,20 @@ Other application work may consume pool capacity, so some workers can wait
 under the existing acquire timeout. `query_many()` neither creates a private
 pool nor reserves the full pool in advance.
 
+If the SQL-free statistics read fails or reports an invalid `max_size`, the
+iterator performs abnormal producer cleanup before any source pull or child
+query. That startup failure is preserved without a fabricated
+`query_index`, because no parameter set has yet been associated with it.
+
 ### Fixed topology
 
 The coordinator lives in `python/fastmssql/_query_many.py`; the public wrapper
 and typing surface remain in `python/fastmssql/__init__.py` and
-`python/fastmssql/__init__.pyi`.
+`python/fastmssql/__init__.pyi`. `QueryManyIterator` is a small facade over a
+private `_QueryManyState`. Background producer, worker and cleanup tasks
+capture only that state, never the public facade. Consequently the facade can
+be collected and synchronously request the documented best-effort fallback
+instead of being kept alive forever by its own bound task methods.
 
 One active iterator owns:
 
@@ -569,8 +578,13 @@ Expected commits:
 ```text
 docs: design bounded query many
 docs: plan bounded query many
+test: require query many public contract
+test: require bounded query many coordination
 test: require bounded query many concurrency
-feat: add bounded query many
+refactor: share parameter set validation
+feat: add bounded query many coordination
+feat: supervise query many terminal cleanup
+docs: document bounded query many usage
 docs: record batch bulk validation evidence
 docs: record batch bulk validation status
 ```

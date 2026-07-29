@@ -71,6 +71,30 @@ No release, package-version change, or artifact publication has occurred.
 - Limited `query_index` to producer, parameter-set and child-query failures;
   consumer cancellation or explicit close cannot truthfully select one index
   from multiple outstanding workers and therefore fabricates none.
+- Added the executable TDD plan
+  `docs/superpowers/plans/2026-07-30-fastmssql-query-many-bounded-concurrency.md`
+  with separate public/coordinator/SQL-auth RED commits, a real RED→feature
+  ancestry, shared parameter validation, fixed-worker implementation tasks,
+  Docker fault tests, required/99,999 stress, installed-wheel checks,
+  framework smoke, exact graph review and fork-only publication.
+- Separated the public `QueryManyIterator` facade from private
+  `_QueryManyState`: background tasks retain only the state, so they cannot
+  keep the facade alive and make its explicitly best-effort drop fallback
+  unreachable.
+- Self-review corrected the executable plan to use only existing SQL-auth
+  fixtures, admit exactly `QMANY-013` into load metrics, test JOIN/CTE/empty
+  result/stored-procedure query-many use cases, count uniquely named
+  candidate sessions, keep background tasks state-only, and place isolated
+  wheel products under the repository's actually ignored
+  `.artifacts/sql-auth/` tree.
+- Reconciled the final handoff with the authoritative parent batch/bulk plan:
+  it regenerates the canonical SQL-auth matrix/report and creates
+  `SQL_AUTH_BATCH_BULK_STRESS_REPORT.md`, rather than referring to an
+  unplanned validation-report filename.
+- Added deterministic startup-failure/traceback cleanup coverage and a
+  resolved-prefix plus single-wheel preflight so malformed pool metadata or
+  stale ignored build products cannot make the implementation or wheel gate
+  pass accidentally.
 - This documentation-only change does not alter runtime behavior, package
   metadata, displayed `0.7.7` version, release state or published artefacts.
 
