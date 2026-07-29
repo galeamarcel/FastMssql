@@ -62,6 +62,13 @@ No release, package-version change, or artifact publication has occurred.
 - Defined `EMANY-001`–`EMANY-011`, deterministic RED/cancellation contracts,
   isolated-wheel gates and bounded sync/async stress through 99,999
   parameter sets.
+- Added the executable TDD plan with immutable RED ancestry, a semantics-
+  preserving shared-coordinator refactor, operation-metrics schema migration,
+  private Rust sequence, wrapper exposure, real SQL-auth/fault-proxy cases and
+  exact fork-only publication gates.
+- Made the plan's commit-acknowledgement-loss, active-Transaction reservation,
+  empty-input, abnormal producer-close and native-bulk non-regression
+  checkpoints explicit before any implementation begins.
 - Kept `query_many()`, byte-level LOB streaming, remaining enterprise SQL
   types, release publication and any original-repository PR outside this
   slice.
