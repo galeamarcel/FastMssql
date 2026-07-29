@@ -9,6 +9,8 @@ import shutil
 import subprocess
 import sys
 
+import pytest
+
 from sql_auth_strict.cases import (
     source_case_ids,
     source_case_occurrences,
@@ -99,12 +101,18 @@ def test_full_runner_contract() -> None:
     assert "-n 1" in source
     assert "record result-stream-load " in source
     assert "scripts/sql_auth/run_result_stream_stress.sh" in source
+    assert "record query-many-load " in source
+    assert "scripts/sql_auth/run_query_many_stress.sh" in source
     assert "tests/sql_auth_strict/test_resultsets_streaming.py" in source
     assert "tests/sql_auth_strict/test_rpc_results.py" in source
+    assert "tests/sql_auth_strict/test_query_many_strict.py" in source
     assert source.index("record provision ") < source.index(
         "record result-stream-load "
     )
     assert source.index("record result-stream-load ") < source.index(
+        "record query-many-load "
+    )
+    assert source.index("record query-many-load ") < source.index(
         "record strict "
     )
     for ignored in (
@@ -187,6 +195,10 @@ def test_full_runner_uses_original_local_regression_display_name(
     )
     _write_executable(
         scripts / "run_result_stream_stress.sh",
+        "#!/usr/bin/env bash\nexit 0\n",
+    )
+    _write_executable(
+        scripts / "run_query_many_stress.sh",
         "#!/usr/bin/env bash\nexit 0\n",
     )
 
@@ -358,6 +370,31 @@ def test_report_generator_preserves_not_run_and_redacts(
         ),
         encoding="utf-8",
     )
+    (artifact_dir / "query-many-stress.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "source_sha": source_sha,
+                "status": "passed",
+                "profiles": [
+                    {
+                        "status": "passed",
+                        "operations": 1_000,
+                        "source": "sync",
+                        "ordered": True,
+                        "requested_concurrency": 10,
+                        "pool_max": 10,
+                        "maximum_active_queries": 10,
+                        "maximum_sql_sessions": 10,
+                        "maximum_accepted_window": 10,
+                        "rss_growth_bytes": 1_024,
+                        "maximum_event_loop_gap_seconds": 0.01,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
     matrix_output = tmp_path / "matrix.md"
     report_output = tmp_path / "report.md"
     environment = os.environ.copy()
@@ -390,7 +427,7 @@ def test_report_generator_preserves_not_run_and_redacts(
     matrix = matrix_output.read_text(encoding="utf-8")
     report = report_output.read_text(encoding="utf-8")
     assert (
-        sum(line.startswith("| `") for line in matrix.splitlines()) == 407
+        sum(line.startswith("| `") for line in matrix.splitlines()) == 420
     )
     assert "| `ENV-001` | PASS |" in matrix
     assert "| `AUTH-001` | FAIL |" in matrix
@@ -420,6 +457,8 @@ def test_report_generator_preserves_not_run_and_redacts(
     assert "Result-stream stress metrics" in report
     assert "nearest_rank" in report
     assert "| 1 | passed | 1000 | 64 |" in report
+    assert "Query-many stress metrics" in report
+    assert "| 1 | passed | 1000 | sync | yes | 10 | 10 | 10 | 10 | 10 |" in report
 
 
 def test_stale_result_stream_evidence_cannot_be_reported_as_pass(
@@ -763,10 +802,10 @@ def test_report_generator_can_require_complete_evidence(
     )
 
     assert completed.returncode == 1
-    assert "missing evidence for 407 case(s)" in completed.stderr
+    assert "missing evidence for 420 case(s)" in completed.stderr
     assert matrix_output.is_file()
     assert report_output.is_file()
-    assert "| NOT RUN | 407 |" in report_output.read_text(encoding="utf-8")
+    assert "| NOT RUN | 420 |" in report_output.read_text(encoding="utf-8")
 
 
 def test_config_redacts_password(monkeypatch) -> None:
@@ -777,13 +816,13 @@ def test_config_redacts_password(monkeypatch) -> None:
     assert "NeverPrintMe_2026!" not in repr(config)
 
 
-def test_approved_spec_contains_407_unique_case_ids() -> None:
+def test_approved_spec_contains_420_unique_case_ids() -> None:
     spec = ROOT / (
         "docs/superpowers/specs/"
         "2026-07-24-fastmssql-sql-auth-validation-design.md"
     )
     ids = spec_case_ids(spec)
-    assert len(ids) == 407
+    assert len(ids) == 420
 
 
 def test_framework_contract_is_wired_into_runner_and_report() -> None:
@@ -1083,6 +1122,210 @@ def test_result_stream_stress_harness_is_bounded_and_required(
     assert list(evidence_path.parent.glob(".*.tmp")) == []
 
 
+def test_query_many_stress_runner_is_required_and_privacy_safe(
+    tmp_path: Path,
+) -> None:
+    python_runner = ROOT / "scripts/sql_auth/query_many_stress.py"
+    shell_runner = ROOT / "scripts/sql_auth/run_query_many_stress.sh"
+    full_runner = ROOT / "scripts/sql_auth/run_all.sh"
+    report = ROOT / "scripts/sql_auth/generate_report.py"
+    assert python_runner.is_file()
+    assert shell_runner.is_file()
+    assert shell_runner.stat().st_mode & 0o111
+
+    sandbox_root = tmp_path / "repo"
+    sandbox_runner = sandbox_root / "scripts/sql_auth/run_query_many_stress.sh"
+    sandbox_runner.parent.mkdir(parents=True)
+    shutil.copy2(shell_runner, sandbox_runner)
+    (sandbox_root / ".env.sql-auth.local").write_text("", encoding="utf-8")
+    fake_python = sandbox_root / ".venv/bin/python"
+    fake_python.parent.mkdir(parents=True)
+    _write_executable(
+        fake_python,
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "${CAPTURE_PATH}"\n',
+    )
+    captured_arguments = tmp_path / "query-many-stress-arguments.txt"
+    runner_env = os.environ.copy()
+    for name in tuple(runner_env):
+        if name.startswith("FASTMSSQL_QUERY_MANY_"):
+            del runner_env[name]
+    runner_env.update(
+        {
+            "CAPTURE_PATH": str(captured_arguments),
+            "FASTMSSQL_QUERY_MANY_PROFILES": (
+                "3:async:false:5:2"
+            ),
+            "FASTMSSQL_QUERY_MANY_ALLOW_EXTENDED": "1",
+        }
+    )
+    completed = subprocess.run(
+        [str(sandbox_runner)],
+        cwd=sandbox_root,
+        env=runner_env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    arguments = captured_arguments.read_text(encoding="utf-8").splitlines()
+    assert arguments[arguments.index("--profiles") + 1] == (
+        "3:async:false:5:2"
+    )
+    assert "--allow-extended" in arguments
+    output = Path(arguments[arguments.index("--metrics-output") + 1])
+    assert output == (
+        sandbox_root / ".artifacts/sql-auth/query-many-stress.json"
+    )
+
+    shell_source = shell_runner.read_text(encoding="utf-8")
+    for token in (
+        "FASTMSSQL_QUERY_MANY_PROFILES",
+        "FASTMSSQL_QUERY_MANY_ALLOW_EXTENDED",
+        "FASTMSSQL_QUERY_MANY_METRICS_PATH",
+        "FASTMSSQL_QUERY_MANY_RSS_GROWTH_LIMIT_BYTES",
+        "FASTMSSQL_QUERY_MANY_EVENT_LOOP_GAP_LIMIT_SECONDS",
+        "FASTMSSQL_QUERY_MANY_OPERATION_TIMEOUT_SECONDS",
+        "query-many-stress.json",
+        "--profiles",
+        "--metrics-output",
+        ".env.sql-auth.local",
+    ):
+        assert token in shell_source
+    assert "FASTMSSQL_SQL_AUTH_OWNER_PASSWORD" not in completed.stdout
+    assert "FASTMSSQL_SQL_AUTH_SA_PASSWORD" not in completed.stdout
+
+    full_source = full_runner.read_text(encoding="utf-8")
+    assert "record query-many-load " in full_source
+    assert full_source.index("record provision ") < full_source.index(
+        "record query-many-load "
+    )
+    assert full_source.index("record query-many-load ") < full_source.index(
+        "record strict "
+    )
+    assert "tests/sql_auth_strict/test_query_many_strict.py" in full_source
+
+    report_source = report.read_text(encoding="utf-8")
+    assert "query-many-stress.json" in report_source
+    assert "Query-many stress metrics" in report_source
+
+
+def test_query_many_case_ownership_and_load_routing_are_exact(
+    monkeypatch,
+) -> None:
+    strict_path = ROOT / "tests/sql_auth_strict/test_query_many_strict.py"
+    strict_tree = ast.parse(
+        strict_path.read_text(encoding="utf-8"),
+        filename=str(strict_path),
+    )
+    expected = {
+        "test_query_many_surface_validation_and_empty": (
+            ("QMANY-001", "QMANY-002", "QMANY-003"),
+            ("sql_auth_config", "sa_connection", "unique_sql_name"),
+        ),
+        "test_query_many_parameter_sources_and_typed_results": (
+            ("QMANY-004",),
+            ("owner_connection", "unique_sql_name", "cleanup_registry"),
+        ),
+        "test_query_many_pool_window_and_ordering": (
+            ("QMANY-005", "QMANY-006", "QMANY-007"),
+            (
+                "sql_auth_config",
+                "sa_connection",
+                "transaction_factory",
+                "unique_sql_name",
+                "cleanup_registry",
+            ),
+        ),
+        "test_query_many_failure_and_consumer_cleanup": (
+            ("QMANY-008", "QMANY-009"),
+            (
+                "sql_auth_config",
+                "sa_connection",
+                "transaction_factory",
+                "unique_sql_name",
+                "cleanup_registry",
+            ),
+        ),
+        "test_query_many_faults_and_lifecycle": (
+            ("QMANY-010", "QMANY-011"),
+            (
+                "sql_auth_config",
+                "sa_connection",
+                "transaction_factory",
+                "unique_sql_name",
+                "cleanup_registry",
+            ),
+        ),
+        "test_query_many_metrics_and_security_retirement": (
+            ("QMANY-012",),
+            ("sql_auth_config", "sa_connection", "unique_sql_name"),
+        ),
+    }
+    actual: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {}
+    for node in strict_tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name not in expected:
+            continue
+        case_ids = tuple(
+            argument.value
+            for decorator in node.decorator_list
+            if isinstance(decorator, ast.Call)
+            and isinstance(decorator.func, ast.Name)
+            and decorator.func.id == "case"
+            for argument in decorator.args
+            if isinstance(argument, ast.Constant)
+            and isinstance(argument.value, str)
+        )
+        fixtures = tuple(argument.arg for argument in node.args.args)
+        actual[node.name] = (case_ids, fixtures)
+    assert actual == expected
+
+    load_path = ROOT / "tests/sql_auth_strict/test_resilience_load.py"
+    load_tree = ast.parse(
+        load_path.read_text(encoding="utf-8"),
+        filename=str(load_path),
+    )
+    load_function = next(
+        node
+        for node in load_tree.body
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "test_query_many_thousand_operation_required_profile"
+    )
+    assert tuple(argument.arg for argument in load_function.args.args) == (
+        "sql_auth_config",
+        "record_load_metric",
+    )
+    assert {ast.unparse(item) for item in load_function.decorator_list} == {
+        "case('QMANY-013')",
+        "pytest.mark.load",
+        "pytest.mark.asyncio",
+    }
+
+    monkeypatch.setattr(strict_conftest, "_LOAD_METRICS", {})
+    recorder = strict_conftest.record_load_metric.__wrapped__()
+    recorder("QMANY-013", contract_probe=True)
+    for functional_id in ("QMANY-001", "QMANY-012"):
+        with pytest.raises(ValueError):
+            recorder(functional_id, contract_probe=True)
+
+
+def test_hosted_wheel_gate_runs_all_query_many_offline_contracts() -> None:
+    workflow = (
+        ROOT / ".github/workflows/rust-unit-tests.yml"
+    ).read_text(encoding="utf-8")
+    start = workflow.index(
+        "- name: Verify installed Python configuration contracts"
+    )
+    wheel_gate = workflow[start:]
+    for test_path in (
+        "tests/test_query_many_contract.py",
+        "tests/test_query_many_coordinator.py",
+        "tests/test_query_many_stress_contract.py",
+    ):
+        assert test_path in wheel_gate
+
+
 def test_result_stream_isolated_wheel_gate_installs_test_dependencies() -> None:
     plan = ROOT / (
         "docs/superpowers/plans/"
@@ -1180,7 +1423,7 @@ def test_resilience_and_load_cases_are_routed_to_their_runner_lanes() -> None:
                 else "pytest.mark.load"
                 if (
                     case_id.startswith("LOAD-")
-                    or case_id in {"OPMET-011", "PARAM-033"}
+                    or case_id in {"OPMET-011", "PARAM-033", "QMANY-013"}
                 )
                 else ""
             )

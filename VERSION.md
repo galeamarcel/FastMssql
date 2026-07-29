@@ -132,6 +132,36 @@ No release, package-version change, or artifact publication has occurred.
 - This test-only commit changes no runtime behavior, package metadata,
   displayed `0.7.7` version, release state or published artifact.
 
+### Query-many SQL-auth, matrix and stress RED
+
+- Extended the canonical SQL-auth specification from 407 to 420 unique case
+  IDs with `QMANY-001`–`QMANY-013`, mapped exactly once to six strict
+  real-SQL functions and one required load function.
+- Added deterministic SQL Server contracts for the public/empty surface,
+  typed list/synchronous/asynchronous sources, parameterized JOIN, CTE,
+  empty-result and stored-procedure queries, pool-capped concurrency,
+  lock-controlled input/completion ordering, first-error propagation,
+  cancellation, timeout, saturated acquire, killed SPID, graceful/forced
+  shutdown, schema-2 child query metrics and security-context session
+  retirement.
+- Added the lazy query-many stress harness and shell lane with exact required
+  profiles at 1,000 and 10,000 operations, explicit 99,999-operation opt-in,
+  bounded admission and latency tracking, child-query/pool/session sampling,
+  atomic privacy-safe evidence and 13 non-advisory resource/correctness
+  gates.
+- Wired the required stress lane before strict execution, the focused strict
+  file into `strict_functional`, a redacted query-many stress section into
+  report generation and all three offline contracts into the installed-wheel
+  workflow on Linux, macOS and Windows.
+- Fresh structural verification passed 6/6 stress contracts and 30/30 matrix
+  contracts. The dedicated Docker SQL Server was healthy and freshly
+  provisioned; all six strict functions and the `QMANY-013` required-load
+  function failed for the intended sole reason that
+  `Connection.query_many()` is absent.
+- This complete RED branch adds no FastMssql runtime behavior, dependency,
+  package-metadata change, displayed-version change, release or published
+  artifact.
+
 ### Execute-many live audit status
 
 - Marked only the sixth of seven batch/bulk slices,

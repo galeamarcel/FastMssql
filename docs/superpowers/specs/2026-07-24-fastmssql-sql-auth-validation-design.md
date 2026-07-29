@@ -645,6 +645,45 @@ Enterprise compatibility-bulk buffering:
   `CommitOutcomeUnknown`, performs no rollback or retry and reports the first
   set in the unconfirmed commit plus truthful partial-commit evidence.
 
+### QMANY — independent pool-bounded queries
+
+- `QMANY-001`: the wrapper and stub expose the lazy query-many iterator while
+  raw extension and Transaction surfaces intentionally do not expose
+  concurrent query-many execution.
+- `QMANY-002`: scalar and source validation acquires one producer protocol
+  exactly once and invalid input performs zero producer pulls, pool activity,
+  SQL or operation-metric activity.
+- `QMANY-003`: empty concrete-list, synchronous and asynchronous sources
+  complete with zero pool creation, SQL and query metrics.
+- `QMANY-004`: concrete-list, synchronous and asynchronous sources preserve
+  typed positional parameters and return exact `QueryStream` results for
+  parameterized joins, CTEs, empty results and stored-procedure execution.
+- `QMANY-005`: requested concurrency, pool maximum, total accepted window,
+  active query count and SQL application-session count remain bounded by the
+  effective concurrency.
+- `QMANY-006`: deterministic completion in a different physical order is
+  delivered in input order when ordered delivery is requested, with bounded
+  reordering.
+- `QMANY-007`: completion-order delivery returns the deterministic physical
+  completion order without loss or duplication.
+- `QMANY-008`: producer, validation, conversion and SQL first failures retain
+  their original exception and traceback, receive a privacy-safe zero-based
+  `query_index` and settle every sibling.
+- `QMANY-009`: full exhaustion, explicit close, async-context early exit,
+  consumer cancellation and supervised drop fallback leave no active worker,
+  pool lease or application session.
+- `QMANY-010`: operation timeout and killed-SPID faults retire affected
+  sessions, recover the pool and leave no leaked task or application session.
+- `QMANY-011`: graceful and forced disconnect settle admitted work according
+  to the lifecycle contract and reject new query-many work while the
+  connection is Closing.
+- `QMANY-012`: every started child contributes one existing schema-2 `query`
+  metric, no aggregate query-many metric is added, and consumed
+  security-context SQL retires and replaces its physical session.
+- `QMANY-013`: required and extended bounded stress, isolated installed-wheel
+  import and post-load recovery prove exact operation integrity, resource
+  bounds and deterministic teardown.
+
 ### TX — dedicated transactions
 
 - `TX-001`: dedicated session ID remains constant.

@@ -139,6 +139,7 @@ record tiberius-response-sql-auth \
   --features chrono,tds73,rustls \
   --test response_events_sql_auth -- --test-threads=1
 record result-stream-load scripts/sql_auth/run_result_stream_stress.sh
+record query-many-load scripts/sql_auth/run_query_many_stress.sh
 
 export FASTMSSQL_TEST_CONNECTION_STRING="Server=${FASTMSSQL_SQL_AUTH_HOST},${FASTMSSQL_SQL_AUTH_PORT};Database=fastmssql_upstream_regression;User Id=${FASTMSSQL_SQL_AUTH_OWNER_USER};Password=${FASTMSSQL_SQL_AUTH_OWNER_PASSWORD};Encrypt=True;TrustServerCertificate=True"
 export FAST_MSSQL_TEST_DB_USER="${FASTMSSQL_SQL_AUTH_OWNER_USER}"
@@ -165,6 +166,7 @@ readonly strict_functional=(
   tests/sql_auth_strict/test_native_bulk_strict.py
   tests/sql_auth_strict/test_native_bulk_iterable_strict.py
   tests/sql_auth_strict/test_execute_many_strict.py
+  tests/sql_auth_strict/test_query_many_strict.py
   tests/sql_auth_strict/test_transactions_strict.py
   tests/sql_auth_strict/test_operation_timeouts.py
   tests/sql_auth_strict/test_lifecycle.py

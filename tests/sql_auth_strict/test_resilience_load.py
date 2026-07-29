@@ -1363,3 +1363,33 @@ async def test_thousand_concurrent_typed_operations_are_exact_and_pool_bounded(
         application_name,
         expected=baseline_sessions,
     )
+
+
+@case("QMANY-013")
+@pytest.mark.load
+@pytest.mark.asyncio
+async def test_query_many_thousand_operation_required_profile(
+    sql_auth_config: SqlAuthConfig,
+    record_load_metric,
+) -> None:
+    operation_count = 1_000
+    connection = _connection(sql_auth_config, max_size=10, min_idle=10)
+    yielded = 0
+    try:
+        async with connection.query_many(
+            "SELECT @P1 AS value, @@SPID AS spid",
+            ([value] for value in range(operation_count)),
+            concurrency=10,
+            ordered=True,
+        ) as results:
+            async for result in results:
+                row = result.fetchone()
+                assert row["value"] == yielded
+                yielded += 1
+        assert yielded == operation_count
+        stats = await connection.pool_stats()
+        assert stats["active_connections"] == 0
+        assert stats["connections"] <= 10
+        record_load_metric("QMANY-013", operations=yielded)
+    finally:
+        await connection.disconnect()

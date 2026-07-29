@@ -237,7 +237,8 @@ def record_load_metric():
     def record(case_id: str, **values: object) -> None:
         if not (
             case_id.startswith("LOAD-")
-            or case_id in {"OBS-009", "OPMET-011", "PARAM-033"}
+            or case_id
+            in {"OBS-009", "OPMET-011", "PARAM-033", "QMANY-013"}
         ):
             raise ValueError(f"not a load case ID: {case_id}")
         json.dumps(values)

@@ -223,6 +223,49 @@ def load_result_stream_metrics(
     return payload
 
 
+def load_query_many_metrics(
+    artifact_dir: Path,
+    expected_source_sha: str,
+) -> dict[str, object]:
+    path = Path(
+        os.getenv(
+            "FASTMSSQL_QUERY_MANY_METRICS_PATH",
+            str(artifact_dir / "query-many-stress.json"),
+        )
+    )
+    if not path.is_file():
+        return {
+            "schema_version": 1,
+            "source_sha": "",
+            "status": "NOT RUN",
+            "profiles": [],
+        }
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schema_version") != 1:
+        raise ValueError("unsupported query-many metrics schema")
+    if payload.get("source_sha") != expected_source_sha:
+        return {
+            "schema_version": 1,
+            "source_sha": str(payload.get("source_sha", "")),
+            "expected_source_sha": expected_source_sha,
+            "status": "STALE",
+            "profiles": [],
+        }
+    return payload
+
+
+def _maximum_profile_value(
+    profiles: list[dict[str, object]],
+    key: str,
+) -> int | float:
+    values = [
+        value
+        for profile in profiles
+        if isinstance((value := profile.get(key)), (int, float))
+    ]
+    return max(values, default=0)
+
+
 def _git_commit(root: Path) -> str:
     completed = subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -277,6 +320,7 @@ def render_report(
     framework_metrics: dict[str, dict],
     load_metrics: dict[str, dict],
     result_stream_metrics: dict[str, object],
+    query_many_metrics: dict[str, object],
     secrets: tuple[str, ...],
 ) -> str:
     counts = Counter(
@@ -436,6 +480,61 @@ def render_report(
             f"{markdown_cell(metrics.get('concurrency'), secrets)} | "
             f"{markdown_cell(json.dumps(metrics, sort_keys=True), secrets)} |"
         )
+    query_profiles = [
+        profile
+        for profile in query_many_metrics.get("profiles", [])
+        if isinstance(profile, dict)
+    ]
+    lines.extend(
+        [
+            "",
+            "## Query-many stress metrics",
+            "",
+            "- Schema version: "
+            f"`{markdown_cell(query_many_metrics.get('schema_version'), secrets)}`",
+            "- Evidence status: "
+            f"`{markdown_cell(query_many_metrics.get('status'), secrets)}`",
+            "- Source SHA: "
+            f"`{markdown_cell(query_many_metrics.get('source_sha'), secrets)}`",
+            f"- Profile count: `{len(query_profiles)}`",
+            "- Maximum active queries: "
+            f"`{_maximum_profile_value(query_profiles, 'maximum_active_queries')}`",
+            "- Maximum SQL sessions: "
+            f"`{_maximum_profile_value(query_profiles, 'maximum_sql_sessions')}`",
+            "- Maximum accepted window: "
+            f"`{_maximum_profile_value(query_profiles, 'maximum_accepted_window')}`",
+            "- Maximum RSS growth bytes: "
+            f"`{_maximum_profile_value(query_profiles, 'rss_growth_bytes')}`",
+            "- Maximum event-loop gap seconds: "
+            f"`{_maximum_profile_value(query_profiles, 'maximum_event_loop_gap_seconds')}`",
+            "",
+            "| Profile | Status | Operations | Source | Ordered | Requested "
+            "concurrency | Pool max | Active queries | SQL sessions | "
+            "Accepted window | RSS growth bytes | Event-loop gap seconds |",
+            "|---|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    if not query_profiles:
+        lines.append(
+            "| none | "
+            f"{markdown_cell(query_many_metrics.get('status'), secrets)} "
+            "| 0 | | | 0 | 0 | 0 | 0 | 0 | 0 | 0 |"
+        )
+    for index, metrics in enumerate(query_profiles, start=1):
+        lines.append(
+            f"| {index} | "
+            f"{markdown_cell(metrics.get('status'), secrets)} | "
+            f"{markdown_cell(metrics.get('operations'), secrets)} | "
+            f"{markdown_cell(metrics.get('source'), secrets)} | "
+            f"{'yes' if metrics.get('ordered') is True else 'no'} | "
+            f"{markdown_cell(metrics.get('requested_concurrency'), secrets)} | "
+            f"{markdown_cell(metrics.get('pool_max'), secrets)} | "
+            f"{markdown_cell(metrics.get('maximum_active_queries'), secrets)} | "
+            f"{markdown_cell(metrics.get('maximum_sql_sessions'), secrets)} | "
+            f"{markdown_cell(metrics.get('maximum_accepted_window'), secrets)} | "
+            f"{markdown_cell(metrics.get('rss_growth_bytes'), secrets)} | "
+            f"{markdown_cell(metrics.get('maximum_event_loop_gap_seconds'), secrets)} |"
+        )
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -475,6 +574,10 @@ def main(argv: list[str] | None = None) -> int:
         args.artifact_dir,
         source_sha,
     )
+    query_many_metrics = load_query_many_metrics(
+        args.artifact_dir,
+        source_sha,
+    )
     matrix = render_matrix(cases, results, secrets)
     report = render_report(
         root,
@@ -484,6 +587,7 @@ def main(argv: list[str] | None = None) -> int:
         framework_metrics,
         load_metrics,
         result_stream_metrics,
+        query_many_metrics,
         secrets,
     )
     args.matrix_output.parent.mkdir(parents=True, exist_ok=True)
