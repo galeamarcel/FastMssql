@@ -439,6 +439,35 @@ async def test_cancellation_during_async_pull_finishes_abort_and_aclose() -> Non
 
 
 @pytest.mark.asyncio
+async def test_cancellation_after_reservation_effect_waits_for_explicit_abort() -> None:
+    events: list[object] = []
+
+    class CancellingReservationSequence(FakeSequence):
+        async def reserve(self) -> None:
+            self.events.append("reserve_effective")
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+            await asyncio.sleep(0)
+
+    sequence = CancellingReservationSequence(events)
+    raw = FakeRawOwner(sequence, events)
+    rows = CountingSyncRows([[1, "one"]])
+
+    task = asyncio.create_task(_run(raw, rows, chunk_size=2))
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert rows.pull_calls == 0
+    assert rows.closed is True
+    assert events == [
+        ("construct", "dbo.items", ["id", "payload"], 2),
+        "reserve_effective",
+        ("abort", "cancelled"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_cancellation_during_push_stops_later_pulls() -> None:
     push_started = asyncio.Event()
     push_release = asyncio.Event()

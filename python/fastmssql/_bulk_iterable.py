@@ -75,7 +75,7 @@ async def native_bulk_insert_iterable(
         chunk_size=chunk_size,
     )
     asynchronous, producer = _acquire_producer(rows)
-    reserved = False
+    reservation_started = False
     activated = False
     expired = False
 
@@ -145,8 +145,11 @@ async def native_bulk_insert_iterable(
         return row
 
     try:
+        # Treat the reservation await as cleanup-owning before yielding to it:
+        # cancellation may be delivered after Rust has made the reservation
+        # effective but before Python observes the successful return.
+        reservation_started = True
         await sequence.reserve()
-        reserved = True
         chunk: list[list[Any]] = []
 
         while True:
@@ -177,7 +180,7 @@ async def native_bulk_insert_iterable(
         return await sequence.finish()
     except BaseException as primary:
         cleanup_error: BaseException | None = None
-        if reserved and not expired:
+        if reservation_started and not expired:
             outcome = (
                 "cancelled"
                 if isinstance(primary, asyncio.CancelledError)

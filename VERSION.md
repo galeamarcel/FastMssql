@@ -88,6 +88,10 @@ No release, package-version change, or artifact publication has occurred.
   mandatory sequence cleanup: `abort()`/`expire()` now wait for the cancelled
   call to release the private sequence lock, so database state and the single
   operation observer are terminal before the original exception is re-raised.
+- Closed the reservation-completion cancellation race by assigning cleanup
+  ownership before awaiting `reserve()`, ensuring an effective caller
+  transaction reservation is explicitly released before cancellation is
+  re-raised rather than relying on asynchronous drop cleanup.
 - Restored the disabled operation-metrics fast path so it does not read the
   monotonic clock before confirming that a metrics registry exists.
 - Made the result-stream retirement proof account for SQL Server's bounded,
