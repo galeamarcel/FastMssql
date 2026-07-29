@@ -220,6 +220,21 @@ No release, package-version change, or artifact publication has occurred.
 - Package metadata and the displayed `0.7.7` version remain unchanged; no
   release or artifact was published.
 
+### Query-many SQL-auth contract corrections
+
+- Corrected the typed-conversion fault input to use an explicit `INT`
+  `Parameter`, matching the asserted `ConversionError` and preserving its
+  existing `parameter_index` before query-many adds `query_index`.
+- Scheduled the raw PyO3 query awaitable with `asyncio.ensure_future()`;
+  `asyncio.create_task()` accepts coroutine objects only and therefore
+  rejected this valid driver Future before the pool-saturation scenario
+  could start.
+- Both focused real-MSSQL failure/lifecycle functions now pass, including
+  producer/conversion/SQL errors, cancellation, early exit, acquire timeout,
+  KILL SPID and graceful/forced shutdown.
+- This test-only correction changes no FastMssql runtime, dependency, package
+  metadata, displayed `0.7.7` version, release or published artifact.
+
 ### Execute-many live audit status
 
 - Marked only the sixth of seven batch/bulk slices,
