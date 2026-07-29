@@ -41,6 +41,10 @@ from .fastmssql import (
 
 BulkRow = Sequence[Any]
 BulkRows = list[list[Any]] | Iterable[BulkRow] | AsyncIterable[BulkRow]
+ParameterSet = list[Any] | Parameters
+ParameterSetSource = (
+    list[ParameterSet] | Iterable[ParameterSet] | AsyncIterable[ParameterSet]
+)
 
 class _OperationStatsEntry(TypedDict):
     started: int
@@ -286,6 +290,17 @@ class Connection:
         """
         ...
 
+    def execute_many(
+        self,
+        sql: str,
+        parameter_sets: ParameterSetSource,
+        *,
+        atomic: bool = True,
+        chunk_size: int = 1000,
+    ) -> Coroutine[Any, Any, int]:
+        """Execute one statement over bounded positional parameter sets."""
+        ...
+
     def execute_batch(
         self,
         commands: List[Tuple[str, Optional[List[Any]]]],
@@ -476,6 +491,16 @@ class Transaction:
         params: Optional[List[Any]] = None,
     ) -> Coroutine[Any, Any, int]:
         """Execute an INSERT/UPDATE/DELETE/DDL command."""
+        ...
+
+    def execute_many(
+        self,
+        sql: str,
+        parameter_sets: ParameterSetSource,
+        *,
+        chunk_size: int = 1000,
+    ) -> Coroutine[Any, Any, int]:
+        """Execute bounded sets without settling the active transaction."""
         ...
 
     def execute_batch(

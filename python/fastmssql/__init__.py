@@ -7,6 +7,7 @@ connection pooling, SSL/TLS encryption, Azure Active Directory authentication, a
 import asyncio
 
 from ._bulk_iterable import native_bulk_insert_iterable
+from ._execute_many import execute_many_iterable
 
 # Import from the compiled Rust module
 from .fastmssql import (
@@ -146,6 +147,30 @@ class Connection:
             procedure,
             params,
             buffer_size=buffer_size,
+        )
+
+    async def execute_many(
+        self,
+        sql,
+        parameter_sets,
+        *,
+        atomic=True,
+        chunk_size=1000,
+    ):
+        """Execute one statement over bounded positional parameter sets."""
+        if isinstance(parameter_sets, list):
+            return await self._conn.execute_many(
+                sql,
+                parameter_sets,
+                atomic=atomic,
+                chunk_size=chunk_size,
+            )
+        return await execute_many_iterable(
+            self._conn,
+            sql,
+            parameter_sets,
+            atomic=atomic,
+            chunk_size=chunk_size,
         )
 
     async def native_bulk_insert(
@@ -307,6 +332,27 @@ class Transaction:
     async def execute(self, sql, params=None):
         """Execute an INSERT/UPDATE/DELETE/DDL command."""
         return await self._rust_conn.execute(sql, params)
+
+    async def execute_many(
+        self,
+        sql,
+        parameter_sets,
+        *,
+        chunk_size=1000,
+    ):
+        """Execute bounded parameter sets without settling this transaction."""
+        if isinstance(parameter_sets, list):
+            return await self._rust_conn.execute_many(
+                sql,
+                parameter_sets,
+                chunk_size=chunk_size,
+            )
+        return await execute_many_iterable(
+            self._rust_conn,
+            sql,
+            parameter_sets,
+            chunk_size=chunk_size,
+        )
 
     async def execute_batch(self, commands):
         """Execute multiple commands in sequence on this connection."""

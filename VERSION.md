@@ -45,6 +45,44 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Public bounded execute-many adapter
+
+- Added the public `Connection.execute_many()` and
+  `Transaction.execute_many()` wrappers for concrete lists plus lazy
+  synchronous and asynchronous parameter-set producers.
+- Kept concrete lists on the raw Rust fast path, while iterable sources use
+  one private sequence, reserve before their first pull and retain at most one
+  configured chunk.
+- Added privacy-safe per-set preflight, global failure metadata, acknowledged
+  partial-commit tracking and cancellation-shielded abort/producer-close
+  cleanup.
+- Kept an explicitly supplied invalid Connection `atomic=None` distinct from
+  the Transaction adapter's omitted option so Rust validation cannot be
+  bypassed.
+- Made producer-boundary expiry prefer Python's exact next-set index over the
+  raw sequence's necessarily synthetic no-active-statement fallback.
+- Corrected the caller-Transaction isolation proof for the canonical
+  `READ_COMMITTED_SNAPSHOT=OFF` database: `READPAST` observes zero committed
+  rows without misclassifying SQL Server's expected lock wait as a driver
+  deadlock.
+- Corrected the focused cancellation harness to inspect `CancelledError` at
+  the API boundary; Python 3.12 reconstructs the exception for waiters of a
+  terminal cancelled `Task` and therefore cannot preserve instance
+  attributes or cleanup causes there.
+- Aligned the late-invalid-set coordinator assertion with the approved lazy
+  contract: activation follows the first valid set, while no incomplete
+  chunk is sent after a later preflight failure.
+- Published the exact public/raw type-stub split and private sequence progress
+  contract, plus README guidance for atomic, per-chunk and caller-Transaction
+  use.
+- Verified 35 focused execute-many contracts, 64 unchanged native-bulk,
+  metrics, result-stream and packaging contracts, all 116 Rust tests,
+  warning-free all-target Clippy, Rust formatting, Ruff and `compileall`.
+- Exercised `EMANY-001`–`EMANY-011` together on the approved Docker SQL
+  Server after the focused fixes; all 11 cases passed.
+- This unreleased adapter does not change package metadata, the displayed
+  `0.7.7` version or release state.
+
 ### Stateful execute-many native engine
 
 - Added strict raw-list `Connection.execute_many()` and

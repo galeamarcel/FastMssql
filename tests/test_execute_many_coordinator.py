@@ -367,6 +367,33 @@ async def test_keyword_validation_never_acquires_or_advances_producer(
 
 
 @pytest.mark.asyncio
+async def test_explicit_connection_atomic_none_reaches_raw_validation() -> None:
+    observed_kwargs: dict[str, object] = {}
+
+    class RejectingRawOwner:
+        def _execute_many_sequence(
+            self,
+            sql: str,
+            **kwargs: object,
+        ) -> None:
+            observed_kwargs.update(kwargs)
+            raise TypeError("atomic must be exactly bool")
+
+    values = CountingSyncSets([[1]])
+    with pytest.raises(TypeError, match="atomic"):
+        await _coordinator()(
+            RejectingRawOwner(),
+            "INSERT INTO dbo.items VALUES (@P1)",
+            values,
+            atomic=None,
+            chunk_size=2,
+        )
+
+    assert observed_kwargs == {"atomic": None, "chunk_size": 2}
+    assert values.iter_calls == values.pull_calls == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "values",
     (
@@ -450,7 +477,9 @@ async def test_invalid_parameter_set_aborts_with_global_index_and_privacy() -> N
     assert "not a list" not in str(raised.value)
     assert values.close_calls == 1
     assert ("abort", "error") in events
-    assert "activate" not in events
+    # The approved lazy contract activates after the first valid set. A later
+    # set can still fail before any chunk reaches SQL Server.
+    assert [event for event in events if event == "activate"] == ["activate"]
     assert not any(
         isinstance(event, tuple) and event[0] == "push" for event in events
     )
@@ -557,7 +586,17 @@ async def test_cancellation_during_async_pull_finishes_abort_and_aclose() -> Non
     sequence.abort_release = abort_release
     values = CountingAsyncSets([[1]], wait_before_pull=pull_release)
 
-    task = asyncio.create_task(_run(raw, values, chunk_size=2))
+    async def capture_cancellation() -> asyncio.CancelledError:
+        try:
+            await _run(raw, values, chunk_size=2)
+        except asyncio.CancelledError as error:
+            # A terminal cancelled Task reconstructs CancelledError for its
+            # waiter and drops instance metadata. Catch it at the API boundary
+            # where application cleanup code can actually observe it.
+            return error
+        raise AssertionError("execute_many unexpectedly completed")
+
+    task = asyncio.create_task(capture_cancellation())
     await asyncio.wait_for(values.pull_started.wait(), timeout=1.0)
     task.cancel()
     await asyncio.wait_for(abort_started.wait(), timeout=1.0)
@@ -566,11 +605,10 @@ async def test_cancellation_during_async_pull_finishes_abort_and_aclose() -> Non
     assert task.done() is False
 
     abort_release.set()
-    with pytest.raises(asyncio.CancelledError) as raised:
-        await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+    cancellation = await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
 
     _assert_failure_metadata(
-        raised.value,
+        cancellation,
         index=0,
         committed=0,
         partial=False,
@@ -677,6 +715,35 @@ async def test_async_pull_timeout_uses_sequence_typed_error_and_closes() -> None
 
 
 @pytest.mark.asyncio
+async def test_timeout_waiting_for_second_set_uses_python_next_index() -> None:
+    events, sequence, raw = _fixture_sequence(remaining=0.01)
+
+    class SecondPullWaitSets(CountingAsyncSets):
+        async def __anext__(self) -> object:
+            self.pull_calls += 1
+            self.pull_started.set()
+            if self.pull_calls == 1:
+                return self.values.pop(0)
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    values = SecondPullWaitSets([[1]])
+    with pytest.raises(FakeOperationTimeoutError) as raised:
+        await asyncio.wait_for(_run(raw, values, chunk_size=2), timeout=1.0)
+
+    assert raised.value is sequence.timeout_error
+    _assert_failure_metadata(
+        raised.value,
+        index=1,
+        committed=0,
+        partial=False,
+    )
+    assert values.pull_calls == 2
+    assert values.aclose_calls == 1
+    assert "expire" in events
+
+
+@pytest.mark.asyncio
 async def test_deadline_crossing_sync_pull_uses_typed_timeout() -> None:
     events, sequence, raw = _fixture_sequence()
     primary = ProducerFailure()
@@ -759,7 +826,15 @@ async def test_repeated_cancellation_cannot_interrupt_failing_producer_close() -
             raise cleanup
 
     values = SlowFailingCloseSets([[1]], wait_before_pull=pull_release)
-    task = asyncio.create_task(_run(raw, values, chunk_size=2))
+
+    async def capture_cancellation() -> asyncio.CancelledError:
+        try:
+            await _run(raw, values, chunk_size=2)
+        except asyncio.CancelledError as error:
+            return error
+        raise AssertionError("execute_many unexpectedly completed")
+
+    task = asyncio.create_task(capture_cancellation())
     await asyncio.wait_for(values.pull_started.wait(), timeout=1.0)
     task.cancel()
     await asyncio.wait_for(close_started.wait(), timeout=1.0)
@@ -768,12 +843,11 @@ async def test_repeated_cancellation_cannot_interrupt_failing_producer_close() -
     assert task.done() is False
 
     close_release.set()
-    with pytest.raises(asyncio.CancelledError) as raised:
-        await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+    cancellation = await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
 
-    assert raised.value.__cause__ is cleanup
+    assert cancellation.__cause__ is cleanup
     _assert_failure_metadata(
-        raised.value,
+        cancellation,
         index=0,
         committed=0,
         partial=False,

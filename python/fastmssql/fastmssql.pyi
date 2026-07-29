@@ -925,6 +925,28 @@ class _NativeBulkSequence:
     def expire(self) -> Coroutine[Any, Any, NoReturn]: ...
     def remaining_timeout(self) -> float | None: ...
 
+class _ExecuteManyAbortProgress(TypedDict):
+    active_parameter_set_index: int | None
+    confirmed_committed_parameter_sets: int
+    partial_commit_possible: bool
+
+class _ExecuteManySequence:
+    """Private bounded execute-many coordinator primitive."""
+
+    def reserve(self) -> Coroutine[Any, Any, None]: ...
+    def activate(self) -> Coroutine[Any, Any, None]: ...
+    def push(
+        self,
+        parameter_sets: list[list[Any] | Parameters],
+    ) -> Coroutine[Any, Any, int]: ...
+    def finish(self) -> Coroutine[Any, Any, int]: ...
+    def abort(
+        self,
+        outcome: Literal["error", "cancelled"],
+    ) -> Coroutine[Any, Any, _ExecuteManyAbortProgress]: ...
+    def expire(self) -> Coroutine[Any, Any, NoReturn]: ...
+    def remaining_timeout(self) -> float | None: ...
+
 class Connection:
     """
     High-performance SQL Server connection with async/await support.
@@ -1114,6 +1136,25 @@ class Connection:
             Number of affected rows
         """
         ...
+
+    def execute_many(
+        self,
+        sql: str,
+        parameter_sets: list[list[Any] | Parameters],
+        *,
+        atomic: bool = True,
+        chunk_size: int = 1000,
+    ) -> Coroutine[Any, Any, int]:
+        """Execute a concrete parameter-set list on one TDS session."""
+        ...
+
+    def _execute_many_sequence(
+        self,
+        sql: str,
+        *,
+        atomic: bool = True,
+        chunk_size: int = 1000,
+    ) -> _ExecuteManySequence: ...
 
     def execute_batch(
         self,
@@ -1329,6 +1370,23 @@ class Transaction:
     ) -> Coroutine[Any, Any, int]:
         """Execute an INSERT/UPDATE/DELETE/DDL command."""
         ...
+
+    def execute_many(
+        self,
+        sql: str,
+        parameter_sets: list[list[Any] | Parameters],
+        *,
+        chunk_size: int = 1000,
+    ) -> Coroutine[Any, Any, int]:
+        """Execute concrete sets without settling this transaction."""
+        ...
+
+    def _execute_many_sequence(
+        self,
+        sql: str,
+        *,
+        chunk_size: int = 1000,
+    ) -> _ExecuteManySequence: ...
 
     def execute_batch(
         self,

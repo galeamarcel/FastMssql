@@ -575,6 +575,73 @@ asyncio.run(main())
 
 Parameters use positional placeholders: `@P1`, `@P2`, ... Provide values as a list in the same order.
 
+### Bounded parameterized `execute_many`
+
+Use `execute_many()` to repeat one parameterized statement in exact input
+order on one physical TDS session:
+
+```python
+affected = await conn.execute_many(
+    "INSERT INTO dbo.events (event_id, payload) VALUES (@P1, @P2)",
+    [
+        [1, "created"],
+        [2, "updated"],
+    ],
+    chunk_size=1000,
+)
+assert affected == 2
+```
+
+The public wrapper accepts a concrete list, a synchronous iterable or an
+asynchronous iterable of `list`/`Parameters` sets. Iterable sources are lazy:
+FastMssql reserves one operation before the first pull, retains at most one
+configured chunk and never requests the next chunk while TDS work is in
+flight. A concrete top-level list uses the direct Rust adapter. Do not resize
+that outer list or mutate an unconsumed/yielded parameter set until the
+awaitable completes.
+
+```python
+async def generated_parameter_sets(total):
+    for event_id in range(total):
+        await asyncio.sleep(0)
+        yield [event_id, f"event-{event_id}"]
+
+
+await conn.execute_many(
+    "INSERT INTO dbo.events (event_id, payload) VALUES (@P1, @P2)",
+    generated_parameter_sets(10_000),
+    chunk_size=500,
+)
+```
+
+`Connection.execute_many()` is atomic by default: all chunks commit once at
+the end, and a deterministic late failure rolls the complete call back.
+`atomic=False` instead commits each acknowledged chunk independently. A
+failure then exposes `parameter_set_index`,
+`confirmed_committed_parameter_sets` and `partial_commit_possible`; uncertain
+COMMIT acknowledgement raises `CommitOutcomeUnknown` and is never retried.
+All chunks share one absolute operation deadline and one `execute_many`
+schema-2 metric; internal statement and settlement work does not inflate the
+ordinary `execute`, `begin`, `commit` or `rollback` counters.
+
+The Transaction form has no `atomic` option and never settles its
+caller-owned transaction:
+
+```python
+async with conn.transaction() as transaction:
+    await transaction.execute_many(
+        "UPDATE dbo.events SET payload = @P1 WHERE event_id = @P2",
+        [["processed", 1], ["processed", 2]],
+    )
+```
+
+`chunk_size` defaults to 1,000 and must be in `1..=10_000`. Each set accepts
+at most 2,098 positional parameters. Named `Parameters`, strings, mappings,
+tuples and bytes-like parameter sets are rejected rather than reinterpreted.
+A synchronous producer executes `next()` on the event-loop thread; expose
+blocking producers as async iterables. Chunking bounds retained set count,
+not the byte size of a single parameter or LOB.
+
 ### Native TDS bulk insert
 
 Use `native_bulk_insert()` when rows should travel through SQL Server's native

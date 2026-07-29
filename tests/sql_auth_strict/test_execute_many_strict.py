@@ -860,7 +860,14 @@ async def test_execute_many_transaction_is_neutral_then_rollback_only(
             chunk_size=1,
         ) == 2
         assert await _row_count(transaction, table) == 2
-        assert await _row_count(owner_connection, table) == 0
+        # READ_COMMITTED_SNAPSHOT is intentionally off in the canonical
+        # container, so an ordinary external COUNT correctly waits on these
+        # uncommitted inserts. READPAST proves no committed row is visible
+        # without turning SQL Server's lock wait into a driver deadlock.
+        assert await scalar(
+            owner_connection,
+            f"SELECT COUNT_BIG(*) FROM {table} WITH (READPAST)",
+        ) == 0
         assert await scalar(transaction, "SELECT @@TRANCOUNT") == 1
 
         with pytest.raises(SqlError) as failure:
