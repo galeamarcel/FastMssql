@@ -45,6 +45,21 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### TIME-006 bulk absolute-budget determinism plan
+
+- Added the executable design/test/fix lineage for the intermittent
+  compatibility-bulk request-count race found while gating `execute_many()`.
+- Required a bounded opt-in Docker SQL-auth runner on the unchanged test
+  branch, followed by a test-only 500/850 ms correction that retains exactly
+  two observed requests and 20 consecutive repetitions.
+- Required the complete execute-many runner, sync/async stress through 99.999
+  sets, isolated ABI3 wheel, graph/source/credential review and fork-only
+  evidence to restart from the exact corrected candidate.
+- Kept `query_many()` and enterprise features 20/21 open and prohibited any
+  runtime change, upstream write, release or wheel publication.
+- This documentation-only plan changes no runtime, public API, displayed
+  `0.7.7` version, release state or package metadata.
+
 ### TIME-006 bulk absolute-budget determinism design
 
 - Recorded the intermittent strict-runner failure in which the unchanged
