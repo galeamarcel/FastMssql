@@ -10,7 +10,7 @@ yet applied to package metadata; release versioning remains a separate,
 explicit decision.
 
 Changes currently integrated in fork history through
-`428bc7471f61376294a8cb0f43587e86dd76ed9d`:
+`13c91c06bcf27da0e00bc514364c42e591b0632f`:
 
 - closed, validated SQL parameter descriptors with exact TDS metadata;
 - exact decimal, UUID, temporal, ANSI/Unicode, binary, XML, and typed-null
@@ -28,6 +28,9 @@ Changes currently integrated in fork history through
 - a safe ordered vendored-Tiberius bulk column-subset primitive with
   pre-wire raw-identifier validation, exact metadata checks and a total
   declaration formatter;
+- native TDS bulk input from bounded synchronous/asynchronous iterables with
+  one lease/transaction/deadline/metric, global diagnostics and
+  cancellation-safe terminal cleanup;
 - deterministic SQL-auth, exact-wire, compatibility, and 1,000-operation
   concurrent load coverage;
 - load-metric contract coverage for the typed-parameter case `PARAM-033`;
@@ -119,6 +122,36 @@ No release, package-version change, or artifact publication has occurred.
   unsupported SQL type families as separate visible slices.
 - This documentation-only change does not modify runtime behavior, package
   metadata, the displayed `0.7.7` version or release state.
+
+### Native bulk iterable backpressure audit status
+
+- Marked the fifth of seven approved batch/bulk slices `VERIFIED_FORK` at
+  technical commit `13c91c06bcf27da0e00bc514364c42e591b0632f`.
+- Added
+  `docs/NATIVE_BULK_ITERABLE_BACKPRESSURE_VALIDATION_REPORT.md` with exact
+  design/RED/feature ancestry, the reservation-cancellation race found during
+  self-review and its deterministic RED/GREEN proof.
+- Recorded the canonical runtime gate at `cb60cf8`: 396/396 required IDs,
+  412 strict, 16 async, 33 framework, 6 resilience, 12 load and 1,141
+  original-local-regression tests, all without fail/error/skip/not-run.
+- Recorded exact-HEAD sync/async stress through 99,999 rows, artifact hashes,
+  one-session/one-chunk invariants and zero sessions after teardown.
+- Recorded isolated wheel SHA-256
+  `cc6f114a9a5f84accb4388b46197aed1d930acb410ab4fd339481e23ce63e30d`
+  with 43 offline, 9 iterable SQL-auth and 4 representative SQL tests from
+  `site-packages` without `PYTHONPATH`.
+- Recorded the exact graph state and the GitHub status truthfully: zero
+  workflow/check runs for `13c91c0`, therefore candidate hosted status
+  `NOT RUN`; ancestral Linux/macOS/Windows and RustSec results are not
+  presented as candidate success.
+- Updated the future upstream candidate intake to keep the Tiberius
+  primitive, list fast path and iterable layer reviewable, with a fresh
+  rebase, reproduction, exact hosted gate and explicit approval required
+  before any original-repository PR.
+- Kept `execute_many()`, `query_many()`, byte-level LOB streaming and
+  unsupported SQL type families open. This status-only change does not alter
+  runtime behavior, package metadata, the displayed `0.7.7` version or
+  release state.
 
 ### Checkout reset and first-statement DDL audit status
 

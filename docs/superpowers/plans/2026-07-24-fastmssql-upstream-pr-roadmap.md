@@ -2850,7 +2850,7 @@ fork, testată live și auditată.
 | Result lifecycle | ownership fail-closed pentru pool și tranzacție | `VERIFIED_FORK`; separare de API-ul de bază, DMV/timeout/shutdown reproduse pe ancestry originală proaspătă |
 | Typed parameters | tip/direction/precision/scale/length | wire metadata verificată prin SQL Server |
 | Stored procedures | RPC, OUT params, return status, result sets | `VERIFIED_FORK`; RPC-001–011 și wheel real trec; depinde de named-RPC/response events acceptate |
-| Native bulk | TDS bulk copy | subset de coloane, streaming input, atomicity contract |
+| Native bulk | TDS bulk copy în slice-uri reviewable: primitiva Tiberius, API list fast path și iterable backpressure | `VERIFIED_FORK` la `13c91c0`; rebase separat pe sursele curente, reproducere proaspătă, gate hosted exact și aprobare explicită înainte de orice fork/PR original |
 | Named instances | SQL Browser Tokio | instanță reală fără port explicit |
 | Operation timeouts | PR-22, connect/acquire/operation/transaction/rollback | `VERIFIED_FORK`; rebase curat, RED proaspăt, comparație cu #121, gate pe trei sisteme și aprobare separată înainte de upstream |
 | Pool observability | PR-24, migrare aditivă `pool_stats()` peste contoarele bb8 | `VERIFIED_FORK`; dependency-free, RED + SQL-auth real + installed-wheel Linux/macOS/Windows, fără PR upstream |
