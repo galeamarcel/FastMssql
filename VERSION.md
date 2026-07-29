@@ -42,6 +42,23 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Native bulk iterable backpressure design
+
+- Added the focused fifth-slice design for synchronous and asynchronous
+  producer input to `native_bulk_insert()`.
+- Selected a bounded Python coordinator over one private Rust sequence so
+  all chunks retain one lease, transaction, absolute deadline, metric and
+  global diagnostic index space.
+- Preserved the concrete-list raw-extension fast path and kept the raw stub
+  intentionally list-only while widening only the public wrapper contract.
+- Defined deterministic `BULK-013`–`BULK-021` RED contracts, Docker
+  SQL-auth evidence, isolated-wheel gates and 1,000/10,000/99,999-row stress
+  profiles.
+- Kept `execute_many()`, `query_many()`, byte-level LOB streaming and the
+  unsupported SQL type families as separate visible slices.
+- This documentation-only change does not modify runtime behavior, package
+  metadata, the displayed `0.7.7` version or release state.
+
 ### Checkout reset and first-statement DDL audit status
 
 - Closed the live `OPEN_REPRO_REQUIRED` observation with exact
