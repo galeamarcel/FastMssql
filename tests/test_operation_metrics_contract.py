@@ -21,6 +21,7 @@ OPERATION_NAMES = (
     "query",
     "simple_query",
     "execute",
+    "execute_many",
     "query_batch",
     "execute_batch",
     "bulk_insert",
@@ -79,7 +80,7 @@ def assert_zero_snapshot(snapshot: dict[str, object], *, enabled: bool) -> None:
         "bucket_bounds_seconds",
         "operations",
     }
-    assert snapshot["schema_version"] == 1
+    assert snapshot["schema_version"] == 2
     assert snapshot["enabled"] is enabled
     assert tuple(snapshot["bucket_bounds_seconds"]) == BUCKET_BOUNDS_SECONDS
     assert tuple(snapshot["operations"]) == OPERATION_NAMES
@@ -161,7 +162,7 @@ def _assert_stub_contract(path: Path) -> None:
         operation: "_OperationStatsEntry" for operation in OPERATION_NAMES
     }
     assert _annotated_fields(snapshot) == {
-        "schema_version": "Literal[1]",
+        "schema_version": "Literal[2]",
         "enabled": "bool",
         "bucket_bounds_seconds": "List[float]",
         "operations": "_OperationStatsByName",
@@ -301,6 +302,13 @@ def test_disabled_branch_precedes_clock_and_atomic_recording() -> None:
     assert "opentelemetry" not in source.lower()
 
 
+def test_schema_two_reserves_one_exact_execute_many_slot() -> None:
+    source = RUST_METRICS.read_text(encoding="utf-8")
+    assert "METRIC_OPERATIONS: [OperationName; 14]" in source
+    assert 'root.set_item("schema_version", 2)?;' in source
+    assert source.count("OperationName::ExecuteMany") >= 1
+
+
 def test_wrapper_stubs_and_readme_publish_operation_metrics() -> None:
     wrapper = (ROOT / "python/fastmssql/__init__.py").read_text(encoding="utf-8")
     readme = README.read_text(encoding="utf-8")
@@ -314,3 +322,5 @@ def test_wrapper_stubs_and_readme_publish_operation_metrics() -> None:
         "weakly consistent",
     ):
         assert token in wrapper or token in readme
+    assert "execute_many" in readme
+    assert "schema version 2" in readme.lower()

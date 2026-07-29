@@ -9,6 +9,7 @@ OPERATION_NAMES = (
     "query",
     "simple_query",
     "execute",
+    "execute_many",
     "query_batch",
     "execute_batch",
     "bulk_insert",
@@ -72,7 +73,7 @@ def assert_operation_stats(
         "operations",
     }
     assert type(snapshot["schema_version"]) is int
-    assert snapshot["schema_version"] == 1
+    assert snapshot["schema_version"] == 2
     assert snapshot["enabled"] is enabled
     bounds = snapshot["bucket_bounds_seconds"]
     assert tuple(bounds) == BUCKET_BOUNDS_SECONDS

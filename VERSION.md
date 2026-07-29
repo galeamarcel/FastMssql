@@ -45,6 +45,45 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Bounded execute-many immutable RED coverage
+
+- Added deterministic public/raw/stub contracts for list, synchronous-
+  iterable and asynchronous-iterable `execute_many()` sources, including the
+  Connection-only `atomic` option and private bounded sequence protocol.
+- Added fake-sequence tests for reservation-before-pull, async protocol
+  preference, empty-input neutrality, one-chunk backpressure, global and
+  confirmed-commit metadata, deadline precedence, repeated-cancellation
+  cleanup shielding, timeout and cleanup-error precedence.
+- Required successful private `abort()` cleanup to return Rust's exact active
+  index and confirmed-commit progress for Python-owned primary exceptions.
+- Advanced the current operation-metrics requirement to schema version 2
+  with one exact `execute_many` key while leaving runtime implementation for
+  the feature branch.
+- Added `EMANY-001`–`EMANY-011` to the canonical SQL-auth specification and
+  raised its exact unique-case contract from 396 to 407.
+- Added real SQL Server cases for API/validation/empty behavior, typed ordered
+  DML, TDS-gated pulls, atomic rollback, acknowledged partial commits,
+  cancellation, timeout, caller-Transaction state, stored procedures,
+  metric isolation and deterministic lost atomic-COMMIT acknowledgement.
+- Added a bounded, privacy-safe execute-many stress harness for sync/async
+  1,000, 10,000 and explicit 99,999-set profiles plus the 10,000-set
+  `atomic=False` profile, with external-only evidence paths and hard gates for
+  retained sets/cells and exact confirmed commits.
+- Observed focused offline RED as `37 failed, 9 passed`; all failures were the
+  absent API/coordinator or schema-2 contract, while stress contracts passed
+  `5/5`, matrix contracts passed `26/26` and native-bulk contracts passed
+  `30/30`.
+- On the dedicated Docker SQL-auth server, all 86 pre-existing batch,
+  native-bulk and transaction baseline tests passed. All 11 `EMANY` cases
+  failed through the absent `execute_many` API, without an authentication,
+  build or fixture error.
+- The real 1,000-set sync stress reproduction failed through the same absent
+  API after zero pulls, observed at most one candidate SQL session and
+  confirmed zero candidate sessions after teardown.
+- This RED branch changes requirements, tests and test tooling only; it does
+  not modify runtime behavior, package metadata, the displayed `0.7.7`
+  version or release state.
+
 ### Bounded execute-many focused design
 
 - Added the sixth-slice design for repeating one parameterized statement over

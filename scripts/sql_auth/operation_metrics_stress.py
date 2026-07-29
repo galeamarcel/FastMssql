@@ -38,6 +38,7 @@ OPERATION_NAMES = (
     "query",
     "simple_query",
     "execute",
+    "execute_many",
     "query_batch",
     "execute_batch",
     "bulk_insert",
@@ -228,7 +229,7 @@ def assert_snapshot(snapshot: dict[str, Any], *, enabled: bool) -> None:
         "operations",
     }:
         raise AssertionError("operation statistics root schema changed")
-    if snapshot["schema_version"] != 1 or snapshot["enabled"] is not enabled:
+    if snapshot["schema_version"] != 2 or snapshot["enabled"] is not enabled:
         raise AssertionError("operation statistics version/enabled mismatch")
     if tuple(snapshot["bucket_bounds_seconds"]) != BUCKET_BOUNDS_SECONDS:
         raise AssertionError("operation statistics bounds changed")

@@ -604,6 +604,44 @@ Enterprise compatibility-bulk buffering:
   TDS activity is typed, bounded and privacy-safe, completes terminal cleanup
   and leaves no leaked application session.
 
+### EMANY — bounded repeated parameterized execution
+
+- `EMANY-001`: public connection/transaction wrappers and raw extension
+  methods expose the exact list/synchronous-iterable/asynchronous-iterable
+  surface split; concrete lists retain the bounded raw fast path and only the
+  Connection form accepts `atomic`.
+- `EMANY-002`: invalid `atomic`, chunk size, top-level source or parameter-set
+  input advances the producer zero forbidden times and performs no pool, SQL
+  or operation-metric activity.
+- `EMANY-003`: successfully empty list, synchronous and asynchronous sources
+  return zero; Connection remains disconnected and an active caller
+  Transaction remains active, with no SQL or execute-many metric activity.
+- `EMANY-004`: list, synchronous and asynchronous sources execute one
+  statement in exact input order, return the checked affected total, preserve
+  typed parameters and do not advance while the current TDS chunk is blocked.
+- `EMANY-005`: default atomic mode rolls back every earlier chunk after a late
+  conversion, constraint or producer failure and reports the exact global
+  parameter-set index.
+- `EMANY-006`: `atomic=False` preserves acknowledged earlier chunk commits,
+  rolls back only the failing chunk and reports exact confirmed-commit and
+  partial-success metadata.
+- `EMANY-007`: cancellation during producer wait or TDS activity stops pulls,
+  completes terminal cleanup, records one cancellation and leaves no leaked
+  application session.
+- `EMANY-008`: operation timeout during producer wait or TDS activity is
+  typed, bounded and privacy-safe, completes terminal cleanup and leaves the
+  pool reusable with no leaked application session.
+- `EMANY-009`: execute-many success inside a caller Transaction is
+  settlement-neutral; a post-wire failure enters rollback-only without
+  settling, and only caller rollback recovers it.
+- `EMANY-010`: parameterized INSERT, UPDATE, DELETE and direct stored
+  procedure execution return exact totals; schema-2 metrics record one
+  execute-many operation per call and zero internal execute or settlement
+  operations.
+- `EMANY-011`: loss of an atomic or per-chunk COMMIT acknowledgement raises
+  `CommitOutcomeUnknown`, performs no rollback or retry and reports the first
+  set in the unconfirmed commit plus truthful partial-commit evidence.
+
 ### TX — dedicated transactions
 
 - `TX-001`: dedicated session ID remains constant.

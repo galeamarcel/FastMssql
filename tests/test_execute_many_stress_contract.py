@@ -1,0 +1,287 @@
+from __future__ import annotations
+
+import argparse
+import ast
+import gc
+import json
+from pathlib import Path
+import runpy
+import subprocess
+import sys
+
+import pytest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+RUNNER = ROOT / "scripts/sql_auth/execute_many_stress.py"
+
+
+def _namespace() -> dict[str, object]:
+    assert RUNNER.is_file(), "missing execute-many stress harness"
+    return runpy.run_path(str(RUNNER))
+
+
+def test_execute_many_stress_cli_is_bounded_and_extended_is_explicit(
+    tmp_path: Path,
+) -> None:
+    assert RUNNER.is_file(), "missing execute-many stress harness"
+    completed = subprocess.run(
+        [sys.executable, str(RUNNER), "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    for option in (
+        "--profiles",
+        "--modes",
+        "--include-partial-profile",
+        "--allow-extended",
+        "--metrics-output",
+        "--rss-growth-limit-bytes",
+        "--event-loop-gap-limit-seconds",
+        "--operation-timeout-seconds",
+        "--payload-bytes",
+    ):
+        assert option in completed.stdout
+
+    namespace = _namespace()
+    parse_profiles = namespace["parse_profiles"]
+    profiles = parse_profiles("1_000:100,10_000:1_000,99_999:1_000")
+    assert [(profile.sets, profile.chunk_size) for profile in profiles] == [
+        (1_000, 100),
+        (10_000, 1_000),
+        (99_999, 1_000),
+    ]
+    for invalid in (
+        "0:1",
+        "100_000:1_000",
+        "1_000:0",
+        "1_000:10_001",
+        "1_000",
+        "1_000:100,1_000:100",
+    ):
+        with pytest.raises(argparse.ArgumentTypeError):
+            parse_profiles(invalid)
+
+    parse_modes = namespace["parse_modes"]
+    assert parse_modes("sync,async") == ("sync", "async")
+    for invalid in ("", "sync,sync", "threaded"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            parse_modes(invalid)
+
+    parse_args = namespace["parse_args"]
+    baseline = parse_args(
+        [
+            "--profiles",
+            "1_000:100,10_000:1_000",
+            "--modes",
+            "sync,async",
+            "--include-partial-profile",
+            "--metrics-output",
+            str(tmp_path / "baseline.json"),
+        ]
+    )
+    assert baseline.allow_extended is False
+    assert baseline.include_partial_profile is True
+    assert baseline.metrics_output == (tmp_path / "baseline.json").resolve()
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--metrics-output",
+                str(ROOT / "forbidden-stress-evidence.json"),
+            ]
+        )
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--profiles",
+                "99_999:1_000",
+                "--metrics-output",
+                str(tmp_path / "rejected.json"),
+            ]
+        )
+    extended = parse_args(
+        [
+            "--profiles",
+            "99_999:1_000",
+            "--allow-extended",
+            "--metrics-output",
+            str(tmp_path / "extended.json"),
+        ]
+    )
+    assert extended.allow_extended is True
+
+
+def test_execute_many_stress_producers_are_lazy_and_track_retention() -> None:
+    namespace = _namespace()
+    tracker = namespace["BufferTracker"]()
+    producer = namespace["SyncProducer"](3, "payload", tracker)
+
+    iterator = iter(producer)
+    assert producer.pulls == 0
+    first = next(iterator)
+    second = next(iterator)
+    assert producer.pulls == 2
+    assert tracker.current_sets == 2
+    assert tracker.maximum_sets == 2
+    assert tracker.current_cells == 4
+    assert tracker.maximum_cells == 4
+    assert first[0] == 0
+    assert second[0] == 1
+    del first
+    del second
+    gc.collect()
+    assert tracker.current_sets == 0
+    assert tracker.current_cells == 0
+
+    tree = ast.parse(RUNNER.read_text(encoding="utf-8"), filename=str(RUNNER))
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "list"
+        and node.args
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id in {"parameter_sets", "producer"}
+        for node in ast.walk(tree)
+    )
+    assert not any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in {"build_parameter_sets", "materialize_parameter_sets"}
+        for node in ast.walk(tree)
+    )
+
+
+def test_execute_many_stress_hard_gates_are_not_advisory() -> None:
+    namespace = _namespace()
+    expected_summary = namespace["expected_summary"]
+    profile_violations = namespace["profile_violations"]
+    metrics = {
+        "parameter_set_count": 1_000,
+        "chunk_size": 100,
+        "atomic": True,
+        "affected_rows": 1_000,
+        "persisted": expected_summary(1_000),
+        "producer_pulls": 1_000,
+        "executed_parameter_sets": 1_000,
+        "confirmed_committed_parameter_sets": 0,
+        "maximum_buffered_sets": 100,
+        "maximum_buffered_cells": 200,
+        "buffered_sets_after_gc": 0,
+        "buffered_cells_after_gc": 0,
+        "rss_growth_bytes": 1_024,
+        "maximum_event_loop_gap_seconds": 0.01,
+        "event_loop_ticks": 10,
+        "maximum_sql_sessions": 1,
+        "physical_identity_stable": True,
+        "operation_metric_delta": {
+            "started": 1,
+            "completed": 1,
+            "succeeded": 1,
+            "errors": 0,
+            "timed_out": 0,
+            "cancelled": 0,
+            "outcome_unknown": 0,
+        },
+        "execute_metric_delta": {
+            "started": 0,
+            "completed": 0,
+        },
+        "pool": {
+            "max_size": 1,
+            "connections": 1,
+            "active_connections": 0,
+        },
+        "post_load_smoke": True,
+        "teardown_sessions": 0,
+        "errors": [],
+        "timed_out": 0,
+    }
+    assert (
+        profile_violations(
+            metrics,
+            rss_growth_limit_bytes=67_108_864,
+            event_loop_gap_limit_seconds=0.100,
+        )
+        == []
+    )
+
+    metrics["maximum_buffered_sets"] = 101
+    metrics["maximum_buffered_cells"] = 201
+    metrics["rss_growth_bytes"] = 67_108_865
+    metrics["maximum_event_loop_gap_seconds"] = 0.101
+    metrics["confirmed_committed_parameter_sets"] = 1
+    metrics["execute_metric_delta"]["started"] = 1
+    metrics["teardown_sessions"] = 1
+    assert set(
+        profile_violations(
+            metrics,
+            rss_growth_limit_bytes=67_108_864,
+            event_loop_gap_limit_seconds=0.100,
+        )
+    ) >= {
+        "buffer_bound_exceeded",
+        "buffer_cell_bound_exceeded",
+        "rss_growth_exceeded",
+        "event_loop_gap_exceeded",
+        "confirmed_commit_mismatch",
+        "execute_metric_inflation",
+        "teardown_session_leak",
+    }
+
+
+def test_execute_many_stress_artifact_is_atomic_and_privacy_safe(
+    tmp_path: Path,
+) -> None:
+    namespace = _namespace()
+    output = tmp_path / "nested" / "metrics.json"
+    payload = {
+        "schema_version": 1,
+        "status": "contract",
+        "source_sha": "0" * 40,
+        "worktree_dirty": False,
+        "profiles": [],
+    }
+
+    namespace["atomic_write"](output, payload)
+
+    assert json.loads(output.read_text(encoding="utf-8")) == payload
+    assert list(output.parent.glob(".*.tmp")) == []
+    source = RUNNER.read_text(encoding="utf-8")
+    assert "owner_password" not in json.dumps(payload)
+    assert "observer_password" not in json.dumps(payload)
+    assert "repr(error)" not in source
+    assert "str(error)" not in source
+
+
+def test_execute_many_stress_cleanup_is_unmasking() -> None:
+    namespace = _namespace()
+    assert namespace["MAX_PARAMETER_SETS"] == 99_999
+    source = RUNNER.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(RUNNER))
+    handlers = [
+        node for node in ast.walk(tree) if isinstance(node, ast.ExceptHandler)
+    ]
+
+    assert any(
+        isinstance(handler.type, ast.Name)
+        and handler.type.id == "OperationTimeoutError"
+        for handler in handlers
+    )
+    assert not any(
+        isinstance(handler.type, ast.Name)
+        and handler.type.id == "BaseException"
+        for handler in handlers
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "gather"
+        and any(
+            keyword.arg == "return_exceptions"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is True
+            for keyword in node.keywords
+        )
+        for node in ast.walk(tree)
+    )
