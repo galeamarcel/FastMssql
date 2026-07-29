@@ -242,7 +242,8 @@ and GitHub Actions.
   ```
 
   Before starting bulk, begin a holder Transaction on
-  `bulk_connection`. Create the bulk task and then wait:
+  `bulk_connection`. Schedule its PyO3 `Future` with
+  `asyncio.ensure_future()` and then wait:
 
   ```python
   async def bulk_is_waiting_for_checkout() -> bool:

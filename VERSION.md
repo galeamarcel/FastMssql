@@ -58,6 +58,9 @@ No release, package-version change, or artifact publication has occurred.
   deadline across `BEGIN`, later conversion, all chunks and `COMMIT`.
 - Retained exact-two request observation, 20 consecutive SQL-auth
   repetitions, complete execute-many gates and fork-only publication.
+- Corrected the executable plan to schedule the PyO3 awaitable with
+  `asyncio.ensure_future()`; `asyncio.create_task()` rejects an already
+  constructed native `Future`.
 - This documentation-only plan correction changes no runtime, public API,
   displayed `0.7.7` version, release state or package metadata.
 
