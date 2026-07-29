@@ -46,6 +46,10 @@ No release, package-version change, or artifact publication has occurred.
 
 - Added the focused fifth-slice design for synchronous and asynchronous
   producer input to `native_bulk_insert()`.
+- Added the executable branch-by-branch TDD plan covering offline RED,
+  canonical Docker SQL-auth cases, the private Rust sequence, the bounded
+  Python coordinator, isolated-wheel validation and sync/async stress through
+  99,999 rows.
 - Selected a bounded Python coordinator over one private Rust sequence so
   all chunks retain one lease, transaction, absolute deadline, metric and
   global diagnostic index space.
