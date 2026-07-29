@@ -113,6 +113,25 @@ No release, package-version change, or artifact publication has occurred.
 - This test-only commit changes no runtime behavior, package metadata,
   displayed `0.7.7` version, release state or published artifact.
 
+### Query-many coordinator RED
+
+- Added deterministic event/barrier contracts for fixed worker count,
+  pool-capped effective concurrency, one accepted-result capacity window,
+  slow-consumer backpressure, exact ordered/completion-order delivery and
+  normal exhaustion.
+- Required first-error identity/traceback/index preservation, privacy-safe
+  producer/parameter/conversion failures, startup pool-stat validation,
+  quiescent close ordering and cleanup-error chaining.
+- Covered close before/after start, async-context early break, caller and
+  repeated cancellation, concurrent consumers, second-loop rejection,
+  supervised drop fallback and absence of leaked named tasks.
+- The focused coordinator RED collected 29 cases and all 29 failed at the
+  intended absent `Connection.query_many()` surface; Ruff passed and
+  ordering assertions use explicit gates rather than wall-clock completion
+  guesses.
+- This test-only commit changes no runtime behavior, package metadata,
+  displayed `0.7.7` version, release state or published artifact.
+
 ### Execute-many live audit status
 
 - Marked only the sixth of seven batch/bulk slices,
