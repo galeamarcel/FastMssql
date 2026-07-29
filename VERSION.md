@@ -42,6 +42,35 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Checkout reset and first-statement DDL audit status
+
+- Closed the live `OPEN_REPRO_REQUIRED` observation with exact
+  design/RED/Tiberius/fix ancestry ending at technical commit `9e86cc4`.
+- Recorded 452/452 deterministic SQL-auth, 1,106/1,106 original local
+  regression, 6/6 resilience, 82/82 FastMssql Rust, 168/168 vendored
+  Tiberius and 8/8 direct reset SQL-auth results.
+- Recorded the isolated ABI3 wheel SHA-256
+  `37795d74a8aa275b7ef1b0295f0b2c46ee0186c03d9fab4f3323a337c365b280`
+  and its offline plus real SQL-auth installed-package gates.
+- Added privacy-safe pre/post stress evidence for 1,000, 10,000 and 99,999
+  operation/ResultStream profiles and a 99,999-transaction shared-pool
+  profile.
+- Documented the mandatory private-reset round-trip cost when
+  `test_on_check_out=False` and a reused lease is `NeedsReset`; no zero-cost
+  claim is made for that policy.
+- Documented RSS high-water under repeated pool creation as a separate
+  residual allocator/native-buffer audit item rather than attributing it to
+  the checkout-reset fix.
+- Recorded that the exact candidate has no hosted GitHub Actions run; the
+  latest ancestral Linux/macOS/Windows and RustSec successes are identified
+  separately and are not presented as candidate success.
+- Updated PR-15 to require a clean Tiberius immediate-reset slice followed by
+  the FastMssql checkout-policy slice, with a fresh rebase, exact hosted gate
+  and explicit approval before any original-repository PR.
+- All documentation and evidence remain on Marcel Galea's fork. This status
+  change does not modify runtime behavior, package metadata, the displayed
+  `0.7.7` version or release state.
+
 ### Immediate checkout reset and pristine application batches
 
 - Added an additive vendored-Tiberius `Client::reset_connection()` primitive

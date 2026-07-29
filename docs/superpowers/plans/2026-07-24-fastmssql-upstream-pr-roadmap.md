@@ -1208,6 +1208,14 @@ ultimul upstream și aprobarea explicită.
 
 **Cumulative fork commit:** `e61b771`
 
+**Checkout-completion hardening:**
+
+- design/plan: `docs/checkout-reset-ddl-design` la `8f0ddbf`;
+- FastMssql RED: `test/checkout-reset-ddl` la `deeff658`;
+- Tiberius compile-RED: `test/tiberius-immediate-reset` la `73bb150`;
+- fix: `fix/checkout-reset-ddl` la `663acdd`;
+- commit tehnic final: `9e86cc4`.
+
 **Proposed clean upstream branch:** `fix/upstream-tds-session-reset`
 
 **Proposed title:** `fix: reset pooled SQL Server sessions before reuse`
@@ -1231,8 +1239,11 @@ ultimul upstream și aprobarea explicită.
 **Interfaces:**
 
 - Consumes: o conexiune `NeedsReset` la următorul checkout.
-- Produces: primul pachet Batch/RPC/TransactionManager cu bitul MS-TDS
-  `RESETCONNECTION`, fără round-trip separat.
+- Produces: reset complet și drenat înainte ca primul SQL al aplicației să
+  poată porni.
+- Cu health probe activ, resetul este combinat cu probe-ul; cu probe-ul
+  dezactivat, `Clean` nu face I/O, iar `NeedsReset` execută un reset privat
+  separat înainte de aplicație.
 - Restabilește explicit `READ COMMITTED`, deoarece MS-TDS exclude isolation
   level din reset.
 - Elimină sesiunea în loc să o reutilizeze când SQL-ul poate lăsa un context
@@ -1243,10 +1254,10 @@ ultimul upstream și aprobarea explicită.
 - pachetul unic folosește statusul combinat `RESETCONNECTION | EOM = 0x09`;
 - numai primul pachet al cererii poartă bitul de reset;
 - descriptorul tranzacției și metadata cache sunt curățate client-side;
-- resetarea este piggyback pe următoarea comandă, fără query T-SQL sau RTT
-  suplimentar;
-- `test_on_check_out` resetează înainte de health probe și consumă complet
-  răspunsul;
+- politica implicită face reset piggyback pe health probe;
+- `test_on_check_out=False` dezactivează numai probe-ul opțional; un lease
+  `NeedsReset` folosește `Client::reset_connection()` și drenează răspunsul
+  înainte de primul batch/RPC/`BEGIN`;
 - anularea în timpul resetului elimină conexiunea fail-closed;
 - temp tables, `USE`, `SET` options, language/dateformat, lock timeout,
   deadlock priority, `CONTEXT_INFO`, `SESSION_CONTEXT`, tranzacții locale și
@@ -1281,14 +1292,18 @@ first and last packet             -> 0x09
 later packets                     -> 0x00 / EOM
 ```
 
-Nu se folosește `sp_reset_connection` ca procedură T-SQL și nu se adaugă un
-round-trip dedicat.
+Nu se folosește `sp_reset_connection` ca procedură T-SQL. Calea implicită
+combină resetul cu probe-ul. Calea `test_on_check_out=False` adaugă
+intenționat un round-trip privat numai pentru un lease reutilizat
+`NeedsReset`; acesta este necesar pentru a păstra primul batch al aplicației
+nemodificat.
 
 - [x] **Step 3: Leagă resetarea de disposition**
 
-`NeedsReset` armează următoarea cerere. O operație incompletă, o anulare, un
-panic sau un context de securitate potențial persistent marchează conexiunea
-`Broken`; numai răspunsul consumat complet poate reveni în pool.
+`NeedsReset` selectează acțiunea de checkout înainte ca lease-ul să ajungă la
+aplicație. O operație incompletă, o anulare, un panic sau un context de
+securitate potențial persistent marchează conexiunea `Broken`; numai resetul
+și răspunsul consumate complet pot readuce conexiunea în `Clean`.
 
 - [x] **Step 4: Rulează dovada completă**
 
@@ -1306,13 +1321,34 @@ cargo fmt / Clippy -D warnings    PASS
 remaining application sessions   0
 ```
 
+Hardeningul checkout-completion la `9e86cc4` adaugă dovada:
+
+```text
+trigger/procedure/function/view DDL     PASS ca primul batch
+reset timeout                           acquire, înainte de application SQL
+strict SQL-auth                         452/452 PASS
+original-local-regression             1.106/1.106 PASS
+resilience Docker                          6/6 PASS
+FastMssql / Tiberius Rust                82/82 și 168/168 PASS
+Tiberius reset SQL-auth                     8/8 PASS
+stress operation/result stream          1.000/10.000/99.999 PASS
+pooled transaction stress               99.999 PASS, zero sesiuni rămase
+```
+
+Costul observat pentru politica `False` este explicit: microbenchmarkul
+operation-metrics a pierdut 36,82%–45,04% throughput, iar ResultStream
+24,01%–31,19%, compatibil cu RTT-ul de reset obligatoriu. Un PR nu trebuie să
+promită reset zero-cost pentru această politică.
+
 - [ ] **Step 5: Alege traseul Tiberius înainte de PR**
 
 Ordinea preferată pentru upstream este:
 
-1. PR minimal către Tiberius pentru API-ul și bitul `RESETCONNECTION`;
+1. PR minimal către Tiberius pentru API-ul/bitul `RESETCONNECTION` și metoda
+   aditivă de reset imediat complet drenat;
 2. release sau commit Tiberius acceptat și pin-uit;
-3. PR FastMssql care consumă API-ul public.
+3. PR FastMssql care păstrează hook-ul bb8 activ, separă resetul obligatoriu
+   de probe-ul opțional și consumă API-ul public.
 
 O dependență Git temporară sau includerea sursei vendored sunt variante de
 rezervă și necesită aprobare explicită. Nu se creează și nu se publică un fork
@@ -1320,14 +1356,16 @@ Tiberius fără această aprobare.
 
 - [ ] **Step 6: Construiește diff-ul curat față de ultimul upstream**
 
-PR-ul nu va cherry-pick-ui orb `16f076a`, deoarece repository-ul original nu
-conține încă patchul Tiberius local și poate evolua față de `v0.7.7`.
+PR-ul nu va cherry-pick-ui orb `16f076a` sau `663acdd`, deoarece repository-ul
+original nu conține încă patchul Tiberius local și poate evolua față de
+`v0.7.7`.
 Reaplică separat:
 
-1. testele RED;
+1. testele RED de contaminare și first-statement DDL;
 2. commitul de compatibilitate pentru fixture-urile `##temp`;
-3. integrarea FastMssql;
-4. dependency bump-ul sau API-ul Tiberius aprobat.
+3. primitiva Tiberius de reset imediat și testul ei SQL-auth;
+4. integrarea FastMssql cu matricea checkout explicită;
+5. dependency bump-ul sau API-ul Tiberius aprobat.
 
 Riscurile trebuie declarate: resetarea invalidează intenționat obiectele
 temporare legate de sesiunea precedentă; isolation level este restaurat
@@ -2805,7 +2843,7 @@ fork, testată live și auditată.
 | Transaction cancellation | PR-19, retragere automată după anulare | implementat/verificat pe fork; fixture DMV portabil, rebase și comparație cu #121 înainte de upstream |
 | Connection readiness | PR-20, `connect(validate=...)` și `ping()` | implementat/verificat pe fork; rebase curat și fixture portabil înainte de upstream |
 | PoolConfig defaults | PR-21, un singur profil pentru argumentele omise și calea implicită | `VERIFIED_FORK`; rebase curat, RED și gate wheel pe toate cele trei sisteme înainte de aprobarea upstream |
-| TDS session reset | PR-15, bit `RESETCONNECTION` | implementat/verificat pe fork; traseu Tiberius și aprobare înainte de upstream |
+| TDS session reset | PR-15, bit `RESETCONNECTION` plus reset imediat complet drenat | `VERIFIED_FORK` la `9e86cc4`; split Tiberius/FastMssql, rebase, gate hosted exact și aprobare înainte de upstream |
 | PyO3 build/test separation | elimină feature-ul permanent și folosește `maturin >= 1.9.4` pentru buildul extensiei | `VERIFIED_FORK`; rebase curat, RED și toate cele trei joburi hosted înainte de aprobarea upstream |
 | Tiberius response/RPC | evenimente complete, token safety și named RPC | `VERIFIED_FORK`; rebase separat pe Tiberius actual, reproducere și aprobare explicită înainte de orice fork/PR |
 | True async streaming | stream Python async cu backpressure | `VERIFIED_FORK`; RESULT-016–031, stress până la 99.999 și wheel instalat; cere API Tiberius acceptat/pinuit |

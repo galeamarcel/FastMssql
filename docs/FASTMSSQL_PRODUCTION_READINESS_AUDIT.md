@@ -1,32 +1,28 @@
 # FastMssql — audit consolidat pentru utilizare în producție
 
-Data auditului: 28 iulie 2026<br>
+Data auditului: 29 iulie 2026<br>
 Fork auditat: `https://github.com/galeamarcel/FastMssql.git`  
-Branch: `docs/native-bulk-insert-status`<br>
+Branch: `docs/checkout-reset-ddl-status`<br>
 Commit tehnic cumulativ:
-`428bc7471f61376294a8cb0f43587e86dd76ed9d`
+`9e86cc4d9040b451ded47889adf9e1cec17216d0`
 
-Ultima actualizare live: 28 iulie 2026
-Ultimul subsistem verificat: API-ul FastMssql list-only pentru bulk TDS nativ,
-cu designul și planul la `36cfca1`, contractul RED principal la `fe916b6`,
-contractele corrective până la `4897c93` și implementarea cumulativă la
-`428bc74`
-Ultimul contract de load pentru bulk TDS nativ: 1.000, 10.000 și 99.999
-rânduri persistate exact, cu maximum RSS growth `3.981.312` bytes în profilul
-extins, maximum event-loop stall `0,022436750` secunde în toate profilurile și
-zero erori/timeout-uri
-Ultimul contract de load pentru rezultate: RESULT-029, 1.000/1.000 operații
-reușite la concurență 64, pool maxim 8 și buffer 8; profilele opt-in
-10.000:128 și 99.999:200 au trecut cu pool maxim 32 și buffer 16
-Ultimul arbore tehnic verificat: `feat/native-bulk-insert` la `428bc74`
+Ultima actualizare live: 29 iulie 2026
+Ultimul subsistem verificat: resetul complet al sesiunii în timpul checkoutului
+bb8, înainte de primul batch al aplicației, inclusiv DDL
+trigger/procedure/function/view cu `test_on_check_out=False`
+Ultimele contracte de load pentru remediere: operation-metrics și
+ResultStream la 1.000, 10.000 și 99.999 operații, plus 99.999 tranzacții
+pooled la concurență 200 și pool maxim 100; toate au avut rezultate exacte,
+zero eroare/timeout și zero sesiuni după teardown
+Ultimul arbore tehnic verificat: `fix/checkout-reset-ddl` la `9e86cc4`
 Ultimul gate hosted verificat: `rust-unit-tests.yml`, rularea
-[#30284587006](https://github.com/galeamarcel/FastMssql/actions/runs/30284587006)
-verde pe Linux, macOS și Windows la strămoșul cumulativ `a9d5c2a`; slice-urile
-bulk de la `dec2914`, `deef315`, `52c04c3` și `428bc74` sunt verificate local
-și pe MSSQL Docker, dar nu sunt încă reprezentate de un gate hosted nou
+[#30287773056](https://github.com/galeamarcel/FastMssql/actions/runs/30287773056)
+verde pe Linux, macOS și Windows la strămoșul cumulativ `0d50c48`; API-ul
+public GitHub raportează zero rulări pentru branchul
+`fix/checkout-reset-ddl`, deci commitul `9e86cc4` rămâne `NOT RUN` hosted
 Ultimul gate dependency-security verificat: rularea
-[#30284587019](https://github.com/galeamarcel/FastMssql/actions/runs/30284587019)
-verde la același strămoș `a9d5c2a`
+[#30287773059](https://github.com/galeamarcel/FastMssql/actions/runs/30287773059)
+verde la același strămoș `0d50c48`
 
 ## Concluzie
 
@@ -112,6 +108,15 @@ Celulele raw și descriptorii `Parameter` non-expanded folosesc acum aceeași
 familie închisă de conversie; erorile tipizate păstrează poziții globale
 privacy-safe, iar conexiunea este retrasă după o eroare de conversie
 post-wire.
+
+Și observația first-statement DDL este acum închisă. Resetul obligatoriu al
+unui lease `NeedsReset` se finalizează și se drenează în checkout înainte ca
+SQL-ul aplicației să poată porni. Cu probe-ul opțional dezactivat, un lease
+curat nu face I/O, iar unul reutilizat plătește un reset privat separat;
+defaultul activ combină resetul cu health probe-ul. Trigger-ele, procedurile,
+funcțiile și view-urile rămân astfel prima instrucțiune din batch. Dovada
+completă este în
+[CHECKOUT_RESET_DDL_VALIDATION_REPORT.md](CHECKOUT_RESET_DDL_VALIDATION_REPORT.md).
 
 Dependența locală Tiberius oferă acum aditiv
 `Client::bulk_insert_columns(table, columns)`: validează și citează
@@ -367,8 +372,10 @@ Remedierea:
 - combină corect `RESETCONNECTION | EOM` ca `0x09` pentru o cerere cu un singur
   pachet și nu repetă bitul pe pachetele următoare;
 - curăță client-side descriptorul tranzacției și metadata cache;
-- face piggyback pe următoarea cerere, fără query T-SQL și fără round-trip
-  suplimentar;
+- pentru politica implicită/activă, combină resetul cu health probe-ul;
+  implementarea istorică făcea piggyback și pe primul SQL al aplicației când
+  probe-ul era dezactivat, iar această variantă este corectată ulterior prin
+  resetul privat imediat documentat mai jos;
 - prefixează acea cerere cu `SET TRANSACTION ISOLATION LEVEL READ COMMITTED`,
   deoarece
   [MS-TDS 2.2.3.1.2](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-tds/ce398f9a-7d47-4ede-8f36-9dd6fc21ca43)
@@ -427,6 +434,62 @@ Limite rămase la acest checkpoint:
 - pentru un PR FastMssql upstream, patchul protocolar trebuie acceptat în
   Tiberius sau consumat printr-o strategie de dependență aprobată. Nu a fost
   creat sau publicat niciun fork Tiberius.
+
+### Checkout reset înainte de primul batch DDL — remediat și verificat
+
+Corecția ulterioară închide limita piggyback-ului pe SQL-ul aplicației:
+
+- design/plan: `docs/checkout-reset-ddl-design` la `8f0ddbf`;
+- RED FastMssql: `test/checkout-reset-ddl` la `deeff658`;
+- compile-RED Tiberius: `test/tiberius-immediate-reset` la `73bb150`;
+- implementare: `fix/checkout-reset-ddl` la `663acdd`;
+- commit tehnic final: `9e86cc4`.
+
+Hook-ul bb8 rulează intern pentru toate politicile. `test_on_check_out`
+controlează numai health probe-ul, nu izolarea cross-lease. Matricea este:
+
+```text
+Clean + False       -> Ready, fără I/O
+NeedsReset + False  -> reset privat și drain complet
+Clean + True        -> health probe
+NeedsReset + True   -> reset + health în aceeași cerere
+Broken + oricare    -> reject
+```
+
+Vendored-Tiberius expune aditiv `Client::reset_connection()`, care trimite și
+drenează resetul plus baseline-ul `READ COMMITTED` înainte de a reveni.
+Conexiunea este `Broken` înaintea await-ului și devine `Clean` numai după
+succes. Timeoutul resetului rămâne în deadline-ul de acquire, SQL-ul
+aplicației nu pornește, iar sesiunea incertă este înlocuită.
+
+Dovada finală:
+
+```text
+SQL-auth strict determinist        452/452 PASS
+original-local-regression        1.106/1.106 PASS
+resilience Docker                     6/6 PASS
+FastMssql Rust                       82/82 PASS
+Tiberius vendored                   168/168 PASS
+Tiberius reset SQL-auth                 8/8 PASS
+wheel instalat SQL-auth                11/11 PASS
+```
+
+Stress-ul la 1.000/10.000/99.999 operații și 99.999 tranzacții pooled a
+terminat exact, fără eroare/timeout și cu zero sesiuni după teardown.
+Microbenchmarkul cu probe-ul dezactivat arată costul RTT-ului obligatoriu:
+throughput median cu 36,82%–45,04% mai mic față de baseline-ul nesigur.
+ResultStream a scăzut cu 24,01%–31,19%. Acesta este cost de corectitudine, nu
+este ascuns ca regresie zero-cost.
+
+RSS high-water la recrearea repetată a pool-urilor rămâne observație separată:
+prima rulare pooled maximă a reținut aproximativ 132 MiB, iar a doua rulare în
+același proces aproximativ 15 MiB suplimentari. O cale directă `persistent`,
+fără reset pooled, a avut același ordin de mărime. Nu există dovadă de retenție
+proporțională cu fiecare tranzacție, dar allocatorul/native buffers cer un
+soak audit separat.
+
+Raportul exact, inclusiv wheel-ul, latențele și statusul hosted, este
+[CHECKOUT_RESET_DDL_VALIDATION_REPORT.md](CHECKOUT_RESET_DDL_VALIDATION_REPORT.md).
 
 ### Mașina atomică de stare a tranzacțiilor — remediată și verificată
 
@@ -2428,7 +2491,9 @@ original actual la acel moment.
 - `sp_reset_connection` nu poate fi apelată normal ca procedură T-SQL.
   Resetarea completă trebuie transmisă prin bitul TDS `RESETCONNECTION`;
   extensia Tiberius locală din `16f076a` implementează și verifică această
-  cale, fără round-trip separat.
+  cale fără query T-SQL. La `9e86cc4`, politica implicită o combină cu health
+  probe-ul, iar `test_on_check_out=False` folosește un round-trip privat numai
+  pentru un lease reutilizat `NeedsReset`, înainte de SQL-ul aplicației.
 - Tiberius nu expune momentan public trimiterea unui pachet TDS `ATTENTION`.
   Conexiunea anulată este acum eliminată automat. `ATTENTION` este necesar
   numai pentru o viitoare reutilizare sigură a aceleiași sesiuni, după drenarea
@@ -3062,13 +3127,13 @@ extensia PyO3 și nu înlocuiesc probele wheel/SQL-auth de mai sus.
 `vendor/tiberius` rămâne în afara indexării structurale utile și a fost
 revizuit direct plus cele 176 de teste Rust/Tiberius.
 
-O observație QA separată rămâne `OPEN_REPRO_REQUIRED`: cu
-`PoolConfig(test_on_check_out=False)`, primul DDL care trebuie să fie prima
-instrucțiune din batch, de exemplu `CREATE TRIGGER`, poate întâlni prefixul de
-reset al lease-ului și poate fi respins de SQL Server. Configurația implicită
-consumă resetul prin checkout validation, iar cazul strict `SQL-019` trece.
-Observația nu este o regresie native bulk și va primi branch RED/fix separat
-înainte de orice modificare a resetului.
+Observația QA `PoolConfig(test_on_check_out=False)` plus first-statement DDL
+este `VERIFIED_FORK` la `9e86cc4`. Contractele RED separate au reprodus
+respingerea trigger/procedure/function/view și timeoutul în faza greșită.
+Resetul privat imediat se finalizează acum în acquire, înainte de SQL-ul
+aplicației; toate cele patru forme DDL și recuperarea după timeout au trecut
+pe SQL Server real. Remedierea nu este atribuită slice-ului native bulk și
+istoricul său rămâne separat.
 
 API-urile trebuie separate:
 
@@ -3346,12 +3411,24 @@ upstream fără aprobarea explicită a proprietarului forkului.
 ## Starea verificată curentă
 
 - Fork: `https://github.com/galeamarcel/FastMssql.git`
-- Branch de status: `docs/native-bulk-insert-status`
+- Branch de status: `docs/checkout-reset-ddl-status`
 - HEAD tehnic verificat:
-  `428bc7471f61376294a8cb0f43587e86dd76ed9d`.
+  `9e86cc4d9040b451ded47889adf9e1cec17216d0`.
 - `origin` indică forkul; remote-ul repository-ului original permite numai
   fetch și are push URL-ul `DISABLED`.
-- Feature-ul cumulativ `428bc74` păstrează ancestry-ul lui `a9d5c2a`, al
+- Commitul `9e86cc4` păstrează designul/planul checkout-reset la `8f0ddbf`,
+  RED-ul FastMssql `deeff658`, compile-RED-ul Tiberius `73bb150` și
+  implementarea `663acdd` în ancestry.
+- Pe commitul exact `9e86cc4`: SQL-auth strict a trecut `452/452`, regresia
+  originală locală `1.106/1.106`, resilience `6/6`, FastMssql Rust `82/82`,
+  Tiberius vendored `168/168` și integrarea reset Tiberius `8/8`.
+- Wheel-ul exact are SHA-256
+  `37795d74a8aa275b7ef1b0295f0b2c46ee0186c03d9fab4f3323a337c365b280`;
+  a fost importat din `site-packages` fără `PYTHONPATH`, cu `92` contracte
+  offline și `11/11` probe SQL-auth instalate.
+- Graful exact are 159 fișiere, 3.311 noduri și 41.861 muchii, cu
+  `head_matches_build=true`; 12 fișiere schimbate ating 39 de fluxuri.
+- Strămoșul native-bulk `428bc74` păstrează ancestry-ul lui `a9d5c2a`, al
   designului enterprise batch/bulk și al ramurilor RED/fix pentru primele
   două slice-uri compatibility bulk. `test/bulk-bounded-buffering` este
   ancestor al `fix/bulk-bounded-buffering`, iar
@@ -3434,13 +3511,14 @@ upstream fără aprobarea explicită a proprietarului forkului.
   `10.000:100`, `99.999:100` și `99.999:200` au trecut atât persistent, cât
   și pooled, cu numărul exact de COMMIT/ROLLBACK, smoke PASS și zero sesiuni
   după teardown. Gate-ul separat de overhead a validat 599.994 operații.
-- La strămoșul exact `a9d5c2a`, Linux/macOS/Windows sunt verzi prin
-  [#30284587006](https://github.com/galeamarcel/FastMssql/actions/runs/30284587006),
+- La ultimul strămoș hosted `0d50c48`, Linux/macOS/Windows sunt verzi prin
+  [#30287773056](https://github.com/galeamarcel/FastMssql/actions/runs/30287773056),
   iar RustSec este verde prin
-  [#30284587019](https://github.com/galeamarcel/FastMssql/actions/runs/30284587019).
-- Nu există încă o rulare hosted Linux/macOS/Windows sau RustSec pentru
-  `428bc74`; acest gate rămâne obligatoriu la integrarea cumulativă a
-  programului batch/bulk și nu este inferat din verificarea locală.
+  [#30287773059](https://github.com/galeamarcel/FastMssql/actions/runs/30287773059).
+- API-ul public GitHub raportează zero rulări pentru
+  `fix/checkout-reset-ddl`. Nu există încă o rulare hosted
+  Linux/macOS/Windows sau RustSec pentru `9e86cc4`; statusul exact este
+  `NOT RUN` și nu este inferat din verificarea locală sau din strămoș.
 - Wheel-ul ABI3 a fost construit și instalat separat pe cele trei sisteme,
   iar contractele Python instalate, raw Cargo, `cargo fmt`, Clippy cu
   `-D warnings`, Ruff și `compileall` au trecut.
@@ -3453,17 +3531,18 @@ upstream fără aprobarea explicită a proprietarului forkului.
   servere web reale pornite din wheel rămân deschise în ordinea de
   implementare.
 - Observația `PoolConfig(test_on_check_out=False)` plus DDL care cere prima
-  instrucțiune în batch rămâne `OPEN_REPRO_REQUIRED` și va fi tratată
-  separat; nu este atribuită slice-ului native bulk.
+  instrucțiune în batch este `VERIFIED_FORK` la `9e86cc4`; resetul privat este
+  drenat înaintea aplicației și nu este atribuit slice-ului native bulk.
 - Toate schimbările și dovezile au fost publicate exclusiv pe fork. Nu există
   push, PR sau release în repository-ul original.
 
-Starea de mai sus separă arborele tehnic cumulativ exact `428bc74` de ultimul
-gate complet local/hosted la strămoșul `a9d5c2a`. Branchurile validate au fost
-integrate și publicate numai în fork.
+Starea de mai sus separă arborele tehnic exact `9e86cc4`, verificat local și
+pe MSSQL Docker, de ultimul gate hosted la strămoșul `0d50c48`. Branchurile
+validate au fost integrate și publicate numai în fork.
 
 Rapoarte de stress:
 
 - [SQL_AUTH_RESULT_STREAM_STRESS_REPORT.md](SQL_AUTH_RESULT_STREAM_STRESS_REPORT.md)
 - [SQL_AUTH_NATIVE_BULK_STRESS_REPORT.md](SQL_AUTH_NATIVE_BULK_STRESS_REPORT.md)
 - [SQL_AUTH_TRANSACTION_STRESS_REPORT.md](SQL_AUTH_TRANSACTION_STRESS_REPORT.md)
+- [CHECKOUT_RESET_DDL_VALIDATION_REPORT.md](CHECKOUT_RESET_DDL_VALIDATION_REPORT.md)
