@@ -45,6 +45,22 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### PyO3 uv matrix-harness RED
+
+- Preserved the complete-gate failure that exposed the harness boundary:
+  root Rust 116/116 and every non-strict runner lane passed, while strict
+  reported one failure among 423 tests because its sandboxed fake `uv`
+  returned no interpreter discovery output.
+- Added a focused behavioral contract for a fake uv executable that must
+  return the configured executable/base prefix for the two supported
+  `uv run python -c` expressions, reject any other Python expression and
+  leave unrelated uv commands successful and silent.
+- Observed the intended RED independently: the new test failed with the
+  explicit `_write_fake_uv` `NotImplementedError`, not because of
+  collection, import, Docker or SQL Server setup.
+- This test-only change does not weaken fail-closed runner discovery or alter
+  the displayed `0.7.7` version and release state.
+
 ### PyO3 uv embedded-runtime bootstrap fix
 
 - Made the canonical local SQL-auth runner resolve the exact worktree

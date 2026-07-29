@@ -31,6 +31,12 @@ def _write_executable(path: Path, source: str) -> None:
     path.chmod(0o755)
 
 
+def _write_fake_uv(path: Path) -> None:
+    raise NotImplementedError(
+        "fake uv discovery behavior is not implemented"
+    )
+
+
 def _git_head() -> str:
     completed = subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -93,6 +99,47 @@ def test_full_runner_contract() -> None:
         "tests/sql_auth_strict",
     ):
         assert f"--ignore={ignored}" in source
+
+
+def test_fake_uv_emulates_runner_python_discovery(tmp_path: Path) -> None:
+    fake_uv = tmp_path / "uv"
+    _write_fake_uv(fake_uv)
+    environment = os.environ.copy()
+    environment["FASTMSSQL_TEST_PYTHON_EXECUTABLE"] = sys.executable
+    environment["FASTMSSQL_TEST_PYTHON_HOME"] = sys.base_prefix
+
+    for expression, expected in (
+        ("import sys; print(sys.executable)", sys.executable),
+        ("import sys; print(sys.base_prefix)", sys.base_prefix),
+    ):
+        completed = subprocess.run(
+            [str(fake_uv), "run", "python", "-c", expression],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert completed.stdout == f"{expected}\n"
+
+    unsupported = subprocess.run(
+        [str(fake_uv), "run", "python", "-c", "print('unsupported')"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert unsupported.returncode == 64
+
+    unrelated = subprocess.run(
+        [str(fake_uv), "sync", "--locked"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert unrelated.returncode == 0
+    assert unrelated.stdout == ""
 
 
 def test_full_runner_uses_original_local_regression_display_name(
