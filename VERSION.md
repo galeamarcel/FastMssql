@@ -45,6 +45,24 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### PyO3 uv matrix-harness correction
+
+- Replaced the matrix runner test's zero-output `uv` stub with a bounded fake
+  executable that emulates only the two interpreter-discovery expressions
+  consumed by the production runner.
+- Passed the active test interpreter and base prefix through explicit
+  test-only environment variables; no local path is embedded in repository
+  source or generated command evidence.
+- Made unsupported fake Python expressions fail with exit 64 while unrelated
+  `uv` invocations remain successful and silent, preserving the original
+  display-name test's isolation from package, Docker and network work.
+- Drove the new behavioral contract from explicit `NotImplementedError` to
+  GREEN. Both focused harness tests passed 2/2, the complete matrix-contract
+  file passed 27/27, and Ruff/diff checks passed.
+- The correction changes only deterministic test infrastructure; it does not
+  weaken runner discovery, modify runtime APIs, or alter the displayed
+  `0.7.7` version and release state.
+
 ### PyO3 uv matrix-harness RED
 
 - Preserved the complete-gate failure that exposed the harness boundary:

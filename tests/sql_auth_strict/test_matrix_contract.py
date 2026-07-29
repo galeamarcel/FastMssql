@@ -32,8 +32,25 @@ def _write_executable(path: Path, source: str) -> None:
 
 
 def _write_fake_uv(path: Path) -> None:
-    raise NotImplementedError(
-        "fake uv discovery behavior is not implemented"
+    _write_executable(
+        path,
+        """#!/usr/bin/env bash
+set -u
+if [[ "${1:-}" == "run" && "${2:-}" == "python" && "${3:-}" == "-c" ]]; then
+  case "${4:-}" in
+    *"sys.executable"*)
+      printf '%s\\n' "${FASTMSSQL_TEST_PYTHON_EXECUTABLE:?}"
+      ;;
+    *"sys.base_prefix"*)
+      printf '%s\\n' "${FASTMSSQL_TEST_PYTHON_HOME:?}"
+      ;;
+    *)
+      exit 64
+      ;;
+  esac
+fi
+exit 0
+""",
     )
 
 
@@ -175,7 +192,8 @@ def test_full_runner_uses_original_local_regression_display_name(
 
     fake_bin = sandbox / "fake-bin"
     fake_bin.mkdir()
-    for name in ("uv", "cargo", "docker"):
+    _write_fake_uv(fake_bin / "uv")
+    for name in ("cargo", "docker"):
         _write_executable(
             fake_bin / name,
             "#!/usr/bin/env bash\nexit 0\n",
@@ -185,6 +203,8 @@ def test_full_runner_uses_original_local_regression_display_name(
     environment["PATH"] = (
         f"{fake_bin}{os.pathsep}{environment.get('PATH', '')}"
     )
+    environment["FASTMSSQL_TEST_PYTHON_EXECUTABLE"] = sys.executable
+    environment["FASTMSSQL_TEST_PYTHON_HOME"] = sys.base_prefix
     completed = subprocess.run(
         [str(runner)],
         cwd=sandbox,
