@@ -735,7 +735,7 @@ async def test_batch_and_bulk_share_one_absolute_operation_budget(
         AS
         BEGIN
             SET NOCOUNT ON;
-            WAITFOR DELAY '00:00:00.160';
+            WAITFOR DELAY '00:00:00.500';
         END
         """
     )
@@ -743,13 +743,15 @@ async def test_batch_and_bulk_share_one_absolute_operation_budget(
     bulk_application = unique_sql_name("strict_timeout_bulk")
     bulk_connection = timeout_connection(
         sql_auth_config,
-        pool_config=bounded_pool(),
+        pool_config=bounded_pool(max_size=1),
         timeout_config=TimeoutConfig(
-            acquire_timeout_secs=1.0,
-            operation_timeout_secs=0.25,
+            acquire_timeout_secs=2.0,
+            operation_timeout_secs=0.85,
         ),
         application_name=bulk_application,
     )
+    holder = bulk_connection.transaction()
+    bulk_task: asyncio.Future | None = None
     bulk_stop = asyncio.Event()
     bulk_sampler = asyncio.create_task(
         _sample_request_identities(
@@ -760,16 +762,34 @@ async def test_batch_and_bulk_share_one_absolute_operation_budget(
         )
     )
     rows = [[index] for index in range(4001)]
+    operation_phase_elapsed: float | None = None
     try:
-        started = time.monotonic()
-        with pytest.raises(error_type) as captured:
-            await bulk_connection.bulk_insert(
+        await holder.begin()
+        bulk_task = asyncio.ensure_future(
+            bulk_connection.bulk_insert(
                 raw_bulk_table,
                 ["id"],
                 rows,
             )
-        elapsed = time.monotonic() - started
-        assert 0.18 <= elapsed < 0.75
+        )
+
+        async def bulk_is_waiting_for_checkout() -> bool:
+            return (
+                await bulk_connection.pool_stats()
+            )["pending_gets"] == 1
+
+        await wait_until(bulk_is_waiting_for_checkout)
+        await asyncio.sleep(0.95)
+        assert bulk_task.done() is False
+        await holder.rollback()
+        await holder.close()
+
+        operation_phase_started = time.monotonic()
+        with pytest.raises(error_type) as captured:
+            await bulk_task
+        operation_phase_elapsed = (
+            time.monotonic() - operation_phase_started
+        )
         assert_timeout(
             captured.value,
             phase="operation",
@@ -779,15 +799,23 @@ async def test_batch_and_bulk_share_one_absolute_operation_budget(
             outcome_unknown=True,
         )
     finally:
+        if bulk_task is not None and not bulk_task.done():
+            bulk_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await bulk_task
+        await holder.close()
         bulk_stop.set()
         bulk_requests = await bulk_sampler
         await bulk_connection.disconnect()
 
-    # One-column bulk chunks contain 1,000 rows. The first 160 ms request
-    # completes, the second starts, and the shared 250 ms budget expires
-    # before a third request can start. A reset-per-chunk timeout would allow
-    # all five requests to run.
+    # The 950 ms pending checkout is longer than the operation budget but
+    # shorter than the separate acquire budget. Once checkout completes, the
+    # first 500 ms request must finish, the second must start, and the shared
+    # 850 ms operation budget must expire before a third request can start.
+    # A reset-per-chunk timeout would allow all five requests to run.
     assert len(bulk_requests) == 2
+    assert operation_phase_elapsed is not None
+    assert 0.70 <= operation_phase_elapsed < 1.50
 
     async def bulk_rolled_back() -> bool:
         return await _row_count(sa_connection, bulk_table) == 0

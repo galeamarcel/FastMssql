@@ -45,6 +45,30 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Compatibility-bulk timeout phase-boundary RED
+
+- Extended existing canonical `TIME-006` with a size-one pool held for 0.95
+  seconds after `pending_gets == 1`, longer than its 0.85 second operation
+  budget but shorter than its separate 2.0 second acquire budget.
+- Kept 4.001 rows/five compatibility chunks and required exactly two real SQL
+  requests under a 500 ms trigger delay, typed fail-closed timeout metadata
+  and zero rows after rollback.
+- Added a bounded opt-in runner with a 20-iteration default and strict
+  `1..100` input validation, isolated temporary result output and immediate
+  failure propagation.
+- Scheduled the native PyO3 awaitable with `asyncio.ensure_future()` after the
+  first RED attempt proved that `asyncio.create_task()` correctly rejects a
+  preconstructed `Future`; this was a test-harness correction only.
+- This branch changes tests and test harness only. The unchanged runtime
+  observed `pending_gets == 1`, remained pending through the hold, then
+  expired its operation deadline immediately after checkout and submitted
+  exactly zero bulk requests instead of the required two.
+- The deterministic RED completed in 1,37 seconds; the typed
+  `OperationTimeoutError` metadata remained correct, so the failing dimension
+  is the acquire/operation boundary rather than error classification.
+- No runtime, public API, displayed `0.7.7` version, release state or package
+  metadata changes here.
+
 ### Compatibility-bulk timeout phase-boundary corrected plan
 
 - Corrected the initial test-only hypothesis after correlating `TIME-006`,
