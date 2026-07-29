@@ -45,6 +45,21 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Shared bounded producer coordinator
+
+- Extracted native-bulk's synchronous/asynchronous protocol acquisition,
+  deadline-aware pulls, bounded chunking and strong-referenced terminal
+  cleanup into
+  `python/fastmssql/_bounded_sequence.py`.
+- Kept native-bulk validation, normalization, raw sequence construction and
+  public dispatch feature-specific, including the concrete-list fast path and
+  existing task names.
+- Extended the boundedness contract across both the feature adapter and the
+  shared coordinator; all 30 focused offline contracts and all 9 real
+  SQL-auth iterable native-bulk cases passed after extraction.
+- This internal refactor does not change the displayed `0.7.7` version or
+  release state.
+
 ### Bounded execute-many immutable RED coverage
 
 - Added deterministic public/raw/stub contracts for list, synchronous-

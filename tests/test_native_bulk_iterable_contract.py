@@ -14,6 +14,7 @@ WRAPPER = ROOT / "python/fastmssql/__init__.py"
 WRAPPER_STUB = ROOT / "python/fastmssql/__init__.pyi"
 RAW_STUB = ROOT / "python/fastmssql/fastmssql.pyi"
 COORDINATOR = ROOT / "python/fastmssql/_bulk_iterable.py"
+SHARED_COORDINATOR = ROOT / "python/fastmssql/_bounded_sequence.py"
 OWNER_NAMES = ("Connection", "Transaction")
 POSITIONAL = ("self", "table", "columns", "rows")
 KEYWORD_ONLY = ("chunk_size",)
@@ -231,33 +232,37 @@ def test_wrapper_dispatch_is_explicit_and_list_path_is_not_coordinated() -> None
 
 
 def test_coordinator_has_no_eager_or_unbounded_producer_constructs() -> None:
-    tree = _tree(COORDINATOR)
+    trees = (_tree(COORDINATOR), _tree(SHARED_COORDINATOR))
 
-    for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
-        assert not (
-            isinstance(call.func, ast.Name)
-            and call.func.id == "list"
-            and call.args
-            and isinstance(call.args[0], ast.Name)
-            and call.args[0].id == "rows"
-        )
-        assert not (
-            isinstance(call.func, ast.Attribute)
-            and call.func.attr in {"Queue", "PriorityQueue", "LifoQueue"}
-        )
-
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        if not (
-            isinstance(node.func, ast.Attribute)
-            and node.func.attr == "shield"
-            and node.args
+    for tree in trees:
+        for call in (
+            node for node in ast.walk(tree) if isinstance(node, ast.Call)
         ):
-            continue
-        assert isinstance(node.args[0], ast.Name), (
-            "asyncio.shield must receive the strong-referenced cleanup task"
-        )
+            assert not (
+                isinstance(call.func, ast.Name)
+                and call.func.id == "list"
+                and call.args
+                and isinstance(call.args[0], ast.Name)
+                and call.args[0].id
+                in {"items", "parameter_sets", "producer", "rows", "source"}
+            )
+            assert not (
+                isinstance(call.func, ast.Attribute)
+                and call.func.attr in {"Queue", "PriorityQueue", "LifoQueue"}
+            )
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "shield"
+                and node.args
+            ):
+                continue
+            assert isinstance(node.args[0], ast.Name), (
+                "asyncio.shield must receive the strong-referenced cleanup task"
+            )
 
 
 def test_runtime_surface_keeps_the_same_call_shape() -> None:
