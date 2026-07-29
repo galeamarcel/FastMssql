@@ -50,6 +50,20 @@ No release, package-version change, or artifact publication has occurred.
   canonical Docker SQL-auth cases, the private Rust sequence, the bounded
   Python coordinator, isolated-wheel validation and sync/async stress through
   99,999 rows.
+- Added test-only RED contracts requiring the public iterable/raw-list surface
+  split, one-time protocol acquisition, pre-pull transaction reservation,
+  bounded sync/async backpressure and cancellation-safe abnormal cleanup.
+- Extended the canonical SQL-auth matrix from 387 to 396 unique cases with
+  `BULK-013`–`BULK-021`, covering real connection/transaction atomicity,
+  producer/conversion failure, cancellation, timeout and TDS-gated pull
+  counts.
+- Added a dedicated lazy sync/async iterable stress harness with hard
+  1,000/10,000/99,999-row gates for buffered cells, RSS, event-loop gaps,
+  physical sessions, metrics, exact persistence and teardown, including typed
+  timeout classification and unmasking cleanup evidence.
+- These are test-only RED requirements; they do not implement iterable input,
+  change runtime behavior, package metadata, the displayed `0.7.7` version or
+  release state.
 - Selected a bounded Python coordinator over one private Rust sequence so
   all chunks retain one lease, transaction, absolute deadline, metric and
   global diagnostic index space.

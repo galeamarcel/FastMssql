@@ -576,6 +576,33 @@ Enterprise compatibility-bulk buffering:
 - `BULK-012`: cancellation or timeout during native bulk retires the physical
   session, terminates the server request, restores pool capacity and permits
   a post-fault smoke query.
+- `BULK-013`: public connection/transaction wrappers accept synchronous and
+  asynchronous row producers while raw extension methods remain concrete-list
+  primitives and concrete lists retain the unchanged fast path.
+- `BULK-014`: invalid chunk size, identifier or top-level producer input
+  advances the producer zero times and performs no pool, SQL or operation
+  metric activity.
+- `BULK-015`: successfully empty synchronous and asynchronous producers return
+  zero; Connection remains disconnected and an active caller Transaction
+  remains active, with no SQL or bulk metric activity.
+- `BULK-016`: a synchronous generator crosses multiple chunks in order,
+  returns the exact affected count and is not advanced while its current
+  native TDS chunk is blocked.
+- `BULK-017`: an asynchronous generator crosses multiple chunks in order,
+  returns the exact affected count and is not advanced while its current
+  native TDS chunk is blocked.
+- `BULK-018`: late producer and conversion failures retain the original
+  exception or global diagnostic indices, close the producer, roll back all
+  Connection-owned chunks and leave the pool reusable.
+- `BULK-019`: iterable native-bulk success inside a caller Transaction remains
+  uncommitted and settlement-neutral; a producer failure after sent rows makes
+  the transaction rollback-only without settling it.
+- `BULK-020`: cancellation during producer wait or native TDS activity stops
+  further pulls, completes terminal cleanup, records one cancellation and
+  leaves the pool usable with no leaked application session.
+- `BULK-021`: operation timeout during asynchronous producer wait or native
+  TDS activity is typed, bounded and privacy-safe, completes terminal cleanup
+  and leaves no leaked application session.
 
 ### TX — dedicated transactions
 

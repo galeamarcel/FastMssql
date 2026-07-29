@@ -68,7 +68,11 @@ def _assert_runtime_signature(owner: type) -> None:
     assert chunk_size.default == 1000
 
 
-def _assert_stub_signature(class_node: ast.ClassDef) -> None:
+def _assert_stub_signature(
+    class_node: ast.ClassDef,
+    *,
+    rows_annotation: str,
+) -> None:
     method = _method(
         class_node,
         "native_bulk_insert",
@@ -83,7 +87,7 @@ def _assert_stub_signature(class_node: ast.ClassDef) -> None:
     ) == (
         "str",
         "list[str]",
-        "list[list[Any]]",
+        rows_annotation,
     )
     assert ast.unparse(method.args.kwonlyargs[0].annotation) == "int"
     assert ast.unparse(method.returns) == "Coroutine[Any, Any, int]"
@@ -110,7 +114,7 @@ def _assert_wrapper_signature(class_node: ast.ClassDef) -> None:
     assert len(calls) == 1
 
 
-def test_native_bulk_runtime_has_exact_list_only_surface() -> None:
+def test_native_bulk_runtime_has_exact_call_surface() -> None:
     core = importlib.import_module("fastmssql.fastmssql")
 
     for owner in (
@@ -128,14 +132,19 @@ def test_native_bulk_is_explicit_on_both_wrapper_classes() -> None:
         _assert_wrapper_signature(_class(wrapper, class_name))
 
 
-def test_native_bulk_is_exact_in_both_stub_layers() -> None:
-    for path in (
-        ROOT / "python/fastmssql/__init__.pyi",
-        ROOT / "python/fastmssql/fastmssql.pyi",
-    ):
-        tree = _tree(path)
-        for class_name in ("Connection", "Transaction"):
-            _assert_stub_signature(_class(tree, class_name))
+def test_native_bulk_wrapper_stub_is_iterable_and_raw_stub_stays_list_only() -> None:
+    wrapper = _tree(ROOT / "python/fastmssql/__init__.pyi")
+    raw = _tree(ROOT / "python/fastmssql/fastmssql.pyi")
+
+    for class_name in ("Connection", "Transaction"):
+        _assert_stub_signature(
+            _class(wrapper, class_name),
+            rows_annotation="BulkRows",
+        )
+        _assert_stub_signature(
+            _class(raw, class_name),
+            rows_annotation="list[list[Any]]",
+        )
 
 
 def test_native_bulk_source_uses_tds_rows_and_never_values_sql() -> None:
