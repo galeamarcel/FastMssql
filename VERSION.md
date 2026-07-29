@@ -9,8 +9,8 @@ component represents a feature-level patch. It is documented here but is not
 yet applied to package metadata; release versioning remains a separate,
 explicit decision.
 
-Changes currently integrated in fork history through
-`13c91c06bcf27da0e00bc514364c42e591b0632f`:
+Changes currently integrated in fork history through technical candidate
+`b270205128fc6bd3c951a3e822b600c9ad049ee9`:
 
 - closed, validated SQL parameter descriptors with exact TDS metadata;
 - exact decimal, UUID, temporal, ANSI/Unicode, binary, XML, and typed-null
@@ -44,6 +44,70 @@ Changes currently integrated in fork history through
   `30284587019`.
 
 No release, package-version change, or artifact publication has occurred.
+
+### Execute-many exact-candidate validation evidence
+
+- Integrated the deterministic compatibility-bulk timeout correction into
+  `feat/execute-many` and verified the exact clean technical candidate
+  `b270205128fc6bd3c951a3e822b600c9ad049ee9`.
+- The canonical SQL-auth runner passed all 407 required matrix IDs, 424
+  strict tests, 16 true-async tests, 33 framework tests, 6 resilience tests
+  with 12 intentional deselections, 12 load tests with 6 intentional
+  deselections, and 1,183 original-local-regression tests. No required case
+  failed, errored, skipped or remained not run.
+- Root Rust passed 116/116; vendored Tiberius passed 168/168 library tests,
+  2/2 token-safety SQL-auth tests, 8/8 bulk-column-subset SQL-auth tests and
+  8/8 response SQL-auth tests. Rust and vendored formatting/Clippy gates
+  passed with warnings denied.
+- The canonical ResultStream stress gate passed 1,000 operations at
+  concurrency 64 with zero failures/timeouts, 2,707.44 operations/second,
+  at most eight SQL sessions, a 6.900 ms maximum event-loop gap, 16,252,928
+  bytes RSS growth and a successful post-load smoke query.
+- Execute-many stress passed all seven exact-source profiles: atomic sync and
+  async inputs at 1,000, 10,000 and 99,999 parameter sets plus the 10,000-set
+  sync `atomic=False` profile. Every profile persisted and affected the exact
+  requested count, used at most one physical SQL session, retained at most
+  1,000 sets/2,000 cells, completed its smoke query and left zero application
+  sessions after teardown.
+- Across those profiles throughput was 2,344.08–2,706.15 parameter sets per
+  second, maximum event-loop gap was 22.548 ms against the 100 ms hard limit,
+  and maximum RSS growth was 4,603,904 bytes against the 64 MiB hard limit.
+  The partial profile reported exactly 10,000 acknowledged committed sets;
+  every profile recorded one successful `execute_many` operation and no
+  internal `execute` metric.
+- Built
+  `fastmssql-0.7.7-cp311-abi3-macosx_11_0_arm64.whl` from that exact SHA
+  with SHA-256
+  `233008ea32a57a3689822edcd0df99cd9bc9fc4207484373a01812a327492097`.
+  A fresh external Python 3.12 environment imported it from isolated
+  `site-packages` with `PYTHONPATH` removed, then passed 40/40 offline
+  execute-many contracts, 11/11 real `EMANY-001`–`EMANY-011` cases, 3/3
+  representative native-bulk/query/ResultStream SQL-auth smoke tests and
+  `pip check`.
+- The first sandboxed `uv` wheel command stopped before compilation in macOS
+  `SystemConfiguration`; the identical command outside that sandbox built
+  successfully. The first import probe contained a command-line quoting
+  `SyntaxError` before import; the corrected probe proved the isolated module
+  path and package version. Neither harness issue changed source or masked a
+  FastMssql failure.
+- A fresh graph built on the exact candidate and matching HEAD contains 3,914
+  nodes and 48,297 edges across 176 files. The cumulative feature diff
+  touches 42 files and 102 statically detected flows. Both public
+  `execute_many` wrappers map to the strict real-MSSQL test file; the shared
+  coordinator's dynamic protocol tests are not represented by direct static
+  edges, so its graph warning was reconciled against the 40 offline
+  coordinator contracts and the complete SQL-auth/non-regression gates.
+- Every changed source/test/documentation hunk was reviewed after graph
+  analysis. `git diff --check` passed; high-confidence token/private-key
+  scanning found nothing; all password-shaped matches were environment-fed
+  arguments or explicit `not-used` disconnected probes; no `.env`, wheel,
+  build cache or runner artifact is tracked.
+- `origin` remains `galeamarcel/FastMssql`; the original
+  `Rivendael/FastMssql` remote remains fetch-only with push URL exactly
+  `DISABLED`. This evidence does not publish the wheel, create a release or
+  create an original-repository pull request.
+- This documentation-only evidence update does not change runtime behavior,
+  package metadata, the displayed `0.7.7` version or release state.
 
 ### Compatibility-bulk timeout phase boundary
 
