@@ -45,6 +45,29 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Bounded execute-many focused design
+
+- Added the sixth-slice design for repeating one parameterized statement over
+  bounded list, synchronous-iterable or asynchronous-iterable parameter
+  sets.
+- Chose a shared audited Python producer coordinator over a private Rust
+  `_ExecuteManySequence`, keeping iterator/GIL behavior in Python and all
+  lease, transaction, deadline, metric and connection-disposition decisions
+  in Rust.
+- Defined atomic-by-default Connection semantics, explicit per-chunk commits
+  for `atomic=False`, settlement-neutral active Transaction semantics and
+  privacy-safe global/confirmed-commit error metadata.
+- Defined operation-metrics schema version 2 with an exact `execute_many`
+  key and no internal `execute`/settlement metric inflation.
+- Defined `EMANY-001`–`EMANY-011`, deterministic RED/cancellation contracts,
+  isolated-wheel gates and bounded sync/async stress through 99,999
+  parameter sets.
+- Kept `query_many()`, byte-level LOB streaming, remaining enterprise SQL
+  types, release publication and any original-repository PR outside this
+  slice.
+- This documentation-only change does not modify runtime behavior, package
+  metadata, the displayed `0.7.7` version or release state.
+
 ### Native bulk iterable backpressure design
 
 - Added the focused fifth-slice design for synchronous and asynchronous
