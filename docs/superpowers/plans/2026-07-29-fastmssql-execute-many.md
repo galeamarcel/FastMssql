@@ -250,7 +250,11 @@ Cargo fmt/Clippy/test, Git worktrees and code-review-graph.
   activate()
   push(list[ParameterSet])
   finish() -> int
-  abort("error" | "cancelled")
+  abort("error" | "cancelled") -> {
+      active_parameter_set_index: int | None,
+      confirmed_committed_parameter_sets: int,
+      partial_commit_possible: bool,
+  }
   expire()
   remaining_timeout() -> float | None
   ```
@@ -295,6 +299,10 @@ Cargo fmt/Clippy/test, Git worktrees and code-review-graph.
   partial_commit_possible
   ```
 
+- [ ] When Python owns the primary producer/cancellation exception, merge the
+  adapter's current index with the authoritative Rust `abort()` progress
+  snapshot; Rust's active statement index wins and confirmed commits are
+  never inferred from an unacknowledged push.
 - [ ] For commit acknowledgement loss, require `parameter_set_index` to be
   the first set in the unconfirmed commit, not a fictitious failed statement.
 - [ ] Assert messages/metadata never contain SQL text, values or producer
@@ -674,6 +682,10 @@ Cargo fmt/Clippy/test, Git worktrees and code-review-graph.
   ```
 
 - [ ] Retain exact active/global indices across cancellation and timeout.
+- [ ] Make successful `abort()` return the terminal
+  `active_parameter_set_index`, `confirmed_committed_parameter_sets` and
+  `partial_commit_possible` snapshot so Python can annotate its own primary
+  exception without guessing.
 - [ ] On dropped live sequences, schedule bounded terminal cleanup on the
   runtime and fail closed if cleanup cannot be scheduled.
 - [ ] Retire/discard any connection with unread response data, timed-out TDS,

@@ -69,6 +69,10 @@ No release, package-version change, or artifact publication has occurred.
 - Made the plan's commit-acknowledgement-loss, active-Transaction reservation,
   empty-input, abnormal producer-close and native-bulk non-regression
   checkpoints explicit before any implementation begins.
+- Clarified the cross-language cancellation boundary: successful private
+  `abort()` cleanup returns Rust's active-index and confirmed-commit progress
+  so Python can annotate its own primary producer/cancellation exception
+  exactly rather than guessing.
 - Kept `query_many()`, byte-level LOB streaming, remaining enterprise SQL
   types, release publication and any original-repository PR outside this
   slice.

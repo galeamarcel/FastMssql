@@ -300,6 +300,24 @@ confirmed_committed_parameter_sets: int
 partial_commit_possible: bool
 ```
 
+The Python task owns producer and `CancelledError` objects, while Rust alone
+knows which statement was active and which chunk COMMIT acknowledgements were
+received. The private sequence therefore returns this privacy-safe snapshot
+from every successful `abort("error" | "cancelled")` cleanup:
+
+```text
+active_parameter_set_index: int | None
+confirmed_committed_parameter_sets: int
+partial_commit_possible: bool
+```
+
+The execute-many adapter merges that authoritative Rust snapshot with its
+Python-side next/pulled index before attaching the three public attributes.
+When a statement was active, Rust's index wins. During producer wait or
+normalization, the Python current index wins. An abort cleanup failure cannot
+replace the primary exception; the adapter attaches conservative metadata
+from its last confirmed Python/Rust progress and chains the cleanup failure.
+
 Semantics:
 
 - `parameter_set_index` is the zero-based set whose production, conversion or
@@ -444,7 +462,9 @@ Create `src/execute_many_sequence.rs` for:
 - Connection atomic/chunk-commit ownership;
 - active Transaction reservation;
 - absolute deadline and one observer;
-- push/finish/abort/expire/drop cleanup;
+- push/finish/abort/expire/drop cleanup, with `abort()` returning the terminal
+  privacy-safe progress snapshot needed to annotate a Python-owned primary
+  exception;
 - the private PyO3 `_ExecuteManySequence`.
 
 `src/connection.rs` and `src/transaction.rs` expose raw concrete-list
