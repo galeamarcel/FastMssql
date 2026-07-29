@@ -100,8 +100,34 @@ def test_linux_runner_exposes_managed_python_library_to_runtime_loader() -> None
 def test_sql_auth_runner_uses_locked_cargo_tests() -> None:
     runner = _read_required(SQL_AUTH_RUNNER)
 
-    assert "record cargo-test cargo test --locked" in runner
+    assert runner.count("cargo test --locked") == 1
     assert "record cargo-test cargo test\n" not in runner
+
+
+def test_sql_auth_runner_scopes_worktree_python_to_embedded_cargo_test() -> None:
+    runner = _read_required(SQL_AUTH_RUNNER)
+    normalized = " ".join(runner.replace("\\", " ").split())
+
+    assert "uv run python -c 'import sys; print(sys.executable)'" in runner
+    assert "uv run python -c 'import sys; print(sys.base_prefix)'" in runner
+    assert "if ! cargo_test_python=" in runner
+    assert '-x "${cargo_test_python}"' in runner
+    assert "if ! cargo_test_python_home=" in runner
+    assert '-d "${cargo_test_python_home}"' in runner
+    assert "readonly cargo_test_python" in runner
+    assert "readonly cargo_test_python_home" in runner
+    assert "export PYO3_PYTHON" not in runner
+    assert "export PYTHONHOME" not in runner
+    assert (
+        'record cargo-test env '
+        '"PYO3_PYTHON=${cargo_test_python}" '
+        '"PYTHONHOME=${cargo_test_python_home}" '
+        "cargo test --locked"
+    ) in normalized
+    assert runner.index("record uv-sync") < runner.index("cargo_test_python=")
+    assert runner.index("cargo_test_python_home=") < runner.index(
+        "record cargo-test"
+    )
 
 
 def test_hosted_gate_runs_database_independent_vendored_tests() -> None:

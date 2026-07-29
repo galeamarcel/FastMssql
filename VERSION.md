@@ -45,6 +45,24 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### PyO3 uv embedded-runtime bootstrap RED
+
+- Added a deterministic configuration contract requiring the canonical
+  SQL-auth runner to discover the current worktree's `sys.executable` and
+  `sys.base_prefix` through `uv run python`, reject invalid discovery and
+  scope both `PYO3_PYTHON` and `PYTHONHOME` only to `cargo test --locked`.
+- Preserved the existing manifest, hosted workflow, lock enforcement and
+  failure-bypass contracts unchanged.
+- Observed the focused contract on the unchanged runner: exactly one intended
+  failure and eight passes. The new test failed because interpreter discovery
+  was absent, not because of collection, import or environment setup.
+- Retained the runtime reproduction evidence: a fresh target compiled 116
+  Rust tests but uv CPython initialization retained `/install` and could not
+  import `encodings`; the identical executable passed 116/116 with
+  command-scoped `PYTHONHOME=sys.base_prefix`.
+- This test-only change does not alter the displayed `0.7.7` version or
+  release state.
+
 ### PyO3 uv embedded-runtime bootstrap design
 
 - Documented a clean-target failure in the canonical local runner when raw
