@@ -253,6 +253,21 @@ async def _timeout_route_value(
     }
 
 
+async def query_many_payload(connection: Connection) -> list[int]:
+    values: list[int] = []
+    async with connection.query_many(
+        "SELECT @P1 AS value",
+        [[1], [2], [3]],
+        concurrency=3,
+        ordered=True,
+    ) as results:
+        async for result in results:
+            row = result.fetchone()
+            assert row is not None
+            values.append(int(row["value"]))
+    return values
+
+
 def create_fastapi_app(
     state: FrameworkState,
     table_sql: str,
@@ -283,6 +298,10 @@ def create_fastapi_app(
                 "SELECT CAST(SUSER_SNAME() AS NVARCHAR(128))",
             )
         }
+
+    @app.get("/query-many")
+    async def query_many():
+        return {"values": await query_many_payload(state.connection)}
 
     @app.get("/wait/{value}")
     async def wait_value(value: int, profile: str = "short"):
@@ -391,6 +410,10 @@ def create_flask_app(state: FrameworkState) -> Flask:
             "SELECT CAST(SUSER_SNAME() AS NVARCHAR(128))",
         )
         return jsonify(principal=value)
+
+    @app.get("/query-many")
+    async def query_many():
+        return jsonify(values=await query_many_payload(state.connection))
 
     @app.get("/value/<int:value>")
     async def value(value: int):

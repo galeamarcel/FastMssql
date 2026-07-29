@@ -235,6 +235,35 @@ No release, package-version change, or artifact publication has occurred.
 - This test-only correction changes no FastMssql runtime, dependency, package
   metadata, displayed `0.7.7` version, release or published artifact.
 
+### Query-many SQL-auth, stress and framework evidence
+
+- All six strict real-SQL query-many functions passed, covering
+  `QMANY-001`–`QMANY-012`, followed by 6/6 structural stress contracts.
+- The four required 1,000/10,000-operation profiles yielded exactly 22,000
+  results with no duplicate or missing ID, at most 16 accepted/active
+  queries and SQL sessions, exact child-query metrics, successful smoke
+  queries and zero teardown sessions.
+- Both explicitly approved 99,999-operation profiles passed on exact source
+  `4d7a58cd78992379018d808a2ff2020b615d1243`: 199,998 exact pulls/yields,
+  maximum accepted window, active queries and SQL sessions of 32, maximum
+  RSS growth 42,041,344 bytes, maximum event-loop gap
+  0.008793624816462398 seconds and zero teardown sessions.
+- Documented canonical full-consumption and explicit early-close usage,
+  ordinary per-child query metrics, pool-capped effective concurrency,
+  first-result-set buffering and the deliberate absence of a concurrent
+  Transaction surface.
+- Added one shared real-SQL helper and route for FastAPI/ASGI, Flask
+  `async def` under WSGI and Flask through `WsgiToAsgi`. The three tests were
+  first RED with the expected 404 responses, then passed with exact
+  `[1, 2, 3]` payloads and zero active pool leases after every request.
+- The complete framework suite passed 36/36. Flask/WSGI remains functionally
+  compatible with a per-request event loop; the ASGI adapter smoke verifies
+  the approved persistent-loop ownership path without claiming the later
+  production process-server matrix.
+- This documentation/test-harness change modifies no FastMssql runtime,
+  dependency, package metadata, displayed `0.7.7` version, release or
+  published artifact.
+
 ### Execute-many live audit status
 
 - Marked only the sixth of seven batch/bulk slices,

@@ -642,6 +642,56 @@ A synchronous producer executes `next()` on the event-loop thread; expose
 blocking producers as async iterables. Chunking bounds retained set count,
 not the byte size of a single parameter or LOB.
 
+### Bounded concurrent `query_many`
+
+Use `query_many()` for independent executions of one parameterized query
+when they should overlap across multiple pooled SQL Server sessions:
+
+```python
+async with connection.query_many(
+    "SELECT @P1 AS customer_id",
+    ([customer_id] for customer_id in customer_ids),
+    concurrency=20,
+    ordered=True,
+) as results:
+    async for result in results:
+        consume(result.fetchone())
+```
+
+Each child query takes a separate pool lease and contributes one ordinary
+schema-2 `query` metric. Effective concurrency is capped by the connection
+pool's `max_size`, even when `concurrency` is higher, and the coordinator
+retains only a bounded accepted window rather than creating a task for every
+input item. `ordered=True` yields in source order with bounded reordering;
+`ordered=False` yields in completion order.
+
+Each yielded `QueryStream` buffers one complete first result set. It is not
+the byte-level row/LOB streaming surface; use `stream()` when a single large
+response must remain incrementally consumed.
+
+Always close an operation that may stop early. A bare `break` does not
+synchronously close a general async iterator:
+
+```python
+results = connection.query_many(
+    "SELECT @P1 AS customer_id",
+    ([customer_id] for customer_id in customer_ids),
+    concurrency=20,
+)
+try:
+    async for result in results:
+        consume(result.fetchone())
+        break
+finally:
+    await results.aclose()
+```
+
+Using `async with`, as in the first example, performs the same terminal
+cleanup automatically on early exit or failure. `Transaction` intentionally
+has no concurrent `query_many()` surface: concurrent child queries require
+independent physical leases and therefore do not belong to one
+caller-controlled transaction.
+
 ### Native TDS bulk insert
 
 Use `native_bulk_insert()` when rows should travel through SQL Server's native

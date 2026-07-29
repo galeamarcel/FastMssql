@@ -678,6 +678,19 @@ async def test_fastapi_request_cancellation_recovers_immediately(
     )
 
 
+@pytest.mark.asyncio
+async def test_fastapi_query_many_route_releases_all_pool_leases(
+    framework_fastapi_app,
+) -> None:
+    app, state = framework_fastapi_app
+    async with LifespanManager(app), asgi_client(app) as client:
+        response = await client.get("/query-many")
+        pool_after = await state.connection.pool_stats()
+    assert response.status_code == 200
+    assert response.json() == {"values": [1, 2, 3]}
+    assert pool_after["active_connections"] == 0
+
+
 @pytest.fixture
 def framework_flask_app(sql_auth_config, unique_sql_name):
     state = FrameworkState.create(
@@ -809,6 +822,21 @@ async def test_flask_wsgi_explicit_shutdown_removes_app_sessions(
         state.application_name,
         expected=0,
     )
+
+
+@pytest.mark.asyncio
+async def test_flask_wsgi_query_many_route_releases_all_pool_leases(
+    framework_flask_app,
+) -> None:
+    app, state = framework_flask_app
+    try:
+        response = await flask_request(app, "/query-many")
+        pool_after = await state.connection.pool_stats()
+        assert response.status_code == 200
+        assert response.get_json() == {"values": [1, 2, 3]}
+        assert pool_after["active_connections"] == 0
+    finally:
+        await state.connection.disconnect()
 
 
 @pytest.fixture
@@ -958,6 +986,23 @@ async def test_adapted_flask_shutdown_removes_app_sessions(
         state.application_name,
         expected=0,
     )
+
+
+@pytest.mark.asyncio
+async def test_adapted_flask_query_many_route_releases_all_pool_leases(
+    framework_adapted_flask_app,
+) -> None:
+    app, state = framework_adapted_flask_app
+    await state.connection.connect()
+    try:
+        async with asgi_client(app) as client:
+            response = await client.get("/query-many")
+            pool_after = await state.connection.pool_stats()
+        assert response.status_code == 200
+        assert response.json() == {"values": [1, 2, 3]}
+        assert pool_after["active_connections"] == 0
+    finally:
+        await state.connection.disconnect()
 
 
 @case("FRAME-025")
