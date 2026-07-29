@@ -272,13 +272,21 @@ Contract:
   callers needing all result sets use independent `stream()` calls instead;
 - the first error terminates the iterator, cancels/retire-checks outstanding
   workers, and is never converted to a skip or swallowed;
-- early consumer exit cancels outstanding workers and awaits their cleanup;
+- deterministic early consumer exit uses the iterator's async context
+  manager or explicit `aclose()` and awaits worker cleanup; a bare
+  `async for ... break` cannot synchronously notify a general async iterator,
+  so drop finalization is only a supervised best-effort fallback;
 - each physical query remains independently observable through existing
   `query` metrics; aggregate query-many metrics require a schema-versioned
   metrics change and are not fabricated.
 
 The transaction class does not expose concurrent `query_many()`: a single TDS
 transaction session is intentionally sequential.
+
+The focused
+[bounded-concurrency query-many design](2026-07-30-fastmssql-query-many-bounded-concurrency-design.md)
+is authoritative for iterator closure, one-window backpressure and fault
+semantics.
 
 ## Internal architecture
 
@@ -422,7 +430,7 @@ No branch may opportunistically implement a later pair.
 - early cancellation stops input advancement and retires the session;
 - `execute_many` atomic and partial modes have exact settlement evidence;
 - `query_many` never exceeds configured concurrency or pool size and cleans up
-  on early exit/error.
+  on error, cancellation, explicit close or async-context early exit.
 
 ### Real SQL Server cases
 

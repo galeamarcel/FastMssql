@@ -367,7 +367,9 @@ RED requirements:
 - ordered and completion-order modes;
 - configured concurrency and pool max are never exceeded;
 - input and output backpressure are both bounded;
-- first error and early consumer exit clean all workers;
+- first error, consumer cancellation, explicit `aclose()` and async-context
+  early exit clean all workers; a bare `break` is not claimed to await
+  asynchronous cleanup;
 - transaction objects do not advertise concurrent `query_many`.
 
 Implementation:
@@ -375,7 +377,9 @@ Implementation:
 1. Use a fixed worker set and bounded queue, never one task per input.
 2. Run independent pooled `query()` operations.
 3. Buffer at most the concurrency window for ordered mode.
-4. Await worker cleanup in generator finalization.
+4. Await worker cleanup on exhaustion, error, cancellation, explicit
+   `aclose()` and async-context exit; provide only a supervised best-effort
+   fallback for a dropped active iterator.
 5. Preserve underlying per-query metrics and document the absence of an
    aggregate metric until a schema-versioned change.
 6. Commit RED as `test: require bounded query many concurrency`.

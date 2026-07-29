@@ -45,6 +45,32 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Query-many bounded-concurrency design
+
+- Added the focused design for the seventh and final batch/bulk slice on
+  branch `docs/query-many-design`, based on exact status commit
+  `7b5ee080ab57ff1d777b1d607590141870f1b9bd`.
+- Selected a fixed Python worker coordinator over the already verified raw
+  `Connection.query()` path so every child retains existing typed conversion,
+  lifecycle, pool timeout, operation timeout, metric and fail-closed
+  connection disposition semantics.
+- Defined one shared capacity window across producer input, queued work,
+  active queries, completed results and ordered reassembly, bounded by
+  `min(concurrency, pool.max_size)` and never implemented as one task per
+  input item.
+- Corrected the parent contract: a bare `async for ... break` cannot
+  synchronously notify a general async iterator. Deterministic early exit
+  therefore uses public idempotent `aclose()` or the iterator's async context
+  manager; drop cleanup remains an explicitly best-effort fallback.
+- Reserved `QMANY-001`–`QMANY-013`, required load at 1,000 and 10,000
+  operations, extended load at 99,999 operations, installed-wheel evidence
+  and cumulative SQL-auth/Rust/graph gates.
+- Kept the operation-metrics schema exactly 2 with one existing `query`
+  observation per child, no fabricated aggregate `query_many` metric and no
+  concurrent Transaction surface.
+- This documentation-only change does not alter runtime behavior, package
+  metadata, displayed `0.7.7` version, release state or published artefacts.
+
 ### Execute-many live audit status
 
 - Marked only the sixth of seven batch/bulk slices,
