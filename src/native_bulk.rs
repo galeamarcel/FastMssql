@@ -54,27 +54,103 @@ pub(crate) fn parse_native_chunk_size(value: &Bound<'_, PyAny>) -> PyResult<usiz
     Ok(chunk_size)
 }
 
-pub(crate) struct PreparedNativeBulk {
+#[derive(Clone)]
+pub(crate) struct NativeBulkTarget {
     table: String,
     columns: Vec<String>,
-    rows: Py<PyList>,
-    row_count: usize,
     column_count: usize,
     chunk_size: usize,
+}
+
+pub(crate) struct PreparedNativeBulk {
+    target: NativeBulkTarget,
+    rows: Py<PyList>,
+    source_row_count: usize,
+    row_start: usize,
+    row_count: usize,
+    row_index_base: usize,
 }
 
 impl PreparedNativeBulk {
     pub(crate) fn is_empty(&self) -> bool {
         self.row_count == 0
     }
+
+    fn chunk_window(&self, start: usize) -> PyResult<Self> {
+        let remaining = self.row_count.checked_sub(start).ok_or_else(|| {
+            PyValueError::new_err("native bulk chunk offset exceeded the input row count")
+        })?;
+        let row_count = remaining.min(self.target.chunk_size);
+        let row_start = self
+            .row_start
+            .checked_add(start)
+            .ok_or_else(|| PyValueError::new_err("native bulk chunk offset overflowed usize"))?;
+        let row_index_base = checked_native_bulk_row_index(self.row_index_base, start)?;
+        validate_native_bulk_diagnostic_capacity(
+            row_count,
+            row_index_base,
+            self.target.column_count,
+        )?;
+
+        Ok(Self {
+            target: self.target.clone(),
+            rows: Python::attach(|py| self.rows.clone_ref(py)),
+            source_row_count: self.source_row_count,
+            row_start,
+            row_count,
+            row_index_base,
+        })
+    }
 }
 
-pub(crate) fn prepare_native_bulk(
+fn native_bulk_diagnostic_overflow() -> PyErr {
+    PyValueError::new_err("native bulk diagnostic index overflowed usize")
+}
+
+fn checked_native_bulk_row_index(row_index_base: usize, local_row_index: usize) -> PyResult<usize> {
+    row_index_base
+        .checked_add(local_row_index)
+        .ok_or_else(native_bulk_diagnostic_overflow)
+}
+
+fn checked_native_bulk_parameter_index(
+    row_index: usize,
+    column_count: usize,
+    column_index: usize,
+) -> PyResult<usize> {
+    row_index
+        .checked_mul(column_count)
+        .and_then(|offset| offset.checked_add(column_index))
+        .ok_or_else(native_bulk_diagnostic_overflow)
+}
+
+fn validate_native_bulk_diagnostic_capacity(
+    row_count: usize,
+    row_index_base: usize,
+    column_count: usize,
+) -> PyResult<()> {
+    if row_count == 0 {
+        return Ok(());
+    }
+
+    let last_row_index = checked_native_bulk_row_index(row_index_base, row_count - 1)?;
+    if column_count > 0 {
+        checked_native_bulk_parameter_index(last_row_index, column_count, column_count - 1)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn prepare_native_bulk_target(
     table: String,
     columns: Vec<String>,
-    rows: &Bound<'_, PyList>,
     chunk_size: usize,
-) -> PyResult<PreparedNativeBulk> {
+) -> PyResult<NativeBulkTarget> {
+    if !(1..=MAX_CHUNK_SIZE).contains(&chunk_size) {
+        return Err(PyValueError::new_err(
+            "chunk_size must be an integer between 1 and 10000",
+        ));
+    }
+
     let column_refs = columns.iter().map(String::as_str).collect::<Vec<_>>();
     validate_bulk_insert_columns(&table, &column_refs).map_err(|_| {
         native_conversion_error(
@@ -84,14 +160,40 @@ pub(crate) fn prepare_native_bulk(
         )
     })?;
 
-    Ok(PreparedNativeBulk {
+    Ok(NativeBulkTarget {
         table,
         column_count: columns.len(),
         columns,
-        rows: rows.clone().unbind(),
-        row_count: rows.len(),
         chunk_size,
     })
+}
+
+pub(crate) fn prepare_native_bulk_chunk(
+    target: NativeBulkTarget,
+    rows: &Bound<'_, PyList>,
+    row_index_base: usize,
+) -> PyResult<PreparedNativeBulk> {
+    let row_count = rows.len();
+    validate_native_bulk_diagnostic_capacity(row_count, row_index_base, target.column_count)?;
+
+    Ok(PreparedNativeBulk {
+        target,
+        rows: rows.clone().unbind(),
+        source_row_count: row_count,
+        row_start: 0,
+        row_count,
+        row_index_base,
+    })
+}
+
+pub(crate) fn prepare_native_bulk(
+    table: String,
+    columns: Vec<String>,
+    rows: &Bound<'_, PyList>,
+    chunk_size: usize,
+) -> PyResult<PreparedNativeBulk> {
+    let target = prepare_native_bulk_target(table, columns, chunk_size)?;
+    prepare_native_bulk_chunk(target, rows, 0)
 }
 
 pub(crate) struct NativeBulkFailure {
@@ -219,29 +321,30 @@ fn validate_row_list<'py>(
     column_count: usize,
     wire_sent: bool,
 ) -> PyResult<Bound<'py, PyList>> {
+    let first_parameter_index = checked_native_bulk_parameter_index(row_index, column_count, 0)?;
     let row = row.cast::<PyList>().map_err(|_| {
         attach_cell_context(
             native_conversion_error(
-                row_index.saturating_mul(column_count),
+                first_parameter_index,
                 "row_must_be_list",
                 "Each native bulk row must be a list",
             ),
             row_index,
             0,
-            row_index.saturating_mul(column_count),
+            first_parameter_index,
             wire_sent,
         )
     })?;
     if row.len() != column_count {
         return Err(attach_cell_context(
             native_conversion_error(
-                row_index.saturating_mul(column_count),
+                first_parameter_index,
                 "row_width_mismatch",
                 "Native bulk row width does not match the target column count",
             ),
             row_index,
             0,
-            row_index.saturating_mul(column_count),
+            first_parameter_index,
             wire_sent,
         ));
     }
@@ -250,7 +353,7 @@ fn validate_row_list<'py>(
 
 fn validate_top_level_length(input: &PreparedNativeBulk) -> PyResult<()> {
     Python::attach(|py| {
-        if input.rows.bind(py).len() != input.row_count {
+        if input.rows.bind(py).len() != input.source_row_count {
             return Err(PyValueError::new_err(
                 "native_bulk_insert rows must not be resized while the operation is running",
             ));
@@ -267,29 +370,37 @@ fn convert_chunk(
 ) -> PyResult<Vec<TokenRow<'static>>> {
     Python::attach(|py| {
         let rows = input.rows.bind(py);
-        if rows.len() != input.row_count {
+        if rows.len() != input.source_row_count {
             return Err(PyValueError::new_err(
                 "native_bulk_insert rows must not be resized while the operation is running",
             ));
         }
 
-        let end = start.saturating_add(input.chunk_size).min(input.row_count);
+        let end = start
+            .checked_add(input.target.chunk_size)
+            .ok_or_else(|| PyValueError::new_err("native bulk chunk offset overflowed usize"))?
+            .min(input.row_count);
         let mut converted = Vec::with_capacity(end - start);
 
-        for row_index in start..end {
-            let row = rows.get_item(row_index)?;
-            let row = validate_row_list(&row, row_index, input.column_count, any_row_sent)?;
-            let mut token_row = TokenRow::with_capacity(input.column_count);
+        for local_row_index in start..end {
+            let source_row_index =
+                input
+                    .row_start
+                    .checked_add(local_row_index)
+                    .ok_or_else(|| {
+                        PyValueError::new_err("native bulk chunk offset overflowed usize")
+                    })?;
+            let row_index = checked_native_bulk_row_index(input.row_index_base, local_row_index)?;
+            let row = rows.get_item(source_row_index)?;
+            let row = validate_row_list(&row, row_index, input.target.column_count, any_row_sent)?;
+            let mut token_row = TokenRow::with_capacity(input.target.column_count);
 
             for (column_index, target) in targets.iter().enumerate() {
-                let parameter_index = row_index
-                    .checked_mul(input.column_count)
-                    .and_then(|offset| offset.checked_add(column_index))
-                    .ok_or_else(|| {
-                        PyValueError::new_err(
-                            "native bulk parameter diagnostic index overflowed usize",
-                        )
-                    })?;
+                let parameter_index = checked_native_bulk_parameter_index(
+                    row_index,
+                    input.target.column_count,
+                    column_index,
+                )?;
                 let value = row.get_item(column_index)?;
                 let converted_cell = python_to_target_column_data(&value, target, parameter_index)
                     .map_err(|error| {
@@ -336,6 +447,119 @@ where
     }
 }
 
+fn validate_native_bulk_affected_count(
+    expected_row_count: usize,
+    affected: u64,
+    any_row_sent: bool,
+) -> Result<u64, NativeBulkFailure> {
+    let expected = u64::try_from(expected_row_count).map_err(|_| {
+        NativeBulkFailure::new(
+            create_protocol_error("Native bulk chunk row count overflowed u64"),
+            any_row_sent,
+            true,
+        )
+    })?;
+    if affected != expected {
+        return Err(NativeBulkFailure::new(
+            create_protocol_error(
+                "Native bulk response row count did not match the submitted chunk",
+            ),
+            any_row_sent,
+            true,
+        ));
+    }
+    Ok(affected)
+}
+
+pub(crate) async fn run_native_bulk_chunk(
+    client: &mut TiberiusClient,
+    input: &PreparedNativeBulk,
+    any_prior_row_sent: bool,
+) -> Result<u64, NativeBulkFailure> {
+    if input.is_empty() {
+        return Ok(0);
+    }
+    if input.row_count > input.target.chunk_size {
+        return Err(NativeBulkFailure::new(
+            PyValueError::new_err("native bulk chunk exceeded the configured chunk_size"),
+            any_prior_row_sent,
+            true,
+        ));
+    }
+
+    validate_top_level_length(input)
+        .map_err(|error| NativeBulkFailure::new(error, any_prior_row_sent, true))?;
+
+    let column_refs = input
+        .target
+        .columns
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let mut request = client
+        .bulk_insert_columns(&input.target.table, &column_refs)
+        .await
+        .map_err(|error| map_bulk_start_error(error, any_prior_row_sent))?;
+
+    let declarations = match request.column_declarations() {
+        Ok(declarations) => declarations,
+        Err(error) => {
+            let primary = map_bulk_start_error(error, any_prior_row_sent).error;
+            return Err(finalize_after_local_failure(request, primary, any_prior_row_sent).await);
+        }
+    };
+
+    let mut targets = Vec::with_capacity(declarations.len());
+    for (column_index, declaration) in declarations.iter().enumerate() {
+        match parse_sql_parameter_type(
+            declaration,
+            ParameterTypeMetadata {
+                precision: None,
+                scale: None,
+                length: None,
+            },
+        ) {
+            Ok(target) => targets.push(target),
+            Err(_) => {
+                let primary = native_conversion_error(
+                    column_index,
+                    "unsupported_target",
+                    "Native bulk target type is unsupported",
+                );
+                return Err(
+                    finalize_after_local_failure(request, primary, any_prior_row_sent).await,
+                );
+            }
+        }
+    }
+
+    let converted = match convert_chunk(input, 0, &targets, any_prior_row_sent) {
+        Ok(converted) => converted,
+        Err(primary) => {
+            return Err(finalize_after_local_failure(request, primary, any_prior_row_sent).await);
+        }
+    };
+    let chunk_row_count = converted.len();
+    let mut any_row_sent = any_prior_row_sent;
+
+    for row in converted {
+        any_row_sent = true;
+        if let Err(error) = request.send(row).await {
+            return Err(map_bulk_wire_error(error, any_row_sent));
+        }
+    }
+
+    let affected = request
+        .finalize()
+        .await
+        .map_err(|error| map_bulk_wire_error(error, any_row_sent))?
+        .total();
+    let affected = validate_native_bulk_affected_count(chunk_row_count, affected, any_row_sent)?;
+    validate_top_level_length(input)
+        .map_err(|error| NativeBulkFailure::new(error, any_row_sent, true))?;
+    Ok(affected)
+}
+
 pub(crate) async fn run_native_bulk_chunks(
     client: &mut TiberiusClient,
     input: &PreparedNativeBulk,
@@ -343,85 +567,14 @@ pub(crate) async fn run_native_bulk_chunks(
     let mut start = 0usize;
     let mut total = 0u64;
     let mut any_row_sent = false;
-    let column_refs = input.columns.iter().map(String::as_str).collect::<Vec<_>>();
 
     while start < input.row_count {
-        validate_top_level_length(input)
+        let chunk = input
+            .chunk_window(start)
             .map_err(|error| NativeBulkFailure::new(error, any_row_sent, true))?;
-
-        let mut request = client
-            .bulk_insert_columns(&input.table, &column_refs)
-            .await
-            .map_err(|error| map_bulk_start_error(error, any_row_sent))?;
-
-        let declarations = match request.column_declarations() {
-            Ok(declarations) => declarations,
-            Err(error) => {
-                let primary = map_bulk_start_error(error, any_row_sent).error;
-                return Err(finalize_after_local_failure(request, primary, any_row_sent).await);
-            }
-        };
-
-        let mut targets = Vec::with_capacity(declarations.len());
-        for (column_index, declaration) in declarations.iter().enumerate() {
-            match parse_sql_parameter_type(
-                declaration,
-                ParameterTypeMetadata {
-                    precision: None,
-                    scale: None,
-                    length: None,
-                },
-            ) {
-                Ok(target) => targets.push(target),
-                Err(_) => {
-                    let primary = native_conversion_error(
-                        column_index,
-                        "unsupported_target",
-                        "Native bulk target type is unsupported",
-                    );
-                    return Err(finalize_after_local_failure(request, primary, any_row_sent).await);
-                }
-            }
-        }
-
-        let converted = match convert_chunk(input, start, &targets, any_row_sent) {
-            Ok(converted) => converted,
-            Err(primary) => {
-                return Err(finalize_after_local_failure(request, primary, any_row_sent).await);
-            }
-        };
-        let chunk_row_count = converted.len();
-
-        for row in converted {
-            any_row_sent = true;
-            if let Err(error) = request.send(row).await {
-                return Err(map_bulk_wire_error(error, any_row_sent));
-            }
-        }
-
-        let affected = request
-            .finalize()
-            .await
-            .map_err(|error| map_bulk_wire_error(error, any_row_sent))?
-            .total();
-        let expected = u64::try_from(chunk_row_count).map_err(|_| {
-            NativeBulkFailure::new(
-                create_protocol_error("Native bulk chunk row count overflowed u64"),
-                any_row_sent,
-                true,
-            )
-        })?;
-        if affected != expected {
-            return Err(NativeBulkFailure::new(
-                create_protocol_error(
-                    "Native bulk response row count did not match the submitted chunk",
-                ),
-                any_row_sent,
-                true,
-            ));
-        }
-        validate_top_level_length(input)
-            .map_err(|error| NativeBulkFailure::new(error, any_row_sent, true))?;
+        let chunk_row_count = chunk.row_count;
+        let affected = run_native_bulk_chunk(client, &chunk, any_row_sent).await?;
+        any_row_sent |= chunk_row_count > 0;
         total = total.checked_add(affected).ok_or_else(|| {
             NativeBulkFailure::new(
                 create_protocol_error("Native bulk cumulative row count overflowed u64"),
@@ -650,15 +803,28 @@ pub(crate) fn connection_native_bulk_insert<'p>(
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_CHUNK_SIZE, parse_native_chunk_size, tiberius_start_error_allows_reuse,
-        tiberius_wire_error_allows_reuse,
+        DEFAULT_CHUNK_SIZE, NativeBulkTarget, convert_chunk, parse_native_chunk_size,
+        prepare_native_bulk, prepare_native_bulk_chunk, prepare_native_bulk_target,
+        tiberius_start_error_allows_reuse, tiberius_wire_error_allows_reuse,
+        validate_native_bulk_affected_count,
     };
     use pyo3::IntoPyObjectExt;
     use pyo3::prelude::*;
+    use pyo3::types::PyList;
+    use std::ffi::CString;
+    use tiberius::SqlParameterType;
     use tiberius::error::Error as TiberiusError;
+
+    fn python_rows<'py>(py: Python<'py>, expression: &str) -> PyResult<Bound<'py, PyList>> {
+        let expression = CString::new(expression).expect("fixed test expression has no NUL");
+        py.eval(&expression, None, None)?
+            .cast_into::<PyList>()
+            .map_err(Into::into)
+    }
 
     #[test]
     fn native_chunk_size_rejects_bool_and_out_of_range_values() -> PyResult<()> {
+        Python::initialize();
         Python::attach(|py| {
             for invalid in [
                 true.into_py_any(py)?,
@@ -679,9 +845,152 @@ mod tests {
 
     #[test]
     fn bulk_input_is_reusable_only_before_the_live_wire_request() {
+        Python::initialize();
         let error = TiberiusError::BulkInput("local row encoding failed".into());
 
         assert!(tiberius_start_error_allows_reuse(&error));
         assert!(!tiberius_wire_error_allows_reuse(&error));
+    }
+
+    #[test]
+    fn native_bulk_target_validation_is_not_repeated_for_chunks() -> PyResult<()> {
+        Python::initialize();
+        Python::attach(|py| {
+            assert!(
+                prepare_native_bulk_target(
+                    "[dbo].[already_quoted_target]".to_owned(),
+                    vec!["id".to_owned()],
+                    1,
+                )
+                .is_err()
+            );
+
+            let forged_target = NativeBulkTarget {
+                table: "[dbo].[already_quoted_target]".to_owned(),
+                columns: vec!["id".to_owned()],
+                column_count: 1,
+                chunk_size: 1,
+            };
+            let rows = python_rows(py, "[[1]]")?;
+            let input = prepare_native_bulk_chunk(forged_target, &rows, 0)?;
+
+            assert_eq!(input.row_count, 1);
+            assert_eq!(input.row_index_base, 0);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn native_bulk_chunk_uses_checked_global_diagnostic_indices() -> PyResult<()> {
+        Python::initialize();
+        Python::attach(|py| {
+            let target = prepare_native_bulk_target(
+                "dbo.native_bulk_global_index".to_owned(),
+                vec!["left_value".to_owned(), "right_value".to_owned()],
+                2,
+            )?;
+            let rows = python_rows(py, "[[1, 2], [3, 'do-not-leak']]")?;
+            let input = prepare_native_bulk_chunk(target, &rows, 5)?;
+            let error = match convert_chunk(
+                &input,
+                0,
+                &[SqlParameterType::int(), SqlParameterType::int()],
+                false,
+            ) {
+                Ok(_) => panic!("the second row must fail integer conversion"),
+                Err(error) => error,
+            };
+
+            assert_eq!(error.value(py).getattr("row_index")?.extract::<usize>()?, 6);
+            assert_eq!(
+                error
+                    .value(py)
+                    .getattr("column_index")?
+                    .extract::<usize>()?,
+                1
+            );
+            assert_eq!(
+                error
+                    .value(py)
+                    .getattr("parameter_index")?
+                    .extract::<usize>()?,
+                13
+            );
+            assert!(!error.to_string().contains("do-not-leak"));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn native_bulk_chunk_rejects_global_index_overflow_before_execution() -> PyResult<()> {
+        Python::initialize();
+        Python::attach(|py| {
+            let target = prepare_native_bulk_target(
+                "dbo.native_bulk_overflow".to_owned(),
+                vec!["left_value".to_owned(), "right_value".to_owned()],
+                2,
+            )?;
+            let two_rows = python_rows(py, "[[1, 2], [3, 4]]")?;
+            let row_overflow =
+                match prepare_native_bulk_chunk(target.clone(), &two_rows, usize::MAX) {
+                    Ok(_) => panic!("row_index_base plus local index must be checked"),
+                    Err(error) => error,
+                };
+            assert!(
+                row_overflow
+                    .to_string()
+                    .contains("diagnostic index overflowed usize")
+            );
+
+            let one_row = python_rows(py, "[[1, 2]]")?;
+            let parameter_overflow = match prepare_native_bulk_chunk(target, &one_row, usize::MAX) {
+                Ok(_) => panic!("global parameter index must be checked"),
+                Err(error) => error,
+            };
+            assert!(
+                parameter_overflow
+                    .to_string()
+                    .contains("diagnostic index overflowed usize")
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn native_bulk_list_adapter_uses_global_row_base_zero() -> PyResult<()> {
+        Python::initialize();
+        Python::attach(|py| {
+            let rows = python_rows(py, "[[1], [2]]")?;
+            let input = prepare_native_bulk(
+                "dbo.native_bulk_list_adapter".to_owned(),
+                vec!["id".to_owned()],
+                &rows,
+                1,
+            )?;
+
+            assert_eq!(input.row_index_base, 0);
+            assert_eq!(input.row_count, 2);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn native_bulk_chunk_requires_the_exact_affected_count() {
+        Python::initialize();
+        let exact = match validate_native_bulk_affected_count(3, 3, true) {
+            Ok(affected) => affected,
+            Err(_) => panic!("the exact count must pass"),
+        };
+        assert_eq!(exact, 3);
+
+        let failure = validate_native_bulk_affected_count(3, 2, true)
+            .expect_err("a short server count must fail");
+        assert!(failure.any_row_sent);
+        assert!(
+            failure
+                .error
+                .to_string()
+                .contains("did not match the submitted chunk")
+        );
     }
 }

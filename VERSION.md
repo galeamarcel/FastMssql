@@ -61,8 +61,14 @@ No release, package-version change, or artifact publication has occurred.
   1,000/10,000/99,999-row gates for buffered cells, RSS, event-loop gaps,
   physical sessions, metrics, exact persistence and teardown, including typed
   timeout classification and unmasking cleanup evidence.
-- These are test-only RED requirements; they do not implement iterable input,
-  change runtime behavior, package metadata, the displayed `0.7.7` version or
+- The immutable RED branch contains only requirements and test
+  infrastructure; it does not implement iterable input.
+- Split native bulk target validation from row-chunk preparation, added
+  checked global row/parameter diagnostics and exposed a crate-private
+  exact-count one-chunk engine while preserving the concrete-list public
+  path at global row base zero.
+- This internal runtime foundation does not yet widen the public list-only
+  surface or change package metadata, the displayed `0.7.7` version or
   release state.
 - Selected a bounded Python coordinator over one private Rust sequence so
   all chunks retain one lease, transaction, absolute deadline, metric and
