@@ -198,6 +198,28 @@ No release, package-version change, or artifact publication has occurred.
   displayed `0.7.7` version remain unchanged; no release or artifact was
   published.
 
+### Query-many terminal cleanup supervision
+
+- Made first producer/parameter/query failure registration single-assignment
+  and terminal: it records the truthful `query_index`, stops admission,
+  cancels sibling work and starts one state-owned cleanup supervisor without
+  retaining the public iterator facade.
+- Added quiescent abnormal producer close, complete queue/pending-token
+  reconciliation and cancellation-shielded cleanup that survives repeated
+  consumer cancellation and leaves no unobserved task exception.
+- Preserved the original failure object and traceback, existing
+  `parameter_index`, body/caller cancellation primacy and privacy; the first
+  cleanup failure is chained as `__cause__`, while explicit close raises it
+  when no primary exists.
+- Self-review fixed an exhaustion-vs-failure race that could skip abnormal
+  producer close and a shield-result path that could replace the primary
+  exception with its cleanup failure.
+- Fresh verification passed 65/65 offline query-many public/coordinator/stress
+  contracts and 46/46 execute-many/operation-metrics regressions with no
+  pending-task or never-retrieved warning.
+- Package metadata and the displayed `0.7.7` version remain unchanged; no
+  release or artifact was published.
+
 ### Execute-many live audit status
 
 - Marked only the sixth of seven batch/bulk slices,

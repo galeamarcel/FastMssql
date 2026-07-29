@@ -5,7 +5,11 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 
-from ._bounded_sequence import _acquire_producer, _close_producer
+from ._bounded_sequence import (
+    _acquire_producer,
+    _await_cleanup,
+    _close_producer,
+)
 from ._parameter_sets import (
     INVALID_PRODUCER_TYPES,
     preflight_parameter_set,
@@ -106,13 +110,13 @@ class _QueryManyState:
         self._producer_task: asyncio.Task[None] | None = None
         self._worker_tasks: list[asyncio.Task[None]] = []
         self._cleanup_task: asyncio.Task[None] | None = None
-        self._producer_exhausted = False
         self._producer_closed = False
         self._workers_finished = 0
         self._pending_ordered: dict[int, _CompletedQuery] = {}
         self._next_ordered_index = 0
         self._primary_failure: BaseException | None = None
         self._failure_raised = False
+        self._failure_origin_task: asyncio.Task[object] | None = None
 
     def _bind_loop(self) -> asyncio.AbstractEventLoop:
         loop = asyncio.get_running_loop()
@@ -184,12 +188,26 @@ class _QueryManyState:
         except BaseException:
             pass
         self._primary_failure = error
+        self._closing = True
+        self._failure_origin_task = asyncio.current_task()
+        self._cancel_background_tasks(exclude=self._failure_origin_task)
+        completed_queue = self._completed_queue
+        if completed_queue is not None:
+            try:
+                completed_queue.put_nowait(_FAILURE)
+            except asyncio.QueueFull:
+                pass
+        self._ensure_cleanup_task()
         return True
 
-    async def _signal_failure(self) -> None:
-        completed_queue = self._completed_queue
-        assert completed_queue is not None
-        await completed_queue.put(_FAILURE)
+    def _cancel_background_tasks(
+        self,
+        *,
+        exclude: asyncio.Task[object] | None = None,
+    ) -> None:
+        for task in [self._producer_task, *self._worker_tasks]:
+            if task is not None and task is not exclude and not task.done():
+                task.cancel()
 
     async def _produce(self) -> None:
         capacity = self._capacity
@@ -215,7 +233,6 @@ class _QueryManyState:
             except StopAsyncIteration:
                 if token is not None:
                     token.release()
-                self._producer_exhausted = True
                 for _ in range(self._effective_concurrency):
                     await work_queue.put(_END)
                 return
@@ -226,8 +243,7 @@ class _QueryManyState:
             except BaseException as error:
                 if token is not None:
                     token.release()
-                if self._register_failure(query_index, error):
-                    await self._signal_failure()
+                self._register_failure(query_index, error)
                 return
 
     async def _worker(self, worker_index: int) -> None:
@@ -263,8 +279,7 @@ class _QueryManyState:
             except asyncio.CancelledError:
                 return
             except BaseException as error:
-                if self._register_failure(item.index, error):
-                    await self._signal_failure()
+                self._register_failure(item.index, error)
                 return
             finally:
                 if not transferred:
@@ -318,22 +333,33 @@ class _QueryManyState:
 
     async def _cleanup(self) -> None:
         self._closing = True
-        current = asyncio.current_task()
-        tasks = [
+        cleanup_error: BaseException | None = None
+        self._cancel_background_tasks(exclude=self._failure_origin_task)
+        tasks: list[asyncio.Task[None]] = [
             task
             for task in [self._producer_task, *self._worker_tasks]
-            if task is not None and task is not current and not task.done()
+            if task is not None
         ]
-        for task in tasks:
-            task.cancel()
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._release_retained_items()
+            outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+            for outcome in outcomes:
+                if (
+                    isinstance(outcome, BaseException)
+                    and not isinstance(outcome, asyncio.CancelledError)
+                    and outcome is not self._primary_failure
+                    and cleanup_error is None
+                ):
+                    cleanup_error = outcome
 
-        if not self._producer_exhausted and not self._producer_closed:
+        if not self._producer_closed:
             self._producer_closed = True
-            await _close_producer(self._producer)
+            try:
+                await _close_producer(self._producer)
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
 
+        self._release_retained_items()
         self._closed = True
         completed_queue = self._completed_queue
         if completed_queue is not None:
@@ -342,22 +368,65 @@ class _QueryManyState:
             except asyncio.QueueFull:
                 pass
 
+        if cleanup_error is not None:
+            raise cleanup_error
+
+    async def _supervise_cleanup(self) -> None:
+        await _await_cleanup(
+            self._cleanup(),
+            name="query-many-terminal-cleanup-body",
+        )
+
+    @staticmethod
+    def _observe_cleanup_task(task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        task.exception()
+
     def _ensure_cleanup_task(self) -> asyncio.Task[None]:
         task = self._cleanup_task
         if task is None:
             loop = self._bind_loop()
             self._closing = True
+            self._cancel_background_tasks(
+                exclude=self._failure_origin_task,
+            )
             task = loop.create_task(
-                self._cleanup(),
+                self._supervise_cleanup(),
                 name="fastmssql-query-many-cleanup",
             )
+            task.add_done_callback(self._observe_cleanup_task)
             self._cleanup_task = task
         return task
+
+    async def _settle_cleanup(self) -> BaseException | None:
+        task = self._ensure_cleanup_task()
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        try:
+            task.result()
+        except BaseException as error:
+            return error
+        return None
+
+    @staticmethod
+    def _chain_cleanup_error(
+        primary: BaseException,
+        cleanup_error: BaseException | None,
+    ) -> None:
+        if cleanup_error is not None and primary.__cause__ is None:
+            primary.__cause__ = cleanup_error
 
     async def _raise_primary_failure(self) -> None:
         error = self._primary_failure
         assert error is not None
-        await self._ensure_cleanup_task()
+        cleanup_error = await self._settle_cleanup()
+        self._chain_cleanup_error(error, cleanup_error)
         self._failure_raised = True
         raise error
 
@@ -377,8 +446,11 @@ class _QueryManyState:
         try:
             try:
                 await self.ensure_started()
-            except BaseException:
-                await self._ensure_cleanup_task()
+            except asyncio.CancelledError:
+                raise
+            except BaseException as error:
+                cleanup_error = await self._settle_cleanup()
+                self._chain_cleanup_error(error, cleanup_error)
                 raise
 
             completed_queue = self._completed_queue
@@ -418,6 +490,10 @@ class _QueryManyState:
                     continue
                 completed.capacity.release()
                 return completed.result
+        except asyncio.CancelledError as cancelled:
+            cleanup_error = await self._settle_cleanup()
+            self._chain_cleanup_error(cancelled, cleanup_error)
+            raise
         finally:
             self._next_active = False
 
@@ -425,7 +501,9 @@ class _QueryManyState:
         self._bind_loop()
         if self._closed:
             return
-        await self._ensure_cleanup_task()
+        cleanup_error = await self._settle_cleanup()
+        if cleanup_error is not None:
+            raise cleanup_error
 
     async def enter(self) -> None:
         self._bind_loop()
@@ -436,13 +514,22 @@ class _QueryManyState:
         exc: BaseException | None,
         traceback: object,
     ) -> bool:
-        del exc_type, exc, traceback
-        await self.aclose()
+        del exc_type, traceback
+        if exc is None:
+            await self.aclose()
+        else:
+            cleanup_error = await self._settle_cleanup()
+            self._chain_cleanup_error(exc, cleanup_error)
         return False
 
-    def request_drop(self) -> None:
+    def request_drop_cleanup(self) -> None:
         loop = self._loop
-        if self._closed or loop is None or loop.is_closed():
+        if (
+            not self._started
+            or self._closed
+            or loop is None
+            or loop.is_closed()
+        ):
             return
 
         def schedule_cleanup() -> None:
@@ -484,7 +571,7 @@ class QueryManyIterator:
 
     def __del__(self) -> None:
         try:
-            self._state.request_drop()
+            self._state.request_drop_cleanup()
         except BaseException:
             pass
 
