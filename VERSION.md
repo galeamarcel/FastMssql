@@ -45,6 +45,22 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### PyO3 uv embedded-runtime bootstrap design
+
+- Documented a clean-target failure in the canonical local runner when raw
+  PyO3 Rust tests embed the worktree's relocatable uv CPython: the test
+  executable linked successfully but CPython retained its `/install` build
+  prefix and could not import `encodings`.
+- Confirmed the root cause without changing source: the identical executable
+  passed all 116 Rust tests when `PYTHONHOME` was set to the selected
+  interpreter's `sys.base_prefix`.
+- Specified a test-first, command-scoped runner correction that resolves
+  `PYO3_PYTHON` and `PYTHONHOME` through `uv run python`, without global
+  environment mutation, hard-coded installation paths or runtime API
+  changes.
+- This documentation change does not alter the displayed `0.7.7` version or
+  release state.
+
 ### Public bounded execute-many adapter
 
 - Added the public `Connection.execute_many()` and
