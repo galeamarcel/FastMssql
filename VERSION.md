@@ -68,6 +68,9 @@ No release, package-version change, or artifact publication has occurred.
 - Kept the operation-metrics schema exactly 2 with one existing `query`
   observation per child, no fabricated aggregate `query_many` metric and no
   concurrent Transaction surface.
+- Limited `query_index` to producer, parameter-set and child-query failures;
+  consumer cancellation or explicit close cannot truthfully select one index
+  from multiple outstanding workers and therefore fabricates none.
 - This documentation-only change does not alter runtime behavior, package
   metadata, displayed `0.7.7` version, release state or published artefacts.
 

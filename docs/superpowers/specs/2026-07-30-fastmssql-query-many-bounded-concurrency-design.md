@@ -28,7 +28,7 @@ The feature must provide:
   disposition, typed-parameter and operation-metric contracts;
 - deterministic terminal cleanup after errors, cancellation, explicit close
   and async-context exit;
-- privacy-safe zero-based query indices on failures;
+- privacy-safe zero-based query indices on item-associated failures;
 - real SQL Server, fault, load, installed-wheel and graph evidence through
   99,999 operations.
 
@@ -365,16 +365,21 @@ Mandatory cleanup runs in one supervised task and is awaited through
 `asyncio.shield()` until complete, even if the consumer is cancelled again.
 No task exception may be left for the event loop as “never retrieved”.
 
-The underlying primary exception object and traceback are preserved.
+The underlying primary exception object and traceback are preserved. For a
+producer failure, local parameter-set failure or child-query failure,
 FastMssql attaches:
 
 ```text
 query_index: int
 ```
 
-where the exception object permits attributes. It does not attach parameter
-values, producer representations, SQL text or credentials. Existing
-parameter-level metadata such as `parameter_index` remains unchanged.
+where the exception object permits attributes. A producer failure uses the
+index that its next item would have received. Consumer cancellation, explicit
+close and context-manager exit do not identify one query among multiple
+outstanding workers and therefore do not fabricate `query_index`. FastMssql
+does not attach parameter values, producer representations, SQL text or
+credentials. Existing parameter-level metadata such as `parameter_index`
+remains unchanged.
 
 If cleanup also fails, the primary error remains primary and the first
 cleanup failure is chained as its cause. When `__aexit__()` receives a body
