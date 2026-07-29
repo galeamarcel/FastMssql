@@ -590,13 +590,56 @@ async with Connection(conn_str) as conn:
     assert affected == 2
 ```
 
-This API is deliberately list-only in `0.7.7`: `rows` must be a concrete
-Python `list`, every row must also be a concrete `list`, and every row must
-have exactly one cell per requested column. Generators, async generators and
-other iterables are not accepted yet. `chunk_size` defaults to 1,000 and must
-be between 1 and 10,000. Empty input returns `0` without opening the pool or
-recording a bulk operation. Treat the input lists as immutable until the
-awaitable completes; resizing the top-level list is detected and rejected.
+The public wrapper also accepts bounded synchronous and asynchronous
+producers. Both forms are lazy and preserve backpressure:
+
+```python
+import asyncio
+
+
+def generated_events(total):
+    for event_id in range(total):
+        yield (event_id, f"event-{event_id}", event_id % 32)
+
+
+async def generated_events_async(total):
+    for event_id in range(total):
+        await asyncio.sleep(0)
+        yield (event_id, f"event-{event_id}", event_id % 32)
+
+
+await conn.native_bulk_insert(
+    "dbo.events",
+    ["event_id", "payload", "bucket"],
+    generated_events(10_000),
+    chunk_size=1000,
+)
+
+await conn.native_bulk_insert(
+    "dbo.events",
+    ["event_id", "payload", "bucket"],
+    generated_events_async(10_000),
+    chunk_size=1000,
+)
+```
+
+A concrete top-level `list` retains the original direct Rust fast path: each
+row must also be a concrete `list`, and the lists must remain immutable until
+the awaitable completes. Other synchronous or asynchronous producers yield
+non-string row sequences, which are normalized one row at a time. The async
+protocol is preferred when an object exposes both protocols.
+
+`chunk_size` defaults to 1,000 and must be between 1 and 10,000. It bounds
+buffered row count, not bytes: a single row or LOB can still dominate memory.
+No next row is requested while a chunk is in flight. A synchronous `next()`
+runs on the event-loop thread and cannot be preempted, so blocking sources
+must be exposed as async iterables. The raw extension methods in
+`fastmssql.fastmssql` remain concrete-list primitives.
+
+Empty input returns `0` without opening the pool or recording a bulk
+operation. Producer, conversion, timeout, and cancellation failures stop
+further pulls and complete rollback/retirement plus producer-close cleanup
+before the original exception is re-raised.
 
 Values are converted against the exact target metadata, including integer
 width, decimal precision/scale, ANSI or Unicode length, binary length, UUID,

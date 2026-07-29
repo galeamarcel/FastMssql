@@ -6,6 +6,8 @@ connection pooling, SSL/TLS encryption, Azure Active Directory authentication, a
 
 import asyncio
 
+from ._bulk_iterable import native_bulk_insert_iterable
+
 # Import from the compiled Rust module
 from .fastmssql import (
     Connection as _RustConnection,
@@ -154,8 +156,16 @@ class Connection:
         *,
         chunk_size=1000,
     ):
-        """Upload concrete rows through SQL Server's native TDS bulk path."""
-        return await self._conn.native_bulk_insert(
+        """Upload bounded concrete, sync-iterable, or async-iterable rows."""
+        if isinstance(rows, list):
+            return await self._conn.native_bulk_insert(
+                table,
+                columns,
+                rows,
+                chunk_size=chunk_size,
+            )
+        return await native_bulk_insert_iterable(
+            self._conn,
             table,
             columns,
             rows,
@@ -310,8 +320,16 @@ class Transaction:
         *,
         chunk_size=1000,
     ):
-        """Upload concrete rows inside the caller's active transaction."""
-        return await self._rust_conn.native_bulk_insert(
+        """Upload bounded rows without settling the caller's transaction."""
+        if isinstance(rows, list):
+            return await self._rust_conn.native_bulk_insert(
+                table,
+                columns,
+                rows,
+                chunk_size=chunk_size,
+            )
+        return await native_bulk_insert_iterable(
+            self._rust_conn,
             table,
             columns,
             rows,

@@ -6,6 +6,7 @@ supports INPUT, OUTPUT, INPUT_OUTPUT, and RETURN_VALUE descriptors; ordinary
 query execution accepts INPUT descriptors.
 """
 
+from collections.abc import AsyncIterable, Iterable, Sequence
 from typing import Any, Coroutine, Dict, List, Literal, Optional, StrEnum, Tuple, TypedDict
 from .fastmssql import (
     AzureCredential,
@@ -37,6 +38,9 @@ from .fastmssql import (
     TimeoutConfig,
     TypedNull,
 )
+
+BulkRow = Sequence[Any]
+BulkRows = list[list[Any]] | Iterable[BulkRow] | AsyncIterable[BulkRow]
 
 class _OperationStatsEntry(TypedDict):
     started: int
@@ -316,11 +320,11 @@ class Connection:
         self,
         table: str,
         columns: list[str],
-        rows: list[list[Any]],
+        rows: BulkRows,
         *,
         chunk_size: int = 1000,
     ) -> Coroutine[Any, Any, int]:
-        """Upload a concrete row list through the native TDS bulk path."""
+        """Upload bounded concrete, sync-iterable, or async-iterable rows."""
         ...
 
     def query_batch(
@@ -484,11 +488,11 @@ class Transaction:
         self,
         table: str,
         columns: list[str],
-        rows: list[list[Any]],
+        rows: BulkRows,
         *,
         chunk_size: int = 1000,
     ) -> Coroutine[Any, Any, int]:
-        """Upload concrete rows inside the active transaction."""
+        """Upload bounded rows without settling the active transaction."""
         ...
 
     def query_batch(

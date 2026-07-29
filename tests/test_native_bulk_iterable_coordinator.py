@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -25,6 +25,7 @@ class FakeOperationTimeoutError(TimeoutError):
 class FakeSequence:
     events: list[object]
     remaining: float | None = None
+    remaining_provider: Callable[[], float | None] | None = None
     total: int = 0
     push_started: asyncio.Event | None = None
     push_release: asyncio.Event | None = None
@@ -77,6 +78,8 @@ class FakeSequence:
 
     def remaining_timeout(self) -> float | None:
         self.events.append("remaining_timeout")
+        if self.remaining_provider is not None:
+            return self.remaining_provider()
         return self.remaining
 
 
@@ -198,6 +201,19 @@ class DualProtocolRows:
     def __aiter__(self) -> AsyncIterator[object]:
         self.aiter_calls += 1
         return self._async
+
+
+class DeadlineCrossingRow(Sequence[object]):
+    def __init__(self, failure: BaseException) -> None:
+        self.failure = failure
+        self.normalization_started = False
+
+    def __len__(self) -> int:
+        self.normalization_started = True
+        return 2
+
+    def __getitem__(self, index: int) -> object:
+        raise self.failure
 
 
 def _fixture_sequence(
@@ -454,6 +470,80 @@ async def test_async_pull_timeout_uses_sequence_typed_error_and_closes() -> None
     events, sequence, raw = _fixture_sequence(remaining=0.01)
     pull_release = asyncio.Event()
     rows = CountingAsyncRows([[1, "one"]], wait_before_pull=pull_release)
+
+    with pytest.raises(FakeOperationTimeoutError) as raised:
+        await asyncio.wait_for(_run(raw, rows, chunk_size=2), timeout=1.0)
+
+    assert raised.value is sequence.timeout_error
+    assert rows.closed is True
+    assert "expire" in events
+    assert not any(
+        isinstance(event, tuple) and event[0] == "abort" for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_deadline_crossing_sync_pull_uses_typed_timeout_not_producer_error() -> None:
+    events, sequence, raw = _fixture_sequence()
+    primary = ProducerFailure()
+
+    class DeadlineCrossingRows(CountingSyncRows):
+        def __next__(self) -> object:
+            self.pull_calls += 1
+            raise primary
+
+    rows = DeadlineCrossingRows([])
+    sequence.remaining_provider = (
+        lambda: 1.0 if rows.pull_calls == 0 else 0.0
+    )
+
+    with pytest.raises(FakeOperationTimeoutError) as raised:
+        await _run(raw, rows, chunk_size=2)
+
+    assert raised.value is sequence.timeout_error
+    assert rows.pull_calls == 1
+    assert rows.closed is True
+    assert "expire" in events
+    assert not any(
+        isinstance(event, tuple) and event[0] == "abort" for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_deadline_crossing_normalization_uses_typed_timeout() -> None:
+    events, sequence, raw = _fixture_sequence()
+    row = DeadlineCrossingRow(ProducerFailure())
+    rows = CountingSyncRows([row])
+    sequence.remaining_provider = (
+        lambda: 0.0 if row.normalization_started else 1.0
+    )
+
+    with pytest.raises(FakeOperationTimeoutError) as raised:
+        await _run(raw, rows, chunk_size=2)
+
+    assert raised.value is sequence.timeout_error
+    assert rows.closed is True
+    assert "expire" in events
+    assert not any(
+        isinstance(event, tuple) and event[0] == "abort" for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_deadline_wins_if_producer_transforms_timeout_cancellation() -> None:
+    events, sequence, raw = _fixture_sequence(remaining=0.01)
+    primary = ProducerFailure()
+
+    class CancellationTransformingRows(CountingAsyncRows):
+        async def __anext__(self) -> object:
+            self.pull_calls += 1
+            self.pull_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise primary
+
+    rows = CancellationTransformingRows([])
 
     with pytest.raises(FakeOperationTimeoutError) as raised:
         await asyncio.wait_for(_run(raw, rows, chunk_size=2), timeout=1.0)

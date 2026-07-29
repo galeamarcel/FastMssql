@@ -79,12 +79,13 @@ No release, package-version change, or artifact publication has occurred.
   commit/rollback and fail-closed cancellation/drop cleanup. Repeated healthy
   activation is idempotent, while any post-wire accounting inconsistency
   permanently requires abort instead of allowing settlement.
-- Kept the public wrapper surface list-only at this intermediate Task 5
-  boundary; bounded sync/async producer dispatch remains the next committed
-  coordinator step.
-- This internal runtime foundation does not yet widen the public list-only
-  surface or change package metadata, the displayed `0.7.7` version or
-  release state.
+- Added the public bounded iterable coordinator: concrete lists retain the
+  unchanged raw Rust fast path, while synchronous and asynchronous producers
+  reserve before their first pull, prefer the async protocol, hold at most one
+  configured chunk, share the absolute Rust deadline and finish shielded
+  abort/producer-close cleanup before re-raising the original failure.
+- This unreleased development slice does not change package metadata, the
+  displayed `0.7.7` version or release state.
 - Selected a bounded Python coordinator over one private Rust sequence so
   all chunks retain one lease, transaction, absolute deadline, metric and
   global diagnostic index space.
