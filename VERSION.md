@@ -58,6 +58,9 @@ No release, package-version change, or artifact publication has occurred.
   `PYO3_PYTHON` and `PYTHONHOME` through `uv run python`, without global
   environment mutation, hard-coded installation paths or runtime API
   changes.
+- Added the executable branch-by-branch plan for immutable RED evidence, the
+  minimal scoped runner fix, a completely fresh Cargo target and a zero-fail
+  canonical SQL-auth gate before history-only integration.
 - This documentation change does not alter the displayed `0.7.7` version or
   release state.
 
