@@ -14,6 +14,7 @@ mod helpers;
 mod lifecycle;
 mod lifecycle_config;
 mod native_bulk;
+mod native_bulk_sequence;
 mod operation_metrics;
 mod operation_metrics_config;
 mod parameter_conversion;
@@ -47,6 +48,7 @@ pub use types::{
     TlsError,
 };
 
+use crate::native_bulk_sequence::PyNativeBulkSequence;
 use crate::parameter_conversion::TypedNull;
 
 #[pyfunction]
@@ -84,6 +86,7 @@ fn fastmssql(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_class::<PyConnection>()?;
     m.add_class::<Transaction>()?;
+    m.add_class::<PyNativeBulkSequence>()?;
     m.add_class::<PyFastRow>()?;
     m.add_class::<PyQueryStream>()?;
     m.add_class::<PyResultStream>()?;

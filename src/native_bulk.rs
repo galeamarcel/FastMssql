@@ -609,7 +609,7 @@ async fn consume_control_command(
     Ok(())
 }
 
-fn native_timeout_error(
+pub(crate) fn native_timeout_error(
     elapsed: DeadlineElapsed,
     connection_discarded: bool,
     outcome_unknown: bool,

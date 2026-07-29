@@ -25,9 +25,11 @@ use crate::lifecycle::{
     TransactionPermit, run_force_aware,
 };
 use crate::native_bulk::{
-    PreparedNativeBulk, parse_native_chunk_size, prepare_native_bulk, run_native_bulk_chunks,
+    NativeBulkFailure, PreparedNativeBulk, native_timeout_error, parse_native_chunk_size,
+    prepare_native_bulk, run_native_bulk_chunk, run_native_bulk_chunks,
     set_native_connection_discarded,
 };
+use crate::native_bulk_sequence::PyNativeBulkSequence;
 use crate::operation_metrics::{OperationMetricsRegistry, OperationObserver, observe_operation};
 use crate::parameter_conversion::{convert_parameters_to_fast, params_as_sql_refs};
 use crate::pool_config::PyPoolConfig;
@@ -130,6 +132,7 @@ enum TransactionState {
     Idle,
     Beginning,
     Active,
+    BulkProducing,
     RollbackOnly,
     Executing,
     Committing,
@@ -138,6 +141,26 @@ enum TransactionState {
     RolledBack,
     Failed,
     Closing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeBulkTransactionOwner {
+    Connection,
+    Caller,
+}
+
+pub(crate) struct ReservedNativeBulkFailure {
+    pub(crate) error: PyErr,
+    pub(crate) any_row_sent: bool,
+}
+
+impl ReservedNativeBulkFailure {
+    fn new(error: PyErr, any_row_sent: bool) -> Self {
+        Self {
+            error,
+            any_row_sent,
+        }
+    }
 }
 
 impl TransactionState {
@@ -155,6 +178,9 @@ impl TransactionState {
     fn ensure_connection_usable(self) -> PyResult<()> {
         match self {
             Self::Idle | Self::Active | Self::Committed | Self::RolledBack => Ok(()),
+            Self::BulkProducing => Err(PyRuntimeError::new_err(
+                "Transaction is reserved by a native bulk producer",
+            )),
             Self::RollbackOnly => Err(PyRuntimeError::new_err(
                 "Transaction is rollback-only; rollback required before reuse",
             )),
@@ -180,6 +206,7 @@ struct TransactionSession {
     lifetime_deadline: Option<Deadline>,
     lifecycle_permit: Option<TransactionPermit>,
     lifecycle_failure: Option<LifecycleFailure>,
+    owned_bulk_transaction_started: bool,
 }
 
 impl Default for TransactionSession {
@@ -191,6 +218,7 @@ impl Default for TransactionSession {
             lifetime_deadline: None,
             lifecycle_permit: None,
             lifecycle_failure: None,
+            owned_bulk_transaction_started: false,
         }
     }
 }
@@ -215,6 +243,69 @@ impl TransactionSession {
         self.operation_epoch = self.operation_epoch.wrapping_add(1);
         self.transition_to(state);
         self.operation_epoch
+    }
+
+    fn reserve_bulk_producer(&mut self) -> PyResult<()> {
+        match self.state {
+            TransactionState::Active => {
+                self.transition_to(TransactionState::BulkProducing);
+                Ok(())
+            }
+            TransactionState::BulkProducing => Err(PyRuntimeError::new_err(
+                "Transaction is reserved by a native bulk producer",
+            )),
+            TransactionState::RollbackOnly => Err(PyRuntimeError::new_err(
+                "Transaction is rollback-only; rollback required before reuse",
+            )),
+            TransactionState::Idle => Err(PyRuntimeError::new_err("Transaction has not begun")),
+            TransactionState::Committed => Err(PyRuntimeError::new_err(
+                "Transaction has already been committed",
+            )),
+            TransactionState::RolledBack => Err(PyRuntimeError::new_err(
+                "Transaction has already been rolled back",
+            )),
+            TransactionState::Beginning
+            | TransactionState::Executing
+            | TransactionState::Committing
+            | TransactionState::RollingBack
+            | TransactionState::Failed
+            | TransactionState::Closing => Err(PyRuntimeError::new_err(
+                "Transaction state is indeterminate; call close() before reuse",
+            )),
+        }
+    }
+
+    fn finish_reserved_bulk(&mut self) -> PyResult<()> {
+        if self.state != TransactionState::BulkProducing {
+            return Err(PyRuntimeError::new_err(
+                "Native bulk producer no longer owns the transaction reservation",
+            ));
+        }
+        self.transition_to(TransactionState::Active);
+        Ok(())
+    }
+
+    fn confirm_bulk_producer(&self) -> PyResult<()> {
+        if self.state != TransactionState::BulkProducing {
+            return Err(PyRuntimeError::new_err(
+                "Native bulk producer no longer owns the transaction reservation",
+            ));
+        }
+        Ok(())
+    }
+
+    fn abort_reserved_bulk(&mut self, any_row_sent: bool) -> PyResult<()> {
+        if self.state != TransactionState::BulkProducing {
+            return Err(PyRuntimeError::new_err(
+                "Native bulk producer no longer owns the transaction reservation",
+            ));
+        }
+        self.transition_to(if any_row_sent {
+            TransactionState::RollbackOnly
+        } else {
+            TransactionState::Active
+        });
+        Ok(())
     }
 
     fn retire_cancelled_operation(&mut self, epoch: u64) {
@@ -252,12 +343,14 @@ impl TransactionSession {
             self.lifecycle_failure = Some(failure);
         }
         self.lifecycle_permit.take();
+        self.owned_bulk_transaction_started = false;
         connection
     }
 
     fn release_pooled_lease(&mut self) {
         self.conn.take();
         self.lifecycle_permit.take();
+        self.owned_bulk_transaction_started = false;
     }
 
     fn lifecycle_error(&self) -> Option<PyErr> {
@@ -612,6 +705,9 @@ impl TransactionCommand {
             (Self::Commit | Self::Rollback, TransactionState::RolledBack) => Err(
                 PyRuntimeError::new_err("Transaction has already been rolled back"),
             ),
+            (_, TransactionState::BulkProducing) => Err(PyRuntimeError::new_err(
+                "Transaction is reserved by a native bulk producer",
+            )),
             (
                 _,
                 TransactionState::Beginning
@@ -1415,6 +1511,26 @@ impl Transaction {
         })
     }
 
+    #[pyo3(signature = (table, columns, *, chunk_size = 1000))]
+    pub(crate) fn _native_bulk_sequence(
+        &self,
+        py: Python<'_>,
+        table: String,
+        columns: Vec<String>,
+        #[pyo3(from_py_with = parse_native_chunk_size)] chunk_size: usize,
+    ) -> PyResult<Py<PyNativeBulkSequence>> {
+        let sequence = PyNativeBulkSequence::new(
+            NativeBulkTransactionOwner::Caller,
+            self.clone_for_native_bulk(),
+            table,
+            columns,
+            chunk_size,
+            &self.timeout_config,
+            self.operation_metrics.clone(),
+        )?;
+        Py::new(py, sequence)
+    }
+
     /// Release the direct socket or shared pool lease.
     pub fn close<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let session = Arc::clone(&self.session);
@@ -1573,6 +1689,637 @@ impl Transaction {
         }
     }
 
+    pub(crate) fn clone_for_native_bulk(&self) -> Self {
+        Self {
+            session: Arc::clone(&self.session),
+            config: Arc::clone(&self.config),
+            _ssl_config: self._ssl_config.clone(),
+            azure_credential: self.azure_credential.clone(),
+            pool_source: self.pool_source.clone(),
+            timeout_config: self.timeout_config.clone(),
+            operation_metrics: self.operation_metrics.clone(),
+        }
+    }
+
+    pub(crate) async fn reserve_bulk_producer(&self) -> PyResult<Option<Deadline>> {
+        let mut session = self.session.lock().await;
+        if let Some(error) = session.lifecycle_error() {
+            return Err(error);
+        }
+        if session.state != TransactionState::Active {
+            return session.reserve_bulk_producer().map(|_| None);
+        }
+        session.authorize_data(OperationName::BulkInsert, true, false)?;
+        if let Some(elapsed) = session.retire_expired_lifetime() {
+            return Err(transaction_timeout_error(
+                elapsed,
+                OperationName::BulkInsert,
+                false,
+            ));
+        }
+        if session.conn.is_none() {
+            return Err(PyRuntimeError::new_err("Connection is not established"));
+        }
+        let lifetime_deadline = session.lifetime_deadline;
+        session.reserve_bulk_producer()?;
+        Ok(lifetime_deadline)
+    }
+
+    pub(crate) async fn activate_owned_bulk_lifecycle(&self) -> PyResult<()> {
+        let source = self.pool_source.as_ref().ok_or_else(|| {
+            PyRuntimeError::new_err(
+                "Connection-owned native bulk requires a shared pool transaction",
+            )
+        })?;
+        let participant = Arc::new(TransactionShutdownParticipant {
+            session: Arc::downgrade(&self.session),
+        });
+        let mut session = self.session.lock().await;
+        if let Some(error) = session.lifecycle_error() {
+            return Err(error);
+        }
+        if session.state != TransactionState::Idle
+            || session.conn.is_some()
+            || session.lifecycle_permit.is_some()
+        {
+            return Err(PyRuntimeError::new_err(
+                "Connection-owned native bulk transaction is not pristine",
+            ));
+        }
+
+        let permit = source.lifecycle.admit_transaction(participant)?;
+        session.lifecycle_permit = Some(permit);
+        session.owned_bulk_transaction_started = false;
+        session.transition_to(TransactionState::BulkProducing);
+        Ok(())
+    }
+
+    pub(crate) async fn confirm_reserved_bulk(&self) -> PyResult<()> {
+        let session = self.session.lock().await;
+        if let Some(error) = session.lifecycle_error() {
+            return Err(error);
+        }
+        session.confirm_bulk_producer()
+    }
+
+    async fn ensure_reserved_bulk_connected(
+        &self,
+        deadline: Option<Deadline>,
+    ) -> Result<(), ReservedNativeBulkFailure> {
+        let source = self.pool_source.as_ref().ok_or_else(|| {
+            ReservedNativeBulkFailure::new(
+                PyRuntimeError::new_err(
+                    "Connection-owned native bulk requires a shared pool transaction",
+                ),
+                false,
+            )
+        })?;
+        let mut session = self.session.lock().await;
+        if session.state != TransactionState::BulkProducing {
+            return Err(ReservedNativeBulkFailure::new(
+                PyRuntimeError::new_err(
+                    "Native bulk producer no longer owns the transaction reservation",
+                ),
+                false,
+            ));
+        }
+        if session.conn.is_some() {
+            return Ok(());
+        }
+        let force_receiver = session.force_receiver().ok_or_else(|| {
+            ReservedNativeBulkFailure::new(
+                PyRuntimeError::new_err("Connection-owned native bulk lost its lifecycle permit"),
+                false,
+            )
+        })?;
+
+        let acquired = run_force_aware(
+            force_receiver,
+            run_until(deadline, async {
+                let pool = ensure_pool_initialized_with_auth(
+                    Arc::clone(&source.pool),
+                    Arc::clone(&self.config),
+                    &source.pool_config,
+                    &source.timeout_config,
+                    self.azure_credential.clone(),
+                    OperationName::BulkInsert,
+                )
+                .await?;
+                let lease = acquire_owned_connection(
+                    &pool,
+                    OperationName::BulkInsert,
+                    source.timeout_config.acquire_timeout,
+                )
+                .await?;
+                Ok::<TransactionConnection, PyErr>(TransactionConnection::Pooled(lease))
+            }),
+        )
+        .await;
+
+        match acquired {
+            Ok(Ok(Ok(connection))) => {
+                session.conn = Some(connection);
+                Ok(())
+            }
+            Ok(Ok(Err(error))) => Err(ReservedNativeBulkFailure::new(error, false)),
+            Ok(Err(elapsed)) => Err(ReservedNativeBulkFailure::new(
+                native_timeout_error(elapsed, false, false),
+                false,
+            )),
+            Err(ForceRequested) => {
+                let failure = session
+                    .forced_failure(OperationName::BulkInsert, false)
+                    .ok_or_else(|| {
+                        ReservedNativeBulkFailure::new(
+                            PyRuntimeError::new_err(
+                                "forced native bulk acquisition lost its lifecycle permit",
+                            ),
+                            false,
+                        )
+                    })?;
+                session.retire_connection(Some(failure));
+                session.transition_to(TransactionState::Failed);
+                Err(ReservedNativeBulkFailure::new(failure.into_pyerr(), false))
+            }
+        }
+    }
+
+    async fn start_owned_bulk_transaction(
+        &self,
+        deadline: Option<Deadline>,
+    ) -> Result<(), ReservedNativeBulkFailure> {
+        self.ensure_reserved_bulk_connected(deadline).await?;
+
+        let mut cancellation_guard = TransactionCancellationGuard::new(Arc::clone(&self.session));
+        let mut session = self.session.lock().await;
+        if session.state != TransactionState::BulkProducing {
+            return Err(ReservedNativeBulkFailure::new(
+                PyRuntimeError::new_err(
+                    "Native bulk producer no longer owns the transaction reservation",
+                ),
+                false,
+            ));
+        }
+        if session.owned_bulk_transaction_started {
+            return Ok(());
+        }
+        if let Some(connection) = session.conn.as_mut() {
+            connection.begin_operation();
+        }
+        let epoch = session.enter_in_flight(TransactionState::Beginning);
+        cancellation_guard.arm(epoch);
+        let force_receiver = session.force_receiver();
+        let operation = run_with_optional_force(
+            force_receiver,
+            run_until(
+                deadline,
+                catch_driver_panic(async {
+                    let connection = session
+                        .conn
+                        .as_mut()
+                        .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
+                    connection
+                        .simple_query("BEGIN TRANSACTION")
+                        .await
+                        .map_err(|error| {
+                            create_sql_error(error, "Failed to start native bulk transaction")
+                        })?
+                        .into_results()
+                        .await
+                        .map_err(|error| {
+                            create_sql_error(error, "Failed to start native bulk transaction")
+                        })?;
+                    Ok::<(), PyErr>(())
+                }),
+            ),
+        )
+        .await;
+
+        let result = match operation {
+            Err(ForceRequested) => {
+                let failure = session
+                    .forced_failure(OperationName::BulkInsert, false)
+                    .ok_or_else(|| {
+                        ReservedNativeBulkFailure::new(
+                            PyRuntimeError::new_err(
+                                "forced native bulk BEGIN lost its lifecycle permit",
+                            ),
+                            false,
+                        )
+                    })?;
+                session.retire_connection(Some(failure));
+                session.transition_to(TransactionState::Failed);
+                Err(ReservedNativeBulkFailure::new(failure.into_pyerr(), false))
+            }
+            Ok(Err(elapsed)) => {
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+                Err(ReservedNativeBulkFailure::new(
+                    native_timeout_error(elapsed, true, false),
+                    false,
+                ))
+            }
+            Ok(Ok(Err(driver_panic))) => {
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+                Err(ReservedNativeBulkFailure::new(driver_panic, false))
+            }
+            Ok(Ok(Ok(Ok(())))) => {
+                if let Some(connection) = session.conn.as_mut() {
+                    let synchronized: PyResult<()> = Ok(());
+                    connection.finish_operation(&synchronized);
+                }
+                session.owned_bulk_transaction_started = true;
+                session.transition_to(TransactionState::BulkProducing);
+                Ok(())
+            }
+            Ok(Ok(Ok(Err(error)))) => {
+                let synchronized = Python::attach(|py| Err::<(), _>(error.clone_ref(py)));
+                let reusable = session.conn.as_mut().is_some_and(|connection| {
+                    connection.finish_operation(&synchronized);
+                    connection.is_reusable()
+                });
+                if reusable {
+                    set_native_connection_discarded(&error, false);
+                    session.transition_to(TransactionState::BulkProducing);
+                } else {
+                    set_native_connection_discarded(&error, true);
+                    session.retire_connection(None);
+                    session.transition_to(TransactionState::Failed);
+                }
+                Err(ReservedNativeBulkFailure::new(error, false))
+            }
+        };
+        cancellation_guard.disarm();
+        result
+    }
+
+    pub(crate) async fn execute_reserved_native_bulk_chunk(
+        &self,
+        owner: NativeBulkTransactionOwner,
+        deadline: Option<Deadline>,
+        input: PreparedNativeBulk,
+        any_prior_row_sent: bool,
+    ) -> Result<u64, ReservedNativeBulkFailure> {
+        if owner == NativeBulkTransactionOwner::Connection {
+            self.start_owned_bulk_transaction(deadline).await?;
+        }
+
+        let mut cancellation_guard = TransactionCancellationGuard::new(Arc::clone(&self.session));
+        let mut session = self.session.lock().await;
+        if session.state != TransactionState::BulkProducing {
+            return Err(ReservedNativeBulkFailure::new(
+                PyRuntimeError::new_err(
+                    "Native bulk producer no longer owns the transaction reservation",
+                ),
+                any_prior_row_sent,
+            ));
+        }
+        if session.conn.is_none() {
+            return Err(ReservedNativeBulkFailure::new(
+                PyRuntimeError::new_err("Connection is not established"),
+                any_prior_row_sent,
+            ));
+        }
+
+        if let Some(connection) = session.conn.as_mut() {
+            connection.begin_operation();
+        }
+        let epoch = session.enter_in_flight(TransactionState::Executing);
+        cancellation_guard.arm(epoch);
+        let force_receiver = session.force_receiver();
+        let operation = match session.conn.as_mut() {
+            Some(connection) => {
+                run_with_optional_force(
+                    force_receiver,
+                    run_until(
+                        deadline,
+                        catch_driver_panic(run_native_bulk_chunk(
+                            connection,
+                            &input,
+                            any_prior_row_sent,
+                        )),
+                    ),
+                )
+                .await
+            }
+            None => Ok(Ok(Ok(Err(NativeBulkFailure {
+                error: PyRuntimeError::new_err("Connection is not established"),
+                any_row_sent: any_prior_row_sent,
+                protocol_reusable: false,
+            })))),
+        };
+
+        let result = match operation {
+            Err(ForceRequested) => {
+                let failure = session
+                    .forced_failure(OperationName::BulkInsert, true)
+                    .ok_or_else(|| {
+                        ReservedNativeBulkFailure::new(
+                            PyRuntimeError::new_err(
+                                "forced native bulk chunk lost its lifecycle permit",
+                            ),
+                            true,
+                        )
+                    })?;
+                session.retire_connection(Some(failure));
+                session.transition_to(TransactionState::Failed);
+                Err(ReservedNativeBulkFailure::new(failure.into_pyerr(), true))
+            }
+            Ok(Err(elapsed)) => {
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+                Err(ReservedNativeBulkFailure::new(
+                    native_timeout_error(elapsed, true, false),
+                    true,
+                ))
+            }
+            Ok(Ok(Err(driver_panic))) => {
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+                Err(ReservedNativeBulkFailure::new(driver_panic, true))
+            }
+            Ok(Ok(Ok(Ok(affected)))) => {
+                if let Some(connection) = session.conn.as_mut() {
+                    let synchronized: PyResult<()> = Ok(());
+                    connection.finish_operation(&synchronized);
+                }
+                session.transition_to(TransactionState::BulkProducing);
+                Ok(affected)
+            }
+            Ok(Ok(Ok(Err(failure)))) if failure.protocol_reusable => {
+                if let Some(connection) = session.conn.as_mut() {
+                    let synchronized: PyResult<()> = Ok(());
+                    connection.finish_operation(&synchronized);
+                }
+                set_native_connection_discarded(&failure.error, false);
+                session.transition_to(TransactionState::BulkProducing);
+                Err(ReservedNativeBulkFailure::new(
+                    failure.error,
+                    failure.any_row_sent,
+                ))
+            }
+            Ok(Ok(Ok(Err(failure)))) => {
+                set_native_connection_discarded(&failure.error, true);
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+                Err(ReservedNativeBulkFailure::new(
+                    failure.error,
+                    failure.any_row_sent,
+                ))
+            }
+        };
+        cancellation_guard.disarm();
+        result
+    }
+
+    pub(crate) async fn finish_reserved_bulk(
+        &self,
+        owner: NativeBulkTransactionOwner,
+        deadline: Option<Deadline>,
+    ) -> PyResult<()> {
+        if owner == NativeBulkTransactionOwner::Caller {
+            let mut session = self.session.lock().await;
+            return session.finish_reserved_bulk();
+        }
+
+        let mut cancellation_guard = TransactionCancellationGuard::new(Arc::clone(&self.session));
+        let mut session = self.session.lock().await;
+        if session.state != TransactionState::BulkProducing {
+            return Err(PyRuntimeError::new_err(
+                "Native bulk producer no longer owns the transaction reservation",
+            ));
+        }
+        if !session.owned_bulk_transaction_started {
+            session.release_pooled_lease();
+            session.transition_to(TransactionState::Idle);
+            return Ok(());
+        }
+
+        if let Some(connection) = session.conn.as_mut() {
+            connection.begin_operation();
+        }
+        let epoch = session.enter_in_flight(TransactionState::Committing);
+        cancellation_guard.arm(epoch);
+        let force_receiver = session.force_receiver();
+        let operation = run_with_optional_force(
+            force_receiver,
+            run_until(
+                deadline,
+                catch_driver_panic(async {
+                    let connection = session
+                        .conn
+                        .as_mut()
+                        .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
+                    connection
+                        .simple_query("COMMIT TRANSACTION")
+                        .await
+                        .map_err(|error| {
+                            create_sql_error(error, "Failed to commit native bulk transaction")
+                        })?
+                        .into_results()
+                        .await
+                        .map_err(|error| {
+                            create_sql_error(error, "Failed to commit native bulk transaction")
+                        })?;
+                    Ok::<(), PyErr>(())
+                }),
+            ),
+        )
+        .await;
+
+        let result = match operation {
+            Err(ForceRequested) => {
+                let failure = session
+                    .forced_failure(OperationName::BulkInsert, true)
+                    .ok_or_else(|| {
+                        PyRuntimeError::new_err(
+                            "forced native bulk COMMIT lost its lifecycle permit",
+                        )
+                    })?;
+                session.retire_connection(Some(failure));
+                session.transition_to(TransactionState::Failed);
+                create_commit_outcome_unknown(failure.into_pyerr()).and_then(Err)
+            }
+            Ok(Err(elapsed)) => {
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+                create_commit_outcome_unknown(native_timeout_error(elapsed, true, true))
+                    .and_then(Err)
+            }
+            Ok(Ok(Err(driver_panic))) => {
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+                create_commit_outcome_unknown(driver_panic).and_then(Err)
+            }
+            Ok(Ok(Ok(Ok(())))) => {
+                if let Some(connection) = session.conn.as_mut() {
+                    let synchronized: PyResult<()> = Ok(());
+                    connection.finish_operation(&synchronized);
+                }
+                session.transition_to(TransactionState::Committed);
+                session.release_pooled_lease();
+                Ok(())
+            }
+            Ok(Ok(Ok(Err(error)))) => {
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+                if is_deterministic_commit_rejection(&error) {
+                    Err(error)
+                } else {
+                    create_commit_outcome_unknown(error).and_then(Err)
+                }
+            }
+        };
+        cancellation_guard.disarm();
+        result
+    }
+
+    pub(crate) async fn abort_reserved_bulk(
+        &self,
+        owner: NativeBulkTransactionOwner,
+        any_row_sent: bool,
+    ) -> PyResult<()> {
+        let mut cancellation_guard = TransactionCancellationGuard::new(Arc::clone(&self.session));
+        let mut session = self.session.lock().await;
+        if session.state.is_in_flight() {
+            session.retire_connection(None);
+            session.transition_to(TransactionState::Failed);
+            return Ok(());
+        }
+        if session.state == TransactionState::Failed {
+            return Ok(());
+        }
+
+        if owner == NativeBulkTransactionOwner::Caller {
+            return session.abort_reserved_bulk(any_row_sent);
+        }
+        if session.state != TransactionState::BulkProducing {
+            return Err(PyRuntimeError::new_err(
+                "Native bulk producer no longer owns the transaction reservation",
+            ));
+        }
+        if !session.owned_bulk_transaction_started {
+            session.release_pooled_lease();
+            session.transition_to(TransactionState::Idle);
+            return Ok(());
+        }
+
+        if let Some(connection) = session.conn.as_mut() {
+            connection.begin_operation();
+        }
+        let epoch = session.enter_in_flight(TransactionState::RollingBack);
+        cancellation_guard.arm(epoch);
+        let force_receiver = session.force_receiver();
+        let rollback_deadline =
+            deadline_from(TimeoutPhase::Rollback, self.timeout_config.rollback_timeout);
+        let operation = run_with_optional_force(
+            force_receiver,
+            run_until(
+                rollback_deadline,
+                catch_driver_panic(async {
+                    let connection = session
+                        .conn
+                        .as_mut()
+                        .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
+                    connection
+                        .simple_query("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION")
+                        .await
+                        .map_err(|error| {
+                            create_sql_error(error, "Failed to roll back native bulk transaction")
+                        })?
+                        .into_results()
+                        .await
+                        .map_err(|error| {
+                            create_sql_error(error, "Failed to roll back native bulk transaction")
+                        })?;
+                    Ok::<(), PyErr>(())
+                }),
+            ),
+        )
+        .await;
+
+        let result = match operation {
+            Err(ForceRequested) => {
+                let failure = session
+                    .forced_failure(OperationName::BulkInsert, false)
+                    .ok_or_else(|| {
+                        PyRuntimeError::new_err(
+                            "forced native bulk rollback lost its lifecycle permit",
+                        )
+                    })?;
+                session.retire_connection(Some(failure));
+                session.transition_to(TransactionState::Failed);
+                Err(failure.into_pyerr())
+            }
+            Ok(Err(elapsed)) => {
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+                Err(native_timeout_error(elapsed, true, false))
+            }
+            Ok(Ok(Err(driver_panic))) => {
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+                Err(driver_panic)
+            }
+            Ok(Ok(Ok(Ok(())))) => {
+                if let Some(connection) = session.conn.as_mut() {
+                    let synchronized: PyResult<()> = Ok(());
+                    connection.finish_operation(&synchronized);
+                }
+                session.transition_to(TransactionState::RolledBack);
+                session.release_pooled_lease();
+                Ok(())
+            }
+            Ok(Ok(Ok(Err(error)))) => {
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+                Err(error)
+            }
+        };
+        cancellation_guard.disarm();
+        result
+    }
+
+    pub(crate) async fn abandon_reserved_bulk(
+        &self,
+        owner: NativeBulkTransactionOwner,
+        any_row_sent: bool,
+    ) {
+        let mut session = self.session.lock().await;
+        if session.state == TransactionState::Failed {
+            return;
+        }
+        if session.state.is_in_flight() {
+            session.retire_connection(None);
+            session.transition_to(TransactionState::Failed);
+            return;
+        }
+        if session.state != TransactionState::BulkProducing {
+            return;
+        }
+
+        match owner {
+            NativeBulkTransactionOwner::Caller if !any_row_sent => {
+                let _ = session.finish_reserved_bulk();
+            }
+            NativeBulkTransactionOwner::Caller => {
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+            }
+            NativeBulkTransactionOwner::Connection
+                if session.conn.is_none() && !session.owned_bulk_transaction_started =>
+            {
+                session.lifecycle_permit.take();
+                session.transition_to(TransactionState::Idle);
+            }
+            NativeBulkTransactionOwner::Connection => {
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+            }
+        }
+    }
+
     async fn start_result_stream(
         handles: TransactionHandles,
         operation_metrics: Option<Arc<OperationMetricsRegistry>>,
@@ -1634,6 +2381,11 @@ impl Transaction {
         }
         match session.state {
             TransactionState::Active => {}
+            TransactionState::BulkProducing => {
+                return Err(PyRuntimeError::new_err(
+                    "Transaction is reserved by a native bulk producer",
+                ));
+            }
             TransactionState::RollbackOnly => {
                 return Err(PyRuntimeError::new_err(
                     "Transaction is rollback-only; rollback required before reuse",
@@ -2084,12 +2836,13 @@ impl Transaction {
 #[cfg(test)]
 mod cancellation_retirement_tests {
     use super::{
-        TransactionCommand, TransactionSession, TransactionShutdownParticipant, TransactionState,
-        command_deadline,
+        NativeBulkTransactionOwner, Transaction, TransactionCommand, TransactionSession,
+        TransactionShutdownParticipant, TransactionState, command_deadline,
     };
     use crate::deadline::{Deadline, OperationName, TimeoutPhase};
     use crate::lifecycle::{ConnectionLifecycle, ForcedShutdownParticipant};
     use crate::lifecycle_config::{ConnectionLifecycleState, PyLifecycleConfig};
+    use crate::pool_config::PyPoolConfig;
     use crate::pool_manager::ConnectionPool;
     use crate::timeout_config::PyTimeoutConfig;
     use pyo3::Python;
@@ -2159,6 +2912,151 @@ mod cancellation_retirement_tests {
         TransactionCommand::Rollback
             .validate(TransactionState::RollbackOnly)
             .expect("ROLLBACK must remain the recovery path");
+    }
+
+    #[test]
+    fn bulk_producer_reservation_is_exclusive_and_empty_finish_restores_active() {
+        Python::initialize();
+        let lifetime = Deadline {
+            at: Instant::now() + Duration::from_secs(1),
+            timeout: Duration::from_secs(1),
+            phase: TimeoutPhase::Transaction,
+        };
+        let mut session = TransactionSession {
+            state: TransactionState::Active,
+            lifetime_deadline: Some(lifetime),
+            ..TransactionSession::default()
+        };
+
+        session
+            .reserve_bulk_producer()
+            .expect("an active transaction must reserve for one bulk producer");
+
+        assert_eq!(session.state, TransactionState::BulkProducing);
+        assert!(!session.state.is_in_flight());
+        assert_eq!(
+            session.lifetime_deadline.map(|deadline| deadline.at),
+            Some(lifetime.at),
+            "producer reservation must retain the caller transaction lifetime",
+        );
+        let data_error = session
+            .state
+            .ensure_connection_usable()
+            .expect_err("ordinary data operations must reject a bulk reservation");
+        assert!(data_error.to_string().contains("native bulk producer"));
+        for command in [
+            TransactionCommand::Begin,
+            TransactionCommand::Commit,
+            TransactionCommand::Rollback,
+        ] {
+            let command_error = command
+                .validate(session.state)
+                .expect_err("ordinary settlement must not steal a bulk reservation");
+            assert!(command_error.to_string().contains("native bulk producer"));
+        }
+
+        session
+            .finish_reserved_bulk()
+            .expect("an empty producer must release its reservation");
+
+        assert_eq!(session.state, TransactionState::Active);
+        assert_eq!(
+            session.lifetime_deadline.map(|deadline| deadline.at),
+            Some(lifetime.at),
+        );
+    }
+
+    #[test]
+    fn bulk_producer_abort_distinguishes_pre_wire_and_post_wire_state() {
+        Python::initialize();
+        let mut session = TransactionSession {
+            state: TransactionState::Active,
+            ..TransactionSession::default()
+        };
+
+        session
+            .reserve_bulk_producer()
+            .expect("the first producer must reserve the transaction");
+        session
+            .abort_reserved_bulk(false)
+            .expect("pre-wire abort must release the reservation");
+        assert_eq!(session.state, TransactionState::Active);
+
+        session
+            .reserve_bulk_producer()
+            .expect("the transaction must be reusable after a pre-wire abort");
+        session
+            .abort_reserved_bulk(true)
+            .expect("post-wire abort must preserve caller settlement ownership");
+        assert_eq!(session.state, TransactionState::RollbackOnly);
+    }
+
+    #[test]
+    fn bulk_producer_activation_confirms_the_authoritative_reservation() {
+        Python::initialize();
+        let reserved = TransactionSession {
+            state: TransactionState::BulkProducing,
+            ..TransactionSession::default()
+        };
+        reserved
+            .confirm_bulk_producer()
+            .expect("the owning producer reservation must remain authoritative");
+
+        let stolen = TransactionSession {
+            state: TransactionState::Active,
+            ..TransactionSession::default()
+        };
+        let error = stolen
+            .confirm_bulk_producer()
+            .expect_err("activation must reject a lost producer reservation");
+        assert!(error.to_string().contains("no longer owns"));
+    }
+
+    #[test]
+    fn owned_bulk_activation_reserves_lifecycle_without_pool_or_sql() {
+        Python::initialize();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("owned bulk lifecycle runtime must build")
+            .block_on(async {
+                let lifecycle = ConnectionLifecycle::new();
+                let pool: Arc<RwLock<Option<ConnectionPool>>> = Arc::new(RwLock::new(None));
+                let transaction = Transaction::from_pool(
+                    Arc::clone(&pool),
+                    Arc::new(tiberius::Config::new()),
+                    PyPoolConfig::default(),
+                    PyTimeoutConfig::explicit_default(),
+                    Arc::clone(&lifecycle),
+                    None,
+                    None,
+                );
+
+                transaction
+                    .activate_owned_bulk_lifecycle()
+                    .await
+                    .expect("first-row activation must reserve one lifecycle participant");
+
+                {
+                    let session = transaction.session.lock().await;
+                    assert_eq!(session.state, TransactionState::BulkProducing);
+                    assert!(session.conn.is_none());
+                    assert!(session.lifecycle_permit.is_some());
+                }
+                assert!(pool.read().await.is_none());
+                assert_eq!(lifecycle.counts(0), Some((0, 1)));
+
+                transaction
+                    .abort_reserved_bulk(NativeBulkTransactionOwner::Connection, false)
+                    .await
+                    .expect("pre-wire owned abort must release the lifecycle reservation");
+
+                let session = transaction.session.lock().await;
+                assert_eq!(session.state, TransactionState::Idle);
+                assert!(session.conn.is_none());
+                assert!(session.lifecycle_permit.is_none());
+                assert_eq!(lifecycle.counts(0), Some((0, 0)));
+            });
     }
 
     #[test]

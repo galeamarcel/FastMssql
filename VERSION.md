@@ -67,6 +67,21 @@ No release, package-version change, or artifact publication has occurred.
   checked global row/parameter diagnostics and exposed a crate-private
   exact-count one-chunk engine while preserving the concrete-list public
   path at global row base zero.
+- Added Rust RED state-machine contracts requiring an exclusive
+  `BulkProducing` caller-transaction reservation, distinct pre-wire and
+  post-wire abort states, bounded/terminal private-sequence progress with
+  global indices, and one bulk metric whose duration starts before the first
+  producer row.
+- Implemented the underscore-prefixed raw `_NativeBulkSequence` with
+  side-effect-free construction, pre-pull caller reservation, lazy
+  Connection lifecycle/pool activation, one absolute deadline and metric,
+  exact per-chunk/global progress, caller-neutral finish, Connection-owned
+  commit/rollback and fail-closed cancellation/drop cleanup. Repeated healthy
+  activation is idempotent, while any post-wire accounting inconsistency
+  permanently requires abort instead of allowing settlement.
+- Kept the public wrapper surface list-only at this intermediate Task 5
+  boundary; bounded sync/async producer dispatch remains the next committed
+  coordinator step.
 - This internal runtime foundation does not yet widen the public list-only
   surface or change package metadata, the displayed `0.7.7` version or
   release state.

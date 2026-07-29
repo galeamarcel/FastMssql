@@ -349,10 +349,17 @@ impl OperationObserver {
         metrics: Option<Arc<OperationMetricsRegistry>>,
         operation: OperationName,
     ) -> Self {
+        Self::start_at(metrics, operation, Instant::now())
+    }
+
+    pub(crate) fn start_at(
+        metrics: Option<Arc<OperationMetricsRegistry>>,
+        operation: OperationName,
+        started_at: Instant,
+    ) -> Self {
         let guard = metrics.and_then(|registry| {
-            metric_index(operation).map(|operation_index| {
-                OperationGuard::start(registry, operation_index, Instant::now())
-            })
+            metric_index(operation)
+                .map(|operation_index| OperationGuard::start(registry, operation_index, started_at))
         });
         Self { guard }
     }
@@ -621,6 +628,31 @@ mod tests {
         assert_eq!(query.completed, 1);
         assert_eq!(query.in_flight, 0);
         assert_eq!(query.outcomes, [0, 0, 0, 1, 0]);
+    }
+
+    #[test]
+    fn observer_start_at_includes_time_before_first_producer_row() {
+        let registry = Arc::new(OperationMetricsRegistry::new());
+        let index = metric_index(OperationName::BulkInsert).unwrap();
+        let started_at = Instant::now() - Duration::from_secs(2);
+
+        OperationObserver::start_at(
+            Some(Arc::clone(&registry)),
+            OperationName::BulkInsert,
+            started_at,
+        )
+        .success();
+
+        let bulk = &registry.snapshot().operations[index];
+        assert_eq!(bulk.started, 1);
+        assert_eq!(bulk.completed, 1);
+        assert_eq!(bulk.in_flight, 0);
+        assert_eq!(bulk.outcomes, [1, 0, 0, 0, 0]);
+        assert!(
+            bulk.duration_min_micros
+                .is_some_and(|duration| duration >= 2_000_000),
+            "the one public metric must include producer wait before activation",
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ High-performance Rust-backed Python driver for SQL Server with:
 - Bounded async result-set streaming
 """
 
-from typing import Any, Coroutine, Dict, List, Literal, Optional, Tuple, TypedDict
+from typing import Any, Coroutine, Dict, List, Literal, NoReturn, Optional, Tuple, TypedDict
 from enum import StrEnum
 from .fastmssql import _RustConnection, _RustTransaction
 
@@ -907,6 +907,23 @@ class AzureCredential:
         """
         ...
 
+class _NativeBulkSequence:
+    """Private bounded native-bulk coordinator primitive."""
+
+    def reserve(self) -> Coroutine[Any, Any, None]: ...
+    def activate(self) -> Coroutine[Any, Any, None]: ...
+    def push(
+        self,
+        rows: list[list[Any]],
+    ) -> Coroutine[Any, Any, int]: ...
+    def finish(self) -> Coroutine[Any, Any, int]: ...
+    def abort(
+        self,
+        outcome: Literal["error", "cancelled"],
+    ) -> Coroutine[Any, Any, None]: ...
+    def expire(self) -> Coroutine[Any, Any, NoReturn]: ...
+    def remaining_timeout(self) -> float | None: ...
+
 class Connection:
     """
     High-performance SQL Server connection with async/await support.
@@ -1139,6 +1156,14 @@ class Connection:
         """Upload a concrete row list through the native TDS bulk path."""
         ...
 
+    def _native_bulk_sequence(
+        self,
+        table: str,
+        columns: list[str],
+        *,
+        chunk_size: int = 1000,
+    ) -> _NativeBulkSequence: ...
+
     def query_batch(
         self,
         queries: List[str] | List[Tuple[str, Optional[List[Any]]]],
@@ -1332,6 +1357,14 @@ class Transaction:
     ) -> Coroutine[Any, Any, int]:
         """Upload concrete rows inside the active transaction."""
         ...
+
+    def _native_bulk_sequence(
+        self,
+        table: str,
+        columns: list[str],
+        *,
+        chunk_size: int = 1000,
+    ) -> _NativeBulkSequence: ...
 
     def query_batch(
         self,

@@ -19,6 +19,7 @@ use crate::lifecycle_config::{ConnectionLifecycleState, PyLifecycleConfig};
 use crate::native_bulk::{
     connection_native_bulk_insert, parse_native_chunk_size, prepare_native_bulk,
 };
+use crate::native_bulk_sequence::PyNativeBulkSequence;
 use crate::operation_metrics::{
     OperationMetricsRegistry, OperationMetricsSnapshot, OperationObserver, observe_operation,
 };
@@ -33,7 +34,7 @@ use crate::procedure::build_procedure_call;
 use crate::result_stream::{BufferSize, PyResultStream, ResultRequest};
 use crate::ssl_config::PySslConfig;
 use crate::timeout_config::PyTimeoutConfig;
-use crate::transaction::Transaction;
+use crate::transaction::{NativeBulkTransactionOwner, Transaction};
 use crate::types::{TimeoutErrorMetadata, create_sql_error};
 
 const READINESS_QUERY: &str = "SELECT 1";
@@ -978,6 +979,26 @@ impl PyConnection {
             py,
             input,
         )
+    }
+
+    #[pyo3(signature = (table, columns, *, chunk_size = 1000))]
+    pub(crate) fn _native_bulk_sequence(
+        &self,
+        py: Python<'_>,
+        table: String,
+        columns: Vec<String>,
+        #[pyo3(from_py_with = parse_native_chunk_size)] chunk_size: usize,
+    ) -> PyResult<Py<PyNativeBulkSequence>> {
+        let sequence = PyNativeBulkSequence::new(
+            NativeBulkTransactionOwner::Connection,
+            self.transaction(),
+            table,
+            columns,
+            chunk_size,
+            &self.timeout_config,
+            self.operation_metrics.clone(),
+        )?;
+        Py::new(py, sequence)
     }
 
     pub fn execute_batch<'p>(
