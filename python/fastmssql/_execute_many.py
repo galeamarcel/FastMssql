@@ -5,48 +5,17 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from ._bounded_sequence import run_bounded_sequence
-from .fastmssql import Parameters
+from ._parameter_sets import (
+    INVALID_PRODUCER_TYPES,
+    preflight_parameter_set,
+)
 
 
 _PRODUCER_ERROR = (
     "parameter_sets must be an iterable or async iterable of lists or "
     "Parameters objects"
 )
-_INVALID_PRODUCER_TYPES = (str, bytes, bytearray, memoryview, Mapping)
-_MAX_USER_QUERY_PARAMETERS = 2_098
 _ATOMIC_UNSET = object()
-
-
-def _parameter_count_error(count: int) -> ValueError:
-    return ValueError(
-        f"Too many parameters: {count} provided, but FastMssql supports "
-        "maximum 2,098 user parameters per query "
-        "(SQL Server RPC limit 2,100 minus 2 internal parameters)"
-    )
-
-
-def _preflight_parameter_set(parameter_set: object) -> object:
-    if isinstance(parameter_set, list):
-        count = list.__len__(parameter_set)
-    elif isinstance(parameter_set, Parameters):
-        count = len(parameter_set)
-        if count > _MAX_USER_QUERY_PARAMETERS:
-            raise _parameter_count_error(count)
-        named_count = len(parameter_set.named)
-        if named_count:
-            raise ValueError(
-                "Named parameters are not supported by the SQL Server wire "
-                "protocol. Use positional parameters instead. "
-                f"Found {named_count} named parameter(s)"
-            )
-    else:
-        raise TypeError(
-            "each execute_many parameter set must be a list or Parameters object"
-        )
-
-    if count > _MAX_USER_QUERY_PARAMETERS:
-        raise _parameter_count_error(count)
-    return parameter_set
 
 
 def _progress_field(
@@ -165,7 +134,7 @@ async def execute_many_iterable(
     chunk_size: int,
 ) -> int:
     """Execute one statement over one bounded sync or async producer."""
-    if isinstance(parameter_sets, _INVALID_PRODUCER_TYPES):
+    if isinstance(parameter_sets, INVALID_PRODUCER_TYPES):
         raise TypeError(_PRODUCER_ERROR)
 
     # Rust validates SQL extraction, atomic and chunk_size before Python
@@ -206,7 +175,10 @@ async def execute_many_iterable(
         parameter_sets,
         chunk_size=chunk_size,
         normalize_item=lambda parameter_set: parameter_set,
-        preflight_item=_preflight_parameter_set,
+        preflight_item=lambda item: preflight_parameter_set(
+            item,
+            operation="execute_many",
+        ),
         producer_error=_PRODUCER_ERROR,
         task_name_prefix="fastmssql-execute-many",
         annotate_error=annotate_error,

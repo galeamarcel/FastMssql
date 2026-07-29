@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 
 import pytest
 
+from fastmssql import Parameters
+
 
 class ProducerFailure(BaseException):
     pass
@@ -482,6 +484,52 @@ async def test_invalid_parameter_set_aborts_with_global_index_and_privacy() -> N
     assert [event for event in events if event == "activate"] == ["activate"]
     assert not any(
         isinstance(event, tuple) and event[0] == "push" for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_invalid_parameter_set_message_is_stable() -> None:
+    _, _, raw = _fixture_sequence()
+
+    with pytest.raises(
+        TypeError,
+        match=(
+            "^each execute_many parameter set must be a list or "
+            "Parameters object$"
+        ),
+    ):
+        await _run(raw, [(1,)], chunk_size=1)
+
+
+@pytest.mark.asyncio
+async def test_named_parameter_set_message_is_stable() -> None:
+    _, _, raw = _fixture_sequence()
+
+    with pytest.raises(ValueError) as raised:
+        await _run(
+            raw,
+            [Parameters(secret_value="NeverExposeThis")],
+            chunk_size=1,
+        )
+
+    assert str(raised.value) == (
+        "Named parameters are not supported by the SQL Server wire protocol. "
+        "Use positional parameters instead. Found 1 named parameter(s)"
+    )
+    assert "NeverExposeThis" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_parameter_count_limit_message_is_stable() -> None:
+    _, _, raw = _fixture_sequence()
+
+    with pytest.raises(ValueError) as raised:
+        await _run(raw, [list(range(2_099))], chunk_size=1)
+
+    assert str(raised.value) == (
+        "Too many parameters: 2099 provided, but FastMssql supports maximum "
+        "2,098 user parameters per query "
+        "(SQL Server RPC limit 2,100 minus 2 internal parameters)"
     )
 
 

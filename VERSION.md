@@ -162,6 +162,21 @@ No release, package-version change, or artifact publication has occurred.
   package-metadata change, displayed-version change, release or published
   artifact.
 
+### Shared parameter-set validation
+
+- Characterized the exact `execute_many` invalid-set, named-parameter and
+  2,098-user-parameter-limit messages before moving any runtime code,
+  including privacy protection for named parameter values.
+- Extracted the existing producer-type constants, SQL Server parameter limit
+  and per-set validation into the private shared `_parameter_sets` module;
+  `execute_many` now supplies its operation name explicitly and otherwise
+  preserves the same bounded coordinator behavior.
+- Fresh verification passed all 38 focused execute-many contract/coordinator
+  tests, all 11 real Docker SQL-auth execute-many tests and Ruff.
+- This internal refactor adds no public API or behavior, dependency,
+  package-metadata change, displayed `0.7.7` version, release or published
+  artifact.
+
 ### Execute-many live audit status
 
 - Marked only the sixth of seven batch/bulk slices,
