@@ -264,6 +264,38 @@ No release, package-version change, or artifact publication has occurred.
   dependency, package metadata, displayed `0.7.7` version, release or
   published artifact.
 
+### Query-many hosted-wheel contract regression RED
+
+- Created `test/query-many-hosted-gate-contract` from exact query-many
+  candidate `74051228a80a5e498fbb443b1942cdf2dca95f1f` after the cumulative
+  SQL-auth runner exposed one original-local-regression failure.
+- Reproduced
+  `test_hosted_gate_builds_extension_and_checks_configuration_contracts`
+  alone: 1/1 failed in 0.02 seconds for the same deterministic assertion;
+  the complete lane otherwise passed 1,250 tests and failed only this case.
+- Root-cause tracing showed that the hosted workflow correctly appended the
+  three installed-wheel query-many contracts, while the older exact-command
+  assertion still required `-q` immediately after
+  `tests/test_result_stream_contract.py`.
+- The required correction is to extend the existing exact installed-wheel
+  command contract with all three query-many paths. The assertion must not
+  be weakened to accept tests elsewhere in the workflow.
+- This RED evidence changes no runtime, test expectation, dependency,
+  package metadata, displayed `0.7.7` version, release or published
+  artifact.
+
+### Query-many hosted-wheel contract correction
+
+- Extended the existing exact installed-wheel command assertion with
+  `test_query_many_contract.py`, `test_query_many_coordinator.py` and
+  `test_query_many_stress_contract.py`, matching their already required
+  workflow invocation.
+- Preserved the stronger same-command and terminal `-q` contract; the fix
+  does not accept those paths merely appearing elsewhere in the workflow.
+- This test-harness-only correction changes no FastMssql runtime, workflow,
+  dependency, package metadata, displayed `0.7.7` version, release or
+  published artifact.
+
 ### Execute-many live audit status
 
 - Marked only the sixth of seven batch/bulk slices,
