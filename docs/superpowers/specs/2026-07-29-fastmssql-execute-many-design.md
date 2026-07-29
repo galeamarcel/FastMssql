@@ -285,6 +285,16 @@ autocommit per parameter set.
 Concurrent public operations cannot enter while the private state is
 `ExecuteManyProducing`.
 
+The normal-success rule has one existing fail-closed security exception. If
+`requires_connection_retirement(sql)` classifies the statement, successful
+protocol completion still returns the affected total and records a successful
+operation, but the physical session is retired and the caller Transaction
+becomes `Failed`. Later data operations and settlement are rejected, while
+`close()` remains idempotent. This matches the ResultStream security policy
+and prevents an impersonated session from returning to the pool. The affected
+count is not a durability claim for the caller's still-uncommitted transaction,
+which SQL Server rolls back when the transport closes.
+
 ## Error metadata
 
 The original exception class and message remain primary. FastMssql does not
@@ -535,8 +545,11 @@ The canonical matrix grows from 396 to 407 unique cases:
   terminal cleanup, records one cancellation and leaks no session;
 - `EMANY-008`: timeout during producer wait or SQL is typed, bounded,
   privacy-safe and leaves the pool reusable;
-- `EMANY-009`: active Transaction success is settlement-neutral; post-wire
-  failure is rollback-only and only caller rollback settles it;
+- `EMANY-009`: ordinary active-Transaction success is settlement-neutral;
+  post-wire failure is rollback-only and only caller rollback settles it;
+  successful security-context SQL returns its response but retires the
+  physical session, fails the Transaction and recovers the pool on a distinct
+  `connection_id`;
 - `EMANY-010`: INSERT/UPDATE/DELETE/direct EXEC use typed sets and schema-2
   metrics record one `execute_many` with zero internal execute/settlement
   deltas;

@@ -631,9 +631,12 @@ Enterprise compatibility-bulk buffering:
 - `EMANY-008`: operation timeout during producer wait or TDS activity is
   typed, bounded and privacy-safe, completes terminal cleanup and leaves the
   pool reusable with no leaked application session.
-- `EMANY-009`: execute-many success inside a caller Transaction is
+- `EMANY-009`: ordinary execute-many success inside a caller Transaction is
   settlement-neutral; a post-wire failure enters rollback-only without
-  settling, and only caller rollback recovers it.
+  settling, and only caller rollback recovers it. Successfully consumed SQL
+  classified for security-context retirement returns its response but retires
+  the physical session, fails the Transaction and proves pool recovery on a
+  distinct `connection_id`.
 - `EMANY-010`: parameterized INSERT, UPDATE, DELETE and direct stored
   procedure execution return exact totals; schema-2 metrics record one
   execute-many operation per call and zero internal execute or settlement

@@ -45,6 +45,22 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Execute-many security-retirement contract design
+
+- Reconciled the ordinary caller-Transaction success rule with the existing
+  fail-closed policy for effective `EXECUTE AS`, `EXEC AS`, and `SETUSER`
+  statements.
+- Specified that a successfully consumed response remains a successful
+  `execute_many` operation, while the impersonated physical session is
+  retired, the caller Transaction becomes `Failed`, and its uncommitted work
+  is not represented as durable.
+- Kept `EMANY-009` as the single owner of caller-Transaction settlement
+  semantics and required a distinct-`connection_id` pool-recovery proof
+  rather than an unreliable SPID comparison.
+- Selected a test-only characterization because the runtime already follows
+  the approved ResultStream security policy; no public behavior, displayed
+  `0.7.7` version, release state, or package metadata changes here.
+
 ### PyO3 uv matrix-harness correction
 
 - Replaced the matrix runner test's zero-output `uv` stub with a bounded fake
