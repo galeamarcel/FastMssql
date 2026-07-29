@@ -6,7 +6,7 @@ supports INPUT, OUTPUT, INPUT_OUTPUT, and RETURN_VALUE descriptors; ordinary
 query execution accepts INPUT descriptors.
 """
 
-from collections.abc import AsyncIterable, Iterable, Sequence
+from collections.abc import AsyncIterable, AsyncIterator, Iterable, Sequence
 from typing import Any, Coroutine, Dict, List, Literal, Optional, StrEnum, Tuple, TypedDict
 from .fastmssql import (
     AzureCredential,
@@ -95,6 +95,18 @@ class ApplicationIntent(StrEnum):
 
     READ_ONLY: str
     READ_WRITE: str
+
+class QueryManyIterator(AsyncIterator[QueryStream]):
+    def __aiter__(self) -> QueryManyIterator: ...
+    async def __anext__(self) -> QueryStream: ...
+    async def aclose(self) -> None: ...
+    async def __aenter__(self) -> QueryManyIterator: ...
+    async def __aexit__(
+        self,
+        exc_type: Any,
+        exc: BaseException | None,
+        traceback: Any,
+    ) -> bool: ...
 
 class Connection:
     """
@@ -300,6 +312,15 @@ class Connection:
     ) -> Coroutine[Any, Any, int]:
         """Execute one statement over bounded positional parameter sets."""
         ...
+
+    def query_many(
+        self,
+        sql: str,
+        parameter_sets: ParameterSetSource,
+        *,
+        concurrency: int = 10,
+        ordered: bool = True,
+    ) -> QueryManyIterator: ...
 
     def execute_batch(
         self,

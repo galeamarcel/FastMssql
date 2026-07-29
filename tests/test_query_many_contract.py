@@ -181,6 +181,8 @@ def test_wrapper_and_stub_publish_exact_query_many_factory() -> None:
 
 
 def test_wrapper_stub_publishes_exact_query_many_iterator_protocol() -> None:
+    assert "QueryManyIterator" in fastmssql.__all__
+
     tree = _tree(WRAPPER_STUB)
     imports = {
         alias.name

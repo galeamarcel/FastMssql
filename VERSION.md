@@ -177,6 +177,27 @@ No release, package-version change, or artifact publication has occurred.
   package-metadata change, displayed `0.7.7` version, release or published
   artifact.
 
+### Query-many public facade and bounded coordination
+
+- Added the regular `Connection.query_many()` factory and public
+  `QueryManyIterator` protocol while deliberately keeping the raw and
+  transactional surfaces unchanged.
+- Added synchronous scalar validation, exactly one producer-protocol
+  acquisition with async precedence, captured-list resize detection and
+  lazy event-loop/pool binding.
+- Implemented one producer task, exactly
+  `min(concurrency, pool.max_size)` fixed workers and one capacity token that
+  follows every accepted item through query completion to yield/discard.
+  Ordered and completion-order modes therefore share the same bounded input,
+  active-query, completed-result and slow-consumer window.
+- Fresh verification passed all 30 public query-many contracts and 6/6
+  deterministic empty/full-exhaustion, pool-cap, fixed-worker, capacity and
+  ordering coordinator cases; Ruff and diff checks passed.
+- Terminal first-error and cancellation-shielded cleanup semantics remain
+  the immediately following implementation task. Package metadata and the
+  displayed `0.7.7` version remain unchanged; no release or artifact was
+  published.
+
 ### Execute-many live audit status
 
 - Marked only the sixth of seven batch/bulk slices,

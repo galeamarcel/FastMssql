@@ -8,6 +8,10 @@ import asyncio
 
 from ._bulk_iterable import native_bulk_insert_iterable
 from ._execute_many import execute_many_iterable
+from ._query_many import (
+    QueryManyIterator as QueryManyIterator,
+    create_query_many_iterator,
+)
 
 # Import from the compiled Rust module
 from .fastmssql import (
@@ -147,6 +151,23 @@ class Connection:
             procedure,
             params,
             buffer_size=buffer_size,
+        )
+
+    def query_many(
+        self,
+        sql,
+        parameter_sets,
+        *,
+        concurrency=10,
+        ordered=True,
+    ):
+        """Run independent queries with pool-bounded true-async concurrency."""
+        return create_query_many_iterator(
+            self._conn,
+            sql,
+            parameter_sets,
+            concurrency=concurrency,
+            ordered=ordered,
         )
 
     async def execute_many(
@@ -490,6 +511,7 @@ __all__ = [
     "OperationMetricsConfig",
     "OperationTimeoutError",
     "ProtocolError",
+    "QueryManyIterator",
     "QueryStream",
     "ResultSet",
     "ResultStream",
