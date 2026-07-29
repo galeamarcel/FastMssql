@@ -45,6 +45,23 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### TIME-006 bulk absolute-budget determinism design
+
+- Recorded the intermittent strict-runner failure in which the unchanged
+  `TIME-006` observed one rather than exactly two compatibility bulk requests,
+  while retaining the intended typed operation-timeout classification.
+- Traced the stale 90 ms margin to bounded first-chunk conversion, lazy pool
+  setup, checkout, transaction start and wire preparation now occurring
+  inside the one absolute operation deadline.
+- Selected a test-only 500/850 ms trigger/deadline geometry that gives the
+  first request 350 ms of setup headroom but makes two complete trigger waits
+  mathematically exceed the shared deadline.
+- Preserved the exact-two request count, five-chunk reset detector, rollback,
+  discard and outcome-unknown assertions; no one-or-two tolerance or warmed
+  pool precondition is introduced.
+- This documentation-only design changes no runtime, public API, displayed
+  `0.7.7` version, release state or package metadata.
+
 ### Execute-many security-retirement characterization
 
 - Extended canonical `EMANY-009` on its dedicated test branch to prove that
