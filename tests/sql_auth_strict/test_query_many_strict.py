@@ -846,7 +846,7 @@ async def test_query_many_failure_and_consumer_cleanup(
             await _collect_rows(
                 conversion_connection.query_many(
                     "SELECT @P1 AS value",
-                    [[0], [SensitiveValue()]],
+                    [[0], [Parameter(SensitiveValue(), "INT")]],
                     concurrency=1,
                 )
             )
@@ -1015,7 +1015,7 @@ async def test_query_many_faults_and_lifecycle(
     )
     holder: asyncio.Task[Any] | None = None
     try:
-        holder = asyncio.create_task(
+        holder = asyncio.ensure_future(
             acquire_connection.query(
                 "WAITFOR DELAY '00:00:01'; SELECT 1 AS value"
             )
