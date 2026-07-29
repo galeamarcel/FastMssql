@@ -103,6 +103,11 @@ No release, package-version change, or artifact publication has occurred.
   global diagnostic index space.
 - Preserved the concrete-list raw-extension fast path and kept the raw stub
   intentionally list-only while widening only the public wrapper contract.
+- Regenerated the canonical SQL-auth evidence at implementation commit
+  `8433b3bffceb0b41ef7a8e6d29b3156b176b815f`: all 396 required matrix
+  cases, 412 strict tests, 16 async tests, 33 framework tests, 6 resilience
+  tests, 12 load tests and 1,140 original-local-regression tests pass with no
+  failures, errors, skips or missing evidence.
 - Defined deterministic `BULK-013`–`BULK-021` RED contracts, Docker
   SQL-auth evidence, isolated-wheel gates and 1,000/10,000/99,999-row stress
   profiles.
