@@ -674,8 +674,6 @@ pub fn bulk_insert<'p>(
             let permit = lifecycle.admit_operation(OperationName::BulkInsert, true)?;
             permit
                 .run(async move {
-                    let deadline =
-                        deadline_from(TimeoutPhase::Operation, timeout_config.operation_timeout);
                     let mut start = 0usize;
                     let mut chunk = convert_bulk_chunk(
                         &data_rows,
@@ -704,6 +702,8 @@ pub fn bulk_insert<'p>(
                     })?;
                     let mut conn = PooledOperationGuard::new(pooled);
 
+                    let deadline =
+                        deadline_from(TimeoutPhase::Operation, timeout_config.operation_timeout);
                     let mut transaction_started = false;
                     let operation = run_until(
                         deadline,

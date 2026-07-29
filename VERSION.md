@@ -45,6 +45,36 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Compatibility-bulk timeout phase boundary
+
+- Restored the approved compatibility `bulk_insert()` boundary by creating
+  its operation deadline only after pool checkout and construction of the
+  pooled-operation guard.
+- Preserved bounded first-chunk conversion before pool work, so first-chunk
+  shape/type failures remain zero-I/O and zero-lease.
+- Reused the same post-checkout deadline for `BEGIN`, every SQL chunk,
+  later-chunk conversion and `COMMIT`; no per-chunk reset or retry was added.
+- Left native bulk iterable and `execute_many()` unchanged because their
+  later approved sequence contracts explicitly include acquisition.
+- The corrected extension loaded from the exact worktree and passed focused
+  `TIME-006` `1/1`, the bounded repetition `20/20`, timeout/strict/bounded
+  coverage `43/43`, and legacy batch/bulk in its canonical
+  original-local-regression lane `38/38`.
+- Root Rust tests passed `116/116`; fmt, Clippy with warnings denied, Ruff,
+  compileall and diff checks passed. The first direct Cargo invocation omitted
+  the required canonical `PYTHONHOME` and failed before the test harness at
+  embedded-Python codec initialization; rerunning with the runner's exact
+  environment passed all 116 tests.
+- Graph review found five statically affected shared flows and linked 40 tests
+  to compatibility `bulk_insert()`. Its simultaneous untested warning is a
+  PyO3/dynamic-wrapper mapping limitation contradicted by the focused,
+  strict, bounded and legacy executions above.
+- A first combined Python invocation omitted the legacy fixture's
+  `FASTMSSQL_TEST_CONNECTION_STRING`; its 38 setup failures were reproduced
+  as `connection_string=None`, then all 38 passed in the canonical lane.
+- This unreleased fork fix changes no public API, displayed `0.7.7` version,
+  release state or package metadata.
+
 ### Compatibility-bulk timeout phase-boundary RED
 
 - Extended existing canonical `TIME-006` with a size-one pool held for 0.95
