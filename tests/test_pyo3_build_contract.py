@@ -169,7 +169,10 @@ def test_hosted_gate_builds_extension_and_checks_configuration_contracts() -> No
         "tests/test_lifecycle_contract.py "
         "tests/test_pool_observability_contract.py "
         "tests/test_operation_metrics_contract.py "
-        "tests/test_result_stream_contract.py -q"
+        "tests/test_result_stream_contract.py "
+        "tests/test_query_many_contract.py "
+        "tests/test_query_many_coordinator.py "
+        "tests/test_query_many_stress_contract.py -q"
         in normalized_workflow
     )
     assert (

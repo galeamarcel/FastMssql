@@ -284,6 +284,18 @@ No release, package-version change, or artifact publication has occurred.
   package metadata, displayed `0.7.7` version, release or published
   artifact.
 
+### Query-many hosted-wheel contract correction
+
+- Extended the existing exact installed-wheel command assertion with
+  `test_query_many_contract.py`, `test_query_many_coordinator.py` and
+  `test_query_many_stress_contract.py`, matching their already required
+  workflow invocation.
+- Preserved the stronger same-command and terminal `-q` contract; the fix
+  does not accept those paths merely appearing elsewhere in the workflow.
+- This test-harness-only correction changes no FastMssql runtime, workflow,
+  dependency, package metadata, displayed `0.7.7` version, release or
+  published artifact.
+
 ### Execute-many live audit status
 
 - Marked only the sixth of seven batch/bulk slices,
