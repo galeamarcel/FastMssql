@@ -45,6 +45,25 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### PyO3 uv embedded-runtime bootstrap fix
+
+- Made the canonical local SQL-auth runner resolve the exact worktree
+  interpreter and base installation through `uv run python` immediately after
+  locked environment synchronization.
+- Added explicit fail-closed validation for an absent, empty or invalid
+  executable/base-prefix result; discovery failures cannot be hidden by a
+  `readonly` declaration in the runner's intentionally non-`errexit` shell.
+- Scoped `PYO3_PYTHON` and `PYTHONHOME` through `env` only to the existing
+  `cargo test --locked` lane, leaving maturin, fmt/Clippy, vendored Tiberius,
+  pytest and SQL-auth processes unchanged.
+- Drove the focused PyO3 configuration contracts from one intended failure
+  to 9/9 PASS; Ruff and Bash syntax checks also passed.
+- Compiled and executed the raw test binary in a completely fresh external
+  Cargo target against uv CPython 3.12: all 116 Rust tests passed with zero
+  failures and no `/install`/`encodings` bootstrap error.
+- This runner-only fix does not alter FastMssql runtime APIs, the displayed
+  `0.7.7` version or release state.
+
 ### PyO3 uv embedded-runtime bootstrap RED
 
 - Added a deterministic configuration contract requiring the canonical

@@ -76,10 +76,31 @@ record() {
 }
 
 record uv-sync uv sync --locked --all-extras --dev
+
+if ! cargo_test_python="$(
+  uv run python -c 'import sys; print(sys.executable)'
+)" || [[ -z "${cargo_test_python}" || ! -x "${cargo_test_python}" ]]; then
+  echo "unable to resolve the worktree Python executable" >&2
+  exit 2
+fi
+readonly cargo_test_python
+
+if ! cargo_test_python_home="$(
+  uv run python -c 'import sys; print(sys.base_prefix)'
+)" || [[ -z "${cargo_test_python_home}" || ! -d "${cargo_test_python_home}" ]]; then
+  echo "unable to resolve the worktree Python base prefix" >&2
+  exit 2
+fi
+readonly cargo_test_python_home
+
 record maturin-develop uv run maturin develop --release
 record cargo-fmt cargo fmt --check
 record cargo-clippy cargo clippy --all-targets -- -D warnings
-record cargo-test cargo test --locked
+record cargo-test \
+  env \
+  "PYO3_PYTHON=${cargo_test_python}" \
+  "PYTHONHOME=${cargo_test_python_home}" \
+  cargo test --locked
 record tiberius-fmt \
   cargo fmt --manifest-path vendor/tiberius/Cargo.toml --check
 record tiberius-clippy \
