@@ -45,6 +45,21 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Execute-many security-retirement characterization plan
+
+- Added the executable test-only plan that extends canonical `EMANY-009`
+  with successful `EXECUTE AS` response delivery, fail-closed Transaction
+  state, exact operation metrics, physical replacement by `connection_id`
+  and zero-session teardown on Docker SQL Server.
+- Kept the approved lineage on separate design, test, feature and live-status
+  branches, with a distinct runtime-fix branch required only if the
+  deterministic characterization contradicts the existing policy.
+- Required fresh source, full SQL-auth, 99.999-set stress, isolated-wheel,
+  graph, credential and fork-only publication evidence before the sixth of
+  seven batch/bulk slices can become `VERIFIED_FORK`.
+- This documentation-only plan does not change runtime, public API, the
+  displayed `0.7.7` version, release state or package metadata.
+
 ### Execute-many security-retirement contract design
 
 - Reconciled the ordinary caller-Transaction success rule with the existing

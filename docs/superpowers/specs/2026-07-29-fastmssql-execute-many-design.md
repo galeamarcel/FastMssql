@@ -23,7 +23,8 @@ The feature must provide:
 - one checked total affected-row count;
 - atomic-by-default Connection semantics;
 - explicit chunk-commit partial-success semantics;
-- settlement-neutral caller Transaction semantics;
+- ordinary settlement-neutral caller Transaction semantics with fail-closed
+  security-context retirement;
 - one absolute public deadline;
 - one operation metric for the complete call;
 - typed parameter conversion shared with `execute()`;

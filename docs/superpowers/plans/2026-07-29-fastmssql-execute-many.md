@@ -10,8 +10,9 @@
 **Goal:** add a production-safe `execute_many()` that repeats one SQL
 statement over bounded list, synchronous-iterable or asynchronous-iterable
 parameter sets with atomic-by-default Connection semantics, explicit
-per-chunk partial commits, settlement-neutral caller Transaction semantics,
-one deadline, one metric and deterministic cleanup.
+per-chunk partial commits, settlement-neutral caller Transaction semantics
+with fail-closed security-context retirement, one deadline, one metric and
+deterministic cleanup.
 
 **Architecture:** concrete Python lists use bounded raw PyO3 adapters.
 Arbitrary producers use a shared Python bounded-sequence coordinator over a
@@ -406,8 +407,11 @@ Cargo fmt/Clippy/test, Git worktrees and code-review-graph.
   records one cancellation and leaks no session.
 - [ ] `EMANY-008`: timeout during producer wait and SQL is typed, bounded,
   privacy-safe and leaves the pool reusable.
-- [ ] `EMANY-009`: active Transaction success is settlement-neutral;
-  post-wire error is rollback-only and only caller rollback settles it.
+- [ ] `EMANY-009`: ordinary active-Transaction success is
+  settlement-neutral; post-wire error is rollback-only and only caller
+  rollback settles it. Successfully consumed security-context SQL returns
+  its response but retires the physical connection, fails the Transaction
+  and proves pool recovery on a distinct `connection_id`.
 - [ ] `EMANY-010`: parameterized INSERT/UPDATE/DELETE and direct stored
   procedure execution return exact totals with one schema-2 metric and zero
   internal metric deltas.
@@ -969,6 +973,7 @@ full candidate SHA.
   - Connection and Transaction `execute_many`;
   - shared bounded coordinator and native-bulk parity;
   - transaction state/settlement;
+  - caller-Transaction security retirement and ResultStream parity;
   - lifecycle shutdown and pool disposition;
   - operation metrics schema/indexing;
   - timeout/cancellation/drop paths;
