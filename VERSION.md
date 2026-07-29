@@ -98,6 +98,21 @@ No release, package-version change, or artifact publication has occurred.
 - This documentation-only change does not alter runtime behavior, package
   metadata, displayed `0.7.7` version, release state or published artefacts.
 
+### Query-many absent-API RED
+
+- Created branch `test/query-many-bounded-concurrency` from exact approved
+  plan commit `7d8a4dd0d39c8a39495e2c1aaa845f6fd89ffa98`.
+- Added the public contract for the regular `Connection.query_many()`
+  factory, `QueryManyIterator`, exact wrapper typing, deliberate absence from
+  Transaction/raw surfaces, synchronous scalar/source validation, one
+  preferred producer protocol, preserved producer-acquisition
+  `BaseException` and concrete-list resize detection.
+- The focused RED collected 30 cases: 29 failed for the intended absent
+  wrapper/stub/runtime surface and one existing negative-surface case passed.
+  Ruff passed, so the failure is not collection, syntax or lint noise.
+- This test-only commit changes no runtime behavior, package metadata,
+  displayed `0.7.7` version, release state or published artifact.
+
 ### Execute-many live audit status
 
 - Marked only the sixth of seven batch/bulk slices,
