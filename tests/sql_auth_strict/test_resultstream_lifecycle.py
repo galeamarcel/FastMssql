@@ -286,8 +286,8 @@ async def test_complete_aclose_retires_spid_before_pool_recovery(
         await response.aclose()
         assert response.closed is True
         assert response.complete is False
-        assert not await _identity_exists(sa_connection, original)
         await _wait_pool_active(connection, 0)
+        await _wait_identity_absent(sa_connection, original)
 
         replacement = await _identity(connection)
         assert replacement != original

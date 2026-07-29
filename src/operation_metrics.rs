@@ -349,7 +349,12 @@ impl OperationObserver {
         metrics: Option<Arc<OperationMetricsRegistry>>,
         operation: OperationName,
     ) -> Self {
-        Self::start_at(metrics, operation, Instant::now())
+        let guard = metrics.and_then(|registry| {
+            let started_at = Instant::now();
+            metric_index(operation)
+                .map(|operation_index| OperationGuard::start(registry, operation_index, started_at))
+        });
+        Self { guard }
     }
 
     pub(crate) fn start_at(

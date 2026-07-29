@@ -88,6 +88,11 @@ No release, package-version change, or artifact publication has occurred.
   mandatory sequence cleanup: `abort()`/`expire()` now wait for the cancelled
   call to release the private sequence lock, so database state and the single
   operation observer are terminal before the original exception is re-raised.
+- Restored the disabled operation-metrics fast path so it does not read the
+  monotonic clock before confirming that a metrics registry exists.
+- Made the result-stream retirement proof account for SQL Server's bounded,
+  asynchronous DMV visibility after a physical TCP session is removed from
+  the pool, while still requiring retirement before any recovery checkout.
 - Corrected the iterable identifier contract to use a structurally invalid
   raw identifier; safely bracket-quoted SQL Server identifier characters are
   not misclassified as injection.
