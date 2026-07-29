@@ -45,6 +45,19 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Execute-many security-retirement characterization
+
+- Extended canonical `EMANY-009` on its dedicated test branch to prove that
+  a successful `EXECUTE AS` response records exactly one successful
+  `execute_many` operation while the caller Transaction becomes fail-closed.
+- Required query, commit and rollback to reject the retired Transaction,
+  verified idempotent close, and proved that the size-one pool replaces the
+  physical session by comparing `connection_id` rather than reusable SPIDs.
+- Added a successful query and rollback on the replacement Transaction plus
+  an independent DMV teardown assertion for zero application sessions.
+- This test-only characterization changes no runtime, public API, displayed
+  `0.7.7` version, release state or package metadata.
+
 ### Execute-many security-retirement characterization plan
 
 - Added the executable test-only plan that extends canonical `EMANY-009`

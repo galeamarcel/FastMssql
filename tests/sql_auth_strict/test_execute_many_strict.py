@@ -180,6 +180,19 @@ async def _row_count(connection: Any, table: str) -> int:
     return int(await scalar(connection, f"SELECT COUNT_BIG(*) FROM {table}"))
 
 
+async def _physical_connection_id(connection: Any) -> str:
+    return str(
+        await scalar(
+            connection,
+            """
+            SELECT CONVERT(NVARCHAR(36), connection_id)
+            FROM sys.dm_exec_connections
+            WHERE session_id = @@SPID
+            """,
+        )
+    )
+
+
 async def _application_session_count(
     observer: Connection,
     application_name: str,
@@ -844,7 +857,9 @@ async def test_execute_many_timeout_is_typed_bounded_and_reusable(
 @case("EMANY-009")
 @pytest.mark.asyncio
 async def test_execute_many_transaction_is_neutral_then_rollback_only(
+    sql_auth_config: SqlAuthConfig,
     owner_connection: Connection,
+    sa_connection: Connection,
     unique_sql_name: Callable[[str], str],
     cleanup_registry: CleanupRegistry,
 ) -> None:
@@ -885,6 +900,66 @@ async def test_execute_many_transaction_is_neutral_then_rollback_only(
     finally:
         await transaction.close()
     assert await _row_count(owner_connection, table) == 0
+
+    application_name = unique_sql_name("strict_emany_transaction_retirement")
+    connection = _isolated_connection(
+        sql_auth_config,
+        application_name=application_name,
+        metrics=True,
+    )
+    retired = connection.transaction()
+    replacement: Transaction | None = None
+    try:
+        await retired.begin()
+        retired_connection_id = await _physical_connection_id(retired)
+        before = await connection.operation_stats()
+
+        assert await retired.execute_many(
+            "EXECUTE AS USER = 'dbo'",
+            [[]],
+        ) == 0
+
+        after = await connection.operation_stats()
+        delta = operation_delta(before, after, "execute_many")
+        assert delta["started"] == delta["completed"] == 1
+        assert {key: delta[key] for key in OUTCOME_KEYS} == zero_outcomes(
+            succeeded=1
+        )
+        for operation in ("execute", "begin", "commit", "rollback"):
+            assert operation_delta(before, after, operation)["started"] == 0
+
+        assert retired.is_connected() is False
+        with pytest.raises(
+            RuntimeError,
+            match="state is indeterminate; call close",
+        ):
+            await retired.query("SELECT 1")
+        with pytest.raises(
+            RuntimeError,
+            match="state is indeterminate; call close",
+        ):
+            await retired.commit()
+        with pytest.raises(
+            RuntimeError,
+            match="state is indeterminate; call close",
+        ):
+            await retired.rollback()
+
+        await retired.close()
+        await retired.close()
+
+        replacement = connection.transaction()
+        await replacement.begin()
+        replacement_connection_id = await _physical_connection_id(replacement)
+        assert replacement_connection_id != retired_connection_id
+        assert await scalar(replacement, "SELECT 1") == 1
+        await replacement.rollback()
+    finally:
+        if replacement is not None:
+            await replacement.close()
+        await retired.close()
+        await connection.disconnect()
+        await _wait_for_zero_sessions(sa_connection, application_name)
 
 
 @case("EMANY-010")
