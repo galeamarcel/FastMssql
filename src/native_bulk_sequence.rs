@@ -662,9 +662,10 @@ impl PyNativeBulkSequence {
         let outcome = NativeBulkAbortOutcome::parse(outcome)?;
         let inner = Arc::clone(&self.inner);
         future_into_py(py, async move {
-            let mut sequence = inner
-                .try_lock()
-                .map_err(|_| Self::concurrent_call_error())?;
+            // Cleanup may race cancellation delivery from a preceding PyO3
+            // awaitable. Wait for that future to release the sequence so the
+            // observer and database state are terminal before Python re-raises.
+            let mut sequence = inner.lock().await;
             sequence.abort(outcome).await
         })
     }
@@ -672,9 +673,7 @@ impl PyNativeBulkSequence {
     pub fn expire<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let inner = Arc::clone(&self.inner);
         future_into_py(py, async move {
-            let mut sequence = inner
-                .try_lock()
-                .map_err(|_| Self::concurrent_call_error())?;
+            let mut sequence = inner.lock().await;
             sequence.expire().await
         })
     }

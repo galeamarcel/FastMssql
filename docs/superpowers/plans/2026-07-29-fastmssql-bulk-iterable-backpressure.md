@@ -665,6 +665,9 @@ or caller-owned settlement.
   to `Active` without settlement.
 - [ ] `abort()` preserves the supplied metric outcome while performing
   bounded cleanup.
+- [ ] `abort()`/`expire()` wait for a just-cancelled private awaitable to
+  release the sequence lock; normal producer calls still reject concurrency,
+  and Python may not re-raise before observer/database cleanup is terminal.
 - [ ] `abort()` or `expire()` from the reserved-but-not-activated state starts
   and completes exactly one observer from captured `started_at`, releases the
   caller Transaction reservation and performs no lifecycle, pool or SQL work.

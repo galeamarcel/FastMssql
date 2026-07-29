@@ -403,6 +403,13 @@ database-state transition:
   epoch-checked cancellation guard and retires the uncertain transport;
 - no automatic retry occurs.
 
+`abort()` and `expire()` are cleanup entry points: if cancellation delivery
+is still releasing the immediately preceding private awaitable, they wait for
+that sequence lock handoff instead of failing with a transient concurrent-call
+error. Ordinary producer calls remain fail-fast under concurrent use. This
+guarantees that database state and the one operation observer are terminal
+before Python re-raises the original exception.
+
 The original producer or cancellation exception stays primary. Abort returns
 or raises only cleanup evidence for Python to chain.
 

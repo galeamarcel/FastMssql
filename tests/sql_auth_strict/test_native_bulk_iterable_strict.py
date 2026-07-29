@@ -441,7 +441,7 @@ async def test_native_bulk_iterable_validation_advances_zero_rows() -> None:
     producer = SyncRows([[1]])
     with pytest.raises(ConversionError) as captured:
         await connection.native_bulk_insert(
-            "dbo.target; SELECT 1",
+            "dbo..target",
             ["value"],
             producer,
         )
@@ -843,7 +843,7 @@ async def test_native_bulk_iterable_cancellation_stops_pulls_and_cleans_up(
         assert await scalar(wire_connection, "SELECT 1") == 1
         metric = _bulk_metric(await wire_connection.operation_stats())
         assert metric["started"] == 1
-        assert metric["cancelled"] == 1
+        assert metric["cancelled"] == 1, metric
     finally:
         await _settle_task(wire_task)
         await blocker.close()

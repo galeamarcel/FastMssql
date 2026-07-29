@@ -84,6 +84,13 @@ No release, package-version change, or artifact publication has occurred.
   reserve before their first pull, prefer the async protocol, hold at most one
   configured chunk, share the absolute Rust deadline and finish shielded
   abort/producer-close cleanup before re-raising the original failure.
+- Fixed the cancellation handoff between a cancelled PyO3 bulk awaitable and
+  mandatory sequence cleanup: `abort()`/`expire()` now wait for the cancelled
+  call to release the private sequence lock, so database state and the single
+  operation observer are terminal before the original exception is re-raised.
+- Corrected the iterable identifier contract to use a structurally invalid
+  raw identifier; safely bracket-quoted SQL Server identifier characters are
+  not misclassified as injection.
 - This unreleased development slice does not change package metadata, the
   displayed `0.7.7` version or release state.
 - Selected a bounded Python coordinator over one private Rust sequence so
