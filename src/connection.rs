@@ -10,6 +10,8 @@ use crate::azure_auth::PyAzureCredential;
 use crate::batch::{bulk_insert, execute_batch, query_batch};
 use crate::connection_config::config_from_ado_string;
 use crate::deadline::{DeadlineElapsed, OperationName, TimeoutPhase, deadline_from, run_until};
+use crate::execute_many::{parse_execute_many_atomic, parse_execute_many_chunk_size};
+use crate::execute_many_sequence::{ExecuteManyMode, PyExecuteManySequence};
 use crate::helpers::{
     catch_driver_panic, execute_unparameterized_command, requires_connection_retirement,
     requires_direct_batch, wrap_query_stream,
@@ -660,6 +662,37 @@ impl PyConnection {
         })
     }
 
+    #[pyo3(signature = (sql, parameter_sets, *, atomic = true, chunk_size = 1000))]
+    pub fn execute_many<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        parameter_sets: &Bound<'p, PyList>,
+        #[pyo3(from_py_with = parse_execute_many_atomic)] atomic: bool,
+        #[pyo3(from_py_with = parse_execute_many_chunk_size)] chunk_size: usize,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let mode = if atomic {
+            ExecuteManyMode::ConnectionAtomic
+        } else {
+            ExecuteManyMode::ConnectionChunked
+        };
+        let sequence = PyExecuteManySequence::new(
+            mode,
+            self.transaction(),
+            sql,
+            chunk_size,
+            &self.timeout_config,
+            self.operation_metrics.clone(),
+        )?;
+        let captured_len = parameter_sets.len();
+        let parameter_sets = parameter_sets.clone().unbind();
+        future_into_py(py, async move {
+            sequence
+                .run_captured_list(parameter_sets, captured_len)
+                .await
+        })
+    }
+
     /// Return whether this object currently owns a pool handle.
     ///
     /// This method performs no network I/O and does not prove SQL Server
@@ -994,6 +1027,30 @@ impl PyConnection {
             self.transaction(),
             table,
             columns,
+            chunk_size,
+            &self.timeout_config,
+            self.operation_metrics.clone(),
+        )?;
+        Py::new(py, sequence)
+    }
+
+    #[pyo3(signature = (sql, *, atomic = true, chunk_size = 1000))]
+    pub(crate) fn _execute_many_sequence(
+        &self,
+        py: Python<'_>,
+        sql: String,
+        #[pyo3(from_py_with = parse_execute_many_atomic)] atomic: bool,
+        #[pyo3(from_py_with = parse_execute_many_chunk_size)] chunk_size: usize,
+    ) -> PyResult<Py<PyExecuteManySequence>> {
+        let mode = if atomic {
+            ExecuteManyMode::ConnectionAtomic
+        } else {
+            ExecuteManyMode::ConnectionChunked
+        };
+        let sequence = PyExecuteManySequence::new(
+            mode,
+            self.transaction(),
+            sql,
             chunk_size,
             &self.timeout_config,
             self.operation_metrics.clone(),

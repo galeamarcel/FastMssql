@@ -45,6 +45,37 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Stateful execute-many native engine
+
+- Added strict raw-list `Connection.execute_many()` and
+  `Transaction.execute_many()` entry points plus the private
+  `_ExecuteManySequence` used by the bounded iterable adapter.
+- Added checked, privacy-safe parameter-set conversion and affected-row
+  accounting with global set indices, the existing 2,098-parameter limit and
+  direct-batch parity for scope-sensitive parameter-free DDL.
+- Added one-session atomic and acknowledged per-chunk settlement modes,
+  explicit caller-Transaction reservation/rollback-only handoff, one absolute
+  deadline and one `execute_many` metric observer without internal
+  execute/begin/commit/rollback metric inflation.
+- Added fail-closed cancellation, timeout, unknown-COMMIT and dropped-sequence
+  cleanup, including truthful confirmed-commit progress returned by private
+  abort cleanup.
+- Preserved the existing security-context SQL retirement policy so an
+  `execute_many` statement classified as session impersonation can never
+  return its physical connection to the pool.
+- Added focused Rust invariants for validation, list resizing, empty
+  neutrality, checked overflow, global/privacy-safe metadata, commit
+  acknowledgement boundaries and caller-Transaction reservation states.
+- Verified all 116 Rust tests and warning-free all-target Clippy, built the
+  release extension, and exercised the raw API against Docker SQL Server for
+  atomic success/rollback, acknowledged partial commits, list-resize
+  rollback, caller-Transaction neutrality/rollback-only handoff, schema-2
+  metric isolation and security-SQL physical retirement. SQL Server reused
+  the same SPID during the retirement proof, while its physical
+  `connection_id` changed as required.
+- This feature work does not change the displayed `0.7.7` version or release
+  state.
+
 ### Operation metrics schema 2
 
 - Added the stable `execute_many` metric slot between `execute` and

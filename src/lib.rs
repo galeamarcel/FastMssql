@@ -10,6 +10,8 @@ mod batch;
 mod connection;
 mod connection_config;
 mod deadline;
+mod execute_many;
+mod execute_many_sequence;
 mod helpers;
 mod lifecycle;
 mod lifecycle_config;
@@ -48,6 +50,7 @@ pub use types::{
     TlsError,
 };
 
+use crate::execute_many_sequence::PyExecuteManySequence;
 use crate::native_bulk_sequence::PyNativeBulkSequence;
 use crate::parameter_conversion::TypedNull;
 
@@ -86,6 +89,7 @@ fn fastmssql(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_class::<PyConnection>()?;
     m.add_class::<Transaction>()?;
+    m.add_class::<PyExecuteManySequence>()?;
     m.add_class::<PyNativeBulkSequence>()?;
     m.add_class::<PyFastRow>()?;
     m.add_class::<PyQueryStream>()?;

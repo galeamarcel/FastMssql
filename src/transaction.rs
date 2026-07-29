@@ -16,6 +16,11 @@ use crate::deadline::{
     Deadline, DeadlineElapsed, OperationName, TimeoutPhase, deadline_from, earliest_deadline,
     run_until,
 };
+use crate::execute_many::{
+    ExecuteManyChunkFailure, ExecuteManyWireProgress, PreparedExecuteManyChunk,
+    execute_many_chunk_on_connection, parse_execute_many_chunk_size, set_execute_many_operation,
+};
+use crate::execute_many_sequence::{ExecuteManyMode, PyExecuteManySequence};
 use crate::helpers::{
     catch_driver_panic, execute_unparameterized_command, requires_connection_retirement,
     requires_direct_batch, wrap_query_stream,
@@ -133,6 +138,7 @@ enum TransactionState {
     Beginning,
     Active,
     BulkProducing,
+    ExecuteManyProducing,
     RollbackOnly,
     Executing,
     Committing,
@@ -152,6 +158,28 @@ pub(crate) enum NativeBulkTransactionOwner {
 pub(crate) struct ReservedNativeBulkFailure {
     pub(crate) error: PyErr,
     pub(crate) any_row_sent: bool,
+}
+
+pub(crate) struct ReservedExecuteManyFailure {
+    pub(crate) error: PyErr,
+    pub(crate) parameter_set_index: usize,
+    pub(crate) any_statement_sent: bool,
+}
+
+impl ReservedExecuteManyFailure {
+    fn new(error: PyErr, parameter_set_index: usize, any_statement_sent: bool) -> Self {
+        set_execute_many_operation(&error);
+        Self {
+            error,
+            parameter_set_index,
+            any_statement_sent,
+        }
+    }
+}
+
+pub(crate) struct ReservedExecuteManySuccess {
+    pub(crate) affected: u64,
+    pub(crate) commit_acknowledged: bool,
 }
 
 impl ReservedNativeBulkFailure {
@@ -181,6 +209,9 @@ impl TransactionState {
             Self::BulkProducing => Err(PyRuntimeError::new_err(
                 "Transaction is reserved by a native bulk producer",
             )),
+            Self::ExecuteManyProducing => Err(PyRuntimeError::new_err(
+                "Transaction is reserved by an execute_many producer",
+            )),
             Self::RollbackOnly => Err(PyRuntimeError::new_err(
                 "Transaction is rollback-only; rollback required before reuse",
             )),
@@ -207,6 +238,7 @@ struct TransactionSession {
     lifecycle_permit: Option<TransactionPermit>,
     lifecycle_failure: Option<LifecycleFailure>,
     owned_bulk_transaction_started: bool,
+    owned_execute_many_transaction_started: bool,
 }
 
 impl Default for TransactionSession {
@@ -219,6 +251,7 @@ impl Default for TransactionSession {
             lifecycle_permit: None,
             lifecycle_failure: None,
             owned_bulk_transaction_started: false,
+            owned_execute_many_transaction_started: false,
         }
     }
 }
@@ -254,6 +287,9 @@ impl TransactionSession {
             TransactionState::BulkProducing => Err(PyRuntimeError::new_err(
                 "Transaction is reserved by a native bulk producer",
             )),
+            TransactionState::ExecuteManyProducing => Err(PyRuntimeError::new_err(
+                "Transaction is reserved by an execute_many producer",
+            )),
             TransactionState::RollbackOnly => Err(PyRuntimeError::new_err(
                 "Transaction is rollback-only; rollback required before reuse",
             )),
@@ -273,6 +309,64 @@ impl TransactionSession {
                 "Transaction state is indeterminate; call close() before reuse",
             )),
         }
+    }
+
+    fn reserve_execute_many_producer(&mut self) -> PyResult<()> {
+        match self.state {
+            TransactionState::Active => {
+                self.transition_to(TransactionState::ExecuteManyProducing);
+                Ok(())
+            }
+            TransactionState::BulkProducing => Err(PyRuntimeError::new_err(
+                "Transaction is reserved by a native bulk producer",
+            )),
+            TransactionState::ExecuteManyProducing => Err(PyRuntimeError::new_err(
+                "Transaction is reserved by an execute_many producer",
+            )),
+            TransactionState::RollbackOnly => Err(PyRuntimeError::new_err(
+                "Transaction is rollback-only; rollback required before reuse",
+            )),
+            TransactionState::Idle => Err(PyRuntimeError::new_err("Transaction has not begun")),
+            TransactionState::Committed => Err(PyRuntimeError::new_err(
+                "Transaction has already been committed",
+            )),
+            TransactionState::RolledBack => Err(PyRuntimeError::new_err(
+                "Transaction has already been rolled back",
+            )),
+            TransactionState::Beginning
+            | TransactionState::Executing
+            | TransactionState::Committing
+            | TransactionState::RollingBack
+            | TransactionState::Failed
+            | TransactionState::Closing => Err(PyRuntimeError::new_err(
+                "Transaction state is indeterminate; call close() before reuse",
+            )),
+        }
+    }
+
+    fn confirm_execute_many_producer(&self) -> PyResult<()> {
+        if self.state != TransactionState::ExecuteManyProducing {
+            return Err(PyRuntimeError::new_err(
+                "execute_many producer no longer owns the transaction reservation",
+            ));
+        }
+        Ok(())
+    }
+
+    fn finish_reserved_execute_many(&mut self) -> PyResult<()> {
+        self.confirm_execute_many_producer()?;
+        self.transition_to(TransactionState::Active);
+        Ok(())
+    }
+
+    fn abort_reserved_execute_many(&mut self, any_statement_sent: bool) -> PyResult<()> {
+        self.confirm_execute_many_producer()?;
+        self.transition_to(if any_statement_sent {
+            TransactionState::RollbackOnly
+        } else {
+            TransactionState::Active
+        });
+        Ok(())
     }
 
     fn finish_reserved_bulk(&mut self) -> PyResult<()> {
@@ -344,6 +438,7 @@ impl TransactionSession {
         }
         self.lifecycle_permit.take();
         self.owned_bulk_transaction_started = false;
+        self.owned_execute_many_transaction_started = false;
         connection
     }
 
@@ -351,6 +446,7 @@ impl TransactionSession {
         self.conn.take();
         self.lifecycle_permit.take();
         self.owned_bulk_transaction_started = false;
+        self.owned_execute_many_transaction_started = false;
     }
 
     fn lifecycle_error(&self) -> Option<PyErr> {
@@ -427,6 +523,7 @@ impl ForcedShutdownParticipant for TransactionShutdownParticipant {
                 TransactionState::Committing => (OperationName::Commit, true),
                 TransactionState::RollingBack => (OperationName::Rollback, false),
                 TransactionState::Executing => (OperationName::Transaction, true),
+                TransactionState::ExecuteManyProducing => (OperationName::ExecuteMany, false),
                 _ => (OperationName::Close, false),
             };
             let failure = permit.forced_failure(operation, outcome_unknown);
@@ -707,6 +804,9 @@ impl TransactionCommand {
             ),
             (_, TransactionState::BulkProducing) => Err(PyRuntimeError::new_err(
                 "Transaction is reserved by a native bulk producer",
+            )),
+            (_, TransactionState::ExecuteManyProducing) => Err(PyRuntimeError::new_err(
+                "Transaction is reserved by an execute_many producer",
             )),
             (
                 _,
@@ -1261,6 +1361,31 @@ impl Transaction {
         })
     }
 
+    #[pyo3(signature = (sql, parameter_sets, *, chunk_size = 1000))]
+    pub fn execute_many<'p>(
+        &self,
+        py: Python<'p>,
+        sql: String,
+        parameter_sets: &Bound<'p, PyList>,
+        #[pyo3(from_py_with = parse_execute_many_chunk_size)] chunk_size: usize,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let sequence = PyExecuteManySequence::new(
+            ExecuteManyMode::CallerTransaction,
+            self.clone_for_execute_many(),
+            sql,
+            chunk_size,
+            &self.timeout_config,
+            self.operation_metrics.clone(),
+        )?;
+        let captured_len = parameter_sets.len();
+        let parameter_sets = parameter_sets.clone().unbind();
+        future_into_py(py, async move {
+            sequence
+                .run_captured_list(parameter_sets, captured_len)
+                .await
+        })
+    }
+
     /// Execute multiple commands in sequence on the transaction lease.
     #[pyo3(signature = (commands))]
     pub fn execute_batch<'p>(
@@ -1531,6 +1656,24 @@ impl Transaction {
         Py::new(py, sequence)
     }
 
+    #[pyo3(signature = (sql, *, chunk_size = 1000))]
+    pub(crate) fn _execute_many_sequence(
+        &self,
+        py: Python<'_>,
+        sql: String,
+        #[pyo3(from_py_with = parse_execute_many_chunk_size)] chunk_size: usize,
+    ) -> PyResult<Py<PyExecuteManySequence>> {
+        let sequence = PyExecuteManySequence::new(
+            ExecuteManyMode::CallerTransaction,
+            self.clone_for_execute_many(),
+            sql,
+            chunk_size,
+            &self.timeout_config,
+            self.operation_metrics.clone(),
+        )?;
+        Py::new(py, sequence)
+    }
+
     /// Release the direct socket or shared pool lease.
     pub fn close<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let session = Arc::clone(&self.session);
@@ -1698,6 +1841,845 @@ impl Transaction {
             pool_source: self.pool_source.clone(),
             timeout_config: self.timeout_config.clone(),
             operation_metrics: self.operation_metrics.clone(),
+        }
+    }
+
+    pub(crate) fn clone_for_execute_many(&self) -> Self {
+        Self {
+            session: Arc::clone(&self.session),
+            config: Arc::clone(&self.config),
+            _ssl_config: self._ssl_config.clone(),
+            azure_credential: self.azure_credential.clone(),
+            pool_source: self.pool_source.clone(),
+            timeout_config: self.timeout_config.clone(),
+            operation_metrics: self.operation_metrics.clone(),
+        }
+    }
+
+    pub(crate) async fn reserve_execute_many_producer(&self) -> PyResult<Option<Deadline>> {
+        let mut session = self.session.lock().await;
+        if let Some(error) = session.lifecycle_error() {
+            return Err(error);
+        }
+        if session.state != TransactionState::Active {
+            return session.reserve_execute_many_producer().map(|_| None);
+        }
+        session.authorize_data(OperationName::ExecuteMany, true, false)?;
+        if let Some(elapsed) = session.retire_expired_lifetime() {
+            return Err(transaction_timeout_error(
+                elapsed,
+                OperationName::ExecuteMany,
+                false,
+            ));
+        }
+        if session.conn.is_none() {
+            return Err(PyRuntimeError::new_err("Connection is not established"));
+        }
+        let lifetime_deadline = session.lifetime_deadline;
+        session.reserve_execute_many_producer()?;
+        Ok(lifetime_deadline)
+    }
+
+    pub(crate) async fn activate_owned_execute_many_lifecycle(&self) -> PyResult<()> {
+        let source = self.pool_source.as_ref().ok_or_else(|| {
+            PyRuntimeError::new_err(
+                "Connection-owned execute_many requires a shared pool transaction",
+            )
+        })?;
+        let participant = Arc::new(TransactionShutdownParticipant {
+            session: Arc::downgrade(&self.session),
+        });
+        let mut session = self.session.lock().await;
+        if let Some(error) = session.lifecycle_error() {
+            return Err(error);
+        }
+        if session.state != TransactionState::Idle
+            || session.conn.is_some()
+            || session.lifecycle_permit.is_some()
+        {
+            return Err(PyRuntimeError::new_err(
+                "Connection-owned execute_many transaction is not pristine",
+            ));
+        }
+
+        let permit = source.lifecycle.admit_transaction(participant)?;
+        session.lifecycle_permit = Some(permit);
+        session.owned_execute_many_transaction_started = false;
+        session.transition_to(TransactionState::ExecuteManyProducing);
+        Ok(())
+    }
+
+    pub(crate) async fn confirm_reserved_execute_many(&self) -> PyResult<()> {
+        let session = self.session.lock().await;
+        if let Some(error) = session.lifecycle_error() {
+            return Err(error);
+        }
+        session.confirm_execute_many_producer()
+    }
+
+    async fn ensure_reserved_execute_many_connected(
+        &self,
+        deadline: Option<Deadline>,
+        parameter_set_index: usize,
+    ) -> Result<(), ReservedExecuteManyFailure> {
+        let source = self.pool_source.as_ref().ok_or_else(|| {
+            ReservedExecuteManyFailure::new(
+                PyRuntimeError::new_err(
+                    "Connection-owned execute_many requires a shared pool transaction",
+                ),
+                parameter_set_index,
+                false,
+            )
+        })?;
+        let mut session = self.session.lock().await;
+        if session.state != TransactionState::ExecuteManyProducing {
+            return Err(ReservedExecuteManyFailure::new(
+                PyRuntimeError::new_err(
+                    "execute_many producer no longer owns the transaction reservation",
+                ),
+                parameter_set_index,
+                false,
+            ));
+        }
+        if session.conn.is_some() {
+            return Ok(());
+        }
+        let force_receiver = session.force_receiver().ok_or_else(|| {
+            ReservedExecuteManyFailure::new(
+                PyRuntimeError::new_err("Connection-owned execute_many lost its lifecycle permit"),
+                parameter_set_index,
+                false,
+            )
+        })?;
+
+        let acquired = run_force_aware(
+            force_receiver,
+            run_until(deadline, async {
+                let pool = ensure_pool_initialized_with_auth(
+                    Arc::clone(&source.pool),
+                    Arc::clone(&self.config),
+                    &source.pool_config,
+                    &source.timeout_config,
+                    self.azure_credential.clone(),
+                    OperationName::ExecuteMany,
+                )
+                .await?;
+                let lease = acquire_owned_connection(
+                    &pool,
+                    OperationName::ExecuteMany,
+                    source.timeout_config.acquire_timeout,
+                )
+                .await?;
+                Ok::<TransactionConnection, PyErr>(TransactionConnection::Pooled(lease))
+            }),
+        )
+        .await;
+
+        match acquired {
+            Ok(Ok(Ok(connection))) => {
+                session.conn = Some(connection);
+                Ok(())
+            }
+            Ok(Ok(Err(error))) => Err(ReservedExecuteManyFailure::new(
+                error,
+                parameter_set_index,
+                false,
+            )),
+            Ok(Err(elapsed)) => Err(ReservedExecuteManyFailure::new(
+                transaction_timeout_error(elapsed, OperationName::ExecuteMany, false),
+                parameter_set_index,
+                false,
+            )),
+            Err(ForceRequested) => {
+                let failure = session
+                    .forced_failure(OperationName::ExecuteMany, false)
+                    .ok_or_else(|| {
+                        ReservedExecuteManyFailure::new(
+                            PyRuntimeError::new_err(
+                                "forced execute_many acquisition lost its lifecycle permit",
+                            ),
+                            parameter_set_index,
+                            false,
+                        )
+                    })?;
+                session.retire_connection(Some(failure));
+                session.transition_to(TransactionState::Failed);
+                Err(ReservedExecuteManyFailure::new(
+                    failure.into_pyerr(),
+                    parameter_set_index,
+                    false,
+                ))
+            }
+        }
+    }
+
+    async fn start_owned_execute_many_transaction(
+        &self,
+        deadline: Option<Deadline>,
+        parameter_set_index: usize,
+    ) -> Result<(), ReservedExecuteManyFailure> {
+        self.ensure_reserved_execute_many_connected(deadline, parameter_set_index)
+            .await?;
+
+        let mut cancellation_guard = TransactionCancellationGuard::new(Arc::clone(&self.session));
+        let mut session = self.session.lock().await;
+        if session.state != TransactionState::ExecuteManyProducing {
+            return Err(ReservedExecuteManyFailure::new(
+                PyRuntimeError::new_err(
+                    "execute_many producer no longer owns the transaction reservation",
+                ),
+                parameter_set_index,
+                false,
+            ));
+        }
+        if session.owned_execute_many_transaction_started {
+            return Ok(());
+        }
+        if let Some(connection) = session.conn.as_mut() {
+            connection.begin_operation();
+        }
+        let epoch = session.enter_in_flight(TransactionState::Beginning);
+        cancellation_guard.arm(epoch);
+        let force_receiver = session.force_receiver();
+        let operation = run_with_optional_force(
+            force_receiver,
+            run_until(
+                deadline,
+                catch_driver_panic(async {
+                    let connection = session
+                        .conn
+                        .as_mut()
+                        .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
+                    connection
+                        .simple_query("BEGIN TRANSACTION")
+                        .await
+                        .map_err(|error| {
+                            create_sql_error(error, "Failed to start execute_many transaction")
+                        })?
+                        .into_results()
+                        .await
+                        .map_err(|error| {
+                            create_sql_error(error, "Failed to start execute_many transaction")
+                        })?;
+                    Ok::<(), PyErr>(())
+                }),
+            ),
+        )
+        .await;
+
+        let result = match operation {
+            Err(ForceRequested) => {
+                let failure = session
+                    .forced_failure(OperationName::ExecuteMany, false)
+                    .ok_or_else(|| {
+                        ReservedExecuteManyFailure::new(
+                            PyRuntimeError::new_err(
+                                "forced execute_many BEGIN lost its lifecycle permit",
+                            ),
+                            parameter_set_index,
+                            false,
+                        )
+                    })?;
+                session.retire_connection(Some(failure));
+                session.transition_to(TransactionState::Failed);
+                Err(ReservedExecuteManyFailure::new(
+                    failure.into_pyerr(),
+                    parameter_set_index,
+                    false,
+                ))
+            }
+            Ok(Err(elapsed)) => {
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+                Err(ReservedExecuteManyFailure::new(
+                    transaction_timeout_error(elapsed, OperationName::ExecuteMany, true),
+                    parameter_set_index,
+                    false,
+                ))
+            }
+            Ok(Ok(Err(driver_panic))) => {
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+                Err(ReservedExecuteManyFailure::new(
+                    driver_panic,
+                    parameter_set_index,
+                    false,
+                ))
+            }
+            Ok(Ok(Ok(Ok(())))) => {
+                if let Some(connection) = session.conn.as_mut() {
+                    let synchronized: PyResult<()> = Ok(());
+                    connection.finish_operation(&synchronized);
+                }
+                session.owned_execute_many_transaction_started = true;
+                session.transition_to(TransactionState::ExecuteManyProducing);
+                Ok(())
+            }
+            Ok(Ok(Ok(Err(error)))) => {
+                let synchronized = Python::attach(|py| Err::<(), _>(error.clone_ref(py)));
+                let reusable = session.conn.as_mut().is_some_and(|connection| {
+                    connection.finish_operation(&synchronized);
+                    connection.is_reusable()
+                });
+                if reusable {
+                    session.transition_to(TransactionState::ExecuteManyProducing);
+                } else {
+                    session.retire_connection(None);
+                    session.transition_to(TransactionState::Failed);
+                }
+                Err(ReservedExecuteManyFailure::new(
+                    error,
+                    parameter_set_index,
+                    false,
+                ))
+            }
+        };
+        cancellation_guard.disarm();
+        result
+    }
+
+    pub(crate) async fn execute_reserved_execute_many_chunk(
+        &self,
+        mode: ExecuteManyMode,
+        deadline: Option<Deadline>,
+        sql: &str,
+        input: &PreparedExecuteManyChunk,
+        wire_progress: &ExecuteManyWireProgress,
+    ) -> Result<ReservedExecuteManySuccess, ReservedExecuteManyFailure> {
+        let chunk_start_index = input.start_index();
+        if mode != ExecuteManyMode::CallerTransaction {
+            self.start_owned_execute_many_transaction(deadline, chunk_start_index)
+                .await?;
+        }
+
+        let mut cancellation_guard = TransactionCancellationGuard::new(Arc::clone(&self.session));
+        let mut session = self.session.lock().await;
+        if session.state != TransactionState::ExecuteManyProducing {
+            return Err(ReservedExecuteManyFailure::new(
+                PyRuntimeError::new_err(
+                    "execute_many producer no longer owns the transaction reservation",
+                ),
+                chunk_start_index,
+                wire_progress.any_statement_sent(),
+            ));
+        }
+        if session.conn.is_none() {
+            return Err(ReservedExecuteManyFailure::new(
+                PyRuntimeError::new_err("Connection is not established"),
+                chunk_start_index,
+                wire_progress.any_statement_sent(),
+            ));
+        }
+
+        if let Some(connection) = session.conn.as_mut() {
+            connection.begin_operation();
+        }
+        let epoch = session.enter_in_flight(TransactionState::Executing);
+        cancellation_guard.arm(epoch);
+        let force_receiver = session.force_receiver();
+        let operation = match session.conn.as_mut() {
+            Some(connection) => {
+                run_with_optional_force(
+                    force_receiver,
+                    run_until(
+                        deadline,
+                        catch_driver_panic(execute_many_chunk_on_connection(
+                            connection,
+                            sql,
+                            input,
+                            wire_progress,
+                        )),
+                    ),
+                )
+                .await
+            }
+            None => Ok(Ok(Ok(Err(ExecuteManyChunkFailure {
+                error: PyRuntimeError::new_err("Connection is not established"),
+                parameter_set_index: chunk_start_index,
+                any_statement_sent: wire_progress.any_statement_sent(),
+                protocol_reusable: false,
+            })))),
+        };
+
+        let execution = match operation {
+            Err(ForceRequested) => {
+                let parameter_set_index = wire_progress
+                    .active_parameter_set_index()
+                    .unwrap_or(chunk_start_index);
+                let failure = session
+                    .forced_failure(OperationName::ExecuteMany, true)
+                    .ok_or_else(|| {
+                        ReservedExecuteManyFailure::new(
+                            PyRuntimeError::new_err(
+                                "forced execute_many chunk lost its lifecycle permit",
+                            ),
+                            parameter_set_index,
+                            true,
+                        )
+                    })?;
+                session.retire_connection(Some(failure));
+                session.transition_to(TransactionState::Failed);
+                Err(ReservedExecuteManyFailure::new(
+                    failure.into_pyerr(),
+                    parameter_set_index,
+                    true,
+                ))
+            }
+            Ok(Err(elapsed)) => {
+                let parameter_set_index = wire_progress
+                    .active_parameter_set_index()
+                    .unwrap_or(chunk_start_index);
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+                Err(ReservedExecuteManyFailure::new(
+                    transaction_timeout_error(elapsed, OperationName::ExecuteMany, true),
+                    parameter_set_index,
+                    true,
+                ))
+            }
+            Ok(Ok(Err(driver_panic))) => {
+                let parameter_set_index = wire_progress
+                    .active_parameter_set_index()
+                    .unwrap_or(chunk_start_index);
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+                Err(ReservedExecuteManyFailure::new(
+                    driver_panic,
+                    parameter_set_index,
+                    true,
+                ))
+            }
+            Ok(Ok(Ok(Ok(affected)))) => {
+                if let Some(connection) = session.conn.as_mut() {
+                    let synchronized: PyResult<()> = Ok(());
+                    connection.finish_operation(&synchronized);
+                }
+                session.transition_to(TransactionState::ExecuteManyProducing);
+                Ok(affected)
+            }
+            Ok(Ok(Ok(Err(failure)))) if failure.protocol_reusable => {
+                if let Some(connection) = session.conn.as_mut() {
+                    let synchronized: PyResult<()> = Ok(());
+                    connection.finish_operation(&synchronized);
+                }
+                session.transition_to(TransactionState::ExecuteManyProducing);
+                Err(ReservedExecuteManyFailure::new(
+                    failure.error,
+                    failure.parameter_set_index,
+                    failure.any_statement_sent,
+                ))
+            }
+            Ok(Ok(Ok(Err(failure)))) => {
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+                Err(ReservedExecuteManyFailure::new(
+                    failure.error,
+                    failure.parameter_set_index,
+                    failure.any_statement_sent,
+                ))
+            }
+        };
+        cancellation_guard.disarm();
+        drop(session);
+
+        let affected = execution?;
+        if mode == ExecuteManyMode::ConnectionChunked {
+            self.commit_owned_execute_many_transaction(
+                deadline,
+                chunk_start_index,
+                false,
+                false,
+                wire_progress,
+            )
+            .await?;
+            wire_progress.confirm_committed_parameter_sets(chunk_start_index + input.len());
+            wire_progress.clear_active();
+            return Ok(ReservedExecuteManySuccess {
+                affected,
+                commit_acknowledged: true,
+            });
+        }
+
+        wire_progress.clear_active();
+        Ok(ReservedExecuteManySuccess {
+            affected,
+            commit_acknowledged: false,
+        })
+    }
+
+    async fn commit_owned_execute_many_transaction(
+        &self,
+        deadline: Option<Deadline>,
+        unconfirmed_start_index: usize,
+        release_after_commit: bool,
+        retire_after_commit: bool,
+        wire_progress: &ExecuteManyWireProgress,
+    ) -> Result<(), ReservedExecuteManyFailure> {
+        let mut cancellation_guard = TransactionCancellationGuard::new(Arc::clone(&self.session));
+        let mut session = self.session.lock().await;
+        if session.state != TransactionState::ExecuteManyProducing
+            || !session.owned_execute_many_transaction_started
+        {
+            return Err(ReservedExecuteManyFailure::new(
+                PyRuntimeError::new_err("execute_many transaction is not ready for commit"),
+                unconfirmed_start_index,
+                wire_progress.any_statement_sent(),
+            ));
+        }
+
+        wire_progress.begin_commit(unconfirmed_start_index);
+        if let Some(connection) = session.conn.as_mut() {
+            connection.begin_operation();
+        }
+        let epoch = session.enter_in_flight(TransactionState::Committing);
+        cancellation_guard.arm(epoch);
+        let force_receiver = session.force_receiver();
+        let operation = run_with_optional_force(
+            force_receiver,
+            run_until(
+                deadline,
+                catch_driver_panic(async {
+                    let connection = session
+                        .conn
+                        .as_mut()
+                        .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
+                    connection
+                        .simple_query("COMMIT TRANSACTION")
+                        .await
+                        .map_err(|error| {
+                            create_sql_error(error, "Failed to commit execute_many transaction")
+                        })?
+                        .into_results()
+                        .await
+                        .map_err(|error| {
+                            create_sql_error(error, "Failed to commit execute_many transaction")
+                        })?;
+                    Ok::<(), PyErr>(())
+                }),
+            ),
+        )
+        .await;
+
+        let result = match operation {
+            Err(ForceRequested) => {
+                wire_progress.mark_commit_unknown();
+                let failure = session
+                    .forced_failure(OperationName::ExecuteMany, true)
+                    .ok_or_else(|| {
+                        ReservedExecuteManyFailure::new(
+                            PyRuntimeError::new_err(
+                                "forced execute_many COMMIT lost its lifecycle permit",
+                            ),
+                            unconfirmed_start_index,
+                            true,
+                        )
+                    })?;
+                session.retire_connection(Some(failure));
+                session.transition_to(TransactionState::Failed);
+                let error =
+                    create_commit_outcome_unknown(failure.into_pyerr()).map_err(|error| {
+                        ReservedExecuteManyFailure::new(error, unconfirmed_start_index, true)
+                    })?;
+                Err(ReservedExecuteManyFailure::new(
+                    error,
+                    unconfirmed_start_index,
+                    true,
+                ))
+            }
+            Ok(Err(elapsed)) => {
+                wire_progress.mark_commit_unknown();
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+                let timeout = transaction_timeout_error(elapsed, OperationName::ExecuteMany, true);
+                let error = create_commit_outcome_unknown(timeout).map_err(|error| {
+                    ReservedExecuteManyFailure::new(error, unconfirmed_start_index, true)
+                })?;
+                Err(ReservedExecuteManyFailure::new(
+                    error,
+                    unconfirmed_start_index,
+                    true,
+                ))
+            }
+            Ok(Ok(Err(driver_panic))) => {
+                wire_progress.mark_commit_unknown();
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+                let error = create_commit_outcome_unknown(driver_panic).map_err(|error| {
+                    ReservedExecuteManyFailure::new(error, unconfirmed_start_index, true)
+                })?;
+                Err(ReservedExecuteManyFailure::new(
+                    error,
+                    unconfirmed_start_index,
+                    true,
+                ))
+            }
+            Ok(Ok(Ok(Ok(())))) => {
+                wire_progress.mark_commit_known();
+                if let Some(connection) = session.conn.as_mut() {
+                    let synchronized: PyResult<()> = Ok(());
+                    connection.finish_operation(&synchronized);
+                }
+                session.owned_execute_many_transaction_started = false;
+                if release_after_commit {
+                    session.transition_to(TransactionState::Committed);
+                    if retire_after_commit {
+                        session.retire_connection(None);
+                    } else {
+                        session.release_pooled_lease();
+                    }
+                } else {
+                    session.transition_to(TransactionState::ExecuteManyProducing);
+                }
+                Ok(())
+            }
+            Ok(Ok(Ok(Err(error)))) if is_deterministic_commit_rejection(&error) => {
+                wire_progress.mark_commit_known();
+                if let Some(connection) = session.conn.as_mut() {
+                    let synchronized: PyResult<()> = Ok(());
+                    connection.finish_operation(&synchronized);
+                }
+                session.transition_to(TransactionState::ExecuteManyProducing);
+                Err(ReservedExecuteManyFailure::new(
+                    error,
+                    unconfirmed_start_index,
+                    true,
+                ))
+            }
+            Ok(Ok(Ok(Err(error)))) => {
+                wire_progress.mark_commit_unknown();
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+                let error = create_commit_outcome_unknown(error).map_err(|error| {
+                    ReservedExecuteManyFailure::new(error, unconfirmed_start_index, true)
+                })?;
+                Err(ReservedExecuteManyFailure::new(
+                    error,
+                    unconfirmed_start_index,
+                    true,
+                ))
+            }
+        };
+        cancellation_guard.disarm();
+        result
+    }
+
+    pub(crate) async fn finish_reserved_execute_many(
+        &self,
+        mode: ExecuteManyMode,
+        deadline: Option<Deadline>,
+        wire_progress: &ExecuteManyWireProgress,
+        retire_after_operation: bool,
+    ) -> PyResult<()> {
+        if mode == ExecuteManyMode::CallerTransaction {
+            let mut session = self.session.lock().await;
+            session.confirm_execute_many_producer()?;
+            if retire_after_operation {
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+                return Ok(());
+            }
+            return session.finish_reserved_execute_many();
+        }
+
+        {
+            let mut session = self.session.lock().await;
+            if session.state != TransactionState::ExecuteManyProducing {
+                return Err(PyRuntimeError::new_err(
+                    "execute_many producer no longer owns the transaction reservation",
+                ));
+            }
+            if !session.owned_execute_many_transaction_started {
+                if retire_after_operation {
+                    session.retire_connection(None);
+                } else {
+                    session.release_pooled_lease();
+                }
+                session.transition_to(TransactionState::Idle);
+                return Ok(());
+            }
+            if mode == ExecuteManyMode::ConnectionChunked {
+                return Err(PyRuntimeError::new_err(
+                    "execute_many partial mode retained an unexpected open chunk transaction",
+                ));
+            }
+        }
+
+        self.commit_owned_execute_many_transaction(
+            deadline,
+            0,
+            true,
+            retire_after_operation,
+            wire_progress,
+        )
+        .await
+        .map_err(|failure| failure.error)
+    }
+
+    pub(crate) async fn abort_reserved_execute_many(
+        &self,
+        mode: ExecuteManyMode,
+        any_statement_sent: bool,
+        retire_after_operation: bool,
+    ) -> PyResult<()> {
+        let mut cancellation_guard = TransactionCancellationGuard::new(Arc::clone(&self.session));
+        let mut session = self.session.lock().await;
+        if session.state.is_in_flight() {
+            session.retire_connection(None);
+            session.transition_to(TransactionState::Failed);
+            return Ok(());
+        }
+        if session.state == TransactionState::Failed {
+            return Ok(());
+        }
+
+        if mode == ExecuteManyMode::CallerTransaction {
+            if retire_after_operation && any_statement_sent {
+                session.confirm_execute_many_producer()?;
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+                return Ok(());
+            }
+            return session.abort_reserved_execute_many(any_statement_sent);
+        }
+        if session.state != TransactionState::ExecuteManyProducing {
+            return Err(PyRuntimeError::new_err(
+                "execute_many producer no longer owns the transaction reservation",
+            ));
+        }
+        if !session.owned_execute_many_transaction_started {
+            if retire_after_operation {
+                session.retire_connection(None);
+            } else {
+                session.release_pooled_lease();
+            }
+            session.transition_to(TransactionState::Idle);
+            return Ok(());
+        }
+
+        if let Some(connection) = session.conn.as_mut() {
+            connection.begin_operation();
+        }
+        let epoch = session.enter_in_flight(TransactionState::RollingBack);
+        cancellation_guard.arm(epoch);
+        let force_receiver = session.force_receiver();
+        let rollback_deadline =
+            deadline_from(TimeoutPhase::Rollback, self.timeout_config.rollback_timeout);
+        let operation = run_with_optional_force(
+            force_receiver,
+            run_until(
+                rollback_deadline,
+                catch_driver_panic(async {
+                    let connection = session
+                        .conn
+                        .as_mut()
+                        .ok_or_else(|| PyRuntimeError::new_err("Connection is not established"))?;
+                    connection
+                        .simple_query("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION")
+                        .await
+                        .map_err(|error| {
+                            create_sql_error(error, "Failed to roll back execute_many transaction")
+                        })?
+                        .into_results()
+                        .await
+                        .map_err(|error| {
+                            create_sql_error(error, "Failed to roll back execute_many transaction")
+                        })?;
+                    Ok::<(), PyErr>(())
+                }),
+            ),
+        )
+        .await;
+
+        let result = match operation {
+            Err(ForceRequested) => {
+                let failure = session
+                    .forced_failure(OperationName::ExecuteMany, false)
+                    .ok_or_else(|| {
+                        PyRuntimeError::new_err(
+                            "forced execute_many rollback lost its lifecycle permit",
+                        )
+                    })?;
+                session.retire_connection(Some(failure));
+                session.transition_to(TransactionState::Failed);
+                Err(failure.into_pyerr())
+            }
+            Ok(Err(elapsed)) => {
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+                Err(transaction_timeout_error(
+                    elapsed,
+                    OperationName::ExecuteMany,
+                    false,
+                ))
+            }
+            Ok(Ok(Err(driver_panic))) => {
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+                Err(driver_panic)
+            }
+            Ok(Ok(Ok(Ok(())))) => {
+                if let Some(connection) = session.conn.as_mut() {
+                    let synchronized: PyResult<()> = Ok(());
+                    connection.finish_operation(&synchronized);
+                }
+                session.transition_to(TransactionState::RolledBack);
+                if retire_after_operation {
+                    session.retire_connection(None);
+                } else {
+                    session.release_pooled_lease();
+                }
+                Ok(())
+            }
+            Ok(Ok(Ok(Err(error)))) => {
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+                Err(error)
+            }
+        };
+        cancellation_guard.disarm();
+        result
+    }
+
+    pub(crate) async fn abandon_reserved_execute_many(
+        &self,
+        mode: ExecuteManyMode,
+        any_statement_sent: bool,
+        retire_after_operation: bool,
+    ) {
+        let mut session = self.session.lock().await;
+        if session.state == TransactionState::Failed {
+            return;
+        }
+        if session.state.is_in_flight() {
+            session.retire_connection(None);
+            session.transition_to(TransactionState::Failed);
+            return;
+        }
+        if session.state != TransactionState::ExecuteManyProducing {
+            return;
+        }
+
+        match mode {
+            ExecuteManyMode::CallerTransaction if !any_statement_sent => {
+                let _ = session.finish_reserved_execute_many();
+            }
+            ExecuteManyMode::CallerTransaction if retire_after_operation => {
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+            }
+            ExecuteManyMode::CallerTransaction => {
+                let _ = session.abort_reserved_execute_many(true);
+            }
+            ExecuteManyMode::ConnectionAtomic | ExecuteManyMode::ConnectionChunked
+                if session.conn.is_none() && !session.owned_execute_many_transaction_started =>
+            {
+                session.lifecycle_permit.take();
+                session.transition_to(TransactionState::Idle);
+            }
+            ExecuteManyMode::ConnectionAtomic | ExecuteManyMode::ConnectionChunked => {
+                session.retire_connection(None);
+                session.transition_to(TransactionState::Failed);
+            }
         }
     }
 
@@ -2386,6 +3368,11 @@ impl Transaction {
                     "Transaction is reserved by a native bulk producer",
                 ));
             }
+            TransactionState::ExecuteManyProducing => {
+                return Err(PyRuntimeError::new_err(
+                    "Transaction is reserved by an execute_many producer",
+                ));
+            }
             TransactionState::RollbackOnly => {
                 return Err(PyRuntimeError::new_err(
                     "Transaction is rollback-only; rollback required before reuse",
@@ -2988,6 +3975,65 @@ mod cancellation_retirement_tests {
         session
             .abort_reserved_bulk(true)
             .expect("post-wire abort must preserve caller settlement ownership");
+        assert_eq!(session.state, TransactionState::RollbackOnly);
+    }
+
+    #[test]
+    fn execute_many_reservation_is_distinct_exclusive_and_empty_neutral() {
+        Python::initialize();
+        let mut session = TransactionSession {
+            state: TransactionState::Active,
+            ..TransactionSession::default()
+        };
+
+        session
+            .reserve_execute_many_producer()
+            .expect("an active transaction must reserve one execute_many producer");
+        assert_eq!(session.state, TransactionState::ExecuteManyProducing);
+        assert!(
+            session.reserve_bulk_producer().is_err(),
+            "native bulk must not steal an execute_many reservation",
+        );
+        assert!(
+            session.reserve_execute_many_producer().is_err(),
+            "a second execute_many producer must be rejected",
+        );
+        let data_error = session
+            .state
+            .ensure_connection_usable()
+            .expect_err("ordinary data operations must not steal the reservation");
+        assert!(data_error.to_string().contains("execute_many producer"));
+        for command in [
+            TransactionCommand::Begin,
+            TransactionCommand::Commit,
+            TransactionCommand::Rollback,
+        ] {
+            let command_error = command
+                .validate(session.state)
+                .expect_err("ordinary settlement must not steal the reservation");
+            assert!(command_error.to_string().contains("execute_many producer"));
+        }
+
+        session
+            .finish_reserved_execute_many()
+            .expect("empty execute_many must restore the active transaction");
+        assert_eq!(session.state, TransactionState::Active);
+    }
+
+    #[test]
+    fn execute_many_abort_distinguishes_pre_wire_and_post_wire_state() {
+        Python::initialize();
+        let mut session = TransactionSession {
+            state: TransactionState::Active,
+            ..TransactionSession::default()
+        };
+
+        session.reserve_execute_many_producer().unwrap();
+        session.abort_reserved_execute_many(false).unwrap();
+        assert_eq!(session.state, TransactionState::Active);
+
+        session.reserve_execute_many_producer().unwrap();
+        session.abort_reserved_execute_many(true).unwrap();
         assert_eq!(session.state, TransactionState::RollbackOnly);
     }
 
