@@ -45,6 +45,22 @@ Changes currently integrated in fork history through
 
 No release, package-version change, or artifact publication has occurred.
 
+### Operation metrics schema 2
+
+- Added the stable `execute_many` metric slot between `execute` and
+  `query_batch`, advancing the current snapshot/stub contract from schema
+  version 1 to 2 with exactly 14 ordered operation keys.
+- Added a Rust invariant that every active operation maps to its exact array
+  index while the reserved non-I/O `transaction` name remains unmetered.
+- Updated current public stubs and README documentation without rewriting
+  historical schema-1 evidence; no execute-many operation is emitted until
+  its state machine is implemented.
+- Rebuilt the editable extension and verified all 98 Rust tests, warning-free
+  all-target Clippy, all 8 offline Python schema contracts and all 11 real
+  SQL-auth operation-metrics cases.
+- This schema migration does not change the displayed `0.7.7` version or
+  release state.
+
 ### Shared bounded producer coordinator
 
 - Extracted native-bulk's synchronous/asynchronous protocol acquisition,

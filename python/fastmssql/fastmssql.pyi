@@ -168,6 +168,7 @@ class _OperationStatsByName(TypedDict):
     query: _OperationStatsEntry
     simple_query: _OperationStatsEntry
     execute: _OperationStatsEntry
+    execute_many: _OperationStatsEntry
     query_batch: _OperationStatsEntry
     execute_batch: _OperationStatsEntry
     bulk_insert: _OperationStatsEntry
@@ -178,7 +179,7 @@ class _OperationStatsByName(TypedDict):
     disconnect: _OperationStatsEntry
 
 class _OperationStatsSnapshot(TypedDict):
-    schema_version: Literal[1]
+    schema_version: Literal[2]
     enabled: bool
     bucket_bounds_seconds: List[float]
     operations: _OperationStatsByName

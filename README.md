@@ -251,15 +251,19 @@ print(query["succeeded"], query["timed_out"])
 
 Metrics are disabled by default. A disabled connection allocates no metrics
 registry and its normal operations perform no metrics clock read or atomic
-update. `operation_stats()` remains available and returns the fixed schema
-with `enabled=False` and zero values.
+update. `operation_stats()` remains available and returns fixed schema
+version 2 with `enabled=False` and zero values.
 
-The registry has exactly 13 operation series:
+The registry has exactly 14 operation series:
 
 ```text
-connect, ping, query, simple_query, execute, query_batch, execute_batch,
-bulk_insert, begin, commit, rollback, close, disconnect
+connect, ping, query, simple_query, execute, execute_many, query_batch,
+execute_batch, bulk_insert, begin, commit, rollback, close, disconnect
 ```
+
+Schema version 2 adds the stable `execute_many` series. It remains zero until
+an `execute_many()` call starts; internal statements and settlement do not
+inflate the public `execute`, `begin`, `commit` or `rollback` series.
 
 Each completed call increments exactly one mutually exclusive outcome.
 Classification priority is `succeeded`, then `outcome_unknown` for

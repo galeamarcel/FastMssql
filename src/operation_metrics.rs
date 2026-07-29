@@ -8,12 +8,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
 
-pub(crate) const METRIC_OPERATIONS: [OperationName; 13] = [
+pub(crate) const METRIC_OPERATIONS: [OperationName; 14] = [
     OperationName::Connect,
     OperationName::Ping,
     OperationName::Query,
     OperationName::SimpleQuery,
     OperationName::Execute,
+    OperationName::ExecuteMany,
     OperationName::QueryBatch,
     OperationName::ExecuteBatch,
     OperationName::BulkInsert,
@@ -31,14 +32,15 @@ pub(crate) const fn metric_index(operation: OperationName) -> Option<usize> {
         OperationName::Query => Some(2),
         OperationName::SimpleQuery => Some(3),
         OperationName::Execute => Some(4),
-        OperationName::QueryBatch => Some(5),
-        OperationName::ExecuteBatch => Some(6),
-        OperationName::BulkInsert => Some(7),
-        OperationName::Begin => Some(8),
-        OperationName::Commit => Some(9),
-        OperationName::Rollback => Some(10),
-        OperationName::Close => Some(11),
-        OperationName::Disconnect => Some(12),
+        OperationName::ExecuteMany => Some(5),
+        OperationName::QueryBatch => Some(6),
+        OperationName::ExecuteBatch => Some(7),
+        OperationName::BulkInsert => Some(8),
+        OperationName::Begin => Some(9),
+        OperationName::Commit => Some(10),
+        OperationName::Rollback => Some(11),
+        OperationName::Close => Some(12),
+        OperationName::Disconnect => Some(13),
         OperationName::Transaction => None,
     }
 }
@@ -240,7 +242,7 @@ struct OperationMetricSnapshot {
 
 pub(crate) struct OperationMetricsSnapshot {
     enabled: bool,
-    operations: [OperationMetricSnapshot; 13],
+    operations: [OperationMetricSnapshot; 14],
 }
 
 impl OperationMetricsSnapshot {
@@ -263,7 +265,7 @@ impl OperationMetricsSnapshot {
 
     pub(crate) fn to_python(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let root = PyDict::new(py);
-        root.set_item("schema_version", 1)?;
+        root.set_item("schema_version", 2)?;
         root.set_item("enabled", self.enabled)?;
         root.set_item(
             "bucket_bounds_seconds",
@@ -309,7 +311,7 @@ impl OperationMetricsSnapshot {
 }
 
 pub(crate) struct OperationMetricsRegistry {
-    operations: [OperationMetric; 13],
+    operations: [OperationMetric; 14],
 }
 
 impl OperationMetricsRegistry {
@@ -493,6 +495,7 @@ mod tests {
                 "query",
                 "simple_query",
                 "execute",
+                "execute_many",
                 "query_batch",
                 "execute_batch",
                 "bulk_insert",
@@ -503,6 +506,9 @@ mod tests {
                 "disconnect",
             ]
         );
+        for (index, operation) in METRIC_OPERATIONS.iter().copied().enumerate() {
+            assert_eq!(metric_index(operation), Some(index));
+        }
         assert_eq!(metric_index(OperationName::Transaction), None);
     }
 
