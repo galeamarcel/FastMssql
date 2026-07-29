@@ -45,6 +45,43 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Execute-many live audit status
+
+- Marked only the sixth of seven batch/bulk slices,
+  `Connection.execute_many()` and `Transaction.execute_many()`, as
+  `VERIFIED_FORK` at evidence commit
+  `9c02379028af7a94a0814d06aa86c16aa4b4d204`, whose verified runtime parent
+  is `b270205128fc6bd3c951a3e822b600c9ad049ee9`.
+- Added `docs/EXECUTE_MANY_VALIDATION_REPORT.md` and updated the live
+  production-readiness audit with exact design/plan/RED/feature ancestry,
+  the intended absent-API RED, atomic/partial/caller-Transaction behavior,
+  schema-2 metrics, timeout/cancellation/security retirement and remaining
+  risks.
+- Recorded the fresh exact-runtime gate: 407/407 canonical IDs, 424 strict,
+  16 true-async, 33 framework, 6 resilience, 12 load and 1,183 original
+  local regression tests; FastMssql Rust passed 116/116 and vendored
+  Tiberius 168/168 plus its 2/2, 8/8 and 8/8 real-SQL integration lanes.
+- Recorded all seven clean-source stress profiles from 1,000 through 99,999
+  parameter sets, including the 10,000-set `atomic=False` profile. Every
+  profile had exact affected/persisted counts, at most one session and one
+  chunk, zero error/timeout/violation, successful smoke and zero teardown
+  sessions.
+- Recorded the isolated macOS arm64 ABI3 wheel SHA-256
+  `233008ea32a57a3689822edcd0df99cd9bc9fc4207484373a01812a327492097`,
+  imported without source-tree paths, with 40/40 offline, 11/11 `EMANY` and
+  3/3 representative real-SQL tests plus `pip check`.
+- Recorded the exact technical graph at 176 files, 3,914 nodes and 48,297
+  edges, reconciled dynamic Python/PyO3 coverage manually, and preserved the
+  public GitHub truth: zero workflow runs and zero check-runs for `9c02379`,
+  therefore hosted status `NOT RUN`.
+- Added `execute_many` to the future upstream candidate intake as a
+  separately reviewable change. It still requires a fresh upstream rebase,
+  reproduction, exact hosted gate and explicit approval before any
+  original-repository PR.
+- Kept `query_many(concurrency=...)` visibly open as the seventh batch/bulk
+  slice. This status-only branch changes no runtime behavior, package
+  metadata, displayed `0.7.7` version, release state or published artifact.
+
 ### Execute-many exact-candidate validation evidence
 
 - Integrated the deterministic compatibility-bulk timeout correction into
