@@ -304,7 +304,7 @@ def test_full_runner_recreates_sqlserver_before_provision(
     ]
 
 
-def test_report_generator_preserves_not_run_and_redacts(
+def test_report_generator_preserves_not_run_zero_values_and_redacts(
     tmp_path: Path,
 ) -> None:
     generator = ROOT / "scripts/sql_auth/generate_report.py"
@@ -441,6 +441,21 @@ def test_report_generator_preserves_not_run_and_redacts(
         ),
         encoding="utf-8",
     )
+    (artifact_dir / "named-instance-stress.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "source_sha": source_sha,
+                "status": "passed",
+                "profile": {
+                    "operations": 1_000,
+                    "sessions_after_disconnect": 0,
+                    "transactions_after_disconnect": 0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     matrix_output = tmp_path / "matrix.md"
     report_output = tmp_path / "report.md"
     environment = os.environ.copy()
@@ -503,6 +518,8 @@ def test_report_generator_preserves_not_run_and_redacts(
     assert "Query-many stress metrics" in report
     assert "| 1 | passed | 1000 | sync | yes | 10 | 10 | 10 | 10 | 10 |" in report
     assert "Named-instance stress metrics" in report
+    assert "- Sessions after disconnect: `0`" in report
+    assert "- Transactions after disconnect: `0`" in report
 
 
 def test_stale_result_stream_evidence_cannot_be_reported_as_pass(

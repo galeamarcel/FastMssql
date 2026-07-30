@@ -56,7 +56,7 @@ def redact(value: str, secrets: tuple[str, ...]) -> str:
 
 
 def markdown_cell(value: object, secrets: tuple[str, ...]) -> str:
-    text = redact(str(value or ""), secrets)
+    text = redact("" if value is None else str(value), secrets)
     return text.replace("|", "\\|").replace("\r", " ").replace("\n", "<br>")
 
 

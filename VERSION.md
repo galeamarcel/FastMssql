@@ -386,6 +386,37 @@ No release, package-version change, or artifact publication has occurred.
   `0.7.7` version, release, artifact publication or original-repository
   state.
 
+### Named-instance generated-report zero-value RED
+
+- Created `test/named-instance-report-zero-values` directly from exact
+  named-instance candidate
+  `99c4a7c95f14557697eda1920ece718e8a63958f`.
+- Added an end-to-end generator regression requiring the canonical Markdown
+  report to preserve zero residual sessions and transactions from a valid
+  named-instance stress artifact. These zeroes are evidence of clean teardown,
+  not missing values.
+- The focused test fails exactly on both new assertions: the artifact contains
+  integer zero for both counters, while `markdown_cell()` currently renders
+  every falsy value as an empty string through `value or ""`.
+- This RED changes one test and `VERSION.md` only. It changes no generator,
+  runtime, dependency, package metadata, displayed `0.7.7` version, release,
+  artifact publication or original-repository state.
+
+### Named-instance generated-report zero-value fix
+
+- Created `fix/named-instance-report-zero-values` directly from RED commit
+  `a6409f603e08c62045bf0309762a7dce3e33e55e`; the executable report
+  regression remains its mandatory ancestor.
+- Changed the shared Markdown serializer to treat only `None` as absent.
+  Valid falsy evidence such as integer `0` and boolean `False` is now
+  preserved, while redaction and Markdown escaping remain unchanged.
+- The unchanged focused RED now passes `1/1`; the complete SQL-auth matrix
+  contract file passes `32/32`, Ruff check passes for both changed Python
+  files, compilation succeeds and `git diff --check` is clean.
+- The fix is limited to generated evidence serialization. It changes no
+  FastMssql/Tiberius runtime, dependency, package metadata, displayed `0.7.7`
+  version, release, artifact publication or original-repository state.
+
 ### Seven-slice batch/bulk cumulative verification and live-audit closure
 
 - Closed the seventh batch/bulk slice, bounded-concurrency `query_many()`,
