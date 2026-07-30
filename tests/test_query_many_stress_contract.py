@@ -340,6 +340,21 @@ def test_query_many_stress_artifact_is_atomic_and_privacy_safe(
     assert "str(error)" not in source
 
 
+def test_cumulative_vendor_build_artifacts_preserve_clean_source_evidence() -> None:
+    for relative_path in (
+        "vendor/tiberius/Cargo.lock",
+        "vendor/tiberius/target/.query-many-cleanliness-probe",
+    ):
+        completed = subprocess.run(
+            ["git", "check-ignore", "--quiet", "--", relative_path],
+            cwd=ROOT,
+            check=False,
+        )
+        assert completed.returncode == 0, (
+            f"cumulative Tiberius build artifact is not ignored: {relative_path}"
+        )
+
+
 @pytest.mark.asyncio
 async def test_query_many_stress_cleanup_reports_monitor_failures() -> None:
     namespace = _namespace()
