@@ -114,6 +114,10 @@ jobs:
             .artifacts/pool-contract-wheel/*.whl
           echo "POOL_CONTRACT_PYTHON=${contract_python}" >> "${GITHUB_ENV}"
 
+      - name: Verify installed wheel dependency integrity
+        shell: bash
+        run: uv pip check --python "${POOL_CONTRACT_PYTHON}"
+
       - name: Verify installed Python configuration contracts
         shell: bash
         run: |

@@ -365,6 +365,27 @@ No release, package-version change, or artifact publication has occurred.
   runtime, dependency, package metadata, displayed `0.7.7` version, release,
   artifact publication or original-repository state.
 
+### Named-instance hosted installed-wheel `pip check` fix
+
+- Created `fix/named-instance-hosted-pip-check` directly from RED commit
+  `185cdd54efe2fa1bbfa624988b7f705c25f5fd37`; the missing-check contract
+  remains its mandatory ancestor.
+- Added one cross-platform workflow step after wheel/test-dependency
+  installation and before contract execution:
+  `uv pip check --python "${POOL_CONTRACT_PYTHON}"`.
+- The command targets the exact matrix interpreter selected independently on
+  Linux, macOS and Windows; it does not inspect the runner's unrelated
+  ambient Python environment and requires no network.
+- The unchanged named-instance contract now passes `10/10`. The exact local
+  command checked all 11 packages in the isolated CPython 3.13 wheel
+  environment and reported that every installed package is compatible; the
+  workflow YAML and `git diff --check` are also clean before history-only
+  integration into `verify/named-instance`.
+- This harness-only change modifies one workflow step and `VERSION.md`. It
+  changes no runtime, dependency selection, package metadata, displayed
+  `0.7.7` version, release, artifact publication or original-repository
+  state.
+
 ### Seven-slice batch/bulk cumulative verification and live-audit closure
 
 - Closed the seventh batch/bulk slice, bounded-concurrency `query_many()`,
