@@ -48,6 +48,28 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Named-instance discovery design
+
+- Approved the enterprise contract for `instance_name` without an explicit
+  port: bounded SQL Server Resolution Protocol discovery over UDP `1434`,
+  followed by true-async TCP/TLS/TDS login to the returned port.
+- Preserved ordinary direct host/port behavior and defined an explicit port as
+  authoritative, including `host\instance,port`, so no SQL Browser request is
+  made when the caller already supplied the TCP target.
+- Decomposed the work into vendored-Tiberius protocol RED/fix and FastMssql
+  integration RED/fix branches. The Tiberius slice requires a NUL-terminated
+  request, total bounded response parsing, peer validation and useful error
+  preservation before FastMssql enables `sql-browser-tokio`.
+- Required deterministic SSRP plus real Docker SQL-auth, 99,999 pooled logical
+  operations, an isolated installed wheel, Linux/macOS/Windows gates and a
+  genuine hosted Windows SQL Server Express named instance through the real
+  SQL Server Browser service.
+- Context7 was attempted but unavailable because its monthly quota was
+  exhausted; the design records exact vendored-source evidence and primary
+  Tiberius/Microsoft documentation instead.
+- This is specification-only. It changes no runtime, dependency, package
+  metadata, displayed `0.7.7` version, release or artifact publication.
+
 ### Seven-slice batch/bulk cumulative verification and live-audit closure
 
 - Closed the seventh batch/bulk slice, bounded-concurrency `query_many()`,
