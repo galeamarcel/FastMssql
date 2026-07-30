@@ -3,14 +3,22 @@ from __future__ import annotations
 import ast
 import asyncio
 from dataclasses import FrozenInstanceError
+import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 import re
+import socket
+import subprocess
+import sys
+import textwrap
 import tomllib
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
+import psutil
 import pytest
 
 from production_framework import app as framework_app
@@ -110,6 +118,1167 @@ def _workflow_push_branches(source: str) -> set[str]:
     return branches
 
 
+def _load_production_framework_runner():
+    assert PYTHON_RUNNER.is_file(), (
+        "production framework runner has not been implemented"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "fastmssql_production_framework_runner",
+        PYTHON_RUNNER,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _runner_cli_arguments(tmp_path: Path) -> list[str]:
+    run_root = tmp_path / "run"
+    run_root.mkdir(exist_ok=True)
+    wheel = tmp_path / "fastmssql-0.7.7-cp311-abi3.whl"
+    wheel.write_bytes(b"test-wheel")
+    return [
+        "--candidate-sha",
+        "a" * 40,
+        "--wheel",
+        str(wheel),
+        "--wheel-sha256",
+        "b" * 64,
+        "--venv-python",
+        sys.executable,
+        "--run-root",
+        str(run_root),
+        "--output",
+        str(run_root / "production-framework-metrics.json"),
+        "--database-mode",
+        "offline",
+        "--global-connection-budget",
+        "16",
+    ]
+
+
+def test_runner_cli_uses_schema_one_and_closed_operation_bounds(
+    tmp_path: Path,
+) -> None:
+    runner = _load_production_framework_runner()
+    assert runner.SCHEMA_VERSION == 1
+    assert runner.WORKER_COUNTS == (1, 2, 4, 8)
+    assert runner.REQUIRED_OPERATIONS == 1_000
+    assert runner.LARGE_OPERATIONS == 10_000
+    assert runner.EXTENDED_OPERATIONS == 99_999
+    assert runner.MAX_OPERATIONS == 99_999
+
+    required = runner.parse_cli(_runner_cli_arguments(tmp_path))
+    assert required.operations == (1_000,)
+    assert required.allow_extended is False
+
+    for operations in (0, 100_000):
+        with pytest.raises(
+            runner.RunnerConfigurationError,
+            match="operations must be between 1 and 99,999",
+        ):
+            runner.validate_operations(operations, allow_extended=True)
+
+    with pytest.raises(
+        runner.RunnerConfigurationError,
+        match="99,999 operations require --allow-extended",
+    ):
+        runner.parse_cli(
+            [
+                *_runner_cli_arguments(tmp_path),
+                "--operations",
+                "99999",
+            ]
+        )
+
+    extended = runner.parse_cli(
+        [
+            *_runner_cli_arguments(tmp_path),
+            "--operations",
+            "1000",
+            "--operations",
+            "10000",
+            "--operations",
+            "99999",
+            "--allow-extended",
+        ]
+    )
+    assert extended.operations == (1_000, 10_000, 99_999)
+    assert extended.allow_extended is True
+
+
+@pytest.mark.parametrize("platform_name", ["linux", "darwin"])
+def test_posix_profile_expansion_is_complete_and_unique(
+    platform_name: str,
+) -> None:
+    runner = _load_production_framework_runner()
+    profiles = runner.expand_profiles(
+        platform_name,
+        database_mode="sql_auth",
+    )
+    assert len(profiles) == 28
+    assert all(profile.applicable for profile in profiles)
+    assert all(profile.status == "PENDING" for profile in profiles)
+    assert {profile.family for profile in profiles} == EXPECTED_PROFILE_FAMILIES
+    assert {profile.workers for profile in profiles} == set(EXPECTED_WORKER_COUNTS)
+    assert len({profile.id for profile in profiles}) == len(profiles)
+
+
+def test_windows_profile_expansion_is_explicit_not_applicable() -> None:
+    runner = _load_production_framework_runner()
+    profiles = runner.expand_profiles(
+        "win32",
+        database_mode="sql_auth",
+    )
+    assert len(profiles) == 28
+    applicable = [profile for profile in profiles if profile.applicable]
+    not_applicable = [profile for profile in profiles if not profile.applicable]
+    assert len(applicable) == 8
+    assert {profile.family for profile in applicable} == {
+        "fastapi-uvicorn-asyncio",
+        "flask-asgi-uvicorn-asyncio",
+    }
+    assert all(profile.status == "N/A" for profile in not_applicable)
+    assert {
+        profile.not_applicable_reason
+        for profile in not_applicable
+        if profile.loop == "uvloop"
+    } == {"uvloop is not supported on Windows"}
+    assert {
+        profile.not_applicable_reason
+        for profile in not_applicable
+        if profile.server == "gunicorn"
+    } == {"Gunicorn is not supported on Windows"}
+
+
+@pytest.mark.parametrize("platform_name", ["linux", "darwin", "win32"])
+def test_representative_profiles_are_stable_and_platform_applicable(
+    platform_name: str,
+) -> None:
+    runner = _load_production_framework_runner()
+    profiles = {
+        profile.id: profile
+        for profile in runner.expand_profiles(
+            platform_name,
+            database_mode="sql_auth",
+        )
+    }
+    selected = runner.representative_profiles(platform_name)
+    assert selected["native_asgi"] in profiles
+    assert selected["load"] == selected["native_asgi"]
+    assert profiles[selected["native_asgi"]].workers == 4
+    assert profiles[selected["native_asgi"]].applicable
+    if platform_name == "win32":
+        assert selected["flask_sync"] is None
+        assert selected["flask_gthread"] is None
+    else:
+        assert profiles[selected["flask_sync"]].applicable
+        assert profiles[selected["flask_gthread"]].applicable
+
+
+def test_profile_serialization_is_deterministic_and_key_sorted() -> None:
+    runner = _load_production_framework_runner()
+    profiles = runner.expand_profiles(
+        "linux",
+        database_mode="offline",
+    )
+    first = runner.profiles_json(profiles)
+    second = runner.profiles_json(
+        runner.expand_profiles("linux", database_mode="offline")
+    )
+    assert first == second
+    assert first.startswith('[{"app_factory":')
+    records = json.loads(first)
+    assert [record["id"] for record in records] == sorted(
+        record["id"] for record in records
+    )
+    assert all(record["database_mode"] == "offline" for record in records)
+
+
+def _profile_by_family(
+    runner,
+    family: str,
+    *,
+    workers: int = 4,
+):
+    return next(
+        profile
+        for profile in runner.expand_profiles(
+            "linux",
+            database_mode="offline",
+        )
+        if profile.family == family and profile.workers == workers
+    )
+
+
+@pytest.mark.parametrize(
+    ("family", "loop"),
+    [
+        ("fastapi-uvicorn-asyncio", "asyncio"),
+        ("fastapi-uvicorn-uvloop", "uvloop"),
+        ("flask-asgi-uvicorn-asyncio", "asyncio"),
+        ("flask-asgi-uvicorn-uvloop", "uvloop"),
+    ],
+)
+def test_uvicorn_command_is_explicit_factory_worker_and_loop(
+    tmp_path: Path,
+    family: str,
+    loop: str,
+) -> None:
+    runner = _load_production_framework_runner()
+    config = runner.parse_cli(_runner_cli_arguments(tmp_path))
+    profile = _profile_by_family(runner, family)
+    command = runner.build_server_command(
+        config,
+        profile,
+        port=48_123,
+    )
+    assert isinstance(command, list)
+    assert command[:3] == [str(config.venv_python), "-m", "uvicorn"]
+    assert command[3] == profile.app_factory
+    assert command[command.index("--host") + 1] == "127.0.0.1"
+    assert command[command.index("--port") + 1] == "48123"
+    assert command[command.index("--workers") + 1] == "4"
+    assert command[command.index("--loop") + 1] == loop
+    assert command[command.index("--timeout-graceful-shutdown") + 1] == "20"
+    assert command[command.index("--timeout-worker-healthcheck") + 1] == "5"
+    assert "--factory" in command
+    assert "--reload" not in command
+    assert "--preload" not in command
+
+
+def test_gunicorn_uvicorn_worker_command_uses_current_external_path(
+    tmp_path: Path,
+) -> None:
+    runner = _load_production_framework_runner()
+    config = runner.parse_cli(_runner_cli_arguments(tmp_path))
+    profile = _profile_by_family(
+        runner,
+        "fastapi-gunicorn-uvicorn-worker",
+    )
+    command = runner.build_server_command(
+        config,
+        profile,
+        port=48_124,
+    )
+    assert command[:3] == [str(config.venv_python), "-m", "gunicorn"]
+    assert command[command.index("-k") + 1] == ("uvicorn_worker.UvicornWorker")
+    assert "uvicorn.workers.UvicornWorker" not in command
+    assert command[command.index("--workers") + 1] == "4"
+    assert command[command.index("--bind") + 1] == "127.0.0.1:48124"
+    assert command[command.index("--config") + 1] == (
+        "python:production_framework.gunicorn_conf"
+    )
+    assert "--preload" not in command
+
+
+@pytest.mark.parametrize(
+    ("family", "worker_class", "threads"),
+    [
+        ("flask-gunicorn-sync", "sync", None),
+        ("flask-gunicorn-gthread", "gthread", "4"),
+    ],
+)
+def test_flask_gunicorn_commands_are_explicit(
+    tmp_path: Path,
+    family: str,
+    worker_class: str,
+    threads: str | None,
+) -> None:
+    runner = _load_production_framework_runner()
+    config = runner.parse_cli(_runner_cli_arguments(tmp_path))
+    profile = _profile_by_family(runner, family)
+    command = runner.build_server_command(
+        config,
+        profile,
+        port=48_125,
+    )
+    assert command[command.index("-k") + 1] == worker_class
+    if threads is None:
+        assert "--threads" not in command
+    else:
+        assert command[command.index("--threads") + 1] == threads
+    assert "--preload" not in command
+    assert profile.app_factory in command
+
+
+def test_command_builder_rejects_ports_and_not_applicable_profiles(
+    tmp_path: Path,
+) -> None:
+    runner = _load_production_framework_runner()
+    config = runner.parse_cli(_runner_cli_arguments(tmp_path))
+    profile = _profile_by_family(runner, "fastapi-uvicorn-asyncio")
+    for port in (0, 65_536):
+        with pytest.raises(
+            runner.RunnerConfigurationError,
+            match="port must be between 1 and 65,535",
+        ):
+            runner.build_server_command(config, profile, port=port)
+
+    windows_profile = next(
+        candidate
+        for candidate in runner.expand_profiles(
+            "win32",
+            database_mode="offline",
+        )
+        if not candidate.applicable
+    )
+    with pytest.raises(
+        runner.RunnerConfigurationError,
+        match="cannot build a command for a not-applicable profile",
+    ):
+        runner.build_server_command(
+            config,
+            windows_profile,
+            port=48_126,
+        )
+
+
+def _write_process_program(
+    tmp_path: Path,
+    name: str,
+    source: str,
+) -> Path:
+    program = tmp_path / name
+    program.write_text(textwrap.dedent(source), encoding="utf-8")
+    return program
+
+
+def _normal_process_program(tmp_path: Path) -> Path:
+    return _write_process_program(
+        tmp_path,
+        "normal_process.py",
+        """
+        import json
+        import os
+        from pathlib import Path
+        import signal
+        import subprocess
+        import sys
+        import time
+
+        ready = Path(sys.argv[1])
+        shutdown = Path(sys.argv[2])
+        run_id = sys.argv[3]
+        descendant = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import time; time.sleep(60)",
+            ]
+        )
+
+        def stop(_signum, _frame):
+            if descendant.poll() is None:
+                descendant.terminate()
+                try:
+                    descendant.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    descendant.kill()
+                    descendant.wait(timeout=2)
+            shutdown.write_text(
+                json.dumps({"phase": "shutdown", "pid": os.getpid()}) + "\\n",
+                encoding="utf-8",
+            )
+            raise SystemExit(0)
+
+        for signal_name in ("SIGTERM", "SIGBREAK"):
+            selected = getattr(signal, signal_name, None)
+            if selected is not None:
+                signal.signal(selected, stop)
+
+        print("fixture-stdout", flush=True)
+        print("fixture-stderr", file=sys.stderr, flush=True)
+        with ready.open("x", encoding="utf-8") as destination:
+            destination.write(
+                json.dumps(
+                    {
+                        "phase": "ready",
+                        "pid": os.getpid(),
+                        "run_id": run_id,
+                    }
+                )
+                + "\\n"
+            )
+        while True:
+            time.sleep(0.05)
+        """,
+    )
+
+
+def _stubborn_process_program(tmp_path: Path) -> Path:
+    return _write_process_program(
+        tmp_path,
+        "stubborn_process.py",
+        """
+        import os
+        from pathlib import Path
+        import signal
+        import subprocess
+        import sys
+        import time
+
+        for signal_name in ("SIGTERM", "SIGBREAK"):
+            selected = getattr(signal, signal_name, None)
+            if selected is not None:
+                signal.signal(selected, signal.SIG_IGN)
+        descendant = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import signal,time;"
+                    "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+                    "time.sleep(60)"
+                ),
+            ]
+        )
+        Path(sys.argv[1]).write_text(
+            f"{os.getpid()}:{descendant.pid}\\n",
+            encoding="utf-8",
+        )
+        while True:
+            time.sleep(0.05)
+        """,
+    )
+
+
+def _listener_process_program(tmp_path: Path) -> Path:
+    return _write_process_program(
+        tmp_path,
+        "listener_process.py",
+        """
+        import signal
+        import socket
+        import sys
+        import time
+
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            listener.bind(("127.0.0.1", int(sys.argv[1])))
+        except OSError as error:
+            print(error, file=sys.stderr, flush=True)
+            raise SystemExit(98)
+        listener.listen()
+        with open(sys.argv[2], "x", encoding="utf-8") as ready:
+            ready.write("ready\\n")
+
+        def stop(_signum, _frame):
+            listener.close()
+            raise SystemExit(0)
+
+        for signal_name in ("SIGTERM", "SIGBREAK"):
+            selected = getattr(signal, signal_name, None)
+            if selected is not None:
+                signal.signal(selected, stop)
+        print("listener-ready", flush=True)
+        while True:
+            time.sleep(0.05)
+        """,
+    )
+
+
+def _collision_with_stubborn_descendant_program(tmp_path: Path) -> Path:
+    return _write_process_program(
+        tmp_path,
+        "collision_with_stubborn_descendant.py",
+        """
+        import os
+        from pathlib import Path
+        import signal
+        import socket
+        import subprocess
+        import sys
+        import time
+
+        descendant = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import signal,time;"
+                    "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+                    "time.sleep(60)"
+                ),
+            ]
+        )
+        Path(sys.argv[2], f"collision-{os.getpid()}-{descendant.pid}.ready").write_text(
+            "ready\\n",
+            encoding="utf-8",
+        )
+        time.sleep(0.25)
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            listener.bind(("127.0.0.1", int(sys.argv[1])))
+        except OSError as error:
+            print(error, file=sys.stderr, flush=True)
+            raise SystemExit(98)
+        raise SystemExit("fixture expected an occupied port")
+        """,
+    )
+
+
+def _supervisor_policy(runner, **overrides):
+    values = {
+        "startup_timeout_seconds": 2.0,
+        "graceful_timeout_seconds": 2.0,
+        "force_timeout_seconds": 2.0,
+        "poll_interval_seconds": 0.01,
+        "port_retry_attempts": 3,
+        "maximum_capture_bytes": 65_536,
+    }
+    values.update(overrides)
+    return runner.SupervisorPolicy(**values)
+
+
+def _process_environment(runner) -> dict[str, str]:
+    environment = runner.build_child_environment({})
+    assert "PYTHONPATH" not in environment
+    assert environment["PYTHONDONTWRITEBYTECODE"] == "1"
+    assert environment["PYTHONNOUSERSITE"] == "1"
+    assert environment["PYTHONUNBUFFERED"] == "1"
+    return environment
+
+
+def _assert_pids_are_gone(pids: tuple[int, ...]) -> None:
+    assert all(not psutil.pid_exists(pid) for pid in pids)
+
+
+@pytest.mark.asyncio
+async def test_process_supervisor_owns_group_logs_records_and_descendants(
+    tmp_path: Path,
+) -> None:
+    runner = _load_production_framework_runner()
+    program = _normal_process_program(tmp_path)
+    ready = tmp_path / "ready-1.json"
+    shutdown = tmp_path / "shutdown-1.json"
+    supervisor = await runner.ProcessSupervisor.start(
+        [sys.executable, str(program), str(ready), str(shutdown), "run-one"],
+        cwd=tmp_path,
+        environment=_process_environment(runner),
+        policy=_supervisor_policy(runner),
+    )
+
+    async with supervisor:
+        records = await supervisor.wait_for_worker_records(
+            directory=tmp_path,
+            phase="ready",
+            expected_run_id="run-one",
+            expected_count=1,
+        )
+        assert records[0]["pid"] == supervisor.pid
+        if os.name == "posix":
+            assert os.getpgid(supervisor.pid) == supervisor.pid
+        descendants = supervisor.descendant_pids()
+        assert len(descendants) == 1
+        all_pids = (supervisor.pid, *descendants)
+        outcome = await supervisor.stop()
+
+    assert outcome.returncode == 0
+    assert outcome.graceful_stop is (os.name == "posix")
+    assert outcome.forced_cleanup is False
+    assert outcome.descendant_pids == descendants
+    assert "fixture-stdout" in outcome.stdout
+    assert "fixture-stderr" in outcome.stderr
+    assert outcome.output_truncated is False
+    assert shutdown.is_file()
+    _assert_pids_are_gone(all_pids)
+
+
+@pytest.mark.asyncio
+async def test_process_supervisor_propagates_exact_child_exit(
+    tmp_path: Path,
+) -> None:
+    runner = _load_production_framework_runner()
+    program = _write_process_program(
+        tmp_path,
+        "exit_process.py",
+        """
+        import sys
+
+        print("exit-stdout", flush=True)
+        print("exit-stderr", file=sys.stderr, flush=True)
+        raise SystemExit(23)
+        """,
+    )
+    supervisor = await runner.ProcessSupervisor.start(
+        [sys.executable, str(program)],
+        cwd=tmp_path,
+        environment=_process_environment(runner),
+        policy=_supervisor_policy(runner),
+    )
+
+    async with supervisor:
+        with pytest.raises(runner.ProcessExitedError) as captured:
+            await supervisor.wait_for_readiness(lambda: False)
+
+    assert captured.value.returncode == 23
+    assert "exit-stdout" in captured.value.stdout
+    assert "exit-stderr" in captured.value.stderr
+    _assert_pids_are_gone((supervisor.pid,))
+
+
+@pytest.mark.asyncio
+async def test_process_supervisor_bounds_both_diagnostic_streams(
+    tmp_path: Path,
+) -> None:
+    runner = _load_production_framework_runner()
+    program = _write_process_program(
+        tmp_path,
+        "large_diagnostics.py",
+        """
+        import sys
+
+        print("x" * 4096, flush=True)
+        print("y" * 4096, file=sys.stderr, flush=True)
+        raise SystemExit(17)
+        """,
+    )
+    supervisor = await runner.ProcessSupervisor.start(
+        [sys.executable, str(program)],
+        cwd=tmp_path,
+        environment=_process_environment(runner),
+        policy=_supervisor_policy(
+            runner,
+            maximum_capture_bytes=1_024,
+        ),
+    )
+
+    async with supervisor:
+        with pytest.raises(runner.ProcessExitedError) as captured:
+            await supervisor.wait_for_readiness(lambda: False)
+
+    assert captured.value.returncode == 17
+    assert len(captured.value.stdout.encode("utf-8")) == 1_024
+    assert len(captured.value.stderr.encode("utf-8")) == 1_024
+    assert captured.value.outcome.output_truncated is True
+    _assert_pids_are_gone((supervisor.pid,))
+
+
+@pytest.mark.asyncio
+async def test_process_supervisor_redacts_environment_and_inline_credentials(
+    tmp_path: Path,
+) -> None:
+    runner = _load_production_framework_runner()
+    synthetic_credential = f"synthetic-{'x' * 2_048}"
+    program = _write_process_program(
+        tmp_path,
+        "credential_diagnostics.py",
+        """
+        import os
+        import sys
+
+        print(os.environ["FASTMSSQL_TEST_PASSWORD"], flush=True)
+        print("token=inline-private-value", file=sys.stderr, flush=True)
+        raise SystemExit(19)
+        """,
+    )
+    environment = runner.build_child_environment(
+        {
+            "FASTMSSQL_TEST_PASSWORD": synthetic_credential,
+        }
+    )
+    supervisor = await runner.ProcessSupervisor.start(
+        [sys.executable, str(program)],
+        cwd=tmp_path,
+        environment=environment,
+        policy=_supervisor_policy(
+            runner,
+            maximum_capture_bytes=1_024,
+        ),
+    )
+
+    async with supervisor:
+        with pytest.raises(runner.ProcessExitedError) as captured:
+            await supervisor.wait_for_readiness(lambda: False)
+
+    diagnostics = f"{captured.value.stdout}\n{captured.value.stderr}"
+    assert synthetic_credential not in diagnostics
+    assert "x" * 32 not in diagnostics
+    assert "inline-private-value" not in diagnostics
+    assert diagnostics.count("<redacted>") == 2
+    assert not hasattr(supervisor, "environment")
+    _assert_pids_are_gone((supervisor.pid,))
+
+
+@pytest.mark.asyncio
+async def test_process_supervisor_rejects_stale_ready_records(
+    tmp_path: Path,
+) -> None:
+    runner = _load_production_framework_runner()
+    ready = tmp_path / "ready-1.json"
+    ready.write_text(
+        json.dumps({"phase": "ready", "pid": 1, "run_id": "run-stale"}) + "\n",
+        encoding="utf-8",
+    )
+    program = _write_process_program(
+        tmp_path,
+        "stale_record_sleeper.py",
+        """
+        import signal
+        import time
+
+        def stop(_signum, _frame):
+            raise SystemExit(0)
+
+        for signal_name in ("SIGTERM", "SIGBREAK"):
+            selected = getattr(signal, signal_name, None)
+            if selected is not None:
+                signal.signal(selected, stop)
+        while True:
+            time.sleep(0.05)
+        """,
+    )
+    supervisor = await runner.ProcessSupervisor.start(
+        [sys.executable, str(program)],
+        cwd=tmp_path,
+        environment=_process_environment(runner),
+        policy=_supervisor_policy(runner),
+    )
+
+    async with supervisor:
+        with pytest.raises(
+            runner.WorkerEvidenceError,
+            match="ready record predates the supervised process",
+        ):
+            await supervisor.wait_for_worker_records(
+                directory=tmp_path,
+                phase="ready",
+                expected_run_id="run-current",
+                expected_count=1,
+            )
+        descendants = supervisor.descendant_pids()
+        all_pids = (supervisor.pid, *descendants)
+
+    assert ready.read_text(encoding="utf-8").endswith("\n")
+    _assert_pids_are_gone(all_pids)
+
+
+@pytest.mark.asyncio
+async def test_forced_process_tree_cleanup_is_recorded_as_failure(
+    tmp_path: Path,
+) -> None:
+    runner = _load_production_framework_runner()
+    program = _stubborn_process_program(tmp_path)
+    ready = tmp_path / "stubborn-ready.txt"
+    supervisor = await runner.ProcessSupervisor.start(
+        [sys.executable, str(program), str(ready)],
+        cwd=tmp_path,
+        environment=_process_environment(runner),
+        policy=_supervisor_policy(
+            runner,
+            graceful_timeout_seconds=0.1,
+        ),
+    )
+
+    async with supervisor:
+        await supervisor.wait_for_readiness(ready.is_file)
+        parent_pid, descendant_pid = (
+            int(value) for value in ready.read_text(encoding="utf-8").strip().split(":")
+        )
+        assert parent_pid == supervisor.pid
+        with pytest.raises(runner.ForcedProcessCleanupError) as captured:
+            await supervisor.stop()
+
+    assert captured.value.outcome.forced_cleanup is True
+    assert captured.value.outcome.graceful_stop is False
+    _assert_pids_are_gone((parent_pid, descendant_pid))
+
+
+@pytest.mark.asyncio
+async def test_process_context_cleans_tree_after_body_exception(
+    tmp_path: Path,
+) -> None:
+    runner = _load_production_framework_runner()
+    program = _normal_process_program(tmp_path)
+    ready = tmp_path / "ready-exception.json"
+    supervisor = await runner.ProcessSupervisor.start(
+        [
+            sys.executable,
+            str(program),
+            str(ready),
+            str(tmp_path / "shutdown-exception.json"),
+            "run-exception",
+        ],
+        cwd=tmp_path,
+        environment=_process_environment(runner),
+        policy=_supervisor_policy(runner),
+    )
+    all_pids: tuple[int, ...] = ()
+
+    with pytest.raises(RuntimeError, match="synthetic-body-failure"):
+        async with supervisor:
+            await supervisor.wait_for_readiness(ready.is_file)
+            all_pids = (supervisor.pid, *supervisor.descendant_pids())
+            raise RuntimeError("synthetic-body-failure")
+
+    assert all_pids
+    _assert_pids_are_gone(all_pids)
+
+
+@pytest.mark.asyncio
+async def test_process_context_cleans_tree_after_task_cancellation(
+    tmp_path: Path,
+) -> None:
+    runner = _load_production_framework_runner()
+    program = _normal_process_program(tmp_path)
+    ready = tmp_path / "ready-cancel.json"
+    owned_pids: asyncio.Future[tuple[int, ...]] = (
+        asyncio.get_running_loop().create_future()
+    )
+
+    async def own_process() -> None:
+        supervisor = await runner.ProcessSupervisor.start(
+            [
+                sys.executable,
+                str(program),
+                str(ready),
+                str(tmp_path / "shutdown-cancel.json"),
+                "run-cancel",
+            ],
+            cwd=tmp_path,
+            environment=_process_environment(runner),
+            policy=_supervisor_policy(runner),
+        )
+        async with supervisor:
+            await supervisor.wait_for_readiness(ready.is_file)
+            owned_pids.set_result((supervisor.pid, *supervisor.descendant_pids()))
+            await asyncio.Event().wait()
+
+    owner = asyncio.create_task(own_process())
+    all_pids = await asyncio.wait_for(owned_pids, timeout=3)
+    owner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(owner, timeout=5)
+
+    _assert_pids_are_gone(all_pids)
+
+
+@pytest.mark.asyncio
+async def test_loopback_port_collision_retry_is_bounded(
+    tmp_path: Path,
+) -> None:
+    runner = _load_production_framework_runner()
+    program = _listener_process_program(tmp_path)
+    occupied = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    occupied.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    occupied.bind(("127.0.0.1", 0))
+    occupied.listen()
+    occupied_port = occupied.getsockname()[1]
+    available_port = runner.reserve_loopback_port()
+    candidates = iter((occupied_port, available_port))
+
+    async def listener_ready(port: int) -> bool:
+        if not (tmp_path / f"listener-{port}.ready").is_file():
+            return False
+        return await runner.loopback_port_is_listening(port)
+
+    try:
+        launch = await runner.launch_with_port_retry(
+            command_builder=lambda port: [
+                sys.executable,
+                str(program),
+                str(port),
+                str(tmp_path / f"listener-{port}.ready"),
+            ],
+            cwd=tmp_path,
+            environment=_process_environment(runner),
+            readiness_probe=listener_ready,
+            policy=_supervisor_policy(runner, port_retry_attempts=2),
+            port_allocator=lambda: next(candidates),
+        )
+    finally:
+        occupied.close()
+
+    async with launch.supervisor:
+        assert launch.port == available_port
+        assert launch.attempts == 2
+        outcome = await launch.supervisor.stop()
+    assert outcome.forced_cleanup is False
+    _assert_pids_are_gone((outcome.pid, *outcome.descendant_pids))
+
+
+@pytest.mark.asyncio
+async def test_loopback_port_collision_exhaustion_preserves_failure(
+    tmp_path: Path,
+) -> None:
+    runner = _load_production_framework_runner()
+    program = _listener_process_program(tmp_path)
+    occupied = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    occupied.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    occupied.bind(("127.0.0.1", 0))
+    occupied.listen()
+    occupied_port = occupied.getsockname()[1]
+
+    async def listener_ready(port: int) -> bool:
+        if not (tmp_path / f"listener-{port}.ready").is_file():
+            return False
+        return await runner.loopback_port_is_listening(port)
+
+    try:
+        with pytest.raises(runner.PortCollisionError) as captured:
+            await runner.launch_with_port_retry(
+                command_builder=lambda port: [
+                    sys.executable,
+                    str(program),
+                    str(port),
+                    str(tmp_path / f"listener-{port}.ready"),
+                ],
+                cwd=tmp_path,
+                environment=_process_environment(runner),
+                readiness_probe=listener_ready,
+                policy=_supervisor_policy(runner, port_retry_attempts=2),
+                port_allocator=lambda: occupied_port,
+            )
+    finally:
+        occupied.close()
+
+    assert captured.value.attempts == 2
+    assert captured.value.ports == (occupied_port, occupied_port)
+
+
+@pytest.mark.asyncio
+async def test_port_collision_never_hides_forced_descendant_cleanup(
+    tmp_path: Path,
+) -> None:
+    runner = _load_production_framework_runner()
+    program = _collision_with_stubborn_descendant_program(tmp_path)
+    occupied = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    occupied.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    occupied.bind(("127.0.0.1", 0))
+    occupied.listen()
+    occupied_port = occupied.getsockname()[1]
+
+    try:
+        with pytest.raises(runner.ForcedProcessCleanupError) as captured:
+            await runner.launch_with_port_retry(
+                command_builder=lambda port: [
+                    sys.executable,
+                    str(program),
+                    str(port),
+                    str(tmp_path),
+                ],
+                cwd=tmp_path,
+                environment=_process_environment(runner),
+                readiness_probe=lambda port: False,
+                policy=_supervisor_policy(
+                    runner,
+                    port_retry_attempts=2,
+                ),
+                port_allocator=lambda: occupied_port,
+            )
+    finally:
+        occupied.close()
+
+    assert captured.value.outcome.forced_cleanup is True
+    recorded_pids = tuple(
+        int(value)
+        for path in tmp_path.glob("collision-*.ready")
+        for value in path.stem.removeprefix("collision-").split("-")
+    )
+    assert recorded_pids
+    _assert_pids_are_gone(recorded_pids)
+
+
+def _config_with_actual_wheel_hash(runner, tmp_path: Path):
+    arguments = _runner_cli_arguments(tmp_path)
+    wheel = Path(arguments[arguments.index("--wheel") + 1])
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    arguments[arguments.index("--wheel-sha256") + 1] = digest
+    return runner.parse_cli(arguments)
+
+
+def test_isolated_application_copy_is_closed_atomic_and_hash_verified(
+    tmp_path: Path,
+) -> None:
+    runner = _load_production_framework_runner()
+    config = _config_with_actual_wheel_hash(runner, tmp_path)
+    source = ROOT / "tests/production_framework"
+
+    isolated = runner.prepare_isolated_application(
+        config,
+        source_directory=source,
+        directory_name="offline-smoke",
+    )
+
+    assert isolated.root == config.run_root / "offline-smoke"
+    assert isolated.package_directory == isolated.root / "production_framework"
+    assert isolated.manifest_path == isolated.root / "application-manifest.json"
+    assert sorted(
+        path.relative_to(isolated.root).as_posix()
+        for path in isolated.root.rglob("*")
+        if path.is_file()
+    ) == [
+        "application-manifest.json",
+        "production_framework/__init__.py",
+        "production_framework/app.py",
+        "production_framework/gunicorn_conf.py",
+    ]
+    manifest = json.loads(isolated.manifest_path.read_text(encoding="utf-8"))
+    assert manifest == {
+        "candidate_sha": config.candidate_sha,
+        "source_sha256": {
+            name: hashlib.sha256((source / name).read_bytes()).hexdigest()
+            for name in runner.APPLICATION_SOURCE_FILES
+        },
+        "wheel_filename": config.wheel.name,
+        "wheel_sha256": config.wheel_sha256,
+    }
+    runner.verify_isolated_application(isolated)
+    assert not list(isolated.root.rglob("__pycache__"))
+    assert not list(isolated.root.rglob("*.pyc"))
+
+    (isolated.package_directory / "app.py").write_text(
+        "# tampered\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        runner.IsolatedApplicationError,
+        match="isolated application source hash mismatch",
+    ):
+        runner.verify_isolated_application(isolated)
+    with pytest.raises(
+        runner.IsolatedApplicationError,
+        match="isolated application destination already exists",
+    ):
+        runner.prepare_isolated_application(
+            config,
+            source_directory=source,
+            directory_name="offline-smoke",
+        )
+
+
+def test_isolated_application_rejects_wheel_hash_mismatch_before_copy(
+    tmp_path: Path,
+) -> None:
+    runner = _load_production_framework_runner()
+    config = runner.parse_cli(_runner_cli_arguments(tmp_path))
+
+    with pytest.raises(
+        runner.CandidateProvenanceError,
+        match="candidate wheel SHA-256 mismatch",
+    ):
+        runner.prepare_isolated_application(
+            config,
+            source_directory=ROOT / "tests/production_framework",
+            directory_name="must-not-exist",
+        )
+
+    assert not (config.run_root / "must-not-exist").exists()
+
+
+def _valid_package_record(config, isolated) -> dict[str, object]:
+    venv_root = config.venv_python.parent.parent
+    site_packages = (venv_root / "lib/python3.12/site-packages").resolve()
+    return {
+        "candidate_sha": config.candidate_sha,
+        "cwd": str(isolated.root),
+        "distribution_direct_url": {
+            "archive_info": {},
+            "url": config.wheel.as_uri(),
+        },
+        "distribution_version": "0.7.7",
+        "fastmssql_import_path": str(site_packages / "fastmssql/__init__.py"),
+        "pid": 1234,
+        "ppid": 123,
+        "python_executable": str(config.venv_python),
+        "sys_path": [str(isolated.root), str(site_packages)],
+        "wheel_filename": config.wheel.name,
+        "wheel_sha256": config.wheel_sha256,
+    }
+
+
+def test_package_provenance_accepts_only_isolated_site_packages(
+    tmp_path: Path,
+) -> None:
+    runner = _load_production_framework_runner()
+    config = _config_with_actual_wheel_hash(runner, tmp_path)
+    isolated = runner.prepare_isolated_application(
+        config,
+        source_directory=ROOT / "tests/production_framework",
+        directory_name="provenance",
+    )
+    record = _valid_package_record(config, isolated)
+
+    assert (
+        runner.validate_package_record(
+            config,
+            isolated,
+            record,
+            repository_root=ROOT,
+        )
+        == record
+    )
+
+    invalid_records = {
+        "candidate SHA": {
+            **record,
+            "candidate_sha": "f" * 40,
+        },
+        "wheel filename": {
+            **record,
+            "wheel_filename": "fastmssql-0.7.6-test.whl",
+        },
+        "wheel hash": {
+            **record,
+            "wheel_sha256": "f" * 64,
+        },
+        "wheel origin": {
+            **record,
+            "distribution_direct_url": {
+                "archive_info": {},
+                "url": (tmp_path / "other-fastmssql.whl").resolve().as_uri(),
+            },
+        },
+        "editable origin": {
+            **record,
+            "distribution_direct_url": {
+                "dir_info": {"editable": True},
+                "url": config.wheel.as_uri(),
+            },
+        },
+        "worker CWD": {
+            **record,
+            "cwd": str(ROOT),
+        },
+        "source import": {
+            **record,
+            "fastmssql_import_path": str(ROOT / "python/fastmssql/__init__.py"),
+        },
+        "source sys.path": {
+            **record,
+            "sys_path": [
+                *record["sys_path"],
+                str(ROOT / "python"),
+            ],
+        },
+        "repository sys.path": {
+            **record,
+            "sys_path": [
+                *record["sys_path"],
+                str(ROOT),
+            ],
+        },
+        "Python executable": {
+            **record,
+            "python_executable": sys.executable + "-wrong",
+        },
+    }
+    for reason, invalid in invalid_records.items():
+        with pytest.raises(
+            runner.CandidateProvenanceError,
+            match=reason,
+        ):
+            runner.validate_package_record(
+                config,
+                isolated,
+                invalid,
+                repository_root=ROOT,
+            )
+
+
 def _valid_worker_environment(tmp_path: Path) -> dict[str, str]:
     run_root = tmp_path / "run"
     artifact_directory = run_root / "worker-records"
@@ -124,6 +1293,11 @@ def _valid_worker_environment(tmp_path: Path) -> dict[str, str]:
         "FASTMSSQL_FRAMEWORK_ARTIFACT_DIR": str(artifact_directory),
         "FASTMSSQL_FRAMEWORK_TABLE": "framework_items_01234567",
         "FASTMSSQL_FRAMEWORK_SQL_DELAY_MS": "100",
+        "FASTMSSQL_FRAMEWORK_CANDIDATE_SHA": "a" * 40,
+        "FASTMSSQL_FRAMEWORK_WHEEL_FILENAME": (
+            "fastmssql-0.7.7-cp39-abi3-macosx_10_12_universal2.whl"
+        ),
+        "FASTMSSQL_FRAMEWORK_WHEEL_SHA256": "b" * 64,
         "FASTMSSQL_SQL_AUTH_HOST": "127.0.0.1",
         "FASTMSSQL_SQL_AUTH_PORT": "14334",
         "FASTMSSQL_SQL_AUTH_DATABASE": "fastmssql_validation",
@@ -276,6 +1450,400 @@ def test_worker_config_keeps_database_and_offline_modes_disjoint(
         match="offline mode forbids SQL-auth settings",
     ):
         framework_app.WorkerConfig.from_environment(confused_environment)
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        (
+            "FASTMSSQL_FRAMEWORK_CANDIDATE_SHA",
+            "not-a-sha",
+            "candidate SHA",
+        ),
+        (
+            "FASTMSSQL_FRAMEWORK_WHEEL_FILENAME",
+            "../candidate.whl",
+            "wheel filename",
+        ),
+        (
+            "FASTMSSQL_FRAMEWORK_WHEEL_SHA256",
+            "not-a-digest",
+            "wheel SHA-256",
+        ),
+    ],
+)
+def test_worker_config_rejects_invalid_package_provenance(
+    tmp_path: Path,
+    name: str,
+    value: str,
+    message: str,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    environment[name] = value
+
+    with pytest.raises(
+        framework_app.ConfigurationError,
+        match=message,
+    ):
+        framework_app.WorkerConfig.from_environment(environment)
+
+
+def _offline_worker_environment(tmp_path: Path) -> dict[str, str]:
+    environment = _valid_worker_environment(tmp_path)
+    environment["FASTMSSQL_FRAMEWORK_DATABASE_MODE"] = "offline"
+    for name in framework_app.SQL_AUTH_ENVIRONMENT_KEYS:
+        environment.pop(name)
+    return environment
+
+
+def _assert_package_payload(
+    payload: dict[str, object],
+    environment: dict[str, str],
+) -> None:
+    assert payload["candidate_sha"] == environment["FASTMSSQL_FRAMEWORK_CANDIDATE_SHA"]
+    assert (
+        payload["wheel_filename"] == environment["FASTMSSQL_FRAMEWORK_WHEEL_FILENAME"]
+    )
+    assert payload["wheel_sha256"] == environment["FASTMSSQL_FRAMEWORK_WHEEL_SHA256"]
+    assert payload["cwd"] == str(Path.cwd().resolve())
+    assert isinstance(payload["distribution_direct_url"], dict)
+    assert payload["distribution_version"] == "0.7.7"
+    assert Path(payload["fastmssql_import_path"]).is_file()
+    assert payload["pid"] == os.getpid()
+    assert payload["ppid"] == os.getppid()
+    assert payload["python_executable"] == sys.executable
+    assert isinstance(payload["sys_path"], list)
+    rendered = json.dumps(payload, sort_keys=True)
+    assert "private-test-value" not in rendered
+    assert "password" not in rendered.lower()
+
+
+@pytest.mark.asyncio
+async def test_fastapi_package_route_reports_runtime_provenance_after_ready(
+    tmp_path: Path,
+) -> None:
+    environment = _offline_worker_environment(tmp_path / "fastapi")
+    application = framework_app.create_fastapi_app(environment=environment)
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/package")
+
+    assert response.status_code == 200
+    _assert_package_payload(response.json(), environment)
+
+
+@pytest.mark.asyncio
+async def test_flask_package_route_reports_runtime_provenance_after_ready(
+    tmp_path: Path,
+) -> None:
+    environment = _offline_worker_environment(tmp_path / "flask")
+    application = framework_app.create_flask_app(environment=environment)
+    lifecycle = framework_app.flask_worker_lifecycle(application)
+    await lifecycle.start()
+    try:
+        response = application.test_client().get("/package")
+    finally:
+        await lifecycle.stop()
+
+    assert response.status_code == 200
+    _assert_package_payload(response.get_json(), environment)
+
+
+def test_offline_profile_environment_is_closed_and_credential_free(
+    tmp_path: Path,
+) -> None:
+    runner = _load_production_framework_runner()
+    config = _config_with_actual_wheel_hash(runner, tmp_path)
+    isolated = runner.prepare_isolated_application(
+        config,
+        source_directory=ROOT / "tests/production_framework",
+        directory_name="offline-environment",
+    )
+    profile = _profile_by_family(
+        runner,
+        "fastapi-uvicorn-asyncio",
+        workers=1,
+    )
+    artifact_directory = config.run_root / "records" / profile.id
+
+    environment = runner.build_profile_environment(
+        config,
+        isolated,
+        profile,
+        run_id="offline-run-01",
+        artifact_directory=artifact_directory,
+    )
+
+    assert artifact_directory.is_dir()
+    assert environment["FASTMSSQL_FRAMEWORK_DATABASE_MODE"] == "offline"
+    assert environment["FASTMSSQL_FRAMEWORK_WORKER_COUNT"] == "1"
+    assert environment["FASTMSSQL_FRAMEWORK_GLOBAL_CONNECTION_BUDGET"] == "16"
+    assert environment["FASTMSSQL_FRAMEWORK_RUN_ROOT"] == str(config.run_root)
+    assert environment["FASTMSSQL_FRAMEWORK_ARTIFACT_DIR"] == str(artifact_directory)
+    assert environment["FASTMSSQL_FRAMEWORK_CANDIDATE_SHA"] == (config.candidate_sha)
+    assert environment["FASTMSSQL_FRAMEWORK_WHEEL_FILENAME"] == (config.wheel.name)
+    assert environment["FASTMSSQL_FRAMEWORK_WHEEL_SHA256"] == (config.wheel_sha256)
+    assert "PYTHONPATH" not in environment
+    assert not any(name.startswith("FASTMSSQL_SQL_AUTH") for name in environment)
+    assert "password" not in json.dumps(environment).lower()
+
+    imported = subprocess.run(
+        [
+            str(config.venv_python),
+            "-c",
+            "import production_framework.app",
+        ],
+        cwd=isolated.root,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert imported.returncode == 0, imported.stderr
+    runner.verify_isolated_application(isolated)
+    assert not list(isolated.root.rglob("__pycache__"))
+    assert not list(isolated.root.rglob("*.pyc"))
+
+
+def test_gunicorn_hooks_leave_asgi_lifespan_ownership_to_uvicorn() -> None:
+    worker = SimpleNamespace(wsgi=object(), pid=os.getpid())
+
+    assert gunicorn_conf.post_worker_init(worker) is None
+    assert gunicorn_conf.worker_exit(None, worker) is None
+
+
+@pytest.mark.parametrize(
+    ("platform_name", "expected_families"),
+    [
+        (
+            "linux",
+            {
+                "fastapi-uvicorn-asyncio",
+                "fastapi-uvicorn-uvloop",
+                "fastapi-gunicorn-uvicorn-worker",
+                "flask-gunicorn-sync",
+                "flask-gunicorn-gthread",
+            },
+        ),
+        (
+            "darwin",
+            {
+                "fastapi-uvicorn-asyncio",
+                "fastapi-uvicorn-uvloop",
+                "fastapi-gunicorn-uvicorn-worker",
+                "flask-gunicorn-sync",
+                "flask-gunicorn-gthread",
+            },
+        ),
+        (
+            "win32",
+            {
+                "fastapi-uvicorn-asyncio",
+            },
+        ),
+    ],
+)
+def test_offline_smoke_profile_selection_is_explicit_and_portable(
+    platform_name: str,
+    expected_families: set[str],
+) -> None:
+    runner = _load_production_framework_runner()
+    profiles = runner.offline_smoke_profiles(platform_name)
+
+    assert {profile.family for profile in profiles} == expected_families
+    assert all(profile.workers == 1 for profile in profiles)
+    assert all(profile.database_mode == "offline" for profile in profiles)
+    assert all(profile.applicable for profile in profiles)
+
+
+@pytest.mark.asyncio
+async def test_offline_matrix_rechecks_copy_after_the_last_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _load_production_framework_runner()
+    config = _config_with_actual_wheel_hash(runner, tmp_path)
+    profile = _profile_by_family(
+        runner,
+        "fastapi-uvicorn-asyncio",
+        workers=1,
+    )
+    monkeypatch.setattr(
+        runner,
+        "offline_smoke_profiles",
+        lambda platform_name: (profile,),
+    )
+
+    async def tamper_after_start(
+        config,
+        isolated,
+        selected_profile,
+        *,
+        repository_root,
+        run_id,
+        policy,
+    ):
+        del config, repository_root, run_id, policy
+        assert selected_profile == profile
+        (isolated.package_directory / "app.py").write_text(
+            "# modified by the last supervised process\n",
+            encoding="utf-8",
+        )
+        return runner.OfflineSmokeResult(
+            profile_id=profile.id,
+            port=43122,
+            launch_attempts=1,
+            sanitized_command=(sys.executable, "-m", "uvicorn"),
+            package={},
+            ready_pids=(101,),
+            shutdown_pids=(101,),
+            manager_pid=100,
+            descendant_pids=(101,),
+            returncode=0,
+            graceful_stop=True,
+            forced_cleanup=False,
+            listening_sockets_after=(),
+        )
+
+    monkeypatch.setattr(runner, "run_offline_smoke_profile", tamper_after_start)
+
+    with pytest.raises(
+        runner.IsolatedApplicationError,
+        match="isolated application source hash mismatch",
+    ):
+        await runner.run_offline_smoke_matrix(
+            config,
+            repository_root=ROOT,
+            source_directory=ROOT / "tests/production_framework",
+        )
+
+
+def test_offline_cli_writes_exact_schema_one_process_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _load_production_framework_runner()
+    arguments = _runner_cli_arguments(tmp_path)
+    wheel = Path(arguments[arguments.index("--wheel") + 1])
+    wheel_sha256 = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    arguments[arguments.index("--wheel-sha256") + 1] = wheel_sha256
+    package = {
+        "candidate_sha": "a" * 40,
+        "cwd": "/isolated/application",
+        "distribution_version": "0.7.7",
+        "fastmssql_import_path": "/isolated/site-packages/fastmssql/__init__.py",
+        "pid": 101,
+        "ppid": 100,
+        "python_executable": sys.executable,
+        "sys_path": [
+            "/isolated/application",
+            "/isolated/site-packages",
+        ],
+        "wheel_filename": wheel.name,
+        "wheel_sha256": wheel_sha256,
+    }
+    result = runner.OfflineSmokeResult(
+        profile_id="fastapi-uvicorn-asyncio-w1",
+        port=43123,
+        launch_attempts=1,
+        sanitized_command=(sys.executable, "-m", "uvicorn"),
+        package=package,
+        ready_pids=(101,),
+        shutdown_pids=(101,),
+        manager_pid=100,
+        descendant_pids=(101,),
+        returncode=0,
+        graceful_stop=True,
+        forced_cleanup=False,
+        listening_sockets_after=(),
+    )
+
+    async def run_smoke(config, *, repository_root, source_directory, policy=None):
+        assert config.database_mode == "offline"
+        assert repository_root == ROOT
+        assert source_directory == ROOT / "tests/production_framework"
+        assert policy is None
+        return (result,)
+
+    monkeypatch.setattr(runner, "run_offline_smoke_matrix", run_smoke)
+
+    assert runner.main(arguments) == 0
+    output = Path(arguments[arguments.index("--output") + 1])
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload == {
+        "candidate_sha": "a" * 40,
+        "database_mode": "offline",
+        "overall": "PASS",
+        "platform_system": runner.normalize_platform(sys.platform),
+        "profiles": [
+            {
+                "descendant_pids": [101],
+                "forced_cleanup": False,
+                "graceful_stop": True,
+                "launch_attempts": 1,
+                "listening_sockets_after": [],
+                "manager_pid": 100,
+                "package": package,
+                "port": 43123,
+                "profile_id": "fastapi-uvicorn-asyncio-w1",
+                "ready_pids": [101],
+                "returncode": 0,
+                "sanitized_command": [
+                    sys.executable,
+                    "-m",
+                    "uvicorn",
+                ],
+                "shutdown_pids": [101],
+            }
+        ],
+        "schema_version": 1,
+        "violations": [],
+        "wheel": {
+            "filename": wheel.name,
+            "sha256": wheel_sha256,
+        },
+    }
+    assert output.read_text(encoding="utf-8").endswith("\n")
+    assert not list(output.parent.glob(f".{output.name}-*.tmp"))
+
+
+def test_cli_refuses_sql_auth_execution_until_routes_and_observer_exist(
+    tmp_path: Path,
+) -> None:
+    runner = _load_production_framework_runner()
+    arguments = _runner_cli_arguments(tmp_path)
+    arguments[arguments.index("--database-mode") + 1] = "sql_auth"
+    output = Path(arguments[arguments.index("--output") + 1])
+
+    with pytest.raises(
+        runner.RunnerConfigurationError,
+        match="SQL-auth process execution is not implemented",
+    ):
+        runner.main(arguments)
+
+    assert not output.exists()
+
+
+def test_cli_rejects_a_preexisting_output_artifact(
+    tmp_path: Path,
+) -> None:
+    runner = _load_production_framework_runner()
+    arguments = _runner_cli_arguments(tmp_path)
+    output = Path(arguments[arguments.index("--output") + 1])
+    output.write_text('{"overall":"STALE"}\n', encoding="utf-8")
+
+    with pytest.raises(
+        runner.RunnerConfigurationError,
+        match="output artifact already exists",
+    ):
+        runner.parse_cli(arguments)
+
+    assert output.read_text(encoding="utf-8") == '{"overall":"STALE"}\n'
 
 
 def test_importing_application_module_does_not_construct_a_connection() -> None:

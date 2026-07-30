@@ -1,8 +1,8 @@
 """Worker-local application interfaces for the production framework matrix.
 
-The executable factories and routes are introduced by the next TDD task. The
-shared lifecycle primitive is intentionally small and keeps connection
-construction outside module import.
+The structural ``/package`` route proves installed-wheel provenance without a
+database. SQL-auth behavior routes are introduced by the next TDD task. The
+shared lifecycle keeps connection construction outside module import.
 """
 
 from __future__ import annotations
@@ -11,14 +11,17 @@ from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
+import importlib.metadata
 import json
 import os
 from pathlib import Path
 import re
+import sys
 import tempfile
 from typing import Any, Protocol
 
 from asgiref.wsgi import WsgiToAsgi
+import fastmssql
 from fastmssql import (
     Connection,
     LifecycleConfig,
@@ -41,6 +44,9 @@ COMMON_ENVIRONMENT_KEYS = (
     "FASTMSSQL_FRAMEWORK_ARTIFACT_DIR",
     "FASTMSSQL_FRAMEWORK_TABLE",
     "FASTMSSQL_FRAMEWORK_SQL_DELAY_MS",
+    "FASTMSSQL_FRAMEWORK_CANDIDATE_SHA",
+    "FASTMSSQL_FRAMEWORK_WHEEL_FILENAME",
+    "FASTMSSQL_FRAMEWORK_WHEEL_SHA256",
 )
 SQL_AUTH_ENVIRONMENT_KEYS = (
     "FASTMSSQL_SQL_AUTH_HOST",
@@ -54,6 +60,9 @@ SQL_DELAY_MILLISECONDS = frozenset({0, 50, 100, 200, 250, 500, 1_000, 2_000, 5_0
 SAFE_RUN_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 SAFE_SQL_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 SAFE_SERVER = re.compile(r"[A-Za-z0-9][A-Za-z0-9.:[\]_-]{0,252}")
+SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
+SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+WHEEL_FILENAME_PATTERN = re.compile(r"fastmssql-[0-9]+\.[0-9]+\.[0-9]+-.+\.whl")
 
 
 class ConfigurationError(ValueError):
@@ -72,6 +81,13 @@ class DatabaseSettings:
     database: str
     username: str
     password: str = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateProvenance:
+    git_sha: str
+    wheel_filename: str
+    wheel_sha256: str
 
 
 class WorkerState(str, Enum):
@@ -187,6 +203,41 @@ def _database_settings(
     )
 
 
+def _candidate_provenance(
+    environment: Mapping[str, str],
+) -> CandidateProvenance:
+    git_sha = _required(
+        environment,
+        "FASTMSSQL_FRAMEWORK_CANDIDATE_SHA",
+    )
+    if SHA_PATTERN.fullmatch(git_sha) is None:
+        raise ConfigurationError(
+            "candidate SHA must be exactly 40 lowercase hexadecimal characters"
+        )
+    wheel_filename = _required(
+        environment,
+        "FASTMSSQL_FRAMEWORK_WHEEL_FILENAME",
+    )
+    if (
+        Path(wheel_filename).name != wheel_filename
+        or WHEEL_FILENAME_PATTERN.fullmatch(wheel_filename) is None
+    ):
+        raise ConfigurationError("wheel filename is invalid")
+    wheel_sha256 = _required(
+        environment,
+        "FASTMSSQL_FRAMEWORK_WHEEL_SHA256",
+    )
+    if SHA256_PATTERN.fullmatch(wheel_sha256) is None:
+        raise ConfigurationError(
+            "wheel SHA-256 must be exactly 64 lowercase hexadecimal characters"
+        )
+    return CandidateProvenance(
+        git_sha=git_sha,
+        wheel_filename=wheel_filename,
+        wheel_sha256=wheel_sha256,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class WorkerConfig:
     database_mode: DatabaseMode
@@ -199,6 +250,7 @@ class WorkerConfig:
     artifact_directory: Path
     table_name: str
     sql_delay_ms: int
+    candidate: CandidateProvenance
     database: DatabaseSettings | None
 
     @classmethod
@@ -290,6 +342,7 @@ class WorkerConfig:
                 SAFE_SQL_IDENTIFIER,
             ),
             sql_delay_ms=delay,
+            candidate=_candidate_provenance(environment),
             database=database,
         )
 
@@ -300,6 +353,7 @@ class WorkerConfig:
     def public_record(self) -> dict[str, object]:
         return {
             "application_name": self.application_name,
+            "candidate_sha": self.candidate.git_sha,
             "database_configured": self.database is not None,
             "database_mode": self.database_mode.value,
             "global_connection_budget": self.global_connection_budget,
@@ -308,7 +362,52 @@ class WorkerConfig:
             "sql_delay_ms": self.sql_delay_ms,
             "table_name": self.table_name,
             "worker_count": self.worker_count,
+            "wheel_filename": self.candidate.wheel_filename,
+            "wheel_sha256": self.candidate.wheel_sha256,
         }
+
+
+def package_record(config: WorkerConfig) -> dict[str, object]:
+    """Return privacy-safe runtime and installed-candidate provenance."""
+
+    import_location = fastmssql.__file__
+    if import_location is None:
+        raise WorkerLifecycleError("FastMssql import has no filesystem path")
+    distribution = importlib.metadata.distribution("fastmssql")
+    direct_url_text = distribution.read_text("direct_url.json")
+    if direct_url_text is None:
+        raise WorkerLifecycleError(
+            "FastMssql distribution has no direct installation origin"
+        )
+    try:
+        distribution_direct_url = json.loads(direct_url_text)
+    except json.JSONDecodeError as error:
+        raise WorkerLifecycleError(
+            "FastMssql direct installation origin is invalid"
+        ) from error
+    if not isinstance(distribution_direct_url, dict):
+        raise WorkerLifecycleError(
+            "FastMssql direct installation origin must be an object"
+        )
+    cwd = Path.cwd().resolve()
+    normalized_sys_path: list[str] = []
+    for entry in sys.path:
+        normalized = str(Path(entry or cwd).resolve())
+        if normalized not in normalized_sys_path:
+            normalized_sys_path.append(normalized)
+    return {
+        "candidate_sha": config.candidate.git_sha,
+        "cwd": str(cwd),
+        "distribution_direct_url": distribution_direct_url,
+        "distribution_version": distribution.version,
+        "fastmssql_import_path": str(Path(import_location).resolve()),
+        "pid": os.getpid(),
+        "ppid": os.getppid(),
+        "python_executable": sys.executable,
+        "sys_path": normalized_sys_path,
+        "wheel_filename": config.candidate.wheel_filename,
+        "wheel_sha256": config.candidate.wheel_sha256,
+    }
 
 
 def _current_pid() -> int:
@@ -519,8 +618,9 @@ def create_fastapi_app(
 ) -> FastAPI:
     """Create the native FastAPI application inside a spawned worker."""
 
+    config = _worker_config(environment)
     lifecycle = WorkerLifecycle(
-        config=_worker_config(environment),
+        config=config,
         connection_factory=connection_factory,
     )
 
@@ -532,6 +632,12 @@ def create_fastapi_app(
 
     application = FastAPI(lifespan=lifespan)
     application.state.fastmssql_worker = lifecycle
+
+    @application.get("/package")
+    async def package_probe() -> dict[str, object]:
+        lifecycle.ensure_ready()
+        return package_record(config)
+
     return application
 
 
@@ -542,11 +648,19 @@ def create_flask_app(
 ) -> Flask:
     """Create the Flask WSGI application inside a forked worker."""
 
+    config = _worker_config(environment)
     application = Flask("fastmssql-production-framework")
-    application.extensions["fastmssql_worker"] = WorkerLifecycle(
-        config=_worker_config(environment),
+    lifecycle = WorkerLifecycle(
+        config=config,
         connection_factory=connection_factory,
     )
+    application.extensions["fastmssql_worker"] = lifecycle
+
+    @application.get("/package")
+    def package_probe() -> dict[str, object]:
+        lifecycle.ensure_ready()
+        return package_record(config)
+
     return application
 
 

@@ -253,12 +253,12 @@ its own final hash without changing that hash.
 - modify: `tests/sql_auth_strict/test_matrix_contract.py`
 - modify: `VERSION.md`
 
-- [ ] **Step 2.1: create isolated RED worktree**
+- [x] **Step 2.1: create isolated RED worktree**
 
 Create the branch/worktree from the exact plan SHA. Rebuild the graph and
 verify fork/HEAD/worktree cleanliness before editing.
 
-- [ ] **Step 2.2: write database-independent failing contracts**
+- [x] **Step 2.2: write database-independent failing contracts**
 
 `tests/test_production_framework_contract.py` initially requires:
 
@@ -282,7 +282,7 @@ verify fork/HEAD/worktree cleanliness before editing.
 The test reads files as text/AST and must not import absent production
 modules during collection.
 
-- [ ] **Step 2.3: write failing evidence contracts**
+- [x] **Step 2.3: write failing evidence contracts**
 
 `tests/sql_auth_strict/test_production_framework_matrix.py` contains one
 canonical `@case` owner for each `FRAME-027` through `FRAME-054`.
@@ -300,7 +300,7 @@ A session fixture:
 
 Each test validates only its case's evidence. It does not execute a server.
 
-- [ ] **Step 2.4: extend central static contracts**
+- [x] **Step 2.4: extend central static contracts**
 
 Add assertions that:
 
@@ -313,7 +313,7 @@ Add assertions that:
   by its selected profile; and
 - no expected command imports FastMssql from `python/`.
 
-- [ ] **Step 2.5: observe and record RED**
+- [x] **Step 2.5: observe and record RED**
 
 Run:
 
@@ -334,7 +334,7 @@ Expected:
 - no unrelated existing test fails;
 - there is no collection error and no skipped required case.
 
-- [ ] **Step 2.6: self-review and commit RED**
+- [x] **Step 2.6: self-review and commit RED**
 
 Run Ruff, compile the new tests, `git diff --check`, secret scan,
 code-review-graph build/detect/affected-flows/tests-for, then commit:
@@ -366,7 +366,7 @@ The commit must contain tests/documentation only.
 - modify: `VERSION.md`
 - initially create the application package paths required by RED
 
-- [ ] **Step 3.1: create feature worktree from RED**
+- [x] **Step 3.1: create feature worktree from RED**
 
 Verify:
 
@@ -378,7 +378,7 @@ git merge-base --is-ancestor \
 
 Expected: success.
 
-- [ ] **Step 3.2: add exact development dependencies**
+- [x] **Step 3.2: add exact development dependencies**
 
 Update the development group to contain:
 
@@ -402,7 +402,7 @@ uv run python -c \
 On Windows, an equivalent lock/install contract must prove that POSIX-only
 packages are not selected.
 
-- [ ] **Step 3.3: add marker and package skeleton**
+- [x] **Step 3.3: add marker and package skeleton**
 
 Add:
 
@@ -414,7 +414,7 @@ Create `tests/production_framework/__init__.py`, `app.py` and
 `gunicorn_conf.py` with explicit interfaces but initially minimal behavior.
 Update `VERSION.md`.
 
-- [ ] **Step 3.4: make dependency/source-shape RED contracts green**
+- [x] **Step 3.4: make dependency/source-shape RED contracts green**
 
 Run only static tests. Do not fake runtime evidence or weaken artifact
 requirements. Commit:
@@ -437,7 +437,7 @@ git commit -m "feat: scaffold production framework matrix"
 - modify: `tests/production_framework/gunicorn_conf.py`
 - modify: `VERSION.md`
 
-- [ ] **Step 4.1: write failing pure configuration tests**
+- [x] **Step 4.1: write failing pure configuration tests**
 
 Cover:
 
@@ -455,12 +455,12 @@ Cover:
 
 Run and observe RED.
 
-- [ ] **Step 4.2: implement typed immutable configuration**
+- [x] **Step 4.2: implement typed immutable configuration**
 
 Use dataclasses/enums and closed mappings. Parse environment once per worker.
 Never persist the raw environment.
 
-- [ ] **Step 4.3: write failing lifecycle tests with a fake connection**
+- [x] **Step 4.3: write failing lifecycle tests with a fake connection**
 
 Test native ASGI lifespan:
 
@@ -483,13 +483,13 @@ Test adapted Flask:
 - adapter receives only `http`;
 - startup failure prevents service.
 
-- [ ] **Step 4.4: implement lifecycle**
+- [x] **Step 4.4: implement lifecycle**
 
 Use one worker-state object. Native/adapted apps construct the connection
 inside lifespan. Gunicorn WSGI hooks call worker-local async start/stop with
 bounded behavior.
 
-- [ ] **Step 4.5: verify and commit**
+- [x] **Step 4.5: verify and commit**
 
 Run offline unit/static tests, Ruff, compileall, graph review and commit:
 
@@ -509,7 +509,7 @@ git commit -m "feat: own framework pools per worker"
 - modify: `tests/test_production_framework_contract.py`
 - modify: `VERSION.md`
 
-- [ ] **Step 5.1: write failing CLI/profile expansion tests**
+- [x] **Step 5.1: write failing CLI/profile expansion tests**
 
 Test:
 
@@ -525,11 +525,11 @@ Test:
 - no duplicate profile; and
 - deterministic JSON ordering.
 
-- [ ] **Step 5.2: implement pure CLI/profile model**
+- [x] **Step 5.2: implement pure CLI/profile model**
 
 No subprocess or network work yet. Make pure tests green.
 
-- [ ] **Step 5.3: write failing command-builder tests**
+- [x] **Step 5.3: write failing command-builder tests**
 
 Require exact argument arrays:
 
@@ -543,11 +543,11 @@ Require exact argument arrays:
 - no secret-bearing argument; and
 - the isolated venv executable.
 
-- [ ] **Step 5.4: implement command builder**
+- [x] **Step 5.4: implement command builder**
 
 Return `list[str]`; never `shell=True`.
 
-- [ ] **Step 5.5: write failing process-supervisor tests**
+- [x] **Step 5.5: write failing process-supervisor tests**
 
 Use repository-owned tiny local test processes, not the real server, to prove:
 
@@ -562,12 +562,12 @@ Use repository-owned tiny local test processes, not the real server, to prove:
 - stale ready records are rejected; and
 - no orphan remains after test exceptions/cancellation.
 
-- [ ] **Step 5.6: implement supervisor**
+- [x] **Step 5.6: implement supervisor**
 
 Use `asyncio.create_subprocess_exec`, `psutil` and platform-specific process
 group flags. All waits have explicit deadlines.
 
-- [ ] **Step 5.7: implement isolated app copy/provenance**
+- [x] **Step 5.7: implement isolated app copy/provenance**
 
 Copy only the test app/config into a new run directory. Validate:
 
@@ -577,7 +577,7 @@ Copy only the test app/config into a new run directory. Validate:
 - FastMssql import under isolated `site-packages`;
 - wheel filename/hash/SHA match runner inputs.
 
-- [ ] **Step 5.8: offline real-server smoke**
+- [x] **Step 5.8: offline real-server smoke**
 
 From an isolated test venv, start a no-database `/package` app through:
 
@@ -588,7 +588,7 @@ From an isolated test venv, start a no-database `/package` app through:
 
 Use real loopback HTTP, then verify exact process teardown.
 
-- [ ] **Step 5.9: verify and commit**
+- [x] **Step 5.9: verify and commit**
 
 Commit:
 

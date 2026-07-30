@@ -1,4 +1,4 @@
-"""Fail-closed Gunicorn configuration scaffold for matrix workers."""
+"""Fail-closed Gunicorn configuration for matrix workers."""
 
 from __future__ import annotations
 
@@ -21,6 +21,20 @@ def _worker_lifecycle(worker):
     worker_pid = getattr(worker, "pid", None)
     if worker_pid != os.getpid():
         raise RuntimeError("Gunicorn lifecycle hook is outside its worker PID")
+    owner = os.environ.get(
+        "FASTMSSQL_FRAMEWORK_GUNICORN_LIFECYCLE_OWNER",
+        "auto",
+    )
+    if owner not in {"asgi", "auto", "gunicorn"}:
+        raise RuntimeError("invalid Gunicorn lifecycle owner")
+    if owner == "asgi":
+        return None
+    extensions = getattr(worker.wsgi, "extensions", None)
+    has_flask_lifecycle = (
+        isinstance(extensions, dict) and "fastmssql_worker" in extensions
+    )
+    if owner == "auto" and not has_flask_lifecycle:
+        return None
     return flask_worker_lifecycle(worker.wsgi)
 
 
@@ -38,6 +52,8 @@ def post_worker_init(worker) -> None:
     """Start a worker-local pool after Gunicorn has forked the worker."""
 
     lifecycle = _worker_lifecycle(worker)
+    if lifecycle is None:
+        return
     _run_bounded(lifecycle.start())
 
 
@@ -46,4 +62,6 @@ def worker_exit(server, worker) -> None:
 
     del server
     lifecycle = _worker_lifecycle(worker)
+    if lifecycle is None:
+        return
     _run_bounded(lifecycle.stop())
