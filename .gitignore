@@ -1,5 +1,7 @@
 # Rust build artifacts
 /target/
+/vendor/tiberius/Cargo.lock
+/vendor/tiberius/target/
 **/*.rs.bk
 *.pdb
 
