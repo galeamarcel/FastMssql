@@ -7,6 +7,9 @@ mod async_std;
 #[cfg(feature = "sql-browser-smol")]
 mod smol;
 
+#[cfg(test)]
+mod tests;
+
 use crate::client::Config;
 use async_trait::async_trait;
 

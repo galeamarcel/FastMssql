@@ -389,3 +389,55 @@ pub(crate) trait ConfigString {
             .is_some()
     }
 }
+
+#[cfg(test)]
+mod named_instance_config_tests {
+    use super::Config;
+
+    #[test]
+    fn setters_distinguish_instance_and_explicit_port() {
+        let defaults = Config::new();
+        assert!(!defaults.has_instance_name());
+        assert!(!defaults.has_explicit_port());
+        assert_eq!(defaults.get_addr(), "localhost:1433");
+
+        let mut direct = Config::new();
+        direct.host("db-host");
+        direct.port(51_433);
+        assert!(!direct.has_instance_name());
+        assert!(direct.has_explicit_port());
+        assert_eq!(direct.get_addr(), "db-host:51433");
+
+        let mut discovered = Config::new();
+        discovered.host("db-host");
+        discovered.instance_name("SQLEXPRESS");
+        assert!(discovered.has_instance_name());
+        assert!(!discovered.has_explicit_port());
+        assert_eq!(discovered.get_addr(), "db-host:1434");
+
+        let mut explicit = discovered.clone();
+        explicit.port(51_433);
+        assert!(explicit.has_instance_name());
+        assert!(explicit.has_explicit_port());
+        assert_eq!(explicit.get_addr(), "db-host:51433");
+    }
+
+    #[test]
+    fn ado_strings_preserve_instance_and_explicit_port_presence() {
+        let discovered = Config::from_ado_string(
+            r"Server=tcp:db-host\SQLEXPRESS;Encrypt=true;TrustServerCertificate=true",
+        )
+        .expect("valid named-instance connection string");
+        assert!(discovered.has_instance_name());
+        assert!(!discovered.has_explicit_port());
+        assert_eq!(discovered.get_addr(), "db-host:1434");
+
+        let explicit = Config::from_ado_string(
+            r"Server=tcp:db-host\SQLEXPRESS,51433;Encrypt=true;TrustServerCertificate=true",
+        )
+        .expect("valid named-instance connection string with port");
+        assert!(explicit.has_instance_name());
+        assert!(explicit.has_explicit_port());
+        assert_eq!(explicit.get_addr(), "db-host:51433");
+    }
+}

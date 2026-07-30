@@ -90,6 +90,27 @@ No release, package-version change, or artifact publication has occurred.
   package metadata, displayed `0.7.7` version, release, artifact publication
   or original-repository state.
 
+### Vendored Tiberius named-instance pure-protocol RED
+
+- Created `test/tiberius-named-instance-discovery` from exact approved plan
+  commit `0083a472b5547c50629c006f095e9d8bc49fdd6f`.
+- Added test-only contracts for the exact NUL-terminated SQL Browser request,
+  empty/NUL/encoded-length rejection, total response header/size parsing,
+  the 1,024-byte payload boundary, case-insensitive unique TCP tokens,
+  non-UTF-8 unrelated fields and valid port range.
+- Added setter and ADO.NET parser contracts requiring read-only distinction
+  between a named instance with no port and a caller-supplied explicit port.
+- The exact focused command
+  `cargo test --manifest-path vendor/tiberius/Cargo.toml
+  --no-default-features --features
+  chrono,tds73,rustls,sql-browser-tokio --lib sql_browser` exited `101`
+  against the unchanged runtime. Rust reported only the intended unresolved
+  `build_instance_request`/`parse_instance_response` imports and missing
+  `has_instance_name`/`has_explicit_port` methods.
+- This RED changes test-only module wiring and documentation, not production
+  behavior, dependency selection, package metadata, displayed `0.7.7`
+  version, release or published artifact.
+
 ### Seven-slice batch/bulk cumulative verification and live-audit closure
 
 - Closed the seventh batch/bulk slice, bounded-concurrency `query_many()`,

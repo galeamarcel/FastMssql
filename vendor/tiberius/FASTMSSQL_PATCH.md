@@ -127,6 +127,22 @@ The bulk-column-subset patch:
   characters, XML, constraint/trigger semantics and post-rejection
   connection recovery.
 
+The named-instance discovery patch is currently represented by an executable
+RED contract on `test/tiberius-named-instance-discovery`. It requires:
+
+- an exact NUL-terminated `CLNT_UCAST_INST` request with pre-I/O encoded-name
+  validation;
+- a total, size-bounded `SVR_RESP` parser with case-insensitive unique TCP
+  token validation;
+- read-only configuration introspection that distinguishes an absent port
+  from a caller-supplied port;
+- deterministic connected-UDP, timeout, source-validation and TCP-error
+  preservation coverage before the runtime patch is added.
+
+This paragraph records a pending test contract, not implemented behavior. It
+will be replaced with the exact verified runtime patch description only after
+the RED/fix ancestry and required gates pass.
+
 No Tiberius fork has been created or published by the FastMssql fork owner.
 The path dependency keeps the reviewed source inside the FastMssql repository
 and makes builds independent of the contributor fork remaining available.
