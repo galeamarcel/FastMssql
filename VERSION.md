@@ -45,6 +45,28 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Cumulative SQL Server fresh-process gate design
+
+- Recorded the cumulative-runner failure at exact candidate `b997ab3`: the
+  unchanged native-bulk `BULK-008` request waited on
+  `RESOURCE_SEMAPHORE` when SQL Server exposed only about 15 MB of query
+  memory for a request requiring about 58 MB.
+- Confirmed the environmental boundary by restarting only the approved
+  dedicated container, reprovisioning the persistent databases, observing
+  zero semaphore waiters and 638–837 MB available, and rerunning the exact
+  unchanged test successfully in 0.14 seconds.
+- Selected `docker compose up -d --force-recreate sqlserver` for the
+  canonical cumulative runner so every gate begins with a fresh SQL Server
+  process while preserving the named data volume.
+- Defined an executable RED contract that runs the real runner with a
+  recording Docker fake and proves the exact recreate argument vector and
+  ordering before provision, rather than grepping shell source.
+- Rejected retries, destructive volume removal, process-only `restart`, and
+  SQL Server memory tuning as solutions to the inherited-process-state
+  defect.
+- Added no runtime-library behavior, package metadata, displayed-version
+  change, dependency, release or published artifact.
+
 ### Query-many bounded-concurrency design
 
 - Added the focused design for the seventh and final batch/bulk slice on
