@@ -23,6 +23,9 @@ from sql_auth_strict.operation_metrics_assertions import (
     BUCKET_BOUNDS_SECONDS,
     OPERATION_NAMES,
 )
+from sql_auth_strict.test_production_framework_matrix import (
+    production_framework_evidence as _production_framework_evidence,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -65,6 +68,47 @@ def _git_head() -> str:
         text=True,
     )
     return completed.stdout.strip()
+
+
+def _workflow_push_branches(source: str) -> set[str]:
+    lines = source.splitlines()
+    on_index = next(
+        (index for index, line in enumerate(lines) if line in {"on:", '"on":'}),
+        None,
+    )
+    assert on_index is not None, "workflow has no on mapping"
+    on_end = next(
+        (
+            index
+            for index in range(on_index + 1, len(lines))
+            if lines[index] and not lines[index].startswith((" ", "#"))
+        ),
+        len(lines),
+    )
+    on_lines = lines[on_index + 1 : on_end]
+    push_index = next(
+        (index for index, line in enumerate(on_lines) if line == "  push:"),
+        None,
+    )
+    assert push_index is not None, "workflow has no push trigger"
+    branch_index = next(
+        (
+            index
+            for index in range(push_index + 1, len(on_lines))
+            if on_lines[index] == "    branches:"
+        ),
+        None,
+    )
+    assert branch_index is not None, "workflow has no push branch list"
+    branches: set[str] = set()
+    for line in on_lines[branch_index + 1 :]:
+        if line.startswith("      - "):
+            branches.add(line.removeprefix("      - ").strip("'\""))
+            continue
+        if line.strip() and len(line) - len(line.lstrip()) <= 4:
+            break
+    assert branches, "workflow push branch list is empty"
+    return branches
 
 
 def test_sql_auth_repository_contract_files_exist() -> None:
@@ -1747,3 +1791,95 @@ def test_strict_tests_do_not_swallow_failures() -> None:
         if broad_handlers:
             violations.append(str(path.relative_to(ROOT)))
     assert violations == []
+
+
+def test_production_framework_evidence_requires_exact_current_sha(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    evidence_path = tmp_path / "production-framework-metrics.json"
+    payload = {
+        "schema_version": 1,
+        "candidate": {"git_sha": _git_head()},
+        "overall": "PASS",
+        "violations": [],
+    }
+    evidence_path.write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "FASTMSSQL_PRODUCTION_FRAMEWORK_METRICS_PATH",
+        str(evidence_path),
+    )
+
+    assert _production_framework_evidence.__wrapped__() == payload
+
+    payload["candidate"]["git_sha"] = "0" * 40
+    evidence_path.write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError):
+        _production_framework_evidence.__wrapped__()
+
+
+def test_production_framework_runner_precedes_evidence_validation() -> None:
+    source = (ROOT / "scripts/sql_auth/run_all.sh").read_text(encoding="utf-8")
+    process_lane = "record production-framework-process "
+    evidence_lane = "record production-framework-evidence "
+    assert process_lane in source
+    assert evidence_lane in source
+    assert source.index("record provision ") < source.index(process_lane)
+    assert source.index(process_lane) < source.index(evidence_lane)
+    assert source.index(evidence_lane) < source.index("record report ")
+    assert "tests/sql_auth_strict/test_production_framework_matrix.py" in source
+
+
+def test_production_framework_report_receives_exact_metrics_path() -> None:
+    runner = (ROOT / "scripts/sql_auth/run_all.sh").read_text(encoding="utf-8")
+    report = (ROOT / "scripts/sql_auth/generate_report.py").read_text(encoding="utf-8")
+    expected = "${artifact_dir}/production-framework-metrics.json"
+    assert expected in runner
+    assert "--production-framework-metrics" in runner
+    assert "production-framework-metrics.json" in report
+    assert "Production framework process matrix" in report
+
+
+def test_production_framework_candidate_branches_trigger_hosted_gates() -> None:
+    expected = {
+        "test/production-framework-matrix",
+        "feat/production-framework-matrix",
+        "verify/production-framework-matrix",
+        "docs/production-framework-matrix-status",
+    }
+    for path in (
+        ROOT / ".github/workflows/production-framework-matrix.yml",
+        ROOT / ".github/workflows/rust-unit-tests.yml",
+        ROOT / ".github/workflows/dependency-security.yml",
+    ):
+        assert path.is_file(), path
+        source = path.read_text(encoding="utf-8")
+        assert expected <= _workflow_push_branches(source), path.name
+
+
+def test_production_framework_hosted_claims_are_platform_exact() -> None:
+    workflow_path = ROOT / ".github/workflows/production-framework-matrix.yml"
+    assert workflow_path.is_file(), workflow_path
+    workflow = workflow_path.read_text(encoding="utf-8")
+    for token in (
+        "ubuntu-latest",
+        "macos-latest",
+        "windows-2022",
+        "hosted_sql_auth",
+        "Microsoft SQL Server 2022 Docker",
+        "Microsoft SQL Server 2022 Express",
+        "Gunicorn is not supported on Windows",
+        "uvloop is not supported on Windows",
+    ):
+        assert token in workflow
+    assert "macos-hosted-sql-auth: true" not in workflow
+    assert "continue-on-error" not in workflow
+    assert "pytest.skip" not in workflow
+    assert "FastMssql/python" not in workflow
+    assert "PYTHONPATH=${{ github.workspace }}/python" not in workflow

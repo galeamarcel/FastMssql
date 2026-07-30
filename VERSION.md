@@ -52,6 +52,40 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Production framework process matrix RED
+
+- Created `test/production-framework-matrix` directly from the approved
+  executable-plan commit
+  `f7b269d38164843bda53bcdb27ccd1bd78872609`.
+- Added database-independent contracts for exact development-only server
+  dependencies, platform markers, repository-owned app/runner/workflow
+  files, post-spawn/post-fork lifecycle, current Uvicorn worker path,
+  shell-free bounded supervision, isolated-wheel provenance, fixed-worker
+  99,999-operation opt-in, privacy and complete teardown.
+- Added one canonical evidence validator for each `FRAME-027` through
+  `FRAME-054`. Each validates its own schema fields rather than accepting a
+  generic aggregate PASS.
+- Extended the central matrix contract with runner-before-validator ordering,
+  report metrics wiring, exact candidate branch triggers and
+  Linux/macOS/Windows claim boundaries.
+- The focused commands are intentionally RED against the unchanged
+  implementation because the production app, runner, dependencies, workflow
+  and exact-SHA artifact do not yet exist. The database-independent command
+  collected 17 tests and produced the intended `16 failed, 1 passed`;
+  the strict command collected 65 tests and produced the intended
+  `5 failed, 32 passed, 28 errors`. All 28 setup errors have the same
+  fail-closed cause—the required exact-SHA artifact is absent—and neither
+  command has a collection error or skip.
+- Self-review made the evidence contract executable on every claimed
+  platform: lock versions are distinct from platform-selected installed
+  versions, Windows requires explicit N/A records for POSIX shutdown and
+  Gunicorn scenarios, database pool assertions exclude the hosted macOS
+  structural mode, PID reconciliation is order-independent, and extended
+  10,000/99,999 load is required only when explicitly selected.
+- This test-only reproduction changes no FastMssql/Tiberius runtime,
+  dependency, lockfile, package metadata, displayed `0.7.7` version, release,
+  published artifact or original-repository state.
+
 ### Production framework process matrix design
 
 - Specification commit:
