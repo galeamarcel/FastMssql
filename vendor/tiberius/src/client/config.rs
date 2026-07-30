@@ -107,6 +107,16 @@ impl Config {
         self.instance_name = Some(name.to_string());
     }
 
+    /// Whether a named SQL Server instance was configured.
+    pub fn has_instance_name(&self) -> bool {
+        self.instance_name.is_some()
+    }
+
+    /// Whether the caller supplied a port rather than using a default.
+    pub fn has_explicit_port(&self) -> bool {
+        self.port.is_some()
+    }
+
     /// Sets the application name to the connection, queryable with the
     /// `APP_NAME()` command.
     ///

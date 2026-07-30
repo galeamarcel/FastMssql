@@ -469,7 +469,9 @@ For each DNS candidate:
 - bind the same-family wildcard address;
 - `connect()` the UDP socket to that candidate;
 - `send()` the exact request;
-- receive into a fixed `3 + 1_024` byte buffer under one second;
+- receive into a fixed `3 + 1_024 + 1` byte buffer under one second, treating
+  the final byte only as an oversize-rejection sentinel;
+- reject any response longer than the accepted `3 + 1_024` bytes;
 - parse the exact received slice;
 - replace only that candidate's port with the parsed TCP port;
 - attempt `TcpStream::connect(candidate)` and set `TCP_NODELAY`;

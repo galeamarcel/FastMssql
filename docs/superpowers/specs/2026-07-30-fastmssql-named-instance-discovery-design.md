@@ -364,12 +364,18 @@ For every DNS address candidate:
 1. bind an ephemeral wildcard address of the same IP family;
 2. connect the UDP socket to the selected browser address;
 3. send one bounded request;
-4. receive at most `3 + 1024` bytes;
-5. enforce the one-second response timer;
-6. parse only a response from the connected peer;
-7. connect TCP to the returned port on that same IP address.
+4. receive into a fixed `3 + 1024 + 1` byte buffer, where the final byte is
+   only an oversize-rejection sentinel and is never accepted as payload;
+5. accept at most `3 + 1024` response bytes;
+6. enforce the one-second response timer;
+7. parse only a response from the connected peer;
+8. connect TCP to the returned port on that same IP address.
 
-There is no broadcast, retransmission or unbounded allocation.
+The sentinel is required because ordinary UDP `recv` APIs may silently
+truncate a larger datagram to the supplied buffer and do not expose the
+original datagram length. It prevents a response with an otherwise valid
+1,024-byte declaration plus trailing data from becoming valid through
+truncation. There is no broadcast, retransmission or unbounded allocation.
 
 ### SSRP response parser
 

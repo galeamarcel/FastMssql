@@ -12,7 +12,7 @@ use tracing::Level;
 #[async_trait]
 impl SqlBrowser for TcpStream {
     /// This method can be used to connect to SQL Server named instances
-    /// when on a Windows paltform with the `sql-browser-tokio` feature
+    /// when on a Windows platform with the `sql-browser-smol` feature
     /// enabled. Please see the crate examples for more detailed examples.
     async fn connect_named(builder: &Config) -> crate::Result<Self> {
         let addrs = resolve(builder.get_addr()).await?;
@@ -31,12 +31,10 @@ impl SqlBrowser for TcpStream {
 
                 tracing::event!(
                     Level::TRACE,
-                    "Connecting to instance `{}` using SQL Browser in port `{}`",
-                    instance_name,
-                    builder.get_port()
+                    "Resolving a named SQL Server instance through SQL Browser"
                 );
 
-                let msg = [&[4u8], instance_name.as_bytes()].concat();
+                let msg = super::build_instance_request(instance_name)?;
                 let mut buf = vec![0u8; 4096];
 
                 let socket = UdpSocket::bind(&local_bind).await?;
@@ -64,7 +62,10 @@ impl SqlBrowser for TcpStream {
                     }).await?;
 
                 let port = super::get_port_from_sql_browser_reply(buf, len, instance_name)?;
-                tracing::event!(Level::TRACE, "Found port `{}` from SQL Browser", port);
+                tracing::event!(
+                    Level::TRACE,
+                    "SQL Browser returned a named-instance TCP endpoint"
+                );
                 addr.set_port(port);
             };
 

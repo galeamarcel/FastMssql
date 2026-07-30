@@ -1,74 +1,118 @@
 use super::SqlBrowser;
 use crate::client::Config;
 use async_trait::async_trait;
-use futures_util::future::TryFutureExt;
 use net::{TcpStream, UdpSocket};
-use std::io;
+use std::{io, net::SocketAddr};
 use tokio::{
     net,
-    time::{self, error::Elapsed, Duration},
+    time::{self, Duration},
 };
 use tracing::Level;
+
+const SQL_BROWSER_TIMEOUT: Duration = Duration::from_secs(1);
+const SQL_BROWSER_RECEIVE_BUFFER_LEN: usize =
+    super::SQL_BROWSER_HEADER_LEN + super::SQL_BROWSER_MAX_RESPONSE_PAYLOAD + 1;
 
 #[async_trait]
 impl SqlBrowser for TcpStream {
     /// This method can be used to connect to SQL Server named instances
-    /// when on a Windows paltform with the `sql-browser-tokio` feature
+    /// when on a Windows platform with the `sql-browser-tokio` feature
     /// enabled. Please see the crate examples for more detailed examples.
     async fn connect_named(builder: &Config) -> crate::Result<Self> {
+        let browser_request = builder
+            .instance_name
+            .as_deref()
+            .map(super::build_instance_request)
+            .transpose()?;
         let addrs = net::lookup_host(builder.get_addr()).await?;
+        let mut last_error = None;
 
         for mut addr in addrs {
-            if let Some(ref instance_name) = builder.instance_name {
+            if let (Some(instance_name), Some(request)) =
+                (builder.instance_name.as_deref(), browser_request.as_deref())
+            {
                 // First resolve the instance to a port via the
                 // SSRP protocol/MS-SQLR protocol [1]
                 // [1] https://msdn.microsoft.com/en-us/library/cc219703.aspx
 
-                let local_bind: std::net::SocketAddr = if addr.is_ipv4() {
-                    "0.0.0.0:0".parse().unwrap()
+                let local_bind = if addr.is_ipv4() {
+                    SocketAddr::from(([0, 0, 0, 0], 0))
                 } else {
-                    "[::]:0".parse().unwrap()
+                    SocketAddr::from(([0_u16; 8], 0))
                 };
 
                 tracing::event!(
                     Level::TRACE,
-                    "Connecting to instance `{}` using SQL Browser in port `{}`",
-                    instance_name,
-                    builder.get_port()
+                    "Resolving a named SQL Server instance through SQL Browser"
                 );
 
-                let msg = [&[4u8], instance_name.as_bytes()].concat();
-                let mut buf = vec![0u8; 4096];
+                let socket = match UdpSocket::bind(local_bind).await {
+                    Ok(socket) => socket,
+                    Err(error) => {
+                        last_error = Some(error.into());
+                        continue;
+                    }
+                };
 
-                let socket = UdpSocket::bind(&local_bind).await?;
-                socket.send_to(&msg, &addr).await?;
+                if let Err(error) = socket.connect(addr).await {
+                    last_error = Some(error.into());
+                    continue;
+                }
 
-                let timeout = Duration::from_millis(1000);
+                if let Err(error) = socket.send(request).await {
+                    last_error = Some(error.into());
+                    continue;
+                }
 
-                let len = time::timeout(timeout, socket.recv(&mut buf))
-                    .map_err(|_: Elapsed| {
-                        crate::error::Error::Conversion(
-                            format!(
-                                "SQL browser timeout during resolving instance {}. Please check if browser is running in port {} and does the instance exist.",
-                                instance_name,
-                                builder.get_port(),
+                let mut response = [0_u8; SQL_BROWSER_RECEIVE_BUFFER_LEN];
+                let len = match time::timeout(SQL_BROWSER_TIMEOUT, socket.recv(&mut response)).await
+                {
+                    Ok(Ok(len)) => len,
+                    Ok(Err(error)) => {
+                        last_error = Some(error.into());
+                        continue;
+                    }
+                    Err(_) => {
+                        last_error = Some(
+                            io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "SQL Browser response timed out after one second",
                             )
                             .into(),
-                        )
-                    })
-                    .await??;
+                        );
+                        continue;
+                    }
+                };
 
-                let port = super::get_port_from_sql_browser_reply(buf, len, instance_name)?;
-                tracing::event!(Level::TRACE, "Found port `{}` from SQL Browser", port);
+                let port = match super::parse_instance_response(&response[..len], instance_name) {
+                    Ok(port) => port,
+                    Err(error) => {
+                        last_error = Some(error);
+                        continue;
+                    }
+                };
+                tracing::event!(
+                    Level::TRACE,
+                    "SQL Browser returned a named-instance TCP endpoint"
+                );
                 addr.set_port(port);
             };
 
-            if let Ok(stream) = TcpStream::connect(addr).await {
-                stream.set_nodelay(true)?;
-                return Ok(stream);
+            match TcpStream::connect(addr).await {
+                Ok(stream) => {
+                    stream.set_nodelay(true)?;
+                    return Ok(stream);
+                }
+                Err(error) => last_error = Some(error.into()),
             }
         }
 
-        Err(io::Error::new(io::ErrorKind::NotFound, "Could not resolve server host").into())
+        Err(last_error.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "server host resolved to no addresses",
+            )
+            .into()
+        }))
     }
 }

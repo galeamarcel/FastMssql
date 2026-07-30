@@ -4,7 +4,7 @@ This directory is the minimal build source subset of the published `tiberius`
 crate version `0.12.3`, whose registry source records upstream commit
 `c34fab2e14c52ab74519d073d7a7b65bd023fc1a`.
 
-FastMssql temporarily carries seven narrowly scoped patch sets.
+FastMssql temporarily carries eight narrowly scoped patch sets.
 
 The TLS dependency migration includes:
 
@@ -127,21 +127,30 @@ The bulk-column-subset patch:
   characters, XML, constraint/trigger semantics and post-rejection
   connection recovery.
 
-The named-instance discovery patch is currently represented by an executable
-RED contract on `test/tiberius-named-instance-discovery`. It requires:
+The named-instance discovery patch:
 
-- an exact NUL-terminated `CLNT_UCAST_INST` request with pre-I/O encoded-name
-  validation;
-- a total, size-bounded `SVR_RESP` parser with case-insensitive unique TCP
-  token validation;
-- read-only configuration introspection that distinguishes an absent port
-  from a caller-supplied port;
-- deterministic connected-UDP, timeout, source-validation and TCP-error
-  preservation coverage before the runtime patch is added.
-
-This paragraph records a pending test contract, not implemented behavior. It
-will be replaced with the exact verified runtime patch description only after
-the RED/fix ancestry and required gates pass.
+- builds the SQLR `CLNT_UCAST_INST` request as opcode `0x04`, one nonempty
+  NUL-free instance name of at most 32 encoded bytes, and the required
+  trailing NUL;
+- applies that request builder to Tokio, async-std and smol SQL Browser
+  transports without logging the instance or returned port in trace events;
+- parses `SVR_RESP` as a total bounded byte-slice operation, validating type
+  `0x05`, exact little-endian payload length, the 1,024-byte payload ceiling,
+  one case-insensitive `tcp` token and a decimal port in `1..=65535`;
+- uses a connected Tokio UDP socket, one request per resolved address and a
+  one-second inner receive timeout, so an unrelated source cannot select the
+  TCP target;
+- allocates one bounded rejection-sentinel byte beyond the maximum accepted
+  datagram, preventing an oversized UDP response from becoming valid through
+  silent socket truncation;
+- retains the last meaningful DNS, UDP, response or TCP error instead of
+  replacing a refused discovered endpoint with a false host-not-found error;
+- exposes read-only `Config::has_instance_name()` and
+  `Config::has_explicit_port()` without changing existing setters, parsing or
+  `get_addr()`;
+- has deterministic pure and Tokio loopback coverage for request bytes,
+  malformed responses, wrong-source rejection, timeout, error preservation,
+  direct-connect compatibility and ADO.NET configuration parsing.
 
 No Tiberius fork has been created or published by the FastMssql fork owner.
 The path dependency keeps the reviewed source inside the FastMssql repository

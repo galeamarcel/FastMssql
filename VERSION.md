@@ -132,6 +132,52 @@ No release, package-version change, or artifact publication has occurred.
   behavior, dependency, package metadata, displayed `0.7.7` version, release
   or published artifact.
 
+### Vendored Tiberius named-instance discovery fix
+
+- Created `fix/tiberius-named-instance-discovery` directly from final RED
+  commit `ebe96f7cd195c4d70a586fc9da6c5d8cfe7178b6`; both protocol and network
+  RED commits remain ancestors.
+- Added pure request construction with the required trailing NUL and
+  pre-I/O empty/NUL/32-byte validation. Replaced the panic-prone parser with
+  exact header, declared-length, 1,024-byte, case-insensitive unique-TCP and
+  checked port validation over raw bytes. SQLR fields are consumed as
+  key/value pairs, so an unrelated value or instance literally named `tcp`
+  cannot be mistaken for a duplicate transport key.
+- Added read-only Tiberius configuration introspection for instance presence
+  and caller-supplied port presence while retaining all setter, ADO.NET and
+  `get_addr()` behavior.
+- After adding only the pure helpers/getters, the focused suite produced the
+  intended second RED: 9 passed and 3 failed because the old Tokio transport
+  omitted NUL, accepted a response from the wrong UDP peer and replaced a
+  refused discovered TCP port with `NotFound`.
+- Reworked the Tokio transport to connect its UDP socket to each resolved
+  browser peer, send one bounded request, retain the one-second response
+  timer, validate the reply and preserve the last meaningful transport
+  failure before TCP connect. Trace messages are structural.
+- Used a fixed 1,028-byte receive buffer: 1,027 bytes is the maximum accepted
+  header plus payload and the final byte is a rejection sentinel. This closes
+  the UDP truncation ambiguity while retaining the 1,024-byte accepted
+  payload ceiling.
+- Added a loopback regression that sends a valid declared 1,024-byte payload
+  plus one trailing byte and proves neither socket truncation nor parsing can
+  select its embedded TCP target.
+- Clarified the approved design and executable plan with that sentinel
+  distinction after implementation self-review established that ordinary UDP
+  receive APIs do not report a silently truncated datagram's original size.
+- Applied the exact request builder and structural traces to the async-std and
+  smol adapters; their existing transport policy remains otherwise
+  unchanged.
+- The focused Tokio suite passes 14/14; the complete vendored library passes
+  184/184 with `sql-browser-tokio` and 170/170 without a browser feature.
+  Pure compatibility suites pass 8/8 for both async-std and smol.
+- Vendored format passes and Clippy passes for all targets with every
+  non-baseline warning denied under the repository's audited legacy-lint
+  allowlist. A combined check with Tokio, async-std and smol SQL Browser
+  features enabled together also passes.
+- This fix changes only the vendored transport and read-only configuration
+  introspection. It changes no root FastMssql dependency feature yet, package
+  metadata, displayed `0.7.7` version, release or published artifact.
+
 ### Seven-slice batch/bulk cumulative verification and live-audit closure
 
 - Closed the seventh batch/bulk slice, bounded-concurrency `query_many()`,

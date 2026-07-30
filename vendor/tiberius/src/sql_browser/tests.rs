@@ -86,6 +86,16 @@ fn unrelated_multibyte_fields_do_not_require_utf8() {
 }
 
 #[test]
+fn tcp_text_in_an_unrelated_field_value_is_not_a_duplicate_key() {
+    let bytes = response(b"InstanceName;tcp;IsClustered;No;tcp;1433;");
+    assert_eq!(
+        parse_instance_response(&bytes, INSTANCE_NAME)
+            .expect("only the paired TCP key selects the port"),
+        1433
+    );
+}
+
+#[test]
 fn malformed_headers_and_sizes_are_total_and_bounded() {
     for bytes in [
         Vec::new(),
@@ -129,6 +139,8 @@ fn missing_duplicate_and_invalid_tcp_fields_are_rejected() {
         b"ServerName;host;".as_slice(),
         b"tcp;".as_slice(),
         b"tcp;;".as_slice(),
+        b"ServerName;host;orphan".as_slice(),
+        b";nonempty;tcp;1433;".as_slice(),
         b"tcp;1433;TCP;1434;".as_slice(),
         b"tcp;+1433;".as_slice(),
         b"tcp; 1433;".as_slice(),
@@ -209,6 +221,53 @@ mod tokio_transport {
         assert_eq!(
             server.local_addr().expect("server local").port(),
             target_port
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_datagram_cannot_become_valid_through_socket_truncation() {
+        let browser = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind SQL Browser fixture");
+        let browser_address = browser.local_addr().expect("browser address");
+        let target = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind forbidden TCP target");
+        let target_port = target.local_addr().expect("target address").port();
+
+        let responder = tokio::spawn(async move {
+            let mut request = [0_u8; 64];
+            let (_, peer) = timeout(TEST_BOUND, browser.recv_from(&mut request))
+                .await
+                .expect("browser request timeout")
+                .expect("receive browser request");
+
+            let mut payload = format!("ServerName;host;tcp;{target_port};Padding;").into_bytes();
+            payload.resize(1_024, b'x');
+            let mut oversized = response(&payload);
+            oversized.push(b'x');
+            assert_eq!(oversized.len(), 1_028);
+            browser
+                .send_to(&oversized, peer)
+                .await
+                .expect("send oversized response");
+        });
+
+        let error = timeout(TEST_BOUND, connect_named(browser_config(browser_address)))
+            .await
+            .expect("named connect exceeded test bound")
+            .expect_err("oversized response must not select a TCP target");
+        responder.await.expect("browser responder task");
+
+        assert!(
+            matches!(error, Error::Protocol(_)),
+            "oversized response must be a protocol error, got {error:?}"
+        );
+        assert!(
+            timeout(Duration::from_millis(250), target.accept())
+                .await
+                .is_err(),
+            "truncated oversized response reached its embedded TCP target"
         );
     }
 
