@@ -48,6 +48,23 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Named-instance refused-target fixture RED
+
+- Created `test/named-instance-refused-fixture` directly from FastMssql
+  named-instance RED commit
+  `ebe13bedd407846874f92e9b82157bef2ba2179a`.
+- Added a behavior-level loopback contract requiring `refused_tcp` mode to
+  produce `ConnectionRefusedError` in less than `0.5` seconds, which is the
+  prerequisite for testing preservation of a refused discovered TCP target
+  rather than an unrelated outer timeout.
+- Observed the intended RED with
+  `../../.venv/bin/pytest tests/sql_auth_strict/test_sql_browser_fixture_contract.py -q`:
+  `1 failed`; the held bound-but-unlistened socket produced `TimeoutError`
+  after the exact `0.5`-second bound instead of `ConnectionRefusedError`.
+- This RED changes one test and `VERSION.md` only. It changes no fixture,
+  runtime, dependency, package metadata, displayed `0.7.7` version, release
+  or artifact publication.
+
 ### Named-instance discovery design
 
 - Approved the enterprise contract for `instance_name` without an explicit
