@@ -1,9 +1,20 @@
 from __future__ import annotations
 
 import ast
+import asyncio
+from dataclasses import FrozenInstanceError
+import json
+import os
 from pathlib import Path
 import re
 import tomllib
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from production_framework import app as framework_app
+from production_framework import gunicorn_conf
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -97,6 +108,629 @@ def _workflow_push_branches(source: str) -> set[str]:
             break
     assert branches, "workflow push branch list is empty"
     return branches
+
+
+def _valid_worker_environment(tmp_path: Path) -> dict[str, str]:
+    run_root = tmp_path / "run"
+    artifact_directory = run_root / "worker-records"
+    artifact_directory.mkdir(parents=True)
+    return {
+        "FASTMSSQL_FRAMEWORK_DATABASE_MODE": "sql_auth",
+        "FASTMSSQL_FRAMEWORK_WORKER_COUNT": "4",
+        "FASTMSSQL_FRAMEWORK_GLOBAL_CONNECTION_BUDGET": "16",
+        "FASTMSSQL_FRAMEWORK_APPLICATION_NAME": "framework_app_01",
+        "FASTMSSQL_FRAMEWORK_RUN_ID": "run-0123456789abcdef",
+        "FASTMSSQL_FRAMEWORK_RUN_ROOT": str(run_root),
+        "FASTMSSQL_FRAMEWORK_ARTIFACT_DIR": str(artifact_directory),
+        "FASTMSSQL_FRAMEWORK_TABLE": "framework_items_01234567",
+        "FASTMSSQL_FRAMEWORK_SQL_DELAY_MS": "100",
+        "FASTMSSQL_SQL_AUTH_HOST": "127.0.0.1",
+        "FASTMSSQL_SQL_AUTH_PORT": "14334",
+        "FASTMSSQL_SQL_AUTH_DATABASE": "fastmssql_validation",
+        "FASTMSSQL_SQL_AUTH_OWNER_USER": "fastmssql_owner",
+        "FASTMSSQL_SQL_AUTH_OWNER_PASSWORD": "private-test-value",
+    }
+
+
+def test_worker_config_requires_every_common_and_sql_auth_setting(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    for name in tuple(environment):
+        incomplete = environment.copy()
+        del incomplete[name]
+        with pytest.raises(framework_app.ConfigurationError) as captured:
+            framework_app.WorkerConfig.from_environment(incomplete)
+        assert name in str(captured.value)
+        assert "private-test-value" not in str(captured.value)
+
+
+@pytest.mark.parametrize("worker_count", ["0", "3", "16", "1.5"])
+def test_worker_config_rejects_undeclared_worker_counts(
+    tmp_path: Path,
+    worker_count: str,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    environment["FASTMSSQL_FRAMEWORK_WORKER_COUNT"] = worker_count
+    with pytest.raises(framework_app.ConfigurationError):
+        framework_app.WorkerConfig.from_environment(environment)
+
+
+@pytest.mark.parametrize("worker_count", ["1", "2", "4", "8"])
+def test_worker_config_accepts_every_declared_worker_count(
+    tmp_path: Path,
+    worker_count: str,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    environment["FASTMSSQL_FRAMEWORK_WORKER_COUNT"] = worker_count
+    config = framework_app.WorkerConfig.from_environment(environment)
+    assert config.worker_count == int(worker_count)
+    assert config.pool_max_per_worker == 16 // int(worker_count)
+
+
+@pytest.mark.parametrize("budget", ["0", "-1", "3", "15", "not-an-int"])
+def test_worker_config_requires_an_exact_global_budget_division(
+    tmp_path: Path,
+    budget: str,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    environment["FASTMSSQL_FRAMEWORK_GLOBAL_CONNECTION_BUDGET"] = budget
+    with pytest.raises(framework_app.ConfigurationError):
+        framework_app.WorkerConfig.from_environment(environment)
+
+    environment["FASTMSSQL_FRAMEWORK_GLOBAL_CONNECTION_BUDGET"] = "16"
+    config = framework_app.WorkerConfig.from_environment(environment)
+    assert config.pool_max_per_worker == 4
+    assert (
+        config.worker_count * config.pool_max_per_worker
+        == config.global_connection_budget
+    )
+
+
+@pytest.mark.parametrize("port", ["0", "65536", "1.5", "tcp"])
+def test_worker_config_rejects_out_of_range_database_ports(
+    tmp_path: Path,
+    port: str,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    environment["FASTMSSQL_SQL_AUTH_PORT"] = port
+    with pytest.raises(framework_app.ConfigurationError):
+        framework_app.WorkerConfig.from_environment(environment)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("FASTMSSQL_FRAMEWORK_APPLICATION_NAME", "unsafe name"),
+        ("FASTMSSQL_FRAMEWORK_RUN_ID", "../escape"),
+        ("FASTMSSQL_FRAMEWORK_TABLE", "items; DROP TABLE items"),
+        ("FASTMSSQL_FRAMEWORK_SQL_DELAY_MS", "101"),
+    ],
+)
+def test_worker_config_rejects_unsafe_identifiers_and_unlisted_delays(
+    tmp_path: Path,
+    name: str,
+    value: str,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    environment[name] = value
+    with pytest.raises(framework_app.ConfigurationError):
+        framework_app.WorkerConfig.from_environment(environment)
+
+
+def test_worker_config_requires_artifacts_inside_the_run_root(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    environment["FASTMSSQL_FRAMEWORK_ARTIFACT_DIR"] = str(tmp_path / "outside")
+    with pytest.raises(
+        framework_app.ConfigurationError,
+        match="artifact directory must be contained by run root",
+    ):
+        framework_app.WorkerConfig.from_environment(environment)
+
+
+def test_worker_config_is_immutable_and_never_records_credentials(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    secret = environment["FASTMSSQL_SQL_AUTH_OWNER_PASSWORD"]
+    config = framework_app.WorkerConfig.from_environment(environment)
+
+    with pytest.raises(FrozenInstanceError):
+        config.worker_count = 8
+
+    rendered = repr(config)
+    record = json.dumps(config.public_record(), sort_keys=True)
+    assert secret not in rendered
+    assert secret not in record
+    assert "password" not in record.lower()
+
+    invalid = environment.copy()
+    invalid["FASTMSSQL_SQL_AUTH_PORT"] = secret
+    with pytest.raises(framework_app.ConfigurationError) as captured:
+        framework_app.WorkerConfig.from_environment(invalid)
+    assert secret not in str(captured.value)
+
+
+def test_worker_config_keeps_database_and_offline_modes_disjoint(
+    tmp_path: Path,
+) -> None:
+    sql_auth_environment = _valid_worker_environment(tmp_path)
+    sql_auth = framework_app.WorkerConfig.from_environment(sql_auth_environment)
+    assert sql_auth.database_mode is framework_app.DatabaseMode.SQL_AUTH
+    assert sql_auth.database is not None
+
+    offline_environment = sql_auth_environment.copy()
+    offline_environment["FASTMSSQL_FRAMEWORK_DATABASE_MODE"] = "offline"
+    for name in framework_app.SQL_AUTH_ENVIRONMENT_KEYS:
+        offline_environment.pop(name)
+    offline = framework_app.WorkerConfig.from_environment(offline_environment)
+    assert offline.database_mode is framework_app.DatabaseMode.OFFLINE
+    assert offline.database is None
+
+    confused_environment = offline_environment.copy()
+    confused_environment["FASTMSSQL_SQL_AUTH_OWNER_PASSWORD"] = "must-not-be-accepted"
+    with pytest.raises(
+        framework_app.ConfigurationError,
+        match="offline mode forbids SQL-auth settings",
+    ):
+        framework_app.WorkerConfig.from_environment(confused_environment)
+
+
+def test_importing_application_module_does_not_construct_a_connection() -> None:
+    assert not any(
+        isinstance(value, framework_app.Connection)
+        for value in vars(framework_app).values()
+    )
+
+
+class _FakeConnection:
+    def __init__(
+        self,
+        events: list[object],
+        *,
+        connect_error: BaseException | None = None,
+        connect_delay_seconds: float = 0,
+        before_disconnect=None,
+        disconnect_delay_seconds: float = 0,
+        disconnect_error: BaseException | None = None,
+    ) -> None:
+        self.events = events
+        self.connect_error = connect_error
+        self.connect_delay_seconds = connect_delay_seconds
+        self.before_disconnect = before_disconnect
+        self.disconnect_delay_seconds = disconnect_delay_seconds
+        self.disconnect_error = disconnect_error
+
+    async def connect(self, *, validate: bool = True) -> None:
+        self.events.append(("connect", validate, os.getpid()))
+        if self.connect_delay_seconds:
+            await asyncio.sleep(self.connect_delay_seconds)
+        if self.connect_error is not None:
+            raise self.connect_error
+
+    async def disconnect(self) -> None:
+        if self.before_disconnect is not None:
+            self.before_disconnect()
+        self.events.append(("disconnect", os.getpid()))
+        if self.disconnect_delay_seconds:
+            await asyncio.sleep(self.disconnect_delay_seconds)
+        if self.disconnect_error is not None:
+            raise self.disconnect_error
+
+
+def _connection_factory(
+    connection: _FakeConnection,
+    events: list[object],
+):
+    def create(config, pid: int):
+        events.append(("construct", pid, os.getpid(), config.application_name))
+        return connection
+
+    return create
+
+
+def _worker_record(
+    environment: dict[str, str],
+    phase: str,
+    pid: int | None = None,
+) -> Path:
+    worker_pid = os.getpid() if pid is None else pid
+    return (
+        Path(environment["FASTMSSQL_FRAMEWORK_ARTIFACT_DIR"])
+        / f"{phase}-{worker_pid}.json"
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_fastapi_lifespan_owns_one_pool_in_the_worker_pid(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    events: list[object] = []
+    shutdown_record = _worker_record(environment, "shutdown")
+    connection = _FakeConnection(
+        events,
+        before_disconnect=lambda: (
+            pytest.fail("shutdown recorded before disconnect")
+            if shutdown_record.exists()
+            else None
+        ),
+    )
+    application = framework_app.create_fastapi_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+    )
+    assert events == []
+
+    async with application.router.lifespan_context(application):
+        ready_record = _worker_record(environment, "ready")
+        assert ready_record.is_file()
+        assert not shutdown_record.exists()
+        assert events == [
+            (
+                "construct",
+                os.getpid(),
+                os.getpid(),
+                environment["FASTMSSQL_FRAMEWORK_APPLICATION_NAME"],
+            ),
+            ("connect", True, os.getpid()),
+        ]
+        ready_payload = json.loads(ready_record.read_text(encoding="utf-8"))
+        assert ready_payload["phase"] == "ready"
+        assert ready_payload["pid"] == os.getpid()
+        assert environment[
+            "FASTMSSQL_SQL_AUTH_OWNER_PASSWORD"
+        ] not in ready_record.read_text(encoding="utf-8")
+        assert list(ready_record.parent.glob("ready-*.json")) == [ready_record]
+        assert list(ready_record.parent.glob("*.tmp")) == []
+
+    assert events[-1] == ("disconnect", os.getpid())
+    assert shutdown_record.is_file()
+    shutdown_payload = json.loads(shutdown_record.read_text(encoding="utf-8"))
+    assert shutdown_payload["phase"] == "shutdown"
+    assert shutdown_payload["pid"] == os.getpid()
+
+
+@pytest.mark.asyncio
+async def test_default_connection_factory_applies_the_per_worker_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    events: list[object] = []
+    connection = _FakeConnection(events)
+    constructor_arguments: dict[str, object] = {}
+
+    def capture_connection(**arguments):
+        constructor_arguments.update(arguments)
+        return connection
+
+    monkeypatch.setattr(framework_app, "Connection", capture_connection)
+    application = framework_app.create_fastapi_app(environment=environment)
+
+    async with application.router.lifespan_context(application):
+        assert constructor_arguments["application_name"] == (
+            f"{environment['FASTMSSQL_FRAMEWORK_APPLICATION_NAME']}-{os.getpid()}"
+        )
+        pool = constructor_arguments["pool_config"]
+        assert pool.max_size == 4
+        assert pool.min_idle == 0
+        assert constructor_arguments["operation_metrics_config"].enabled is True
+        assert constructor_arguments["timeout_config"].acquire_timeout_secs == 5
+        assert constructor_arguments["lifecycle_config"].shutdown_timeout_secs == 15
+
+
+@pytest.mark.asyncio
+async def test_native_fastapi_startup_failure_propagates_without_readiness(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    events: list[object] = []
+    connection = _FakeConnection(
+        events,
+        connect_error=RuntimeError("synthetic-connect-failure"),
+    )
+    application = framework_app.create_fastapi_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic-connect-failure"):
+        async with application.router.lifespan_context(application):
+            pytest.fail("startup failure must prevent service")
+
+    assert not _worker_record(environment, "ready").exists()
+    assert not _worker_record(environment, "shutdown").exists()
+    assert ("disconnect", os.getpid()) in events
+
+
+@pytest.mark.asyncio
+async def test_native_fastapi_rejects_a_stale_ready_record_and_cleans_pool(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    ready_record = _worker_record(environment, "ready")
+    ready_record.write_text('{"sentinel": true}\n', encoding="utf-8")
+    events: list[object] = []
+    connection = _FakeConnection(events)
+    application = framework_app.create_fastapi_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+    )
+
+    with pytest.raises(
+        framework_app.WorkerLifecycleError,
+        match="ready record already exists",
+    ):
+        async with application.router.lifespan_context(application):
+            pytest.fail("a stale ready record must prevent service")
+
+    assert ready_record.read_text(encoding="utf-8") == '{"sentinel": true}\n'
+    assert events[-1] == ("disconnect", os.getpid())
+    assert list(ready_record.parent.glob("*.tmp")) == []
+
+
+@pytest.mark.asyncio
+async def test_native_fastapi_disconnect_failure_prevents_shutdown_record(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    events: list[object] = []
+    connection = _FakeConnection(
+        events,
+        disconnect_error=RuntimeError("synthetic-disconnect-failure"),
+    )
+    application = framework_app.create_fastapi_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic-disconnect-failure"):
+        async with application.router.lifespan_context(application):
+            assert _worker_record(environment, "ready").is_file()
+
+    assert not _worker_record(environment, "shutdown").exists()
+    assert application.state.fastmssql_worker.state is framework_app.WorkerState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_native_fastapi_offline_lifespan_never_constructs_a_pool(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    environment["FASTMSSQL_FRAMEWORK_DATABASE_MODE"] = "offline"
+    for name in framework_app.SQL_AUTH_ENVIRONMENT_KEYS:
+        environment.pop(name)
+
+    def forbidden_factory(config, pid):
+        del config, pid
+        pytest.fail("offline lifecycle must not construct a connection")
+
+    application = framework_app.create_fastapi_app(
+        environment=environment,
+        connection_factory=forbidden_factory,
+    )
+    async with application.router.lifespan_context(application):
+        lifecycle = application.state.fastmssql_worker
+        assert lifecycle.connection is None
+        ready_payload = json.loads(
+            _worker_record(environment, "ready").read_text(encoding="utf-8")
+        )
+        assert ready_payload["database_mode"] == "offline"
+        assert ready_payload["pool_identity"].endswith("-offline")
+    assert _worker_record(environment, "shutdown").is_file()
+
+
+def test_gunicorn_wsgi_hooks_are_post_fork_bounded_and_deterministic(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    events: list[object] = []
+    connection = _FakeConnection(events)
+    application = framework_app.create_flask_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+    )
+    worker = SimpleNamespace(wsgi=application, pid=os.getpid())
+
+    assert gunicorn_conf.preload_app is False
+    assert events == []
+    gunicorn_conf.post_worker_init(worker)
+    assert _worker_record(environment, "ready").is_file()
+    assert events[:2] == [
+        (
+            "construct",
+            os.getpid(),
+            os.getpid(),
+            environment["FASTMSSQL_FRAMEWORK_APPLICATION_NAME"],
+        ),
+        ("connect", True, os.getpid()),
+    ]
+
+    with pytest.raises(
+        framework_app.WorkerLifecycleError,
+        match="worker lifecycle is already ready",
+    ):
+        gunicorn_conf.post_worker_init(worker)
+
+    gunicorn_conf.worker_exit(None, worker)
+    assert _worker_record(environment, "shutdown").is_file()
+    assert events.count(("disconnect", os.getpid())) == 1
+    gunicorn_conf.worker_exit(None, worker)
+    assert events.count(("disconnect", os.getpid())) == 1
+
+
+def test_gunicorn_wsgi_startup_is_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    events: list[object] = []
+    connection = _FakeConnection(events, connect_delay_seconds=60)
+    application = framework_app.create_flask_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+    )
+    worker = SimpleNamespace(wsgi=application, pid=os.getpid())
+    monkeypatch.setattr(
+        gunicorn_conf,
+        "worker_hook_timeout_seconds",
+        0.01,
+    )
+
+    with pytest.raises(TimeoutError):
+        gunicorn_conf.post_worker_init(worker)
+
+    assert not _worker_record(environment, "ready").exists()
+    assert events[-1] == ("disconnect", os.getpid())
+
+
+def test_gunicorn_wsgi_teardown_is_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    events: list[object] = []
+    connection = _FakeConnection(events, disconnect_delay_seconds=60)
+    application = framework_app.create_flask_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+    )
+    worker = SimpleNamespace(wsgi=application, pid=os.getpid())
+    gunicorn_conf.post_worker_init(worker)
+    monkeypatch.setattr(
+        gunicorn_conf,
+        "worker_hook_timeout_seconds",
+        0.01,
+    )
+
+    with pytest.raises(TimeoutError):
+        gunicorn_conf.worker_exit(None, worker)
+
+    assert not _worker_record(environment, "shutdown").exists()
+    assert (
+        framework_app.flask_worker_lifecycle(application).state
+        is framework_app.WorkerState.FAILED
+    )
+
+
+@pytest.mark.asyncio
+async def test_adapted_flask_owns_lifespan_and_delegates_only_http(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    events: list[object] = []
+    connection = _FakeConnection(events)
+    delegated_scopes: list[str] = []
+
+    async def adapter(scope, receive, send) -> None:
+        del receive, send
+        delegated_scopes.append(scope["type"])
+
+    application = framework_app.create_adapted_flask_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+        adapter_factory=lambda wsgi: adapter,
+    )
+    lifespan_receive: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    lifespan_send: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def receive_lifespan() -> dict[str, Any]:
+        return await lifespan_receive.get()
+
+    async def send_lifespan(message: dict[str, Any]) -> None:
+        await lifespan_send.put(message)
+
+    lifespan_task = asyncio.create_task(
+        application(
+            {"type": "lifespan"},
+            receive_lifespan,
+            send_lifespan,
+        )
+    )
+    await lifespan_receive.put({"type": "lifespan.startup"})
+    assert await asyncio.wait_for(lifespan_send.get(), timeout=1) == {
+        "type": "lifespan.startup.complete"
+    }
+
+    async def unused() -> dict[str, Any]:
+        raise AssertionError("adapter spy must not receive")
+
+    async def discard(message: dict[str, Any]) -> None:
+        del message
+
+    await application({"type": "http"}, unused, discard)
+    assert delegated_scopes == ["http"]
+    with pytest.raises(
+        ValueError,
+        match="only HTTP and lifespan scopes are supported",
+    ):
+        await application({"type": "websocket"}, unused, discard)
+    assert delegated_scopes == ["http"]
+
+    await lifespan_receive.put({"type": "lifespan.shutdown"})
+    assert await asyncio.wait_for(lifespan_send.get(), timeout=1) == {
+        "type": "lifespan.shutdown.complete"
+    }
+    await asyncio.wait_for(lifespan_task, timeout=1)
+    assert _worker_record(environment, "shutdown").is_file()
+
+
+@pytest.mark.asyncio
+async def test_adapted_flask_startup_failure_prevents_http_service(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    events: list[object] = []
+    connection = _FakeConnection(
+        events,
+        connect_error=RuntimeError("synthetic-adapter-startup-failure"),
+    )
+    delegated_scopes: list[str] = []
+
+    async def adapter(scope, receive, send) -> None:
+        del receive, send
+        delegated_scopes.append(scope["type"])
+
+    application = framework_app.create_adapted_flask_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+        adapter_factory=lambda wsgi: adapter,
+    )
+    messages = iter(({"type": "lifespan.startup"},))
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return next(messages)
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    with pytest.raises(
+        RuntimeError,
+        match="synthetic-adapter-startup-failure",
+    ):
+        await application({"type": "lifespan"}, receive, send)
+    assert sent == [
+        {
+            "type": "lifespan.startup.failed",
+            "message": "worker startup failed",
+        }
+    ]
+    assert not _worker_record(environment, "ready").exists()
+
+    with pytest.raises(
+        framework_app.WorkerLifecycleError,
+        match="worker lifecycle is not ready",
+    ):
+        await application(
+            {"type": "http"},
+            receive,
+            send,
+        )
+    assert delegated_scopes == []
 
 
 def test_production_server_dependencies_are_locked_and_development_only() -> None:

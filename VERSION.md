@@ -52,6 +52,34 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Production framework worker configuration and lifecycle
+
+- Added an immutable, fail-closed worker configuration that separates
+  `sql_auth` from `offline`, validates every required setting, accepts only
+  worker counts `1/2/4/8`, divides the global connection budget exactly and
+  rejects unsafe identifiers, unlisted SQL delays and artifact paths outside
+  the run root.
+- Kept credentials out of configuration representations, public records and
+  validation errors; the application module still constructs no FastMssql
+  connection at import time.
+- Added worker-PID ownership and atomic ready/shutdown records around strict
+  `connect(validate=True)`/`disconnect()` lifecycle. Startup, stale-record,
+  disconnect and bounded-hook failures remain visible and cannot emit false
+  readiness or shutdown evidence.
+- Implemented native FastAPI lifespan, Gunicorn WSGI
+  `post_worker_init`/`worker_exit` and an ASGI lifespan owner that delegates
+  only HTTP scopes to Flask through `WsgiToAsgi`.
+- Context7 and the installed locked sources were checked for current FastAPI
+  lifespan ordering, Gunicorn hook timing/signatures and asgiref's HTTP-only,
+  thread-sensitive `WsgiToAsgi` behavior.
+- The 37 focused configuration/lifecycle cases pass. The complete offline
+  contract is intentionally `13 failed, 41 passed`; every remaining failure
+  belongs to routes, orchestration, reporting or hosted gates scheduled in
+  later tasks.
+- This task changes only the repository-owned production-framework harness
+  and tests. It changes no FastMssql/Tiberius runtime, package metadata,
+  displayed `0.7.7` version, release or published artifact.
+
 ### Production framework process matrix scaffold
 
 - Created `feat/production-framework-matrix` directly from the committed RED

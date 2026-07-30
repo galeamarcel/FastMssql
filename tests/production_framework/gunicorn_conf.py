@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from typing import NoReturn
+import asyncio
+import os
+
+from production_framework.app import flask_worker_lifecycle
 
 
 preload_app = False
@@ -11,21 +14,36 @@ supported_worker_classes = frozenset({"sync", "gthread"})
 threads = 1
 graceful_timeout = 30
 worker_tmp_dir = None
+worker_hook_timeout_seconds = 20
 
 
-def _lifecycle_not_implemented(hook: str) -> NoReturn:
-    raise RuntimeError(f"Gunicorn {hook} lifecycle is not implemented")
+def _worker_lifecycle(worker):
+    worker_pid = getattr(worker, "pid", None)
+    if worker_pid != os.getpid():
+        raise RuntimeError("Gunicorn lifecycle hook is outside its worker PID")
+    return flask_worker_lifecycle(worker.wsgi)
 
 
-def post_worker_init(worker) -> NoReturn:
+def _run_bounded(operation) -> None:
+    async def wait() -> None:
+        await asyncio.wait_for(
+            operation,
+            timeout=worker_hook_timeout_seconds,
+        )
+
+    asyncio.run(wait())
+
+
+def post_worker_init(worker) -> None:
     """Start a worker-local pool after Gunicorn has forked the worker."""
 
-    del worker
-    return _lifecycle_not_implemented("post_worker_init")
+    lifecycle = _worker_lifecycle(worker)
+    _run_bounded(lifecycle.start())
 
 
-def worker_exit(server, worker) -> NoReturn:
+def worker_exit(server, worker) -> None:
     """Disconnect the worker-local pool before the worker exits."""
 
-    del server, worker
-    return _lifecycle_not_implemented("worker_exit")
+    del server
+    lifecycle = _worker_lifecycle(worker)
+    _run_bounded(lifecycle.stop())
