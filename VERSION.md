@@ -52,6 +52,35 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Production framework process matrix design
+
+- Approved the final ordered audit feature: real FastAPI and Flask process
+  profiles through standalone Uvicorn and POSIX Gunicorn, importing
+  FastMssql exclusively from an isolated candidate wheel.
+- Defined worker counts `1`, `2`, `4` and `8`, Uvicorn `asyncio` on
+  Linux/macOS/Windows, POSIX `uvloop`, Gunicorn plus the current external
+  `uvicorn_worker.UvicornWorker`, Flask `sync`/`gthread` and adapted Flask
+  through `WsgiToAsgi`.
+- Required pool construction/connection after spawn/fork, one pool per
+  worker and the explicit deployment invariant
+  `workers * pool_max_per_worker <= global_connection_budget`; the design
+  does not claim an impossible shared in-memory pool between processes.
+- Required real-network concurrency, client-disconnect cancellation,
+  graceful query/transaction shutdown, bounded saturation/admission,
+  ResultStream-to-HTTP streaming and exact teardown.
+- Preserved the approved Flask distinction: async views remain WSGI
+  worker/thread-bound; the ASGI adapter supplies a persistent loop but
+  thread-sensitive WSGI calls serialize per process.
+- Defined `FRAME-027` through `FRAME-054`, required 1,000-operation and
+  explicit 10,000/99,999 fixed-worker load profiles, local Docker SQL-auth
+  and exact-wheel Linux/macOS/Windows hosted claim boundaries.
+- Context7 verified current Uvicorn, Gunicorn, FastAPI, Flask and asgiref
+  behavior; current primary project/PyPI sources resolved 2026 Gunicorn
+  release and platform details not yet present in Context7's snapshot.
+- This is specification-only. It changes no runtime, test dependency,
+  lockfile, package metadata, displayed `0.7.7` version, release, published
+  artifact or original-repository state.
+
 ### Named-instance refused-target fixture RED
 
 - Created `test/named-instance-refused-fixture` directly from FastMssql
