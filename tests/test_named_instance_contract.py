@@ -12,7 +12,13 @@ POOL_MANAGER = ROOT / "src/pool_manager.rs"
 CORE_STUB = ROOT / "python/fastmssql/fastmssql.pyi"
 README = ROOT / "README.md"
 RUST_WORKFLOW = ROOT / ".github/workflows/rust-unit-tests.yml"
+SECURITY_WORKFLOW = ROOT / ".github/workflows/dependency-security.yml"
 WINDOWS_WORKFLOW = ROOT / ".github/workflows/named-instance-windows.yml"
+NAMED_INSTANCE_HOSTED_BRANCHES = {
+    "fix/named-instance",
+    "verify/named-instance",
+    "docs/named-instance-status",
+}
 NAMED_TEST_SOURCES = (
     ROOT / "tests/test_named_instance_contract.py",
     ROOT / "tests/sql_auth_strict/test_named_instance_strict.py",
@@ -31,6 +37,19 @@ def _function_body(source: str, name: str) -> str:
     )
     assert match is not None, f"missing Rust function {name}"
     return match.group(0)
+
+
+def _push_branches(workflow: str) -> set[str]:
+    match = re.search(
+        r"(?ms)^on:\n  push:\n    branches:\n"
+        r"(?P<branches>(?:      - [^\n]+\n)+)",
+        workflow,
+    )
+    assert match is not None, "workflow must declare an explicit push branch list"
+    return {
+        line.strip().removeprefix("- ").strip()
+        for line in match.group("branches").splitlines()
+    }
 
 
 def test_root_build_enables_only_the_existing_tokio_browser_adapter() -> None:
@@ -133,6 +152,19 @@ def test_installed_wheel_gate_runs_named_instance_contracts() -> None:
     assert "tests/test_named_instance_contract.py" in workflow
     assert workflow.index("uv pip install") < workflow.index(
         "tests/test_named_instance_contract.py"
+    )
+
+
+def test_named_instance_branches_trigger_exact_sha_hosted_gates() -> None:
+    missing_by_workflow: dict[str, list[str]] = {}
+    for path in (RUST_WORKFLOW, SECURITY_WORKFLOW):
+        branches = _push_branches(_required_text(path))
+        missing = sorted(NAMED_INSTANCE_HOSTED_BRANCHES - branches)
+        if missing:
+            missing_by_workflow[path.name] = missing
+    assert not missing_by_workflow, (
+        "named-instance candidate branches missing from hosted push gates: "
+        f"{missing_by_workflow}"
     )
 
 

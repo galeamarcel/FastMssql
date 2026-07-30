@@ -311,6 +311,23 @@ No release, package-version change, or artifact publication has occurred.
   package metadata, displayed `0.7.7` version, release state, original
   repository, artifact publication or upstream authorization.
 
+### Named-instance exact-SHA hosted-trigger RED
+
+- Created `test/named-instance-hosted-triggers` directly from exact
+  named-instance candidate `ff769825f6d3b7833b7be9d83fed4c0cc560f59b`.
+- Added an offline contract requiring the cross-platform raw-Cargo,
+  vendored-Tiberius and installed-wheel workflow plus the RustSec workflow
+  to run automatically for `fix/named-instance`, `verify/named-instance`
+  and `docs/named-instance-status`.
+- The focused contract failed exactly as intended: both
+  `rust-unit-tests.yml` and `dependency-security.yml` lacked all three
+  named-instance candidate branches. The public push of `ff769825` launched
+  only the genuine Windows named-instance workflow, so the unchanged harness
+  cannot produce the required exact-SHA cross-platform/RustSec evidence.
+- This branch changes one test and `VERSION.md` only. It changes no workflow,
+  runtime, dependency, package metadata, displayed `0.7.7` version, release,
+  artifact publication or original-repository state.
+
 ### Seven-slice batch/bulk cumulative verification and live-audit closure
 
 - Closed the seventh batch/bulk slice, bounded-concurrency `query_many()`,
