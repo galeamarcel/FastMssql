@@ -347,6 +347,24 @@ No release, package-version change, or artifact publication has occurred.
   metadata, displayed `0.7.7` version, release, artifact publication or
   original-repository state.
 
+### Named-instance hosted installed-wheel `pip check` RED
+
+- Created `test/named-instance-hosted-pip-check` directly from exact
+  candidate `a4addefe668087561e937df8aa221958f92a9032`, after the first automatic
+  Linux/macOS/Windows run completed successfully.
+- Added an offline contract requiring `uv pip check` against the exact
+  isolated wheel interpreter after installation and before the installed
+  contract suite. Because the workflow job is a three-platform matrix, this
+  supplies direct dependency-integrity evidence on Linux, macOS and Windows.
+- The local CPython 3.13 wheel already passed `pip check`; this RED targets
+  only the missing hosted proof required by Task 8.
+- The focused contract failed exactly on the absent
+  `uv pip check --python "${POOL_CONTRACT_PYTHON}"` command; wheel
+  build/install and the installed test invocation were already present.
+- This branch changes one test and `VERSION.md` only. It changes no workflow,
+  runtime, dependency, package metadata, displayed `0.7.7` version, release,
+  artifact publication or original-repository state.
+
 ### Seven-slice batch/bulk cumulative verification and live-audit closure
 
 - Closed the seventh batch/bulk slice, bounded-concurrency `query_many()`,
