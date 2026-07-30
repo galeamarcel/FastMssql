@@ -54,6 +54,8 @@ No release, package-version change, or artifact publication has occurred.
 
 ### Production framework process matrix design
 
+- Specification commit:
+  `dfaba8d8ccca571309ca0c147273f53702aa31ef`.
 - Approved the final ordered audit feature: real FastAPI and Flask process
   profiles through standalone Uvicorn and POSIX Gunicorn, importing
   FastMssql exclusively from an isolated candidate wheel.
@@ -80,6 +82,32 @@ No release, package-version change, or artifact publication has occurred.
 - This is specification-only. It changes no runtime, test dependency,
   lockfile, package metadata, displayed `0.7.7` version, release, published
   artifact or original-repository state.
+
+### Production framework process matrix executable plan
+
+- Added the branch-by-branch plan preserving separate
+  `test/production-framework-matrix`, `feat/production-framework-matrix`,
+  focused defect RED/fix, `verify/production-framework-matrix` and
+  `docs/production-framework-matrix-status` ancestry.
+- Assigned exact files and TDD checkpoints for dependency/platform contracts,
+  post-spawn/post-fork worker lifecycle, portable process supervision,
+  installed-wheel isolation, SQL observer, native FastAPI scenarios, Flask
+  execution models, fixed-worker load, report generation and hosted gates.
+- Required one versioned exact-SHA artifact to be generated once per matrix
+  invocation and validated by the 28 canonical `FRAME-027` through
+  `FRAME-054` pytest owners, avoiding one expensive server restart per case.
+- Defined complete local macOS/Docker SQL-auth, hosted Linux SQL-auth, hosted
+  Windows SQL Express/Uvicorn and hosted macOS structural process gates with
+  no cross-platform claim inflation.
+- Required a repeated installed-wheel matrix plus explicit 1,000, 10,000 and
+  99,999 operation profiles before technical verification, followed by an
+  exact-hosted-SHA status branch and a fresh full-document enterprise audit.
+- The plan requires a dedicated RED/fix pair for every FastMssql defect
+  discovered by the matrix and forbids hiding a runtime problem in the
+  harness.
+- This is planning-only. It changes no runtime, test dependency, lockfile,
+  package metadata, displayed `0.7.7` version, release, published artifact or
+  original-repository state.
 
 ### Named-instance refused-target fixture RED
 
