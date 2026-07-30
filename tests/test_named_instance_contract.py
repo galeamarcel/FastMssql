@@ -155,6 +155,17 @@ def test_installed_wheel_gate_runs_named_instance_contracts() -> None:
     )
 
 
+def test_installed_wheel_gate_checks_dependency_integrity() -> None:
+    workflow = _required_text(RUST_WORKFLOW)
+    normalized = " ".join(workflow.replace("\\", " ").split())
+
+    assert 'uv pip check --python "${POOL_CONTRACT_PYTHON}"' in normalized
+    assert workflow.index("uv pip install") < workflow.index("uv pip check")
+    assert workflow.index("uv pip check") < workflow.index(
+        "tests/test_named_instance_contract.py"
+    )
+
+
 def test_named_instance_branches_trigger_exact_sha_hosted_gates() -> None:
     missing_by_workflow: dict[str, list[str]] = {}
     for path in (RUST_WORKFLOW, SECURITY_WORKFLOW):
