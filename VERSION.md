@@ -45,6 +45,22 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Cumulative SQL Server fresh-process gate plan
+
+- Added the executable TDD plan for a recording Docker/provision boundary,
+  one behavior-focused RED contract and the minimal
+  `--force-recreate` runner correction.
+- Fixed the branch topology as documentation → RED → fix → history-only
+  cumulative merge, with `VERSION.md`, fork-only publication and exact remote
+  SHA verification at every repository-changing stage.
+- Required the unchanged timed-out native-bulk test, full matrix contract,
+  real container recreation, complete canonical runner, privacy/artifact
+  checks and exact knowledge-graph review before resuming parent Task 12.
+- Preserved the named SQL Server data volume and prohibited retries, volume
+  deletion, memory tuning, upstream publication and broad runner changes.
+- This plan changes no runtime-library behavior, package metadata, displayed
+  version, dependency, release or published artifact.
+
 ### Cumulative SQL Server fresh-process gate design
 
 - Recorded the cumulative-runner failure at exact candidate `b997ab3`: the
