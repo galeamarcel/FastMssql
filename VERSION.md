@@ -10,7 +10,7 @@ yet applied to package metadata; release versioning remains a separate,
 explicit decision.
 
 Changes currently integrated in fork history through technical candidate
-`b270205128fc6bd3c951a3e822b600c9ad049ee9`:
+`306b44d1aafce6b0dc763bfe179784de5bfd6f06`:
 
 - closed, validated SQL parameter descriptors with exact TDS metadata;
 - exact decimal, UUID, temporal, ANSI/Unicode, binary, XML, and typed-null
@@ -31,19 +31,58 @@ Changes currently integrated in fork history through technical candidate
 - native TDS bulk input from bounded synchronous/asynchronous iterables with
   one lease/transaction/deadline/metric, global diagnostics and
   cancellation-safe terminal cleanup;
+- bounded fixed-worker `query_many()` over independent pooled reads, with one
+  shared producer/result capacity window, ordered or completion-order output
+  and deterministic `aclose()`/async-context cleanup;
 - deterministic SQL-auth, exact-wire, compatibility, and 1,000-operation
   concurrent load coverage;
 - load-metric contract coverage for the typed-parameter case `PARAM-033`;
 - regenerated SQL-auth matrix/report evidence tied to exact cumulative merge
-  `a9d5c2ab42de0f03051c771bb8942ee15dfe6e28`: 372/372 required
-  matrix cases, 386 strict, 16 async, 33 framework, 6 resilience, 12 load,
-  and 1,090
+  `306b44d1aafce6b0dc763bfe179784de5bfd6f06`: 420/420 required
+  matrix cases, 434 strict, 16 async, 36 framework, 6 resilience, 13 load,
+  and 1,253
   original-local-regression tests pass;
 - hosted raw Cargo, Rust tests, wheel build/install contracts on Linux,
-  macOS, and Windows passed in run `30284587006`; RustSec passed in run
-  `30284587019`.
+  macOS, and Windows passed in run `30507343856`; RustSec passed in run
+  `30507343869`.
 
 No release, package-version change, or artifact publication has occurred.
+
+### Seven-slice batch/bulk cumulative verification and live-audit closure
+
+- Closed the seventh batch/bulk slice, bounded-concurrency `query_many()`,
+  while preserving every documentation → RED → implementation ancestry
+  through exact technical candidate
+  `306b44d1aafce6b0dc763bfe179784de5bfd6f06`.
+- Regenerated the canonical SQL-auth matrix and report from the exact clean
+  technical tree: 420/420 required IDs, 434 strict, 16 true-async, 36
+  framework, 6 resilience, 13 load and 1,253 original-local-regression tests
+  passed, with all 22 runner exit-code artifacts equal to zero.
+- Recorded cumulative native-list, native-iterable, `execute_many()` and
+  `query_many()` stress through 99,999 rows/parameter sets/operations.
+  Every profile reported exact producer/output/persistence counts,
+  post-load smoke success, bounded RSS/event-loop/pool/session observations
+  and zero teardown sessions.
+- Recorded the isolated CPython 3.13.14 ABI3 wheel
+  `fastmssql-0.7.7-cp311-abi3-macosx_11_0_arm64.whl`, SHA-256
+  `0f84fb6469a3df3e113b6333326bfe34452647ef55ea07163f14b88b6eb4d49f`.
+  It was imported from external `site-packages` with `PYTHONPATH` unset and
+  passed 104 hosted-contract selections, 160 batch/bulk offline contracts,
+  31 matrix contracts, 58 real SQL-auth batch/bulk tests, 36 framework tests
+  and `pip check`.
+- Recorded the exact-SHA hosted Linux/macOS/Windows raw-Cargo, Rust,
+  wheel-build/install and installed-contract success in run `30507343856`,
+  plus the zero-warning/zero-vulnerability RustSec success in run
+  `30507343869`.
+- Added the cumulative batch/bulk stress report, updated the live
+  production-readiness audit and future-PR candidate intake, and regenerated
+  the canonical SQL-auth evidence. Also removed one historical trailing
+  blank line that made the cumulative `git diff --check` report whitespace
+  noise.
+- These changes are status/evidence only. They do not change FastMssql
+  runtime behavior, package metadata, the displayed `0.7.7` version,
+  dependencies, release state, artifact publication or authorization for an
+  upstream PR.
 
 ### Hosted query-many wheel dependency fix
 

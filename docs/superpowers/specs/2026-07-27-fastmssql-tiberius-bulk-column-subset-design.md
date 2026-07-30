@@ -326,4 +326,3 @@ The slice is complete only when:
 - the complete regression and quality gates above pass;
 - the live audit and `VERSION.md` identify exact commits and do not overstate
   later native-bulk work.
-
