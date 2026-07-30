@@ -157,9 +157,10 @@ fail-closed.
 Aceste rezultate, împreună cu `query_many()` bounded verificat cumulativ la
 `306b44d`, închid toate cele șapte slice-uri batch/bulk. Ele nu declară încă
 biblioteca complet enterprise production-ready: tracing/OpenTelemetry,
-table-valued parameters, tipurile money exacte, named instances, TDS 8,
-framework-urile pornite din wheel prin servere de proces reale și
-proveniența artefactelor rămân cerințe P1/P2.
+table-valued parameters, tipurile money exacte, TDS 8, framework-urile
+pornite din wheel prin servere de proces reale și proveniența artefactelor
+rămân cerințe P1/P2. Named instances, încă deschise la închiderea acestui
+slice batch/bulk, au fost ulterior închise separat la `5728421`.
 
 Auditul corectează explicit o concluzie anterioară: TDS `ATTENTION` nu este o
 condiție necesară pentru a termina sigur un request dacă driverul închide
@@ -2485,7 +2486,8 @@ Acest subsistem nu implementează:
 - bulk copy TDS nativ și input bulk cu backpressure;
 - tracing/OpenTelemetry cu exporter;
 - framework-urile pornite prin Uvicorn/Gunicorn din wheel-ul instalat;
-- TDS 8, named instances ori publicarea artefactelor/release-ului.
+- TDS 8 ori publicarea artefactelor/release-ului; named instances au fost
+  închise ulterior ca feature separat la `5728421`.
 
 Publicarea oricărei părți în repository-ul original rămâne condiționată de o
 aprobare viitoare separată, reproducere nouă și rebase curat peste ancestry-ul
@@ -3407,15 +3409,47 @@ iterator/async iterable, `execute_many()` și `query_many()` sunt acum închise
 este folosit drept dovadă pentru concurență; aceasta este probată direct de
 fixed-worker `query_many()` prin mai multe lease-uri bounded din pool.
 
-### Named instances
+### Named instances — `VERIFIED_FORK`
 
-FastMssql acceptă și documentează `instance_name`, dar folosește
-`TcpStream::connect(config.get_addr())`, nu `connect_named`, și nu activează
-feature-ul Tiberius `sql-browser-tokio`.
+Cauza inițială a fost confirmată: FastMssql accepta `instance_name`, dar
+deschidea întotdeauna `TcpStream::connect(config.get_addr())`. Pentru o
+instanță fără port explicit, Tiberius întorcea `1434`, endpointul UDP al SQL
+Browser, iar FastMssql încerca în mod eronat TCP către el. Dependența
+Tiberius din `Cargo.toml` root nu compila nici `sql-browser-tokio`.
 
-În absența unui port real furnizat explicit, named instance discovery nu este
-funcțional. Testele existente verifică în principal constructorul sau omit
-eșecurile de conectare.
+Remedierea cumulativă este `VERIFIED_FORK` pe exact
+`5728421a3941ce3ca957c5497bc53a78d5553b30`:
+
+- Tiberius construiește cererea `0x04 || INSTANCE || 0x00`, validează limita
+  de 32 bytes, sursa UDP, headerul, dimensiunea declarată, limita de 1.024
+  bytes, unicitatea tokenului `tcp` și portul, fără cale panic;
+- un singur classifier FastMssql selectează discovery numai pentru instanță
+  fără port explicit; conexiunile directe și routingul Azure rămân direct
+  TCP;
+- pool-ul, tranzacția directă și batch-ul direct folosesc același helper
+  fizic, iar erorile discovery sunt `SqlConnectionError` cu metadata stabilă;
+- Docker/MSSQL real prin fixture SSRP determinist, wheel-ul CPython 3.13
+  instalat fără `PYTHONPATH` și instanța hosted reală
+  `localhost\SQLEXPRESS` prin SQL Browser au trecut;
+- profilele de 1.000 și 99.999 operații au rămas la 8 cereri browser,
+  8 conexiuni fizice și maximum 8 sesiuni, cu zero failure/timeout,
+  integritate exactă și teardown 0/0;
+- matricea canonică a trecut 442/442, iar lane-urile au trecut 460 strict,
+  16 async, 36 framework, 6 resilience, 14 load și 1.263 regresie originală;
+  FastMssql Rust a trecut 122/122 și Tiberius 184/184;
+- Linux, macOS și Windows au trecut în
+  [#30522520458](https://github.com/galeamarcel/FastMssql/actions/runs/30522520458),
+  RustSec în
+  [#30522520267](https://github.com/galeamarcel/FastMssql/actions/runs/30522520267),
+  iar instanța Windows reală în
+  [#30522520410](https://github.com/galeamarcel/FastMssql/actions/runs/30522520410).
+
+Raportul exact, inclusiv separarea dintre contractele `NINST-019`–`NINST-021`
+și probele runtime directe, este
+[fastmssql-named-instance-report.md](validation/fastmssql-named-instance-report.md).
+SSRP rămâne un protocol UDP neautentificat; validarea certificatului TLS este
+frontiera finală de identitate, iar un port TCP static explicit rămâne
+recomandarea pentru rețelele care interzic UDP `1434`.
 
 ### CI, stuburi și documentație
 
@@ -3602,7 +3636,10 @@ funcție ar necesita lucru la nivelul driverului TDS:
     bulk list/iterable, `execute_many()` și fixed-worker `query_many()` au
     trecut local, Docker/MSSQL, stress până la 99.999, wheel și hosted pe
     exact `306b44d`**
-20. `fix/named-instance`
+20. `fix/named-instance` — **finalizat și `VERIFIED_FORK`: protocolul SSRP
+    Tiberius, selectorul comun FastMssql, SQL-auth Docker, stressul până la
+    99.999, wheel-ul izolat și instanța Windows reală au trecut pe exact
+    `5728421`**
 21. `test/production-framework-matrix`
 
 Orice remediere FastMssql va fi făcută numai pe forkul
@@ -3667,51 +3704,58 @@ upstream fără aprobarea explicită a proprietarului forkului.
   settlement tranzacțional, timeout/anulare fail-closed, progres durabil și
   gate-uri cumulative până la 99.999 de seturi;
 - [x] `query_many(concurrency=...)` are contracte și gate-uri cumulative;
+- [x] named instances fără port explicit folosesc SQL Browser bounded,
+  portul explicit ocolește discovery, iar fixture-ul Docker și instanța
+  Windows reală trec cu pool/discovery/teardown bounded;
 - [ ] matricea rulează prin servere reale Uvicorn/Gunicorn și din wheel-ul
   instalat.
 
 ## Starea verificată curentă
 
 - Fork: `https://github.com/galeamarcel/FastMssql.git`
-- Branch de status: `docs/batch-bulk-status`
+- Branch de status: `docs/named-instance-status`
 - HEAD tehnic verificat:
-  `306b44d1aafce6b0dc763bfe179784de5bfd6f06`.
+  `5728421a3941ce3ca957c5497bc53a78d5553b30`.
 - `origin` indică forkul; remote-ul repository-ului original permite numai
   fetch și are push URL-ul `DISABLED`.
-- Commitul `306b44d` păstrează designul query-many `4b4347e`, clarificarea
-  `887563c`, planul `7d8a4dd`, RED-urile `443670b`, `57f076d` și `80a798b`,
-  implementarea fixed-worker `3bb7dbb`, cleanupul supravegheat `6f7b8bb`,
-  corecția SQL-auth `4c1b4a6` și documentația API `7405122` în ancestry.
-- Același ancestry păstrează RED/fix pentru gate-ul hosted
-  `435fae0`/`2c1d57b`, vendor-artifact cleanliness
-  `b59bb47`/`3f8ed49`, SQL Server fresh-process
-  `98e80c5`/`64fb90d` și dependențele test-only ale contractului wheel
-  `faef032`/`306b44d`, fără schimbarea dependențelor runtime.
-- Pe exact `306b44d`, runnerul canonic a trecut 420/420 ID-uri, 434 teste
-  strict, 16 async, 36 framework, 6 resilience, 13 load și 1.253
+- Ancestry-ul curent păstrează designul `3162a26`, planul `0083a47`,
+  RED/fix Tiberius `ebe96f7`/`e5ccb60`, RED/fix FastMssql
+  `ebe13be`/`ff76982`, fixture-ul refuzat `d8c32c9`/`18c14a1`, gate-urile
+  hosted `3b87aac`/`bd9bbca` și `185cdd5`/`d71ae58`, plus RED/fix pentru
+  serializarea zero în raport `a6409f6`/`17a3438`.
+- Pe exact `5728421`, runnerul canonic a trecut 442/442 ID-uri, 460 teste
+  strict, 16 async, 36 framework, 6 resilience, 14 load și 1.263
   original-local-regression, fără fail/error/skip/not-run. Root Rust a trecut
-  116/116, iar Tiberius 168/168.
-- Stress-ul cumulativ a trecut native-list 110.999 rânduri, native-iterable
-  221.998 rânduri, execute-many 231.998 seturi și query-many 199.998
-  operații. Toate profilele au avut numere exacte, resurse bounded, smoke
-  PASS și zero sesiuni după teardown; metricile complete sunt în
-  [SQL_AUTH_BATCH_BULK_STRESS_REPORT.md](SQL_AUTH_BATCH_BULK_STRESS_REPORT.md).
+  122/122, iar Tiberius 184/184. Toate cele 23 de fișiere `.exitcode` au
+  valoarea zero.
+- Stress-ul named-instance a trecut 1.000 și 99.999 operații cu 8 cereri
+  browser, 8 conexiuni fizice, maximum 8 sesiuni, zero failure/timeout,
+  zero ID-uri lipsă/duplicate, smoke PASS și teardown 0/0.
 - Wheel-ul exact are SHA-256
-  `0f84fb6469a3df3e113b6333326bfe34452647ef55ea07163f14b88b6eb4d49f`;
+  `c9b1e6b8705182e2a1e5dffe6c30645a10ae4d768683ce88937c24737dbfc227`;
   importat din `site-packages` fără `PYTHONPATH` într-un Python 3.13.14
-  izolat, a trecut 104 contracte hosted-selectate, 160 batch/bulk offline, 31
-  de matrice, 58 SQL-auth batch/bulk, 36 framework și `pip check`.
-- Graful MCP tehnic exact are 184 de fișiere suportate, 4.164 noduri și
-  50.945 muchii, cu `head_matches_build=true`; gap-ul static pentru
-  `__anext__` dinamic este reconciliat cu testele coordinator, SQL-auth,
-  stress și wheel.
-- Scanarea nu a găsit tokenuri, chei private, URL-uri DB cu credențiale,
-  `.env`, wheel-uri sau build caches urmărite. Toate cele 22 de fișiere
-  `.exitcode` ale runnerului au valoarea zero.
-- GitHub Actions a trecut pe exact `306b44d`: Windows, Ubuntu și macOS în
-  [#30507343856](https://github.com/galeamarcel/FastMssql/actions/runs/30507343856),
-  iar RustSec în
-  [#30507343869](https://github.com/galeamarcel/FastMssql/actions/runs/30507343869).
+  izolat, a trecut 10 contracte offline, 26 teste named-instance pe SQL Server
+  real, profilul instalat de 1.000 operații și verificarea celor 11 pachete.
+- Instanța hosted reală `SQLEXPRESS` a trecut fără port explicit; artefactul
+  ei structural confirmă query parametrizat pooled, tranzacție directă și
+  zero sesiuni după disconnect.
+- Graful MCP tehnic exact are 190 de fișiere suportate, 4.289 noduri și
+  52.330 muchii, cu `head_matches_build=true`; gap-urile statice pentru
+  helperii Rust privați, PyO3 și subprocessul generatorului sunt reconciliate
+  cu testele same-module, SQL-auth, wheel, stress și RED/GREEN CLI.
+- Scanarea celor patru valori secrete nu a găsit credențiale în sursele
+  urmărite, artefactele canonice, wheel-ul extras sau rezultatele instalate.
+- GitHub Actions a trecut pe exact `5728421`: Windows, Ubuntu și macOS în
+  [#30522520458](https://github.com/galeamarcel/FastMssql/actions/runs/30522520458),
+  RustSec în
+  [#30522520267](https://github.com/galeamarcel/FastMssql/actions/runs/30522520267)
+  și instanța Windows reală în
+  [#30522520410](https://github.com/galeamarcel/FastMssql/actions/runs/30522520410).
+- Raportul complet este
+  [fastmssql-named-instance-report.md](validation/fastmssql-named-instance-report.md).
+
+### Dovezi ancestrale păstrate
+
 - Commitul ancestral `13c91c0` păstrează designul iterable `0afe5c9`, planul
   `473a657`, RED-ul `ebf74f9`, refactorul one-chunk `22db42f`, secvența Rust
   `ceb8403`, coordonatorul `7c0bb66` și corecțiile `b4b9865`, `8433b3b` și
@@ -3824,12 +3868,13 @@ upstream fără aprobarea explicită a proprietarului forkului.
   trei sisteme, iar contractele Python instalate, raw Cargo, `cargo fmt`,
   Clippy cu `-D warnings`, Ruff și `compileall` au trecut. Wheel-ul exact
   `13c91c0` a fost validat local pe macOS arm64.
-- SQL-auth real a fost executat local pe containerul MSSQL aprobat;
-  workflow-urile hosted validează Rust/wheel/contracts, nu pretind un SQL
-  Server real.
-- TVP, money fixed-point output, SQL_VARIANT, tracing, named instances, TDS
-  8, provenance/SBOM și matricea cu servere web reale pornite din wheel
-  rămân deschise în ordinea de implementare.
+- SQL-auth real a fost executat local pe containerul MSSQL aprobat.
+  Workflow-ul cross-platform hosted validează Rust/wheel/contracts; lane-ul
+  Windows named-instance separat validează și SQL Server Express real.
+- TVP, money fixed-point output, SQL_VARIANT, tracing, TDS 8 și matricea cu
+  servere web reale pornite din wheel rămân deschise în ordinea de
+  implementare. Wheel-urile conțin deja SBOM CycloneDX; provenance-ul de
+  release rămâne separat și nepublicat.
 - Observația `PoolConfig(test_on_check_out=False)` plus DDL care cere prima
   instrucțiune în batch este `VERIFIED_FORK` la `9e86cc4`; resetul privat este
   drenat înaintea aplicației și nu este atribuit slice-ului native bulk.
@@ -3837,9 +3882,9 @@ upstream fără aprobarea explicită a proprietarului forkului.
   push, PR sau release în repository-ul original.
 
 Starea de mai sus leagă runtime-ul, verificarea locală/Docker/MSSQL, wheel-ul
-instalat și gate-urile hosted Linux/macOS/Windows/RustSec de același arbore
-tehnic exact `306b44d`. Branchurile validate au fost integrate și publicate
-numai în fork.
+instalat, instanța Windows reală și gate-urile hosted
+Linux/macOS/Windows/RustSec de același arbore tehnic exact `5728421`.
+Branchurile validate au fost integrate și publicate numai în fork.
 
 Rapoarte de validare și stress:
 
@@ -3850,3 +3895,4 @@ Rapoarte de validare și stress:
 - [SQL_AUTH_BATCH_BULK_STRESS_REPORT.md](SQL_AUTH_BATCH_BULK_STRESS_REPORT.md)
 - [SQL_AUTH_TRANSACTION_STRESS_REPORT.md](SQL_AUTH_TRANSACTION_STRESS_REPORT.md)
 - [CHECKOUT_RESET_DDL_VALIDATION_REPORT.md](CHECKOUT_RESET_DDL_VALIDATION_REPORT.md)
+- [fastmssql-named-instance-report.md](validation/fastmssql-named-instance-report.md)

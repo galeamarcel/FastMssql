@@ -10,7 +10,7 @@ yet applied to package metadata; release versioning remains a separate,
 explicit decision.
 
 Changes currently integrated in fork history through technical candidate
-`306b44d1aafce6b0dc763bfe179784de5bfd6f06`:
+`5728421a3941ce3ca957c5497bc53a78d5553b30`:
 
 - closed, validated SQL parameter descriptors with exact TDS metadata;
 - exact decimal, UUID, temporal, ANSI/Unicode, binary, XML, and typed-null
@@ -34,17 +34,21 @@ Changes currently integrated in fork history through technical candidate
 - bounded fixed-worker `query_many()` over independent pooled reads, with one
   shared producer/result capacity window, ordered or completion-order output
   and deterministic `aclose()`/async-context cleanup;
+- bounded SQL Browser/SSRP discovery for named instances without an explicit
+  port, with hardened vendored-Tiberius parsing, explicit-port bypass and one
+  shared FastMssql physical-connect selector;
 - deterministic SQL-auth, exact-wire, compatibility, and 1,000-operation
   concurrent load coverage;
 - load-metric contract coverage for the typed-parameter case `PARAM-033`;
 - regenerated SQL-auth matrix/report evidence tied to exact cumulative merge
-  `306b44d1aafce6b0dc763bfe179784de5bfd6f06`: 420/420 required
-  matrix cases, 434 strict, 16 async, 36 framework, 6 resilience, 13 load,
-  and 1,253
+  `5728421a3941ce3ca957c5497bc53a78d5553b30`: 442/442 required
+  matrix cases, 460 strict, 16 async, 36 framework, 6 resilience, 14 load,
+  and 1,263
   original-local-regression tests pass;
 - hosted raw Cargo, Rust tests, wheel build/install contracts on Linux,
-  macOS, and Windows passed in run `30507343856`; RustSec passed in run
-  `30507343869`.
+  macOS, and Windows passed in run `30522520458`; RustSec passed in run
+  `30522520267`; genuine Windows SQL Express named-instance discovery passed
+  in run `30522520410`.
 
 No release, package-version change, or artifact publication has occurred.
 
@@ -416,6 +420,46 @@ No release, package-version change, or artifact publication has occurred.
 - The fix is limited to generated evidence serialization. It changes no
   FastMssql/Tiberius runtime, dependency, package metadata, displayed `0.7.7`
   version, release, artifact publication or original-repository state.
+
+### Named-instance exact-SHA verification and live-audit closure
+
+- Closed feature 20 as `VERIFIED_FORK` on exact cumulative technical
+  candidate `5728421a3941ce3ca957c5497bc53a78d5553b30`.
+- Preserved the approved design/plan, both Tiberius RED boundaries and fix,
+  FastMssql RED/fix, refused-target fixture RED/fix, both hosted harness
+  RED/fix pairs and the generated-report zero-value RED/fix in ancestry.
+- Regenerated the canonical SQL-auth matrix/report from the exact candidate:
+  442/442 required IDs, 460 strict, 16 true-async, 36 framework, 6
+  resilience, 14 load and 1,263 original-local-regression tests pass, with all
+  23 runner exit-code artifacts equal to zero. Root Rust passes 122/122 and
+  vendored Tiberius passes 184/184.
+- Ran named-instance profiles at 1,000 and 99,999 logical operations. Both
+  completed with zero failure/timeout/missing/duplicate IDs, eight browser
+  requests, eight physical connections, maximum eight sessions, post-load
+  smoke PASS and teardown sessions/transactions 0/0.
+- Built and installed
+  `fastmssql-0.7.7-cp311-abi3-macosx_11_0_arm64.whl`, SHA-256
+  `c9b1e6b8705182e2a1e5dffe6c30645a10ae4d768683ce88937c24737dbfc227`,
+  in isolated CPython 3.13.14. With `PYTHONPATH` and ambient `VIRTUAL_ENV`
+  unset, it passed 10/10 offline contracts, 26/26 real SQL-auth tests,
+  1,000-operation stress and dependency-integrity checks for 11 packages.
+- Verified exact-SHA hosted raw Cargo, Rust, Tiberius, wheel build/install,
+  `pip check` and installed contracts on Ubuntu, macOS and Windows in
+  `30522520458`; RustSec passed in `30522520267`. The first-party Windows SQL
+  Express `SQLEXPRESS` plus real SQL Browser lane passed pooled parameterized
+  query, direct transaction and zero-session teardown in `30522520410`,
+  without an explicit instance port.
+- Rebuilt the graph on the exact SHA: 190 supported files, 4,289 nodes and
+  52,330 edges with `head_matches_build=true`. Same-module Rust, PyO3 and
+  subprocess graph gaps are reconciled by direct RED/GREEN, SQL-auth, stress,
+  wheel and hosted evidence.
+- Added the exact validation report, updated the live audit and future
+  upstream candidate intake, and kept feature 21—the real
+  Uvicorn/Gunicorn installed-wheel process matrix—explicitly pending.
+- The closure changes documentation and generated evidence only beyond the
+  separately committed report serializer fix. It changes no displayed
+  `0.7.7` package metadata, release or package publication and sends nothing
+  to either original repository.
 
 ### Seven-slice batch/bulk cumulative verification and live-audit closure
 

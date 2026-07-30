@@ -1,8 +1,9 @@
 # FastMssql Named-Instance Discovery Design
 
-**Status:** Approved by Marcel Galea through the standing approval for future
-enterprise designs, specifications, plans and inline implementations, subject
-to self-review
+**Status:** `VERIFIED_FORK` on exact technical candidate
+`5728421a3941ce3ca957c5497bc53a78d5553b30`, under Marcel Galea's standing
+approval for enterprise designs, specifications, plans and inline
+implementations, subject to self-review.
 
 **Source baseline:** `docs/batch-bulk-status` at
 `30f975033090d623b27795da76d59ddcef1277ab`
@@ -17,6 +18,34 @@ by this candidate belongs only to Marcel Galea's fork. The original
 `Rivendael/FastMssql` repository remains fetch-only with push URL `DISABLED`.
 No upstream branch, push, pull request, release, package publication or
 separate Tiberius fork is authorized by this design.
+
+## Exact verification state
+
+The final local candidate preserves every design → RED → fix boundary,
+including the separately justified generated-report RED/fix
+`a6409f6`/`17a3438`. Its evidence is recorded in
+[fastmssql-named-instance-report.md](../../validation/fastmssql-named-instance-report.md).
+
+On this SHA:
+
+- all 442 required matrix IDs pass;
+- strict/async/framework/resilience/load/original regression pass
+  `460/16/36/6/14/1,263`;
+- FastMssql Rust and vendored Tiberius pass `122/122` and `184/184`;
+- deterministic Docker SQL-auth and installed-wheel tests pass;
+- 1,000 and 99,999 logical operations remain bounded at eight browser
+  requests, eight physical connections and eight SQL sessions;
+- teardown and privacy checks pass;
+- the genuine Windows `SQLEXPRESS` plus SQL Browser job passes without an
+  explicit port;
+- RustSec and every Linux/macOS/Windows raw-Cargo, Rust, Tiberius,
+  wheel-build/install, dependency-integrity and installed-contract gate pass.
+
+Exact hosted evidence is:
+
+- [Dependency security #30522520267](https://github.com/galeamarcel/FastMssql/actions/runs/30522520267);
+- [Linux/macOS/Windows Rust and wheel #30522520458](https://github.com/galeamarcel/FastMssql/actions/runs/30522520458);
+- [genuine Windows named instance #30522520410](https://github.com/galeamarcel/FastMssql/actions/runs/30522520410).
 
 ## Decision summary
 
@@ -647,33 +676,33 @@ decision authorizes it.
 Feature 20 may be marked `VERIFIED_FORK` only when all of the following are
 true on one exact cumulative SHA:
 
-- [ ] `sql-browser-tokio` is compiled into FastMssql;
-- [ ] instance without port uses UDP discovery and the discovered TCP port;
-- [ ] explicit port performs no browser request;
-- [ ] ordinary no-instance direct connection retains its existing behavior;
-- [ ] pool, direct transaction, direct batch and routing use the shared path;
-- [ ] the request includes the required NUL and respects the 32-byte limit;
-- [ ] every response parser input is panic-free and bounded;
-- [ ] response source, header, declared size, token uniqueness and port are
+- [x] `sql-browser-tokio` is compiled into FastMssql;
+- [x] instance without port uses UDP discovery and the discovered TCP port;
+- [x] explicit port performs no browser request;
+- [x] ordinary no-instance direct connection retains its existing behavior;
+- [x] pool, direct transaction, direct batch and routing use the shared path;
+- [x] the request includes the required NUL and respects the 32-byte limit;
+- [x] every response parser input is panic-free and bounded;
+- [x] response source, header, declared size, token uniqueness and port are
       validated;
-- [ ] discovery failures are structured `SqlConnectionError`;
-- [ ] the absolute connect deadline and cancellation contracts pass;
-- [ ] deterministic SSRP plus real Docker SQL-auth passes without a configured
+- [x] discovery failures are structured `SqlConnectionError`;
+- [x] the absolute connect deadline and cancellation contracts pass;
+- [x] deterministic SSRP plus real Docker SQL-auth passes without a configured
       TCP port;
-- [ ] 99,999 logical operations retain bounded pool and discovery counts;
-- [ ] the installed wheel passes with `PYTHONPATH` unset;
-- [ ] Linux, macOS and Windows raw Cargo/Tiberius/wheel contracts pass;
-- [ ] a genuine hosted Windows `SQLEXPRESS` instance plus SQL Browser passes
+- [x] 99,999 logical operations retain bounded pool and discovery counts;
+- [x] the installed wheel passes with `PYTHONPATH` unset;
+- [x] Linux, macOS and Windows raw Cargo/Tiberius/wheel contracts pass;
+- [x] a genuine hosted Windows `SQLEXPRESS` instance plus SQL Browser passes
       without an explicit port;
-- [ ] cumulative strict, async, framework, resilience, load,
+- [x] cumulative strict, async, framework, resilience, load,
       original-local-regression, Rust and RustSec gates pass;
-- [ ] teardown reports zero relevant sessions and transactions;
-- [ ] privacy and tracked-artifact scans pass;
-- [ ] the knowledge graph is rebuilt on the exact SHA and impact review has no
+- [x] teardown reports zero relevant sessions and transactions;
+- [x] privacy and tracked-artifact scans pass;
+- [x] the knowledge graph is rebuilt on the exact SHA and impact review has no
       unexplained test gap;
-- [ ] `FASTMSSQL_PRODUCTION_READINESS_AUDIT.md`, the SQL-auth matrix/report,
+- [x] `FASTMSSQL_PRODUCTION_READINESS_AUDIT.md`, the SQL-auth matrix/report,
       validation evidence, stubs, README and `VERSION.md` agree;
-- [ ] every branch and exact SHA is present only on
+- [x] every branch and exact SHA is present only on
       `galeamarcel/FastMssql`.
 
 ## Documentation sources

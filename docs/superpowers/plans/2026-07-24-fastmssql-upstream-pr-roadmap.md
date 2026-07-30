@@ -2853,7 +2853,7 @@ fork, testată live și auditată.
 | Native bulk | TDS bulk copy în slice-uri reviewable: primitiva Tiberius, API list fast path și iterable backpressure | `VERIFIED_FORK` independent la `13c91c0` și reverificat cumulativ la `306b44d`; rebase separat pe sursele curente, reproducere proaspătă, gate hosted exact și aprobare explicită înainte de orice fork/PR original |
 | Execute many | statement pozițional repetat bounded: coordonator Python, secvență Rust, atomicitate și operation metrics schema 2 | `VERIFIED_FORK` independent la `9c02379`, runtime `b270205`, și reverificat cumulativ la `306b44d`; separare reviewable de corecțiile PyO3/compatibility-timeout, rebase proaspăt, `EMANY-001`–`EMANY-011`, gate Linux/macOS/Windows/RustSec exact și aprobare explicită înainte de orice PR original |
 | Query many | fixed workers peste query-uri pooled independente, fereastră comună bounded, ordered/completion-order și cleanup terminal supravegheat | `VERIFIED_FORK` la `306b44d`; rebase proaspăt, separare reviewable de corecțiile cumulative de harness, `QMANY-001`–`QMANY-013`, stress/wheel instalat, gate Linux/macOS/Windows/RustSec exact și aprobare explicită înainte de orice PR original |
-| Named instances | SQL Browser Tokio | instanță reală fără port explicit |
+| Named instances | SQL Browser Tokio, parser SSRP hardenat și selector FastMssql comun | `VERIFIED_FORK` la `5728421`; split Tiberius/FastMssql, rebase proaspăt, fixture portabil plus Windows real și aprobare explicită înainte de orice fork/PR original |
 | Operation timeouts | PR-22, connect/acquire/operation/transaction/rollback | `VERIFIED_FORK`; rebase curat, RED proaspăt, comparație cu #121, gate pe trei sisteme și aprobare separată înainte de upstream |
 | Pool observability | PR-24, migrare aditivă `pool_stats()` peste contoarele bb8 | `VERIFIED_FORK`; dependency-free, RED + SQL-auth real + installed-wheel Linux/macOS/Windows, fără PR upstream |
 | Operation observability | PR-25, durată și rezultat per operație | `VERIFIED_FORK`; 16 cazuri SQL-auth, stress 6 × 99.999, gate hosted pe trei sisteme, fără PR în repository-ul original |
@@ -2863,6 +2863,17 @@ fork, testată live și auditată.
 | TDS 8 | `Encrypt=Strict` | necesită suport la nivel Tiberius/TDS |
 | Enterprise SQL types | TVP, sql_variant, spatial, hierarchyid, UDT | conversii simetrice și erori fără panic |
 | HA/failover | routing, host list, multi-subnet | fault injection și retry numai pentru operații sigure |
+
+Named-instance discovery este numai un candidat viitor de intake, nu un PR
+autorizat. Dovada forkului include RED/fix separat pentru Tiberius, RED/fix
+separat pentru integrarea FastMssql, Docker SQL-auth, 99.999 operații, wheel
+instalat, Linux/macOS/Windows, RustSec și o instanță Windows `SQLEXPRESS`
+reală pe exact `5728421`. Înainte de upstream trebuie reverificat ancestry-ul
+repository-ului original actual, reprodus RED-ul pe acea bază și împărțit
+diff-ul astfel
+încât schimbarea protocolară Tiberius să nu fie mascată într-un PR cumulativ
+FastMssql. Niciun fork Tiberius și niciun PR original nu este autorizat de
+această înregistrare.
 
 ### Candidate slices pentru result sets, streaming și RPC
 
