@@ -70,6 +70,26 @@ No release, package-version change, or artifact publication has occurred.
 - This is specification-only. It changes no runtime, dependency, package
   metadata, displayed `0.7.7` version, release or artifact publication.
 
+### Named-instance discovery executable plan
+
+- Added the task-by-task implementation plan for the approved SSRP design,
+  preserving separate vendored-Tiberius protocol RED/fix ancestry and
+  FastMssql integration RED/fix ancestry before cumulative verification.
+- Assigned exact work to the pure request/response parser, connected Tokio
+  UDP/TCP transport, read-only Tiberius configuration introspection, the
+  shared FastMssql physical-connect classifier, structured Python discovery
+  errors, stubs and documentation.
+- Mapped `NINST-001` through `NINST-022` to deterministic protocol,
+  real Docker SQL-auth, explicit-port, deadline, cancellation, pool-bound,
+  99,999-operation, isolated-wheel, privacy, teardown and genuine hosted
+  Windows SQL Browser evidence.
+- Required exact-SHA Linux/macOS/Windows Cargo and installed-wheel gates, a
+  repository-owned Windows SQL Server Express lane, complete cumulative
+  SQL-auth/Rust/RustSec verification and evidence-backed live-audit closure.
+- The plan authorizes no runtime change by itself and changes no dependency,
+  package metadata, displayed `0.7.7` version, release, artifact publication
+  or original-repository state.
+
 ### Seven-slice batch/bulk cumulative verification and live-audit closure
 
 - Closed the seventh batch/bulk slice, bounded-concurrency `query_many()`,
