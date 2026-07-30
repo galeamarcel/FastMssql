@@ -52,6 +52,24 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Production framework process matrix scaffold
+
+- Created `feat/production-framework-matrix` directly from the committed RED
+  boundary `144052491d6c23f14253d2688a43f5ea265ce848`.
+- Added exact development-only pins for Uvicorn `0.51.0`, Gunicorn `26.0.0`,
+  uvicorn-worker `0.4.0` and uvloop `0.22.1`; POSIX-only packages carry an
+  explicit `sys_platform != 'win32'` marker.
+- Registered the dedicated `production_framework` pytest marker and added
+  repository-owned, fail-closed application and Gunicorn configuration
+  interfaces for the subsequent lifecycle implementation.
+- The three focused dependency/post-worker source contracts pass. The full
+  offline contract remains intentionally RED at `13 failed, 4 passed` for the
+  routes, runner, shell integration, reports and hosted workflow owned by
+  later tasks.
+- This scaffold does not yet claim process, SQL-auth, load or hosted evidence.
+  It changes no FastMssql/Tiberius runtime, package metadata, displayed
+  `0.7.7` version, release or published artifact.
+
 ### Production framework process matrix RED
 
 - Created `test/production-framework-matrix` directly from the approved
