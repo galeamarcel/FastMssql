@@ -315,6 +315,17 @@ No release, package-version change, or artifact publication has occurred.
   dependency, package metadata, displayed `0.7.7` version, release or
   published artifact.
 
+### Cumulative vendor-artifact cleanliness correction
+
+- Added repository-rooted ignore rules only for the vendored Tiberius
+  library's generated `Cargo.lock` and `target/` products.
+- Preserved strict dirty-source detection for every other untracked file;
+  `query_many_stress.py` and its `git status --porcelain` evidence were not
+  weakened.
+- This repository-hygiene correction changes no FastMssql/Tiberius runtime,
+  dependency, package metadata, displayed `0.7.7` version, release or
+  published artifact.
+
 ### Execute-many live audit status
 
 - Marked only the sixth of seven batch/bulk slices,
