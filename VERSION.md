@@ -254,6 +254,63 @@ No release, package-version change, or artifact publication has occurred.
   FastMssql runtime/stubs/README, package metadata, displayed `0.7.7`
   version, release state, original repository or any published artifact.
 
+### FastMssql named-instance discovery integration fix
+
+- Created `fix/named-instance` directly from FastMssql integration RED
+  `ebe13bedd407846874f92e9b82157bef2ba2179a`. The separately demonstrated
+  refused-target fixture RED/fix pair `d8c32c9`/`18c14a1` is also preserved
+  in ancestry through the history-only merge `d153eb5`.
+- Enabled only the existing vendored-Tiberius `sql-browser-tokio` feature.
+  Cargo regenerated one real lockfile edge: the already locked root Tokio
+  crate is now an active dependency of the local Tiberius package; no new
+  crate was added.
+- Added one closed initial-target classifier: an instance without an explicit
+  port uses SQL Browser, while direct hosts, explicit ports and
+  instance-plus-explicit-port configurations use the ordinary TCP path.
+  Initial discovery and direct routing streams are separate helpers, both set
+  `TCP_NODELAY`, and Azure routing always reconnects directly to the server
+  supplied host/port without a second browser lookup.
+- Maps discovery failures to `SqlConnectionError` with stable
+  `stage="sql_browser_discovery"`, retryable/discard/outcome metadata and the
+  existing panic-free metadata-failure cause chain. Messages preserve useful
+  structural transport detail without connection strings or credentials.
+- Hardened bb8 `0.9.1` error delivery for `retry_connection=False`. That bb8
+  version forwards background physical-connect errors and checkout
+  validation errors through the same pool-wide error sink while a waiting
+  `get()` otherwise reports only acquisition timeout. Physical creation
+  errors now carry an internal connect-wave tag; validation errors cannot
+  consume that wave, mismatched tags are ignored and waiting checkouts receive
+  the underlying typed failure. The wrapper exposes only the used
+  `get()`/`get_owned()`/`state()` surface, so callers cannot bypass the
+  attribution contract through unrelated bb8 acquisition methods. Recursive
+  unwrapping also preserves the triggering public operation on a physical
+  connect timeout instead of relabeling it generically as `connect`. A caller
+  arriving during an older cancelled attempt ignores exactly that inherited
+  wave, then treats the next terminal wave as its own failure instead of
+  cascading through unrelated later attempts.
+- The self-review regression was observed RED in two focused Rust tests:
+  validation incorrectly published a physical-connect wave and the tagged
+  terminal result retained its internal wrapper instead of the underlying
+  I/O error. Both are now green, and a mutation that removed wave matching
+  made the cross-wave guard test fail before the correct condition was
+  restored.
+- Documented individual-argument and ADO.NET named-instance forms in both
+  public stubs and README. The contract states that an explicit port is
+  authoritative and bypasses UDP 1434 discovery.
+- A fresh offline ABI3 build loaded the native module from this worktree.
+  Focused Rust tests pass `10/10`; the complete offline/matrix/fixture/real
+  SQL-auth named-instance selection passes `67/67` with no skip or swallowed
+  exception, including direct, ADO.NET, transaction, malformed response,
+  wrong-source, silent-browser, refused-target, deadline, cancellation,
+  concurrent-pool and teardown cases.
+- Extended 99,999-operation load, isolated-wheel and hosted
+  Linux/macOS/Windows verification remain Task 7/8 gates and are not claimed
+  by this implementation entry.
+- This unreleased fix changes runtime behavior, one existing dependency
+  feature selection, stubs, README, tests and `VERSION.md`. It changes no
+  package metadata, displayed `0.7.7` version, release state, original
+  repository, artifact publication or upstream authorization.
+
 ### Seven-slice batch/bulk cumulative verification and live-audit closure
 
 - Closed the seventh batch/bulk slice, bounded-concurrency `query_many()`,

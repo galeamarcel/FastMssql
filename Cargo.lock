@@ -1554,6 +1554,7 @@ dependencies = [
  "pretty-hex",
  "rustls-native-certs",
  "thiserror 1.0.69",
+ "tokio",
  "tokio-rustls",
  "tokio-util",
  "tracing",

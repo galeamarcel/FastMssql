@@ -428,6 +428,50 @@ asyncio.run(main())
 
 Note: Windows authentication (Trusted Connection) is currently not supported. Use SQL authentication (username/password).
 
+### Named instances and SQL Browser
+
+When a named SQL Server instance has no explicit TCP port, FastMssql resolves
+the instance through SQL Browser over UDP 1434 and then opens the returned TDS
+TCP endpoint:
+
+```python
+from fastmssql import Connection
+
+individual = Connection(
+    server="db-host",
+    instance_name="SQLEXPRESS",
+    database="application",
+    username="app_user",
+    password="secret",
+)
+
+ado = Connection(
+    r"Server=tcp:db-host\SQLEXPRESS;"
+    "Database=application;User Id=app_user;Password=secret"
+)
+```
+
+The equivalent ADO.NET server target is
+`Server=tcp:db-host\SQLEXPRESS`. SQL Browser must be running and UDP 1434 must
+be reachable from the application host.
+
+When the instance TCP port is already known, provide it explicitly:
+
+```python
+direct = Connection(
+    server="db-host",
+    instance_name="SQLEXPRESS",
+    port=51433,
+    database="application",
+    username="app_user",
+    password="secret",
+)
+```
+
+The ADO.NET form is `Server=tcp:db-host\SQLEXPRESS,51433`.
+An explicit port bypasses SQL Browser and connects directly; no discovery
+request is sent.
+
 ### Azure Authentication (BETA)
 
 🧪 **This is a beta feature.** Azure authentication functionality is experimental and may change in future versions.

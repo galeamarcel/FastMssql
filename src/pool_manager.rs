@@ -9,10 +9,12 @@ use crate::types::{
 use bb8::Pool;
 use pyo3::prelude::*;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tiberius::Config;
-use tokio::sync::RwLock;
+use tiberius::SqlBrowser;
+use tokio::net::TcpStream;
+use tokio::sync::{RwLock, watch};
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -21,6 +23,20 @@ use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 pub(crate) type TiberiusClient =
     tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum InitialTarget {
+    Direct(String),
+    SqlBrowser,
+}
+
+fn classify_initial_target(config: &Config) -> InitialTarget {
+    if config.has_instance_name() && !config.has_explicit_port() {
+        InitialTarget::SqlBrowser
+    } else {
+        InitialTarget::Direct(config.get_addr())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConnectionDisposition {
@@ -172,12 +188,40 @@ pub enum PoolConnectionError {
         source: std::io::Error,
         address: Option<String>,
     },
+    BackgroundConnect {
+        wave_id: u64,
+        source: Box<PoolConnectionError>,
+    },
+    Discovery(tiberius::error::Error),
     Tiberius(tiberius::error::Error),
     Auth(String),
     Timeout {
         timeout: Duration,
     },
     Unusable,
+}
+
+impl Clone for PoolConnectionError {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Io { source, address } => Self::Io {
+                // std::io::Error is not Clone. This copy is used only to move a
+                // terminal physical-connect failure from bb8's background
+                // creator to the waiting checkout while retaining kind/detail.
+                source: std::io::Error::new(source.kind(), source.to_string()),
+                address: address.clone(),
+            },
+            Self::BackgroundConnect { wave_id, source } => Self::BackgroundConnect {
+                wave_id: *wave_id,
+                source: Box::new((**source).clone()),
+            },
+            Self::Discovery(error) => Self::Discovery(error.clone()),
+            Self::Tiberius(error) => Self::Tiberius(error.clone()),
+            Self::Auth(message) => Self::Auth(message.clone()),
+            Self::Timeout { timeout } => Self::Timeout { timeout: *timeout },
+            Self::Unusable => Self::Unusable,
+        }
+    }
 }
 
 impl fmt::Display for PoolConnectionError {
@@ -193,6 +237,10 @@ impl fmt::Display for PoolConnectionError {
                 source,
                 address: None,
             } => write!(f, "I/O error: {source}"),
+            PoolConnectionError::BackgroundConnect { source, .. } => source.fmt(f),
+            PoolConnectionError::Discovery(error) => {
+                write!(f, "SQL Browser discovery failed: {error}")
+            }
             PoolConnectionError::Tiberius(e) => write!(f, "SQL error: {e}"),
             PoolConnectionError::Auth(e) => write!(f, "Auth error: {e}"),
             PoolConnectionError::Timeout { timeout } => write!(
@@ -224,6 +272,30 @@ impl From<tiberius::error::Error> for PoolConnectionError {
     }
 }
 
+fn discovery_error_with_metadata(source: tiberius::error::Error) -> PyErr {
+    let message = format!("SQL Browser discovery failed: {source}");
+    let error = create_connection_error(message.clone());
+    let metadata = Python::attach(|py| {
+        let value = error.value(py);
+        value.setattr("message", message.as_str())?;
+        value.setattr("stage", "sql_browser_discovery")?;
+        value.setattr("retryable", true)?;
+        value.setattr("connection_discarded", false)?;
+        value.setattr("outcome_unknown", false)?;
+        Ok::<(), PyErr>(())
+    });
+
+    match metadata {
+        Ok(()) => error,
+        Err(metadata_failure) => {
+            Python::attach(|py| {
+                metadata_failure.set_cause(py, Some(error));
+            });
+            metadata_failure
+        }
+    }
+}
+
 /// Convert a [`PoolConnectionError`] into a typed Python exception,
 /// preserving the structured context of the underlying [`tiberius::error::Error`]
 /// (SQL error code/state, TLS details, routing info, etc.) rather than
@@ -231,6 +303,8 @@ impl From<tiberius::error::Error> for PoolConnectionError {
 impl From<PoolConnectionError> for pyo3::PyErr {
     fn from(e: PoolConnectionError) -> Self {
         match e {
+            PoolConnectionError::BackgroundConnect { source, .. } => (*source).into(),
+            PoolConnectionError::Discovery(source) => discovery_error_with_metadata(source),
             PoolConnectionError::Tiberius(terr) => create_sql_error(terr, "Connection error"),
             PoolConnectionError::Io {
                 source,
@@ -262,6 +336,35 @@ impl From<PoolConnectionError> for pyo3::PyErr {
     }
 }
 
+async fn open_direct_stream(address: String) -> Result<TcpStream, PoolConnectionError> {
+    let tcp = TcpStream::connect(&address)
+        .await
+        .map_err(|source| PoolConnectionError::Io {
+            source,
+            address: Some(address.clone()),
+        })?;
+    tcp.set_nodelay(true)
+        .map_err(|source| PoolConnectionError::Io {
+            source,
+            address: Some(address),
+        })?;
+    Ok(tcp)
+}
+
+async fn open_initial_stream(config: &Config) -> Result<TcpStream, PoolConnectionError> {
+    match classify_initial_target(config) {
+        InitialTarget::Direct(address) => open_direct_stream(address).await,
+        InitialTarget::SqlBrowser => {
+            let tcp = <TcpStream as SqlBrowser>::connect_named(config)
+                .await
+                .map_err(PoolConnectionError::Discovery)?;
+            tcp.set_nodelay(true)
+                .map_err(|source| PoolConnectionError::Discovery(source.into()))?;
+            Ok(tcp)
+        }
+    }
+}
+
 pub(crate) fn timeout_error_or_metadata_failure(
     elapsed: DeadlineElapsed,
     metadata: TimeoutErrorMetadata,
@@ -274,6 +377,9 @@ pub(crate) fn timeout_error_or_metadata_failure(
 
 fn map_physical_connection_error(error: PoolConnectionError, operation: OperationName) -> PyErr {
     match error {
+        PoolConnectionError::BackgroundConnect { source, .. } => {
+            map_physical_connection_error(*source, operation)
+        }
         PoolConnectionError::Timeout { timeout } => timeout_error_or_metadata_failure(
             DeadlineElapsed {
                 timeout,
@@ -304,28 +410,14 @@ async fn connect_client_inner(
         config.authentication(auth_method);
     }
 
-    let address = config.get_addr();
-    let tcp = tokio::net::TcpStream::connect(&address)
-        .await
-        .map_err(|source| PoolConnectionError::Io {
-            source,
-            address: Some(address),
-        })?;
-    tcp.set_nodelay(true)?;
+    let tcp = open_initial_stream(&config).await?;
 
     match tiberius::Client::connect(config.clone(), tcp.compat_write()).await {
         Ok(client) => Ok(client),
         Err(tiberius::error::Error::Routing { host, port }) => {
             config.host(&host);
             config.port(port);
-            let address = config.get_addr();
-            let tcp = tokio::net::TcpStream::connect(&address)
-                .await
-                .map_err(|source| PoolConnectionError::Io {
-                    source,
-                    address: Some(address),
-                })?;
-            tcp.set_nodelay(true)?;
+            let tcp = open_direct_stream(config.get_addr()).await?;
             tiberius::Client::connect(config, tcp.compat_write())
                 .await
                 .map_err(Into::into)
@@ -385,20 +477,25 @@ pub struct AzureConnectionManager {
     connect_timeout: Option<Duration>,
     /// Whether checkout performs the optional SQL Server health probe.
     validate_on_checkout: bool,
+    /// Tracks terminal background connection attempts so bb8 can preserve
+    /// their typed error when retries are explicitly disabled.
+    connection_attempts: Arc<ConnectionAttemptTracker>,
 }
 
 impl AzureConnectionManager {
-    pub fn new(
+    fn new(
         base_config: Config,
         azure_credential: Option<Arc<PyAzureCredential>>,
         connect_timeout: Option<Duration>,
         validate_on_checkout: bool,
+        connection_attempts: Arc<ConnectionAttemptTracker>,
     ) -> Self {
         Self {
             base_config,
             azure_credential,
             connect_timeout,
             validate_on_checkout,
+            connection_attempts,
         }
     }
 }
@@ -408,12 +505,19 @@ impl bb8::ManageConnection for AzureConnectionManager {
     type Error = PoolConnectionError;
 
     async fn connect(&self) -> Result<Self::Connection, Self::Error> {
-        let client = connect_client_bounded(
+        let attempt = self.connection_attempts.begin();
+        let wave_id = attempt.wave_id();
+        let result = connect_client_bounded(
             &self.base_config,
             self.azure_credential.as_ref(),
             self.connect_timeout,
         )
-        .await?;
+        .await;
+        attempt.finish(&result);
+        let client = result.map_err(|source| PoolConnectionError::BackgroundConnect {
+            wave_id,
+            source: Box::new(source),
+        })?;
         Ok(ManagedConnection::new(client))
     }
 
@@ -456,6 +560,178 @@ impl bb8::ManageConnection for AzureConnectionManager {
     /// Rust future before Tiberius finished consuming the server response.
     fn has_broken(&self, conn: &mut Self::Connection) -> bool {
         !conn.is_reusable()
+    }
+}
+
+#[derive(Debug, Default)]
+struct ConnectionAttemptState {
+    wave_id: u64,
+    in_flight: usize,
+    pending_failure_sinks: usize,
+    saw_success: bool,
+    last_failure: Option<PoolConnectionError>,
+}
+
+#[derive(Debug)]
+struct ConnectionAttemptTracker {
+    state: Mutex<ConnectionAttemptState>,
+    terminal_failure_wave: watch::Sender<u64>,
+}
+
+impl Default for ConnectionAttemptTracker {
+    fn default() -> Self {
+        let (terminal_failure_wave, _) = watch::channel(0);
+        Self {
+            state: Mutex::new(ConnectionAttemptState::default()),
+            terminal_failure_wave,
+        }
+    }
+}
+
+impl ConnectionAttemptTracker {
+    fn begin(self: &Arc<Self>) -> ConnectionAttemptGuard {
+        let wave_id = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if state.in_flight == 0 && state.pending_failure_sinks == 0 {
+                state.wave_id = state.wave_id.wrapping_add(1);
+                state.saw_success = false;
+                state.last_failure = None;
+            }
+            state.in_flight += 1;
+            state.wave_id
+        };
+        ConnectionAttemptGuard {
+            tracker: Arc::clone(self),
+            wave_id,
+            finished: false,
+        }
+    }
+
+    fn complete(&self, outcome: Option<Result<(), PoolConnectionError>>) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        debug_assert!(state.in_flight > 0);
+        state.in_flight = state.in_flight.saturating_sub(1);
+        match outcome {
+            Some(Ok(())) => {
+                state.saw_success = true;
+                state.last_failure = None;
+            }
+            Some(Err(error)) => {
+                state.pending_failure_sinks += 1;
+                if !state.saw_success {
+                    state.last_failure = Some(error);
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn publish_failure(&self, wave_id: u64, error: PoolConnectionError) {
+        let terminal_wave = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if state.wave_id != wave_id || state.pending_failure_sinks == 0 {
+                return;
+            }
+
+            state.pending_failure_sinks -= 1;
+            if !state.saw_success {
+                state.last_failure = Some(error);
+            }
+            if state.in_flight == 0
+                && state.pending_failure_sinks == 0
+                && !state.saw_success
+                && state.last_failure.is_some()
+            {
+                Some(wave_id)
+            } else {
+                None
+            }
+        };
+
+        if let Some(wave_id) = terminal_wave {
+            // bb8 invokes the error sink only after releasing the failed
+            // connection approval. A waiter can therefore safely start a new
+            // physical attempt after observing this wave.
+            self.terminal_failure_wave.send_replace(wave_id);
+        }
+    }
+
+    fn active_wave(&self) -> Option<u64> {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.in_flight > 0 || state.pending_failure_sinks > 0 {
+            Some(state.wave_id)
+        } else {
+            None
+        }
+    }
+
+    fn subscribe(&self) -> watch::Receiver<u64> {
+        self.terminal_failure_wave.subscribe()
+    }
+
+    fn failure_for_wave(&self, wave_id: u64) -> Option<PoolConnectionError> {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.wave_id == wave_id
+            && state.in_flight == 0
+            && state.pending_failure_sinks == 0
+            && !state.saw_success
+        {
+            state.last_failure.clone()
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ConnectionAttemptErrorSink {
+    tracker: Arc<ConnectionAttemptTracker>,
+}
+
+impl ConnectionAttemptErrorSink {
+    fn new(tracker: Arc<ConnectionAttemptTracker>) -> Self {
+        Self { tracker }
+    }
+}
+
+impl bb8::ErrorSink<PoolConnectionError> for ConnectionAttemptErrorSink {
+    fn sink(&self, error: PoolConnectionError) {
+        if let PoolConnectionError::BackgroundConnect { wave_id, source } = error {
+            self.tracker.publish_failure(wave_id, *source);
+        }
+    }
+
+    fn boxed_clone(&self) -> Box<dyn bb8::ErrorSink<PoolConnectionError>> {
+        Box::new(self.clone())
+    }
+}
+
+struct ConnectionAttemptGuard {
+    tracker: Arc<ConnectionAttemptTracker>,
+    wave_id: u64,
+    finished: bool,
+}
+
+impl ConnectionAttemptGuard {
+    fn wave_id(&self) -> u64 {
+        self.wave_id
+    }
+
+    fn finish<T>(mut self, result: &Result<T, PoolConnectionError>) {
+        let outcome = match result {
+            Ok(_) => Ok(()),
+            Err(error) => Err(error.clone()),
+        };
+        self.tracker.complete(Some(outcome));
+        self.finished = true;
+    }
+}
+
+impl Drop for ConnectionAttemptGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.tracker.complete(None);
+        }
     }
 }
 
@@ -542,7 +818,112 @@ impl Drop for PooledOperationGuard<'_> {
     }
 }
 
-pub type ConnectionPool = Pool<AzureConnectionManager>;
+#[derive(Clone)]
+pub struct ConnectionPool {
+    inner: Pool<AzureConnectionManager>,
+    connection_attempts: Arc<ConnectionAttemptTracker>,
+    retry_connection: bool,
+}
+
+fn consume_inherited_failure(inherited_wave: &mut Option<u64>, failed_wave: u64) -> bool {
+    if *inherited_wave == Some(failed_wave) {
+        *inherited_wave = None;
+        true
+    } else {
+        false
+    }
+}
+
+impl ConnectionPool {
+    fn new(
+        inner: Pool<AzureConnectionManager>,
+        connection_attempts: Arc<ConnectionAttemptTracker>,
+        retry_connection: bool,
+    ) -> Self {
+        Self {
+            inner,
+            connection_attempts,
+            retry_connection,
+        }
+    }
+
+    fn terminal_connection_failure(&self, wave_id: u64) -> Option<PoolConnectionError> {
+        if self.inner.state().connections == 0 {
+            self.connection_attempts.failure_for_wave(wave_id)
+        } else {
+            None
+        }
+    }
+
+    pub fn state(&self) -> bb8::State {
+        self.inner.state()
+    }
+
+    pub async fn get(
+        &self,
+    ) -> Result<bb8::PooledConnection<'_, AzureConnectionManager>, bb8::RunError<PoolConnectionError>>
+    {
+        if self.retry_connection {
+            return self.inner.get().await;
+        }
+
+        let mut inherited_wave = self.connection_attempts.active_wave();
+        loop {
+            let mut failures = self.connection_attempts.subscribe();
+            tokio::select! {
+                result = self.inner.get() => return result,
+                changed = failures.changed() => {
+                    if changed.is_err() {
+                        return self.inner.get().await;
+                    }
+                    let failed_wave = *failures.borrow_and_update();
+                    if consume_inherited_failure(&mut inherited_wave, failed_wave) {
+                        // This waiter arrived while an older caller's physical
+                        // attempt was still settling. Give this logical
+                        // acquisition one fresh wave instead of replaying the
+                        // older caller's terminal failure.
+                        continue;
+                    }
+                    if let Some(error) = self.terminal_connection_failure(failed_wave) {
+                        return Err(bb8::RunError::User(error));
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn get_owned(
+        &self,
+    ) -> Result<
+        bb8::PooledConnection<'static, AzureConnectionManager>,
+        bb8::RunError<PoolConnectionError>,
+    > {
+        if self.retry_connection {
+            return self.inner.get_owned().await;
+        }
+
+        let mut inherited_wave = self.connection_attempts.active_wave();
+        loop {
+            let mut failures = self.connection_attempts.subscribe();
+            tokio::select! {
+                result = self.inner.get_owned() => return result,
+                changed = failures.changed() => {
+                    if changed.is_err() {
+                        return self.inner.get_owned().await;
+                    }
+                    let failed_wave = *failures.borrow_and_update();
+                    if consume_inherited_failure(&mut inherited_wave, failed_wave) {
+                        continue;
+                    }
+                    if let Some(error) = self.terminal_connection_failure(failed_wave) {
+                        return Err(bb8::RunError::User(error));
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub(crate) type OwnedPooledConnection = bb8::PooledConnection<'static, AzureConnectionManager>;
 
 pub(crate) fn map_pool_checkout_error(
@@ -600,15 +981,21 @@ pub async fn establish_pool(
     operation: OperationName,
 ) -> PyResult<ConnectionPool> {
     let validate_on_checkout = pool_config.test_on_check_out.unwrap_or(true);
+    let retry_connection = pool_config.retry_connection.unwrap_or(true);
+    let connection_attempts = Arc::new(ConnectionAttemptTracker::default());
     let manager = AzureConnectionManager::new(
         base_config.clone(),
         azure_credential,
         timeout_config.connect_timeout,
         validate_on_checkout,
+        Arc::clone(&connection_attempts),
     );
     let mut builder = Pool::builder()
         .max_size(pool_config.max_size)
         .connection_timeout(timeout_config.acquire_timeout)
+        .error_sink(Box::new(ConnectionAttemptErrorSink::new(Arc::clone(
+            &connection_attempts,
+        ))))
         // Mandatory cross-lease reset is implemented in the manager hook.
         // This hook must remain active even when the optional health probe is
         // disabled through PoolConfig.
@@ -631,6 +1018,7 @@ pub async fn establish_pool(
         .build(manager)
         .await
         .map_err(|error| map_physical_connection_error(error, operation))?;
+    let pool = ConnectionPool::new(pool, connection_attempts, retry_connection);
 
     // Warmup pool if min_idle is configured to eliminate cold-start latency.
     if let Some(min_idle) = pool_config.min_idle {
@@ -759,12 +1147,193 @@ pub async fn warmup_pool(
 #[cfg(test)]
 mod connection_disposition_tests {
     use super::{
-        CheckoutAction, ConnectionDisposition, checkout_action,
+        CheckoutAction, ConnectionAttemptErrorSink, ConnectionAttemptTracker,
+        ConnectionDisposition, InitialTarget, PoolConnectionError, checkout_action,
+        classify_initial_target, consume_inherited_failure, map_physical_connection_error,
         python_error_allows_connection_reuse,
     };
+    use crate::deadline::OperationName;
     use crate::types::{ConversionError, create_parameter_conversion_error};
     use pyo3::Python;
     use pyo3::types::PyAnyMethods;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tiberius::Config;
+
+    #[test]
+    fn initial_target_matrix_uses_browser_only_without_explicit_port() {
+        let mut direct_default = Config::new();
+        direct_default.host("db-host");
+        assert_eq!(
+            classify_initial_target(&direct_default),
+            InitialTarget::Direct("db-host:1433".to_owned())
+        );
+
+        let mut named = Config::new();
+        named.host("db-host");
+        named.instance_name("SQLEXPRESS");
+        assert_eq!(classify_initial_target(&named), InitialTarget::SqlBrowser);
+
+        let mut direct_port = Config::new();
+        direct_port.host("db-host");
+        direct_port.port(51433);
+        assert_eq!(
+            classify_initial_target(&direct_port),
+            InitialTarget::Direct("db-host:51433".to_owned())
+        );
+
+        let mut named_with_port = Config::new();
+        named_with_port.host("db-host");
+        named_with_port.instance_name("SQLEXPRESS");
+        named_with_port.port(51433);
+        assert_eq!(
+            classify_initial_target(&named_with_port),
+            InitialTarget::Direct("db-host:51433".to_owned())
+        );
+    }
+
+    #[test]
+    fn checkout_validation_error_cannot_complete_a_physical_connect_wave() {
+        let tracker = Arc::new(ConnectionAttemptTracker::default());
+        let attempt = tracker.begin();
+        let connect_failure: Result<(), PoolConnectionError> = Err(PoolConnectionError::Io {
+            source: std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "physical connect refused",
+            ),
+            address: Some("127.0.0.1:51433".to_owned()),
+        });
+        attempt.finish(&connect_failure);
+
+        let failure_wave = tracker.subscribe();
+        let sink = ConnectionAttemptErrorSink::new(Arc::clone(&tracker));
+        bb8::ErrorSink::sink(&sink, PoolConnectionError::Unusable);
+
+        assert!(
+            !failure_wave.has_changed().unwrap(),
+            "an is_valid failure must not publish a background connect wave"
+        );
+        assert!(
+            tracker.active_wave().is_some(),
+            "the pending physical connect failure must remain attributable"
+        );
+    }
+
+    #[test]
+    fn tagged_background_failure_publishes_its_underlying_error() {
+        let tracker = Arc::new(ConnectionAttemptTracker::default());
+        let attempt = tracker.begin();
+        let wave_id = tracker.active_wave().expect("active connect wave");
+        let connect_failure: Result<(), PoolConnectionError> = Err(PoolConnectionError::Io {
+            source: std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "physical connect refused",
+            ),
+            address: Some("127.0.0.1:51433".to_owned()),
+        });
+        attempt.finish(&connect_failure);
+
+        let failure_wave = tracker.subscribe();
+        let sink = ConnectionAttemptErrorSink::new(Arc::clone(&tracker));
+        bb8::ErrorSink::sink(
+            &sink,
+            PoolConnectionError::BackgroundConnect {
+                wave_id,
+                source: Box::new(PoolConnectionError::Io {
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "physical connect refused",
+                    ),
+                    address: Some("127.0.0.1:51433".to_owned()),
+                }),
+            },
+        );
+
+        assert!(failure_wave.has_changed().unwrap());
+        match tracker
+            .failure_for_wave(wave_id)
+            .expect("terminal physical connect failure")
+        {
+            PoolConnectionError::Io { source, address } => {
+                assert_eq!(source.kind(), std::io::ErrorKind::ConnectionRefused);
+                assert_eq!(address.as_deref(), Some("127.0.0.1:51433"));
+            }
+            other => panic!("expected the underlying I/O error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tagged_failure_cannot_consume_another_connect_wave() {
+        let tracker = Arc::new(ConnectionAttemptTracker::default());
+        let attempt = tracker.begin();
+        let wave_id = tracker.active_wave().expect("active connect wave");
+        let connect_failure: Result<(), PoolConnectionError> = Err(PoolConnectionError::Io {
+            source: std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "physical connect refused",
+            ),
+            address: Some("127.0.0.1:51433".to_owned()),
+        });
+        attempt.finish(&connect_failure);
+
+        let failure_wave = tracker.subscribe();
+        let sink = ConnectionAttemptErrorSink::new(Arc::clone(&tracker));
+        bb8::ErrorSink::sink(
+            &sink,
+            PoolConnectionError::BackgroundConnect {
+                wave_id: wave_id.wrapping_add(1),
+                source: Box::new(PoolConnectionError::Unusable),
+            },
+        );
+
+        assert!(
+            !failure_wave.has_changed().unwrap(),
+            "a mismatched tag must not publish the active connect wave"
+        );
+        assert_eq!(tracker.active_wave(), Some(wave_id));
+    }
+
+    #[test]
+    fn background_connect_timeout_preserves_the_triggering_operation() {
+        Python::initialize();
+        let error = map_physical_connection_error(
+            PoolConnectionError::BackgroundConnect {
+                wave_id: 1,
+                source: Box::new(PoolConnectionError::Timeout {
+                    timeout: Duration::from_millis(50),
+                }),
+            },
+            OperationName::Query,
+        );
+
+        Python::attach(|py| {
+            let value = error.value(py);
+            assert_eq!(
+                value
+                    .getattr("operation")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "query"
+            );
+            assert_eq!(
+                value.getattr("phase").unwrap().extract::<String>().unwrap(),
+                "connect"
+            );
+        });
+    }
+
+    #[test]
+    fn inherited_connect_failure_is_ignored_exactly_once() {
+        let mut inherited_wave = Some(7);
+        assert!(consume_inherited_failure(&mut inherited_wave, 7));
+        assert_eq!(inherited_wave, None);
+        assert!(!consume_inherited_failure(&mut inherited_wave, 7));
+
+        let mut newer_wave = Some(8);
+        assert!(!consume_inherited_failure(&mut newer_wave, 7));
+        assert_eq!(newer_wave, Some(8));
+    }
 
     #[test]
     fn checkout_action_matrix_keeps_reset_mandatory_and_health_optional() {

@@ -168,7 +168,9 @@ class Connection:
             azure_credential: Azure Active Directory credential for authentication
             application_intent: Sets ApplicationIntent to "ReadOnly" or "ReadWrite" (default: ReadWrite)
             port: TCP port number (default: 1433)
-            instance_name: Named instance of SQL Server
+            instance_name: Named SQL Server instance. Without an explicit port,
+                FastMssql uses SQL Browser discovery over UDP 1434; an explicit
+                port bypasses discovery.
             application_name: Application name for SQL Server connection
 
         Note:
@@ -461,6 +463,8 @@ class Transaction:
         A connection string without Encrypt requires full-session encryption.
         TLS options must come from either the connection string or ssl_config,
         never both.
+        A named instance without an explicit port uses SQL Browser discovery
+        over UDP 1434. An explicit port is authoritative and bypasses discovery.
         """
         ...
 
