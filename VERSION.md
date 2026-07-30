@@ -45,6 +45,23 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Cumulative SQL Server fresh-process gate RED
+
+- Created `test/cumulative-sqlserver-fresh-start` from exact approved plan
+  commit `bcb51d9cd208c03e28122ddc4f02d72e63e40d03`.
+- Refactored the existing full-runner sandbox setup into one test helper and
+  added a real executable Docker recorder plus a provision event marker.
+- Added one behavior contract requiring the exact Compose argument vector
+  `up -d --force-recreate sqlserver`, exactly one Docker invocation and
+  provision only after that invocation completes.
+- The new test failed once for the intended sole reason: the unchanged runner
+  emitted `up -d sqlserver` without `--force-recreate`; it did not fail on
+  collection, imports, fixtures, sandbox execution or event ordering.
+- The pre-existing original-local-regression display and artifact contract
+  remained green `1/1` against the same extracted helper.
+- This test-only RED changes no runner or library behavior, package metadata,
+  displayed version, dependency, release or published artifact.
+
 ### Cumulative SQL Server fresh-process gate plan
 
 - Added the executable TDD plan for a recording Docker/provision boundary,
