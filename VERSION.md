@@ -45,6 +45,26 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Cumulative SQL Server fresh-process gate fix
+
+- Created `fix/cumulative-sqlserver-fresh-start` directly from RED commit
+  `98e80c52e346c8113f5bf9263039840e41f569bc`, preserving the executable
+  failing contract in ancestry.
+- Added only `--force-recreate` to the canonical
+  `docker compose ... up -d sqlserver` lane; no retry, volume deletion,
+  memory tuning, sleep or additional Docker operation was introduced.
+- The exact unchanged RED contract moved from the intended `1 failed` to
+  `1 passed`, proving the runner now emits the required argument vector and
+  completes recreation before provision.
+- The complete SQL-auth matrix-contract file passed `31/31`, including
+  original-local-regression naming, required stress wiring, hosted wheel
+  command, privacy, unique case ownership and no-swallowed-failure contracts.
+- The persistent named data volume and all library runtime behavior remain
+  unchanged; the correction applies only to the canonical validation
+  harness.
+- This fix does not alter package metadata, displayed version, dependency,
+  release or published artifact.
+
 ### Cumulative SQL Server fresh-process gate RED
 
 - Created `test/cumulative-sqlserver-fresh-start` from exact approved plan
