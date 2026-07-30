@@ -328,6 +328,25 @@ No release, package-version change, or artifact publication has occurred.
   runtime, dependency, package metadata, displayed `0.7.7` version, release,
   artifact publication or original-repository state.
 
+### Named-instance exact-SHA hosted-trigger fix
+
+- Created `fix/named-instance-hosted-triggers` directly from RED commit
+  `3b87aac167813b080e1a78b7a88974ba9779a2bd`; the executable failure remains
+  its mandatory ancestor.
+- Added only `fix/named-instance`, `verify/named-instance` and
+  `docs/named-instance-status` to the existing push branch lists of the
+  cross-platform Rust/wheel workflow and the RustSec workflow.
+- Manual dispatch remains available but is not used as verification
+  evidence. Both workflows retain read-only repository permissions,
+  credential-free checkout and their existing concurrency policy.
+- The unchanged named-instance contract now passes `9/9`; both workflow files
+  also parse as YAML and `git diff --check` is clean before history-only
+  integration into `verify/named-instance`.
+- This harness-only change modifies two workflow branch filters and
+  `VERSION.md`. It changes no runtime, test semantics, dependency, package
+  metadata, displayed `0.7.7` version, release, artifact publication or
+  original-repository state.
+
 ### Seven-slice batch/bulk cumulative verification and live-audit closure
 
 - Closed the seventh batch/bulk slice, bounded-concurrency `query_many()`,
