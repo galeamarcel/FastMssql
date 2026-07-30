@@ -107,13 +107,13 @@ record tiberius-clippy \
   cargo clippy \
   --manifest-path vendor/tiberius/Cargo.toml \
   --no-default-features \
-  --features chrono,tds73,rustls \
+  --features chrono,tds73,rustls,sql-browser-tokio \
   --all-targets -- -D warnings "${tiberius_clippy_legacy_lints[@]}"
 record tiberius-lib \
   cargo test \
   --manifest-path vendor/tiberius/Cargo.toml \
   --no-default-features \
-  --features chrono,tds73,rustls \
+  --features chrono,tds73,rustls,sql-browser-tokio \
   --lib
 
 record compose-up \
@@ -124,20 +124,21 @@ record tiberius-token-safety-sql-auth \
   cargo test \
   --manifest-path vendor/tiberius/Cargo.toml \
   --no-default-features \
-  --features chrono,tds73,rustls \
+  --features chrono,tds73,rustls,sql-browser-tokio \
   --test token_safety_sql_auth -- --test-threads=1
 record tiberius-bulk-column-subset-sql-auth \
   cargo test \
   --manifest-path vendor/tiberius/Cargo.toml \
   --no-default-features \
-  --features chrono,tds73,rustls \
+  --features chrono,tds73,rustls,sql-browser-tokio \
   --test bulk_column_subset_sql_auth -- --test-threads=1
 record tiberius-response-sql-auth \
   cargo test \
   --manifest-path vendor/tiberius/Cargo.toml \
   --no-default-features \
-  --features chrono,tds73,rustls \
+  --features chrono,tds73,rustls,sql-browser-tokio \
   --test response_events_sql_auth -- --test-threads=1
+record named-instance-load scripts/sql_auth/run_named_instance_stress.sh
 record result-stream-load scripts/sql_auth/run_result_stream_stress.sh
 record query-many-load scripts/sql_auth/run_query_many_stress.sh
 
@@ -167,6 +168,7 @@ readonly strict_functional=(
   tests/sql_auth_strict/test_native_bulk_iterable_strict.py
   tests/sql_auth_strict/test_execute_many_strict.py
   tests/sql_auth_strict/test_query_many_strict.py
+  tests/sql_auth_strict/test_named_instance_strict.py
   tests/sql_auth_strict/test_transactions_strict.py
   tests/sql_auth_strict/test_operation_timeouts.py
   tests/sql_auth_strict/test_lifecycle.py
@@ -198,7 +200,9 @@ record resilience \
 record load \
   env FASTMSSQL_SQL_AUTH_RESULTS_PATH="${artifact_dir}/load-results.json" \
   FASTMSSQL_LOAD_METRICS_PATH="${artifact_dir}/load-metrics.json" \
-  uv run pytest tests/sql_auth_strict/test_resilience_load.py \
+  uv run pytest \
+  tests/sql_auth_strict/test_resilience_load.py \
+  tests/sql_auth_strict/test_named_instance_strict.py \
   -m load --junitxml="${artifact_dir}/load.xml" -vv
 
 record upstream \

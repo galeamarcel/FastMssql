@@ -79,10 +79,10 @@ jobs:
         run: cargo test --locked
 
       - name: Run vendored Tiberius unit tests
-        run: cargo test --manifest-path vendor/tiberius/Cargo.toml --no-default-features --features chrono,tds73,rustls --lib
+        run: cargo test --manifest-path vendor/tiberius/Cargo.toml --no-default-features --features chrono,tds73,rustls,sql-browser-tokio --lib
 
       - name: Run vendored Tiberius response API tests
-        run: cargo test --manifest-path vendor/tiberius/Cargo.toml --no-default-features --features chrono,tds73,rustls --test response_api
+        run: cargo test --manifest-path vendor/tiberius/Cargo.toml --no-default-features --features chrono,tds73,rustls,sql-browser-tokio --test response_api
 
       - name: Build Python extension wheel
         shell: bash
@@ -122,6 +122,7 @@ jobs:
             tests/test_pool_observability_contract.py \
             tests/test_operation_metrics_contract.py \
             tests/test_result_stream_contract.py \
+            tests/test_named_instance_contract.py \
             tests/test_query_many_contract.py \
             tests/test_query_many_coordinator.py \
             tests/test_query_many_stress_contract.py -q

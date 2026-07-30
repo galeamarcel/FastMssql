@@ -1,0 +1,342 @@
+name: Windows named instance
+
+on:
+  push:
+    branches:
+      - fix/named-instance
+      - verify/named-instance
+      - docs/named-instance-status
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-named-instance-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_TOOLCHAIN: "1.94.0"
+  PYTHON_VERSION: "3.13"
+  PYO3_PYTHON: python
+  PYTHONPATH: ""
+
+jobs:
+  sql-browser:
+    name: SQL Browser and installed wheel
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv and CPython
+        uses: astral-sh/setup-uv@v8.3.2
+        with:
+          version: "latest"
+          python-version: "3.13"
+          activate-environment: true
+          no-project: true
+          enable-cache: false
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.94.0 --profile minimal --no-self-update
+          rustup default 1.94.0
+          rustc --version
+          cargo --version
+          python -c "import sys; assert sys.version_info[:2] == (3, 13)"
+
+      - name: Generate an ephemeral SQL-auth credential
+        shell: pwsh
+        run: |
+          $password = "Fms!aA1_" + [Guid]::NewGuid().ToString("N")
+          Write-Output "::add-mask::$password"
+          "FASTMSSQL_WINDOWS_SA_PASSWORD=$password" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Download and verify Microsoft SQL Server 2022 Express
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $download = "https://download.microsoft.com/download/5/1/4/5145fe04-4d30-4b85-b0d1-39533663a2f1/SQL2022-SSEI-Expr.exe"
+          $bootstrapper = Join-Path $env:RUNNER_TEMP "SQL2022-SSEI-Expr.exe"
+          $media = Join-Path $env:RUNNER_TEMP "sql2022-express-media"
+          New-Item -ItemType Directory -Path $media -Force | Out-Null
+          Invoke-WebRequest -Uri $download -OutFile $bootstrapper
+
+          $signature = Get-AuthenticodeSignature -FilePath $bootstrapper
+          if ($signature.Status -ne "Valid") {
+            throw "SQL Server bootstrapper Authenticode status is not Valid"
+          }
+          if ($signature.SignerCertificate.Subject -notmatch "Microsoft") {
+            throw "SQL Server bootstrapper signer is not Microsoft"
+          }
+
+          $downloadProcess = Start-Process -FilePath $bootstrapper -Wait -PassThru `
+            -ArgumentList @(
+              "/ACTION=Download",
+              "/MEDIAPATH=$media",
+              "/MEDIATYPE=Core",
+              "/QUIET"
+            )
+          if ($downloadProcess.ExitCode -ne 0) {
+            throw "SQL Server media download failed structurally"
+          }
+
+          $package = Get-ChildItem -Path $media -Filter "SQLEXPR_x64_ENU.exe" `
+            -Recurse | Select-Object -First 1
+          if ($null -eq $package) {
+            throw "SQL Server Express Core media was not downloaded"
+          }
+          $packageSignature = Get-AuthenticodeSignature -FilePath $package.FullName
+          if ($packageSignature.Status -ne "Valid") {
+            throw "SQL Server Express media Authenticode status is not Valid"
+          }
+          if ($packageSignature.SignerCertificate.Subject -notmatch "Microsoft") {
+            throw "SQL Server Express media signer is not Microsoft"
+          }
+          "FASTMSSQL_SQL_EXPRESS_MEDIA=$($package.FullName)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install SQLEXPRESS with SQL authentication and TCP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $arguments = @(
+            "/Q",
+            "/ACTION=Install",
+            "/FEATURES=SQLEngine",
+            "/INSTANCENAME=SQLEXPRESS",
+            "/SECURITYMODE=SQL",
+            "/SAPWD=$env:FASTMSSQL_WINDOWS_SA_PASSWORD",
+            "/SQLSYSADMINACCOUNTS=BUILTIN\Administrators",
+            "/TCPENABLED=1",
+            "/NPENABLED=0",
+            "/BROWSERSVCSTARTUPTYPE=Automatic",
+            "/SQLSVCSTARTUPTYPE=Automatic",
+            "/UpdateEnabled=False",
+            "/IACCEPTSQLSERVERLICENSETERMS"
+          )
+          $install = Start-Process -FilePath $env:FASTMSSQL_SQL_EXPRESS_MEDIA `
+            -ArgumentList $arguments -Wait -PassThru
+          if ($install.ExitCode -notin @(0, 3010)) {
+            throw "SQL Server Express installation failed structurally"
+          }
+
+          Set-Service SQLBrowser -StartupType Automatic
+          Start-Service SQLBrowser
+          Set-Service 'MSSQL$SQLEXPRESS' -StartupType Automatic
+          Start-Service 'MSSQL$SQLEXPRESS'
+
+          New-NetFirewallRule `
+            -DisplayName "FastMssql SQL Browser UDP" `
+            -Direction Inbound -Action Allow -Protocol UDP -LocalPort 1434 |
+            Out-Null
+          if ((Get-Service SQLBrowser).Status -ne "Running") {
+            throw "SQL Server Browser is not running"
+          }
+          if ((Get-Service 'MSSQL$SQLEXPRESS').Status -ne "Running") {
+            throw "SQLEXPRESS is not running"
+          }
+
+      - name: Prove SQL Browser resolution with sqlcmd and no port
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sqlcmd = Get-Command sqlcmd -ErrorAction Stop
+          $ready = $false
+          for ($attempt = 0; $attempt -lt 60; $attempt++) {
+            & $sqlcmd.Source `
+              -S 'localhost\SQLEXPRESS' `
+              -U sa `
+              -P $env:FASTMSSQL_WINDOWS_SA_PASSWORD `
+              -C -b `
+              -Q "SET NOCOUNT ON; SELECT SERVERPROPERTY('InstanceName')" `
+              *> $null
+            if ($LASTEXITCODE -eq 0) {
+              $ready = $true
+              break
+            }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $ready) {
+            throw "sqlcmd could not resolve localhost\SQLEXPRESS through SQL Browser"
+          }
+
+      - name: Build and install the exact candidate wheel
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory `
+            -Path ".artifacts/named-instance-wheel" -Force | Out-Null
+          uvx --from maturin==1.14.1 maturin build `
+            --release `
+            --locked `
+            --out ".artifacts/named-instance-wheel"
+          $wheels = @(Get-ChildItem ".artifacts/named-instance-wheel/fastmssql-0.7.7-*.whl")
+          if ($wheels.Count -ne 1) {
+            throw "expected exactly one fastmssql-0.7.7 candidate wheel"
+          }
+          uv venv --python "3.13" ".named-instance-venv"
+          uv pip install `
+            --python ".named-instance-venv/Scripts/python.exe" `
+            $wheels[0].FullName
+          "FASTMSSQL_NAMED_INSTANCE_PYTHON=.named-instance-venv/Scripts/python.exe" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Exercise pooled and direct named-instance paths
+        shell: pwsh
+        run: |
+          # BEGIN FASTMSSQL_NAMED_INSTANCE_SMOKE
+          $smoke = Join-Path $env:RUNNER_TEMP "fastmssql_named_instance_smoke.py"
+          @'
+          import asyncio
+          import json
+          import os
+          from pathlib import Path
+
+          from fastmssql import Connection, PoolConfig, SslConfig, Transaction
+
+
+          INSTANCE = "SQLEXPRESS"
+          POOLED_APP = "fastmssql_windows_named_pool"
+          TRANSACTION_APP = "fastmssql_windows_named_transaction"
+
+
+          async def scalar(connection, sql, params=None):
+              result = await connection.query(sql, params)
+              row = result.fetchone()
+              assert row is not None and len(row) == 1
+              return row[0]
+
+
+          async def main():
+              password = os.environ["FASTMSSQL_WINDOWS_SA_PASSWORD"]
+              connection = Connection(
+                  server="localhost",
+                  instance_name="SQLEXPRESS",
+                  database="master",
+                  username="sa",
+                  password=password,
+                  application_name=POOLED_APP,
+                  ssl_config=SslConfig.development(),
+                  pool_config=PoolConfig(
+                      max_size=2,
+                      min_idle=2,
+                      max_lifetime_secs=None,
+                      idle_timeout_secs=None,
+                      connection_timeout_secs=10,
+                      test_on_check_out=False,
+                      retry_connection=False,
+                  ),
+              )
+              transaction = Transaction(
+                  server="localhost",
+                  instance_name="SQLEXPRESS",
+                  database="master",
+                  username="sa",
+                  password=password,
+                  application_name=TRANSACTION_APP,
+                  ssl_config=SslConfig.development(),
+              )
+              try:
+                  await connection.connect()
+                  pooled = await connection.query(
+                      """
+                      SELECT
+                          @P1 + 1 AS answer,
+                          CONVERT(nvarchar(128), SERVERPROPERTY('InstanceName'))
+                              AS instance_name
+                      """,
+                      [41],
+                  )
+                  pooled_row = pooled.fetchone()
+                  assert pooled_row["answer"] == 42
+                  assert pooled_row["instance_name"] == INSTANCE
+
+                  await transaction.begin()
+                  direct = await transaction.query(
+                      """
+                      SELECT
+                          @P1 + 1 AS answer,
+                          CONVERT(nvarchar(128), SERVERPROPERTY('InstanceName'))
+                              AS instance_name
+                      """,
+                      [20],
+                  )
+                  direct_row = direct.fetchone()
+                  assert direct_row["answer"] == 21
+                  assert direct_row["instance_name"] == INSTANCE
+                  await transaction.rollback()
+              finally:
+                  await transaction.close()
+                  await connection.disconnect()
+
+              observer = Connection(
+                  server="localhost",
+                  instance_name="SQLEXPRESS",
+                  database="master",
+                  username="sa",
+                  password=password,
+                  application_name="fastmssql_windows_named_observer",
+                  ssl_config=SslConfig.development(),
+                  pool_config=PoolConfig(
+                      max_size=1,
+                      min_idle=1,
+                      max_lifetime_secs=None,
+                      idle_timeout_secs=None,
+                      connection_timeout_secs=10,
+                      test_on_check_out=False,
+                      retry_connection=False,
+                  ),
+              )
+              try:
+                  sessions = await scalar(
+                      observer,
+                      """
+                      SELECT COUNT(*)
+                      FROM sys.dm_exec_sessions
+                      WHERE program_name IN (@P1, @P2)
+                        AND session_id <> @@SPID
+                      """,
+                      [POOLED_APP, TRANSACTION_APP],
+                  )
+                  assert sessions == 0
+              finally:
+                  await observer.disconnect()
+
+              output = Path(os.environ["RUNNER_TEMP"]) / "named-instance-windows.json"
+              output.write_text(
+                  json.dumps(
+                      {
+                          "schema_version": 1,
+                          "status": "passed",
+                          "instance": INSTANCE,
+                          "pooled_parameterized_query": True,
+                          "direct_transaction": True,
+                          "sessions_after_disconnect": 0,
+                      },
+                      sort_keys=True,
+                  )
+                  + "\n",
+                  encoding="utf-8",
+              )
+
+
+          asyncio.run(main())
+          '@ | Set-Content -Path $smoke -Encoding utf8
+          & $env:FASTMSSQL_NAMED_INSTANCE_PYTHON -I $smoke
+          # END FASTMSSQL_NAMED_INSTANCE_SMOKE
+
+      - name: Upload redacted structural evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: named-instance-windows-${{ github.sha }}
+          path: ${{ runner.temp }}/named-instance-windows.json
+          if-no-files-found: error
+          retention-days: 14

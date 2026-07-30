@@ -99,6 +99,8 @@ def test_full_runner_contract() -> None:
     assert "fastmssql-sql-auth-dev" in source
     assert "fastmssql_upstream_regression" in source
     assert "-n 1" in source
+    assert "record named-instance-load " in source
+    assert "scripts/sql_auth/run_named_instance_stress.sh" in source
     assert "record result-stream-load " in source
     assert "scripts/sql_auth/run_result_stream_stress.sh" in source
     assert "record query-many-load " in source
@@ -106,15 +108,17 @@ def test_full_runner_contract() -> None:
     assert "tests/sql_auth_strict/test_resultsets_streaming.py" in source
     assert "tests/sql_auth_strict/test_rpc_results.py" in source
     assert "tests/sql_auth_strict/test_query_many_strict.py" in source
+    assert "tests/sql_auth_strict/test_named_instance_strict.py" in source
     assert source.index("record provision ") < source.index(
+        "record named-instance-load "
+    )
+    assert source.index("record named-instance-load ") < source.index(
         "record result-stream-load "
     )
     assert source.index("record result-stream-load ") < source.index(
         "record query-many-load "
     )
-    assert source.index("record query-many-load ") < source.index(
-        "record strict "
-    )
+    assert source.index("record query-many-load ") < source.index("record strict ")
     for ignored in (
         "tests/test_azure_auth_advanced.py",
         "tests/test_azure_authentication.py",
@@ -198,6 +202,7 @@ printf 'provision\\n' >>"${FASTMSSQL_TEST_SEQUENCE_PATH:?}"
 """,
     )
     for name in (
+        "run_named_instance_stress.sh",
         "run_result_stream_stress.sh",
         "run_query_many_stress.sh",
     ):
@@ -224,9 +229,7 @@ printf '\\n' >>"${FASTMSSQL_TEST_SEQUENCE_PATH:?}"
     )
 
     environment = os.environ.copy()
-    environment["PATH"] = (
-        f"{fake_bin}{os.pathsep}{environment.get('PATH', '')}"
-    )
+    environment["PATH"] = f"{fake_bin}{os.pathsep}{environment.get('PATH', '')}"
     environment["FASTMSSQL_TEST_PYTHON_EXECUTABLE"] = sys.executable
     environment["FASTMSSQL_TEST_PYTHON_HOME"] = sys.base_prefix
     environment["FASTMSSQL_TEST_SEQUENCE_PATH"] = str(sequence_path)
@@ -381,9 +384,7 @@ def test_report_generator_preserves_not_run_and_redacts(
                 "cases": {
                     "RESULT-029": {
                         "outcome": "passed",
-                        "nodeid": (
-                            "external::result_stream_stress[1000:64]"
-                        ),
+                        "nodeid": ("external::result_stream_stress[1000:64]"),
                         "duration_seconds": 2.0,
                         "message": "metrics=result-stream-stress-metrics.json",
                     }
@@ -450,8 +451,7 @@ def test_report_generator_preserves_not_run_and_redacts(
             str(generator),
             "--spec",
             str(
-                ROOT
-                / "docs/superpowers/specs/"
+                ROOT / "docs/superpowers/specs/"
                 "2026-07-24-fastmssql-sql-auth-validation-design.md"
             ),
             "--strict-results",
@@ -471,9 +471,7 @@ def test_report_generator_preserves_not_run_and_redacts(
     assert completed.returncode == 0, completed.stderr
     matrix = matrix_output.read_text(encoding="utf-8")
     report = report_output.read_text(encoding="utf-8")
-    assert (
-        sum(line.startswith("| `") for line in matrix.splitlines()) == 420
-    )
+    assert sum(line.startswith("| `") for line in matrix.splitlines()) == 442
     assert "| `ENV-001` | PASS |" in matrix
     assert "| `AUTH-001` | FAIL |" in matrix
     assert "| `CONN-001` | ERROR |" in matrix
@@ -504,6 +502,7 @@ def test_report_generator_preserves_not_run_and_redacts(
     assert "| 1 | passed | 1000 | 64 |" in report
     assert "Query-many stress metrics" in report
     assert "| 1 | passed | 1000 | sync | yes | 10 | 10 | 10 | 10 | 10 |" in report
+    assert "Named-instance stress metrics" in report
 
 
 def test_stale_result_stream_evidence_cannot_be_reported_as_pass(
@@ -827,8 +826,7 @@ def test_report_generator_can_require_complete_evidence(
             str(generator),
             "--spec",
             str(
-                ROOT
-                / "docs/superpowers/specs/"
+                ROOT / "docs/superpowers/specs/"
                 "2026-07-24-fastmssql-sql-auth-validation-design.md"
             ),
             "--strict-results",
@@ -847,10 +845,10 @@ def test_report_generator_can_require_complete_evidence(
     )
 
     assert completed.returncode == 1
-    assert "missing evidence for 420 case(s)" in completed.stderr
+    assert "missing evidence for 442 case(s)" in completed.stderr
     assert matrix_output.is_file()
     assert report_output.is_file()
-    assert "| NOT RUN | 420 |" in report_output.read_text(encoding="utf-8")
+    assert "| NOT RUN | 442 |" in report_output.read_text(encoding="utf-8")
 
 
 def test_config_redacts_password(monkeypatch) -> None:
@@ -861,13 +859,12 @@ def test_config_redacts_password(monkeypatch) -> None:
     assert "NeverPrintMe_2026!" not in repr(config)
 
 
-def test_approved_spec_contains_420_unique_case_ids() -> None:
+def test_approved_spec_contains_442_unique_case_ids() -> None:
     spec = ROOT / (
-        "docs/superpowers/specs/"
-        "2026-07-24-fastmssql-sql-auth-validation-design.md"
+        "docs/superpowers/specs/2026-07-24-fastmssql-sql-auth-validation-design.md"
     )
     ids = spec_case_ids(spec)
-    assert len(ids) == 420
+    assert len(ids) == 442
 
 
 def test_framework_contract_is_wired_into_runner_and_report() -> None:
@@ -1252,6 +1249,158 @@ def test_query_many_stress_runner_is_required_and_privacy_safe(
     report_source = report.read_text(encoding="utf-8")
     assert "query-many-stress.json" in report_source
     assert "Query-many stress metrics" in report_source
+
+
+def test_named_instance_stress_harness_is_bounded_opt_in_and_required(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    python_runner = ROOT / "scripts/sql_auth/named_instance_stress.py"
+    shell_runner = ROOT / "scripts/sql_auth/run_named_instance_stress.sh"
+    full_runner = ROOT / "scripts/sql_auth/run_all.sh"
+    report = ROOT / "scripts/sql_auth/generate_report.py"
+    assert python_runner.is_file()
+    assert shell_runner.is_file()
+    assert shell_runner.stat().st_mode & 0o111
+
+    source = python_runner.read_text(encoding="utf-8")
+    for token in (
+        "MAX_OPERATIONS = 99_999",
+        "EXTENDED_OPERATIONS = 99_999",
+        "DEFAULT_OPERATIONS = 1_000",
+        "DEFAULT_WORKERS = 32",
+        "DEFAULT_POOL_SIZE = 8",
+        "asyncio.Queue(",
+        "maxsize=max(1, worker_count * 2)",
+        "asyncio.TaskGroup()",
+        "for _ in range(worker_count):",
+        "instance_name=INSTANCE_NAME",
+        '"SELECT @P1 AS operation_id, @@SPID AS spid"',
+        "browser_requests",
+        "successful_physical_connections",
+        "maximum_pool_connections",
+        "maximum_sql_sessions",
+        "rss_growth_bytes",
+        "maximum_event_loop_gap_seconds",
+        "sessions_after_disconnect",
+        "transactions_after_disconnect",
+        "os.replace(temporary, path)",
+    ):
+        assert token in source
+    assert "create_task(connection.query" not in source
+    assert "operations must be between 1 and 99,999" in source
+    assert "99,999 operations require --allow-extended" in source
+
+    sandbox_root = tmp_path / "repo"
+    sandbox_runner = sandbox_root / "scripts/sql_auth/run_named_instance_stress.sh"
+    sandbox_runner.parent.mkdir(parents=True)
+    shutil.copy2(shell_runner, sandbox_runner)
+    (sandbox_root / ".env.sql-auth.local").write_text("", encoding="utf-8")
+    fake_python = sandbox_root / ".venv/bin/python"
+    fake_python.parent.mkdir(parents=True)
+    _write_executable(
+        fake_python,
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "${CAPTURE_PATH}"\n',
+    )
+    fake_bin = sandbox_root / "fake-bin"
+    fake_bin.mkdir()
+    _write_executable(
+        fake_bin / "git",
+        "#!/usr/bin/env bash\nprintf '%040d\\n' 0\n",
+    )
+    captured_arguments = tmp_path / "named-instance-stress-arguments.txt"
+    runner_env = os.environ.copy()
+    for name in tuple(runner_env):
+        if name.startswith("FASTMSSQL_NAMED_INSTANCE_"):
+            del runner_env[name]
+    runner_env.update(
+        {
+            "PATH": (f"{fake_bin}{os.pathsep}{runner_env.get('PATH', '')}"),
+            "CAPTURE_PATH": str(captured_arguments),
+            "FASTMSSQL_NAMED_INSTANCE_OPERATIONS": "3",
+            "FASTMSSQL_NAMED_INSTANCE_WORKERS": "2",
+            "FASTMSSQL_NAMED_INSTANCE_POOL_SIZE": "1",
+            "FASTMSSQL_NAMED_INSTANCE_ALLOW_EXTENDED": "1",
+        }
+    )
+    completed = subprocess.run(
+        [str(sandbox_runner)],
+        cwd=sandbox_root,
+        env=runner_env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    arguments = captured_arguments.read_text(encoding="utf-8").splitlines()
+    assert arguments[arguments.index("--operations") + 1] == "3"
+    assert arguments[arguments.index("--workers") + 1] == "2"
+    assert arguments[arguments.index("--pool-size") + 1] == "1"
+    assert "--allow-extended" in arguments
+    assert arguments[arguments.index("--source-sha") + 1] == "0" * 40
+    metrics_output = Path(arguments[arguments.index("--metrics-output") + 1])
+    assert metrics_output == (
+        sandbox_root / ".artifacts/sql-auth/named-instance-stress-extended.json"
+    )
+    assert "FASTMSSQL_SQL_AUTH_OWNER_PASSWORD" not in completed.stdout
+    assert "FASTMSSQL_SQL_AUTH_SA_PASSWORD" not in completed.stdout
+
+    rejected = subprocess.run(
+        [
+            sys.executable,
+            str(python_runner),
+            "--operations",
+            "99999",
+            "--metrics-output",
+            str(tmp_path / "must-not-exist.json"),
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert rejected.returncode == 2
+    assert "99,999 operations require --allow-extended" in rejected.stderr
+
+    full_source = full_runner.read_text(encoding="utf-8")
+    assert "record named-instance-load " in full_source
+    assert full_source.index("record provision ") < full_source.index(
+        "record named-instance-load "
+    )
+    assert full_source.index("record named-instance-load ") < (
+        full_source.index("record strict ")
+    )
+    assert "tests/sql_auth_strict/test_named_instance_strict.py" in full_source
+
+    report_source = report.read_text(encoding="utf-8")
+    assert "named-instance-stress.json" in report_source
+    assert "Named-instance stress metrics" in report_source
+
+    strict_path = ROOT / "tests/sql_auth_strict/test_named_instance_strict.py"
+    strict_tree = ast.parse(
+        strict_path.read_text(encoding="utf-8"),
+        filename=str(strict_path),
+    )
+    load_test = next(
+        node
+        for node in strict_tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name
+        == "test_required_named_instance_stress_artifact_is_fresh_and_bounded"
+    )
+    assert {ast.unparse(item) for item in load_test.decorator_list} == {
+        "case('NINST-018')",
+        "pytest.mark.load",
+    }
+    assert tuple(argument.arg for argument in load_test.args.args) == (
+        "record_load_metric",
+    )
+
+    monkeypatch.setattr(strict_conftest, "_LOAD_METRICS", {})
+    recorder = strict_conftest.record_load_metric.__wrapped__()
+    recorder("NINST-018", contract_probe=True)
+    with pytest.raises(ValueError):
+        recorder("NINST-017", contract_probe=True)
 
 
 def test_query_many_case_ownership_and_load_routing_are_exact(

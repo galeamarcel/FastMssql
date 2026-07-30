@@ -135,11 +135,13 @@ def test_hosted_gate_runs_database_independent_vendored_tests() -> None:
     normalized_workflow = " ".join(workflow.replace("\\", " ").split())
     vendored_unit_gate = (
         "cargo test --manifest-path vendor/tiberius/Cargo.toml "
-        "--no-default-features --features chrono,tds73,rustls --lib"
+        "--no-default-features --features "
+        "chrono,tds73,rustls,sql-browser-tokio --lib"
     )
     response_api_gate = (
         "cargo test --manifest-path vendor/tiberius/Cargo.toml "
-        "--no-default-features --features chrono,tds73,rustls "
+        "--no-default-features --features "
+        "chrono,tds73,rustls,sql-browser-tokio "
         "--test response_api"
     )
 
@@ -170,15 +172,12 @@ def test_hosted_gate_builds_extension_and_checks_configuration_contracts() -> No
         "tests/test_pool_observability_contract.py "
         "tests/test_operation_metrics_contract.py "
         "tests/test_result_stream_contract.py "
+        "tests/test_named_instance_contract.py "
         "tests/test_query_many_contract.py "
         "tests/test_query_many_coordinator.py "
-        "tests/test_query_many_stress_contract.py -q"
-        in normalized_workflow
+        "tests/test_query_many_stress_contract.py -q" in normalized_workflow
     )
-    assert (
-        "-m pytest tests/test_timeout_config_contract.py"
-        not in workflow
-    )
+    assert "-m pytest tests/test_timeout_config_contract.py" not in workflow
     assert workflow.index("cargo test --locked") < workflow.index(
         "uvx --from maturin==1.14.1 maturin build"
     )

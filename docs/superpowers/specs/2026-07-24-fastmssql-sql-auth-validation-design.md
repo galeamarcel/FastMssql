@@ -684,6 +684,61 @@ Enterprise compatibility-bulk buffering:
   import and post-load recovery prove exact operation integrity, resource
   bounds and deterministic teardown.
 
+### NINST — SQL Server named-instance discovery
+
+- `NINST-001`: the deterministic SQL Browser fixture observes exactly
+  `0x04 || FASTMSSQL || 0x00`, with no credential, database, SQL text or
+  application name in the request.
+- `NINST-002`: an empty instance name, embedded NUL or name longer than 32
+  encoded bytes is rejected before UDP I/O with a controlled connection-stage
+  failure.
+- `NINST-003`: one valid bounded SQL Browser response selects the advertised
+  TCP endpoint and completes TLS, SQL authentication and parameterized SQL
+  against the real Docker SQL Server.
+- `NINST-004`: truncated, wrong-type, length-mismatched and oversized SQL
+  Browser responses fail deterministically without panic or FFI escape.
+- `NINST-005`: missing, empty, non-decimal, out-of-range or duplicate
+  case-insensitive `tcp` response fields are rejected.
+- `NINST-006`: a valid response from a UDP source other than the queried SQL
+  Browser peer cannot select a TCP endpoint.
+- `NINST-007`: a silent SQL Browser fails under the bounded inner receive
+  timeout and never becomes an unbounded connect.
+- `NINST-008`: refusal at the discovered TCP endpoint preserves useful
+  transport detail instead of becoming a false host-resolution error.
+- `NINST-009`: a direct connection without named-instance discovery retains
+  its existing parameterized SQL behavior.
+- `NINST-010`: the pooled `Connection` constructor discovers the instance,
+  authenticates and executes real SQL.
+- `NINST-011`: an ADO.NET `Server=host\instance` connection string performs
+  the same discovery and real SQL path as individual parameters.
+- `NINST-012`: the direct compatibility `Transaction` constructor discovers,
+  executes parameterized SQL and settles on one dedicated session.
+- `NINST-013`: `instance_name` plus an explicit TCP port connects directly
+  and emits no SQL Browser request.
+- `NINST-014`: the shorter outer FastMssql connect deadline wins over the
+  protocol receive timeout and retains structured connect-timeout metadata.
+- `NINST-015`: cancellation during discovery settles the attempt and leaves
+  the same connection object able to connect and query successfully.
+- `NINST-016`: discovery failures are `SqlConnectionError` with
+  `stage=sql_browser_discovery`, retryable true, no discarded connection and
+  no unknown outcome.
+- `NINST-017`: concurrent pool creation remains bounded by `pool.max_size`,
+  and discovery occurs once per successful physical connection rather than
+  once per logical operation.
+- `NINST-018`: required 1,000-operation and explicit 99,999-operation profiles
+  use a fixed worker set and persistent pool, preserve every parameterized
+  result ID, bound RSS/event-loop/pool/session resources and never discover
+  per operation.
+- `NINST-019`: an isolated installed candidate wheel, imported without the
+  repository on `PYTHONPATH`, contains and exercises named-instance discovery.
+- `NINST-020`: a hosted `windows-2022` gate installs a genuine
+  `SQLEXPRESS` named instance, runs the real SQL Server Browser service and
+  connects without an explicit FastMssql TCP port.
+- `NINST-021`: tracked sources and produced structural artifacts contain no
+  SQL-auth credential or complete connection string.
+- `NINST-022`: named-instance pooled and direct-transaction teardown leaves
+  zero matching SQL sessions and zero user transactions.
+
 ### TX — dedicated transactions
 
 - `TX-001`: dedicated session ID remains constant.

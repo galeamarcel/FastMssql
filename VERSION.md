@@ -178,6 +178,48 @@ No release, package-version change, or artifact publication has occurred.
   introspection. It changes no root FastMssql dependency feature yet, package
   metadata, displayed `0.7.7` version, release or published artifact.
 
+### FastMssql named-instance integration RED
+
+- Created `test/named-instance-discovery` directly from exact vendored
+  Tiberius fix `e5ccb60f5c7d05513e8fd36b60a3372f85577380`; both Tiberius RED
+  commits and their fix remain ancestors.
+- Added deterministic FastMssql contracts for root feature selection, the
+  single initial-target classifier, separate direct/discovery stream paths,
+  structured Python discovery metadata, routing precedence, stubs,
+  documentation, installed-wheel coverage and the first-party hosted Windows
+  named-instance lane.
+- Added a bounded loopback SQL Browser fixture and one canonical owner for
+  each `NINST-001` through `NINST-022`. The SQL-auth specification now
+  contains exactly 442 unique required cases, with deterministic malformed,
+  wrong-source, silent, refused-target, deadline, cancellation, pool,
+  privacy, wheel, Windows and teardown coverage.
+- Added a fixed-worker persistent-pool stress harness. Its normal profile is
+  1,000 parameterized logical operations; exactly 99,999 operations require
+  the explicit extended switch. Structural evidence records operation
+  integrity, SQL Browser/physical-connection counts, pool/session/RSS/event
+  loop bounds and teardown without logging credentials or connection
+  strings.
+- The offline runtime contract is intentionally RED at the unchanged
+  FastMssql root: 5 failed and 3 passed. The failures are exactly the absent
+  root `sql-browser-tokio` feature, classifier/stream integration, discovery
+  metadata and public documentation. The 42 matrix/PyO3/harness contracts
+  pass.
+- Against the healthy approved Docker SQL Server, the canonical named
+  instance file produced 26 collected tests: 23 failed, 3 passed, 0 errors
+  and 0 skips. Direct host/port and explicit-port-with-instance behavior pass;
+  the direct transaction exposes the intended root cause as
+  `I/O error connecting to 127.0.0.1:1434: Connection refused`, proving that
+  unchanged FastMssql attempts TCP against the SQL Browser UDP endpoint
+  instead of invoking SSRP. No fixture bind/setup failure occurred.
+- The normal 1,000-operation stress command exits 1 as intended and writes a
+  privacy-safe schema-1 artifact tied to exact source SHA `e5ccb60`, with one
+  `SqlConnectionError` and `stress_execution_failure`. This is RED evidence,
+  not load success.
+- This branch changes tests, harnesses, specifications, reporting and CI
+  contracts only. It does not enable the root dependency feature or modify
+  FastMssql runtime/stubs/README, package metadata, displayed `0.7.7`
+  version, release state, original repository or any published artifact.
+
 ### Seven-slice batch/bulk cumulative verification and live-audit closure
 
 - Closed the seventh batch/bulk slice, bounded-concurrency `query_many()`,

@@ -254,6 +254,37 @@ def load_query_many_metrics(
     return payload
 
 
+def load_named_instance_metrics(
+    artifact_dir: Path,
+    expected_source_sha: str,
+) -> dict[str, object]:
+    path = Path(
+        os.getenv(
+            "FASTMSSQL_NAMED_INSTANCE_STRESS_METRICS_PATH",
+            str(artifact_dir / "named-instance-stress.json"),
+        )
+    )
+    if not path.is_file():
+        return {
+            "schema_version": 1,
+            "source_sha": "",
+            "status": "NOT RUN",
+            "profile": {},
+        }
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schema_version") != 1:
+        raise ValueError("unsupported named-instance metrics schema")
+    if payload.get("source_sha") != expected_source_sha:
+        return {
+            "schema_version": 1,
+            "source_sha": str(payload.get("source_sha", "")),
+            "expected_source_sha": expected_source_sha,
+            "status": "STALE",
+            "profile": {},
+        }
+    return payload
+
+
 def _maximum_profile_value(
     profiles: list[dict[str, object]],
     key: str,
@@ -321,11 +352,11 @@ def render_report(
     load_metrics: dict[str, dict],
     result_stream_metrics: dict[str, object],
     query_many_metrics: dict[str, object],
+    named_instance_metrics: dict[str, object],
     secrets: tuple[str, ...],
 ) -> str:
     counts = Counter(
-        str(results.get(case_id, {}).get("status", "NOT RUN"))
-        for case_id, _ in cases
+        str(results.get(case_id, {}).get("status", "NOT RUN")) for case_id, _ in cases
     )
     lines = [
         "# FastMssql SQL-auth validation report",
@@ -377,8 +408,7 @@ def render_report(
     failures = [
         (case_id, results[case_id])
         for case_id, _ in cases
-        if case_id in results
-        and results[case_id]["status"] in {"FAIL", "ERROR"}
+        if case_id in results and results[case_id]["status"] in {"FAIL", "ERROR"}
     ]
     lines.extend(["", "## Failures and errors", ""])
     if not failures:
@@ -535,6 +565,40 @@ def render_report(
             f"{markdown_cell(metrics.get('rss_growth_bytes'), secrets)} | "
             f"{markdown_cell(metrics.get('maximum_event_loop_gap_seconds'), secrets)} |"
         )
+    named_profile = named_instance_metrics.get("profile", {})
+    if not isinstance(named_profile, dict):
+        named_profile = {}
+    lines.extend(
+        [
+            "",
+            "## Named-instance stress metrics",
+            "",
+            "- Schema version: "
+            f"`{markdown_cell(named_instance_metrics.get('schema_version'), secrets)}`",
+            "- Evidence status: "
+            f"`{markdown_cell(named_instance_metrics.get('status'), secrets)}`",
+            "- Source SHA: "
+            f"`{markdown_cell(named_instance_metrics.get('source_sha'), secrets)}`",
+            "- Logical operations: "
+            f"`{markdown_cell(named_profile.get('operations', 0), secrets)}`",
+            "- SQL Browser requests: "
+            f"`{markdown_cell(named_profile.get('browser_requests', 0), secrets)}`",
+            "- Successful physical connections: "
+            f"`{markdown_cell(named_profile.get('successful_physical_connections', 0), secrets)}`",
+            "- Maximum pool connections: "
+            f"`{markdown_cell(named_profile.get('maximum_pool_connections', 0), secrets)}`",
+            "- Maximum SQL sessions: "
+            f"`{markdown_cell(named_profile.get('maximum_sql_sessions', 0), secrets)}`",
+            "- RSS growth bytes: "
+            f"`{markdown_cell(named_profile.get('rss_growth_bytes', 0), secrets)}`",
+            "- Maximum event-loop gap seconds: "
+            f"`{markdown_cell(named_profile.get('maximum_event_loop_gap_seconds', 0), secrets)}`",
+            "- Sessions after disconnect: "
+            f"`{markdown_cell(named_profile.get('sessions_after_disconnect', 0), secrets)}`",
+            "- Transactions after disconnect: "
+            f"`{markdown_cell(named_profile.get('transactions_after_disconnect', 0), secrets)}`",
+        ]
+    )
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -566,15 +630,17 @@ def main(argv: list[str] | None = None) -> int:
         source_sha,
     )
     lanes = load_lanes(args.artifact_dir, secrets)
-    framework_metrics = load_case_metrics(
-        args.artifact_dir, "framework-metrics.json"
-    )
+    framework_metrics = load_case_metrics(args.artifact_dir, "framework-metrics.json")
     load_metrics = load_case_metrics(args.artifact_dir, "load-metrics.json")
     result_stream_metrics = load_result_stream_metrics(
         args.artifact_dir,
         source_sha,
     )
     query_many_metrics = load_query_many_metrics(
+        args.artifact_dir,
+        source_sha,
+    )
+    named_instance_metrics = load_named_instance_metrics(
         args.artifact_dir,
         source_sha,
     )
@@ -588,6 +654,7 @@ def main(argv: list[str] | None = None) -> int:
         load_metrics,
         result_stream_metrics,
         query_many_metrics,
+        named_instance_metrics,
         secrets,
     )
     args.matrix_output.parent.mkdir(parents=True, exist_ok=True)
