@@ -45,6 +45,27 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Hosted query-many wheel dependency fix
+
+- Created `fix/hosted-wheel-query-many-dependencies` directly from RED commit
+  `faef03288faca8bc96e921579e631a6b0ec81e2f`, preserving the executable
+  failing contract in ancestry.
+- Added pinned `pytest-timeout==2.4.0` and `psutil==7.2.2` only to the
+  workflow's isolated installed-wheel contract venv. They enforce the
+  existing timeout marker and satisfy the stress harness's process-monitor
+  import; they are test-runner dependencies, not FastMssql runtime
+  dependencies.
+- The unchanged RED contract moved from one expected failure listing both
+  omissions to 1/1 PASS, and the complete PyO3 build-contract file passed
+  10/10.
+- Re-ran the exact hosted pytest command against the candidate ABI3 wheel
+  under Python 3.13.14 with `PYTHONPATH` unset: all 104 selected
+  configuration/query-many contracts passed from the minimal venv.
+- A hosted Linux/macOS/Windows rerun remains required on the later cumulative
+  exact SHA; this local result is not recorded as hosted success.
+- This correction changes no FastMssql runtime, `pyproject.toml`, lockfile,
+  package metadata, displayed `0.7.7` version, release or published artifact.
+
 ### Hosted query-many wheel dependency RED
 
 - Created `test/hosted-wheel-query-many-dependencies` from exact cumulative
