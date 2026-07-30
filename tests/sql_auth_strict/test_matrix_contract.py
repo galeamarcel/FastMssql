@@ -167,14 +167,15 @@ def test_fake_uv_emulates_runner_python_discovery(tmp_path: Path) -> None:
     assert unrelated.stdout == ""
 
 
-def test_full_runner_uses_original_local_regression_display_name(
+def _run_full_runner_sandbox(
     tmp_path: Path,
-) -> None:
+) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
     sandbox = tmp_path / "repo"
     scripts = sandbox / "scripts" / "sql_auth"
     scripts.mkdir(parents=True)
     runner = scripts / "run_all.sh"
     shutil.copy2(ROOT / "scripts/sql_auth/run_all.sh", runner)
+    sequence_path = sandbox / "runner-sequence.tsv"
 
     (sandbox / ".env.sql-auth.local").write_text(
         "\n".join(
@@ -191,25 +192,36 @@ def test_full_runner_uses_original_local_regression_display_name(
     )
     _write_executable(
         scripts / "provision.sh",
-        "#!/usr/bin/env bash\nexit 0\n",
+        """#!/usr/bin/env bash
+set -eu
+printf 'provision\\n' >>"${FASTMSSQL_TEST_SEQUENCE_PATH:?}"
+""",
     )
-    _write_executable(
-        scripts / "run_result_stream_stress.sh",
-        "#!/usr/bin/env bash\nexit 0\n",
-    )
-    _write_executable(
-        scripts / "run_query_many_stress.sh",
-        "#!/usr/bin/env bash\nexit 0\n",
-    )
+    for name in (
+        "run_result_stream_stress.sh",
+        "run_query_many_stress.sh",
+    ):
+        _write_executable(
+            scripts / name,
+            "#!/usr/bin/env bash\nexit 0\n",
+        )
 
     fake_bin = sandbox / "fake-bin"
     fake_bin.mkdir()
     _write_fake_uv(fake_bin / "uv")
-    for name in ("cargo", "docker"):
-        _write_executable(
-            fake_bin / name,
-            "#!/usr/bin/env bash\nexit 0\n",
-        )
+    _write_executable(
+        fake_bin / "cargo",
+        "#!/usr/bin/env bash\nexit 0\n",
+    )
+    _write_executable(
+        fake_bin / "docker",
+        """#!/usr/bin/env bash
+set -eu
+printf 'docker' >>"${FASTMSSQL_TEST_SEQUENCE_PATH:?}"
+printf '\\t%s' "$@" >>"${FASTMSSQL_TEST_SEQUENCE_PATH:?}"
+printf '\\n' >>"${FASTMSSQL_TEST_SEQUENCE_PATH:?}"
+""",
+    )
 
     environment = os.environ.copy()
     environment["PATH"] = (
@@ -217,6 +229,7 @@ def test_full_runner_uses_original_local_regression_display_name(
     )
     environment["FASTMSSQL_TEST_PYTHON_EXECUTABLE"] = sys.executable
     environment["FASTMSSQL_TEST_PYTHON_HOME"] = sys.base_prefix
+    environment["FASTMSSQL_TEST_SEQUENCE_PATH"] = str(sequence_path)
     completed = subprocess.run(
         [str(runner)],
         cwd=sandbox,
@@ -225,6 +238,13 @@ def test_full_runner_uses_original_local_regression_display_name(
         text=True,
         env=environment,
     )
+    return completed, sandbox, sequence_path
+
+
+def test_full_runner_uses_original_local_regression_display_name(
+    tmp_path: Path,
+) -> None:
+    completed, sandbox, _ = _run_full_runner_sandbox(tmp_path)
 
     assert completed.returncode == 0, completed.stderr
     assert (
@@ -254,6 +274,31 @@ def test_full_runner_uses_original_local_regression_display_name(
     assert not (
         artifacts / "original-local-regression.exitcode"
     ).exists()
+
+
+def test_full_runner_recreates_sqlserver_before_provision(
+    tmp_path: Path,
+) -> None:
+    completed, sandbox, sequence_path = _run_full_runner_sandbox(tmp_path)
+
+    assert completed.returncode == 0, completed.stderr
+    assert sequence_path.read_text(encoding="utf-8").splitlines() == [
+        "\t".join(
+            (
+                "docker",
+                "compose",
+                "--env-file",
+                str(sandbox / ".env.sql-auth.local"),
+                "-f",
+                "docker-compose.sql-auth.yml",
+                "up",
+                "-d",
+                "--force-recreate",
+                "sqlserver",
+            )
+        ),
+        "provision",
+    ]
 
 
 def test_report_generator_preserves_not_run_and_redacts(

@@ -118,7 +118,7 @@ record tiberius-lib \
 
 record compose-up \
   docker compose --env-file "${env_file}" \
-  -f docker-compose.sql-auth.yml up -d sqlserver
+  -f docker-compose.sql-auth.yml up -d --force-recreate sqlserver
 record provision scripts/sql_auth/provision.sh
 record tiberius-token-safety-sql-auth \
   cargo test \

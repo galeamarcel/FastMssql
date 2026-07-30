@@ -45,6 +45,81 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Cumulative SQL Server fresh-process gate fix
+
+- Created `fix/cumulative-sqlserver-fresh-start` directly from RED commit
+  `98e80c52e346c8113f5bf9263039840e41f569bc`, preserving the executable
+  failing contract in ancestry.
+- Added only `--force-recreate` to the canonical
+  `docker compose ... up -d sqlserver` lane; no retry, volume deletion,
+  memory tuning, sleep or additional Docker operation was introduced.
+- The exact unchanged RED contract moved from the intended `1 failed` to
+  `1 passed`, proving the runner now emits the required argument vector and
+  completes recreation before provision.
+- The complete SQL-auth matrix-contract file passed `31/31`, including
+  original-local-regression naming, required stress wiring, hosted wheel
+  command, privacy, unique case ownership and no-swallowed-failure contracts.
+- The persistent named data volume and all library runtime behavior remain
+  unchanged; the correction applies only to the canonical validation
+  harness.
+- This fix does not alter package metadata, displayed version, dependency,
+  release or published artifact.
+
+### Cumulative SQL Server fresh-process gate RED
+
+- Created `test/cumulative-sqlserver-fresh-start` from exact approved plan
+  commit `bcb51d9cd208c03e28122ddc4f02d72e63e40d03`.
+- Refactored the existing full-runner sandbox setup into one test helper and
+  added a real executable Docker recorder plus a provision event marker.
+- Added one behavior contract requiring the exact Compose argument vector
+  `up -d --force-recreate sqlserver`, exactly one Docker invocation and
+  provision only after that invocation completes.
+- The new test failed once for the intended sole reason: the unchanged runner
+  emitted `up -d sqlserver` without `--force-recreate`; it did not fail on
+  collection, imports, fixtures, sandbox execution or event ordering.
+- The pre-existing original-local-regression display and artifact contract
+  remained green `1/1` against the same extracted helper.
+- This test-only RED changes no runner or library behavior, package metadata,
+  displayed version, dependency, release or published artifact.
+
+### Cumulative SQL Server fresh-process gate plan
+
+- Added the executable TDD plan for a recording Docker/provision boundary,
+  one behavior-focused RED contract and the minimal
+  `--force-recreate` runner correction.
+- Fixed the branch topology as documentation → RED → fix → history-only
+  cumulative merge, with `VERSION.md`, fork-only publication and exact remote
+  SHA verification at every repository-changing stage.
+- Required the unchanged timed-out native-bulk test, full matrix contract,
+  real container recreation, complete canonical runner, privacy/artifact
+  checks and exact knowledge-graph review before resuming parent Task 12.
+- Preserved the named SQL Server data volume and prohibited retries, volume
+  deletion, memory tuning, upstream publication and broad runner changes.
+- This plan changes no runtime-library behavior, package metadata, displayed
+  version, dependency, release or published artifact.
+
+### Cumulative SQL Server fresh-process gate design
+
+- Recorded the cumulative-runner failure at exact candidate `b997ab3`: the
+  unchanged native-bulk `BULK-008` request waited on
+  `RESOURCE_SEMAPHORE` when SQL Server exposed only about 15 MB of query
+  memory for a request requiring about 58 MB.
+- Confirmed the environmental boundary by restarting only the approved
+  dedicated container, reprovisioning the persistent databases, observing
+  zero semaphore waiters and 638–837 MB available, and rerunning the exact
+  unchanged test successfully in 0.14 seconds.
+- Selected `docker compose up -d --force-recreate sqlserver` for the
+  canonical cumulative runner so every gate begins with a fresh SQL Server
+  process while preserving the named data volume.
+- Defined an executable RED contract that runs the real runner with a
+  recording Docker fake and proves the exact recreate argument vector and
+  ordering before provision, rather than grepping shell source.
+- Rejected retries, destructive volume removal, process-only `restart`, and
+  SQL Server memory tuning as solutions to the inherited-process-state
+  defect.
+- Added no runtime-library behavior, package metadata, displayed-version
+  change, dependency, release or published artifact.
+
 ### Query-many bounded-concurrency design
 
 - Added the focused design for the seventh and final batch/bulk slice on
