@@ -65,6 +65,23 @@ No release, package-version change, or artifact publication has occurred.
   runtime, dependency, package metadata, displayed `0.7.7` version, release
   or artifact publication.
 
+### Named-instance refused-target fixture fix
+
+- Created `fix/named-instance-refused-fixture` directly from RED commit
+  `d8c32c9`.
+- Changed `refused_tcp` mode to release the kernel-selected loopback port
+  before advertising it in the SSRP response. A bound-but-unlistened TCP
+  socket is not a refusal primitive on macOS: it can leave SYN attempts
+  pending until timeout.
+- The fixture retains the selected numeric port only for the lifetime of the
+  SSRP responder and clears it during bounded teardown; it opens no listener
+  and accepts no TCP connection.
+- The unchanged RED command now passes `1/1` in `0.01s`; Ruff check/format
+  and `git diff --check` are also required before publication.
+- This harness-only fix changes no FastMssql/Tiberius runtime, dependency,
+  package metadata, displayed `0.7.7` version, release or artifact
+  publication.
+
 ### Named-instance discovery design
 
 - Approved the enterprise contract for `instance_name` without an explicit

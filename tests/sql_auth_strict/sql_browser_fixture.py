@@ -112,7 +112,7 @@ class SqlBrowserFixture:
         self._responses = 0
         self._source_rejection_probes = 0
         self._shutdowns = 0
-        self._refused_socket: socket.socket | None = None
+        self._refused_port: int | None = None
 
     @staticmethod
     def response_for_port(port: int) -> bytes:
@@ -133,9 +133,9 @@ class SqlBrowserFixture:
 
     @property
     def selected_tcp_port(self) -> int:
-        if self._refused_socket is None:
+        if self._refused_port is None:
             return self.tcp_port
-        return int(self._refused_socket.getsockname()[1])
+        return self._refused_port
 
     @property
     def response(self) -> bytes:
@@ -148,10 +148,9 @@ class SqlBrowserFixture:
         if self._transport is not None:
             raise RuntimeError("SQL Browser fixture is already started")
         if self.mode == "refused_tcp":
-            refused = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            refused.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            refused.bind((self.host, 0))
-            self._refused_socket = refused
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind((self.host, 0))
+                self._refused_port = int(probe.getsockname()[1])
 
         loop = asyncio.get_running_loop()
         try:
@@ -161,9 +160,7 @@ class SqlBrowserFixture:
                 family=socket.AF_INET,
             )
         except OSError as error:
-            if self._refused_socket is not None:
-                self._refused_socket.close()
-                self._refused_socket = None
+            self._refused_port = None
             raise RuntimeError(
                 f"cannot bind deterministic SQL Browser fixture at "
                 f"{self.host}:{SQL_BROWSER_PORT}/udp: {error}"
@@ -233,9 +230,7 @@ class SqlBrowserFixture:
         if transport is not None:
             transport.close()
             await asyncio.wait_for(asyncio.shield(self._closed), timeout=1.0)
-        if self._refused_socket is not None:
-            self._refused_socket.close()
-            self._refused_socket = None
+        self._refused_port = None
         if self._protocol_errors:
             rendered = ", ".join(
                 type(error).__name__ for error in self._protocol_errors
