@@ -188,3 +188,30 @@ def test_hosted_gate_builds_extension_and_checks_configuration_contracts() -> No
     assert workflow.index("tests/test_operation_metrics_contract.py") < (
         workflow.index("tests/test_result_stream_contract.py")
     )
+
+
+def test_hosted_contract_venv_installs_selected_test_dependencies() -> None:
+    """Every selected wheel contract must collect in the minimal hosted venv."""
+    workflow = _read_required(WORKFLOW)
+    install_step = workflow.split(
+        "- name: Install extension contract environment",
+        maxsplit=1,
+    )[1].split(
+        "- name: Verify installed Python configuration contracts",
+        maxsplit=1,
+    )[0]
+    required = (
+        "pytest==9.1.1",
+        "pytest-asyncio==1.4.0",
+        "pytest-timeout==2.4.0",
+        "psutil==7.2.2",
+    )
+
+    missing = [
+        dependency for dependency in required if dependency not in install_step
+    ]
+
+    assert not missing, (
+        "installed-wheel contract environment is missing dependencies required "
+        f"by its selected tests: {missing}"
+    )

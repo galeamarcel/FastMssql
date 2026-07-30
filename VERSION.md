@@ -45,6 +45,28 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Hosted query-many wheel dependency RED
+
+- Created `test/hosted-wheel-query-many-dependencies` from exact cumulative
+  candidate `8bc09316839db1496c411fca679aade52669a9f2` after hosted Rust run
+  `30505273021`, Ubuntu job `90753556718`, failed only in
+  `Verify installed Python configuration contracts`.
+- Reproduced the workflow environment with the exact candidate wheel,
+  Python 3.13.14, `pytest==9.1.1` and `pytest-asyncio==1.4.0`: collection
+  exited `2` because the selected query-many coordinator uses the
+  unregistered `timeout` marker.
+- Adding only `pytest-timeout==2.4.0` to the ignored reproduction venv moved
+  collection forward to 99 passing tests and five failures caused by the
+  missing `psutil` import in the selected query-many stress contract.
+  Adding only the remaining `psutil==7.2.2` requirement made the exact hosted
+  command pass 104/104.
+- Added one deterministic workflow contract requiring both test-only
+  dependencies in the same minimal installed-wheel environment as the
+  selected tests. It is expected to fail on the unchanged candidate by
+  listing both omissions.
+- This RED commit changes no workflow, FastMssql runtime, package dependency,
+  package metadata, displayed `0.7.7` version, release or published artifact.
+
 ### Cumulative SQL Server fresh-process gate fix
 
 - Created `fix/cumulative-sqlserver-fresh-start` directly from RED commit
