@@ -111,6 +111,27 @@ No release, package-version change, or artifact publication has occurred.
   behavior, dependency selection, package metadata, displayed `0.7.7`
   version, release or published artifact.
 
+### Vendored Tiberius named-instance network RED
+
+- Extended the same RED branch with deterministic Tokio loopback contracts
+  for the exact observed request, discovered TCP target, connected-UDP peer
+  filtering, the one-second silent-browser bound, preservation of a refused
+  discovered TCP error and unchanged no-instance direct TCP behavior.
+- The wrong-source test sends a valid response from a second UDP socket,
+  proves that its TCP target is not selected, and only then releases the
+  expected browser response. All fixture tasks, accepts and channels are
+  independently bounded.
+- The network contract adds no live external service, DNS dependency,
+  credential, SQL text or arbitrary task fan-out. It uses only ephemeral
+  loopback UDP/TCP sockets.
+- The unchanged runtime remains intentionally RED through the missing pure
+  helper/introspection compile contract. After those interfaces are supplied,
+  the old transport must still fail the exact-NUL, connected-peer and
+  preserved-TCP-error assertions before the runtime fix.
+- This RED changes tests and `VERSION.md` only. It changes no production
+  behavior, dependency, package metadata, displayed `0.7.7` version, release
+  or published artifact.
+
 ### Seven-slice batch/bulk cumulative verification and live-audit closure
 
 - Closed the seventh batch/bulk slice, bounded-concurrency `query_many()`,
