@@ -311,6 +311,42 @@ No release, package-version change, or artifact publication has occurred.
   package metadata, displayed `0.7.7` version, release state, original
   repository, artifact publication or upstream authorization.
 
+### Named-instance exact-SHA hosted-trigger RED
+
+- Created `test/named-instance-hosted-triggers` directly from exact
+  named-instance candidate `ff769825f6d3b7833b7be9d83fed4c0cc560f59b`.
+- Added an offline contract requiring the cross-platform raw-Cargo,
+  vendored-Tiberius and installed-wheel workflow plus the RustSec workflow
+  to run automatically for `fix/named-instance`, `verify/named-instance`
+  and `docs/named-instance-status`.
+- The focused contract failed exactly as intended: both
+  `rust-unit-tests.yml` and `dependency-security.yml` lacked all three
+  named-instance candidate branches. The public push of `ff769825` launched
+  only the genuine Windows named-instance workflow, so the unchanged harness
+  cannot produce the required exact-SHA cross-platform/RustSec evidence.
+- This branch changes one test and `VERSION.md` only. It changes no workflow,
+  runtime, dependency, package metadata, displayed `0.7.7` version, release,
+  artifact publication or original-repository state.
+
+### Named-instance exact-SHA hosted-trigger fix
+
+- Created `fix/named-instance-hosted-triggers` directly from RED commit
+  `3b87aac167813b080e1a78b7a88974ba9779a2bd`; the executable failure remains
+  its mandatory ancestor.
+- Added only `fix/named-instance`, `verify/named-instance` and
+  `docs/named-instance-status` to the existing push branch lists of the
+  cross-platform Rust/wheel workflow and the RustSec workflow.
+- Manual dispatch remains available but is not used as verification
+  evidence. Both workflows retain read-only repository permissions,
+  credential-free checkout and their existing concurrency policy.
+- The unchanged named-instance contract now passes `9/9`; both workflow files
+  also parse as YAML and `git diff --check` is clean before history-only
+  integration into `verify/named-instance`.
+- This harness-only change modifies two workflow branch filters and
+  `VERSION.md`. It changes no runtime, test semantics, dependency, package
+  metadata, displayed `0.7.7` version, release, artifact publication or
+  original-repository state.
+
 ### Seven-slice batch/bulk cumulative verification and live-audit closure
 
 - Closed the seventh batch/bulk slice, bounded-concurrency `query_many()`,

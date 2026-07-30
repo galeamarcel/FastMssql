@@ -5,6 +5,9 @@ on:
     branches:
       - master
       - test/sql-auth-validation
+      - fix/named-instance
+      - verify/named-instance
+      - docs/named-instance-status
   pull_request:
     branches:
       - master
