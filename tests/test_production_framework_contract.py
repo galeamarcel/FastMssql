@@ -10793,6 +10793,345 @@ async def test_fixed_worker_load_fails_fast_and_settles_every_client() -> None:
     assert active_sampler_calls == 0
 
 
+@pytest.mark.asyncio
+async def test_fixed_worker_load_evidence_is_an_immutable_completion_snapshot(
+) -> None:
+    """Catch completed PASS evidence changing through exposed live accumulators."""
+
+    runner = _load_production_framework_runner()
+
+    class Response:
+        __slots__ = ("value",)
+
+        def __init__(self, value: int) -> None:
+            self.value = value
+
+    class Client:
+        def __init__(self, worker_id: int) -> None:
+            self.worker_id = worker_id
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc_info) -> None:
+            return None
+
+        async def request_value(self, operation_id: int):
+            await asyncio.sleep(0)
+            return Response(operation_id)
+
+    baseline_sample = runner.LoadResourceSample(
+        server_child_count=4,
+        sql_sessions=0,
+        sql_requests=0,
+        rss_bytes=100,
+        pool_active=0,
+        pool_pending=0,
+    )
+
+    async def sample_resources():
+        return baseline_sample
+
+    evidence = await runner.run_fixed_worker_load(
+        runner.FixedWorkerLoadPlan(
+            operations=9,
+            allow_extended=False,
+            client_worker_count=3,
+            server_worker_count=4,
+            global_connection_budget=8,
+            request_timeout_seconds=1.0,
+            sample_interval_seconds=0.001,
+        ),
+        client_factory=Client,
+        resource_sampler=sample_resources,
+    )
+    pristine = evidence.to_record()
+
+    histogram = getattr(evidence, "latency_histogram", None)
+    observe_latency = getattr(histogram, "observe", None)
+    if observe_latency is not None:
+        observe_latency(9.0)
+
+    resources = getattr(evidence, "resources", None)
+    observe_resources = getattr(resources, "observe", None)
+    if observe_resources is not None:
+        observe_resources(
+            runner.LoadResourceSample(
+                server_child_count=4,
+                sql_sessions=8,
+                sql_requests=8,
+                rss_bytes=999,
+                pool_active=8,
+                pool_pending=8,
+            )
+        )
+
+    caller_record = evidence.to_record()
+    caller_record["status"] = "FAIL"
+    caller_record["latency_histogram"]["buckets"][0]["count"] = -1
+
+    assert evidence.to_record() == pristine
+
+
+@pytest.mark.asyncio
+async def test_fixed_worker_request_timeout_is_private_and_settles_every_task(
+) -> None:
+    """Catch removal of the per-request deadline or incomplete timeout cleanup."""
+
+    runner = _load_production_framework_runner()
+    never_complete = asyncio.Event()
+    all_requests_started = asyncio.Event()
+    entered: set[int] = set()
+    exited: set[int] = set()
+    cancelled_requests: set[int] = set()
+    active_requests = 0
+    sample_calls = 0
+
+    class Client:
+        def __init__(self, worker_id: int) -> None:
+            self.worker_id = worker_id
+
+        async def __aenter__(self):
+            entered.add(self.worker_id)
+            return self
+
+        async def __aexit__(self, *_exc_info) -> None:
+            exited.add(self.worker_id)
+
+        async def request_value(self, operation_id: int):
+            nonlocal active_requests
+            active_requests += 1
+            if active_requests == 2:
+                all_requests_started.set()
+            try:
+                await never_complete.wait()
+                raise AssertionError("timed request unexpectedly resumed")
+            except asyncio.CancelledError:
+                cancelled_requests.add(self.worker_id)
+                raise
+            finally:
+                active_requests -= 1
+
+    async def sample_resources():
+        nonlocal sample_calls
+        sample_calls += 1
+        return runner.LoadResourceSample(
+            server_child_count=4,
+            sql_sessions=0,
+            sql_requests=0,
+            rss_bytes=100,
+            pool_active=0,
+            pool_pending=0,
+        )
+
+    plan = runner.FixedWorkerLoadPlan(
+        operations=20,
+        allow_extended=False,
+        client_worker_count=2,
+        server_worker_count=4,
+        global_connection_budget=8,
+        request_timeout_seconds=0.02,
+        sample_interval_seconds=0.001,
+    )
+    with pytest.raises(runner.FixedWorkerLoadError) as captured:
+        async with asyncio.timeout(0.5):
+            await runner.run_fixed_worker_load(
+                plan,
+                client_factory=Client,
+                resource_sampler=sample_resources,
+            )
+
+    assert all_requests_started.is_set()
+    assert captured.value.failure_type == "TimeoutError"
+    assert entered == {0, 1}
+    assert exited == {0, 1}
+    assert cancelled_requests == {0, 1}
+    assert active_requests == 0
+    calls_after_return = sample_calls
+    await asyncio.sleep(0.005)
+    assert sample_calls == calls_after_return
+
+
+@pytest.mark.asyncio
+async def test_fixed_worker_sampler_timeout_cancels_clients_and_monitor(
+) -> None:
+    """Catch an unbounded resource sampler or sampler-failure task leak."""
+
+    runner = _load_production_framework_runner()
+    never_sample = asyncio.Event()
+    sampler_blocked = asyncio.Event()
+    sampler_cancelled = asyncio.Event()
+    entered: set[int] = set()
+    exited: set[int] = set()
+    cancelled_clients: set[int] = set()
+    active_requests = 0
+    active_sampler_calls = 0
+    sample_calls = 0
+
+    class Response:
+        __slots__ = ("value",)
+
+        def __init__(self, value: int) -> None:
+            self.value = value
+
+    class Client:
+        def __init__(self, worker_id: int) -> None:
+            self.worker_id = worker_id
+
+        async def __aenter__(self):
+            entered.add(self.worker_id)
+            return self
+
+        async def __aexit__(self, *_exc_info) -> None:
+            exited.add(self.worker_id)
+
+        async def request_value(self, operation_id: int):
+            nonlocal active_requests
+            active_requests += 1
+            try:
+                await asyncio.sleep(0.001)
+                return Response(operation_id)
+            except asyncio.CancelledError:
+                cancelled_clients.add(self.worker_id)
+                raise
+            finally:
+                active_requests -= 1
+
+    async def sample_resources():
+        nonlocal active_sampler_calls, sample_calls
+        sample_calls += 1
+        if sample_calls == 1:
+            return runner.LoadResourceSample(
+                server_child_count=4,
+                sql_sessions=0,
+                sql_requests=0,
+                rss_bytes=100,
+                pool_active=0,
+                pool_pending=0,
+            )
+        active_sampler_calls += 1
+        sampler_blocked.set()
+        try:
+            await never_sample.wait()
+            raise AssertionError("timed sampler unexpectedly resumed")
+        except asyncio.CancelledError:
+            sampler_cancelled.set()
+            raise
+        finally:
+            active_sampler_calls -= 1
+
+    plan = runner.FixedWorkerLoadPlan(
+        operations=1_000,
+        allow_extended=False,
+        client_worker_count=2,
+        server_worker_count=4,
+        global_connection_budget=8,
+        request_timeout_seconds=0.02,
+        sample_interval_seconds=0.001,
+    )
+    with pytest.raises(runner.FixedWorkerLoadError) as captured:
+        async with asyncio.timeout(0.5):
+            await runner.run_fixed_worker_load(
+                plan,
+                client_factory=Client,
+                resource_sampler=sample_resources,
+            )
+
+    assert captured.value.failure_type == "LoadResourceSamplingFailure"
+    assert sampler_blocked.is_set()
+    assert sampler_cancelled.is_set()
+    assert active_sampler_calls == 0
+    assert entered == {0, 1}
+    assert exited == {0, 1}
+    assert cancelled_clients
+    assert active_requests == 0
+    calls_after_return = sample_calls
+    await asyncio.sleep(0.005)
+    assert sample_calls == calls_after_return
+
+
+@pytest.mark.asyncio
+async def test_fixed_worker_external_cancellation_settles_without_wrapping(
+) -> None:
+    """Catch caller cancellation being swallowed or leaving load tasks alive."""
+
+    runner = _load_production_framework_runner()
+    never_complete = asyncio.Event()
+    all_requests_started = asyncio.Event()
+    entered: set[int] = set()
+    exited: set[int] = set()
+    cancelled_requests: set[int] = set()
+    active_requests = 0
+    sample_calls = 0
+
+    class Client:
+        def __init__(self, worker_id: int) -> None:
+            self.worker_id = worker_id
+
+        async def __aenter__(self):
+            entered.add(self.worker_id)
+            return self
+
+        async def __aexit__(self, *_exc_info) -> None:
+            exited.add(self.worker_id)
+
+        async def request_value(self, operation_id: int):
+            nonlocal active_requests
+            active_requests += 1
+            if active_requests == 3:
+                all_requests_started.set()
+            try:
+                await never_complete.wait()
+                raise AssertionError("cancelled request unexpectedly resumed")
+            except asyncio.CancelledError:
+                cancelled_requests.add(self.worker_id)
+                raise
+            finally:
+                active_requests -= 1
+
+    async def sample_resources():
+        nonlocal sample_calls
+        sample_calls += 1
+        return runner.LoadResourceSample(
+            server_child_count=4,
+            sql_sessions=0,
+            sql_requests=0,
+            rss_bytes=100,
+            pool_active=0,
+            pool_pending=0,
+        )
+
+    plan = runner.FixedWorkerLoadPlan(
+        operations=30,
+        allow_extended=False,
+        client_worker_count=3,
+        server_worker_count=4,
+        global_connection_budget=8,
+        request_timeout_seconds=1.0,
+        sample_interval_seconds=0.001,
+    )
+    load_task = asyncio.create_task(
+        runner.run_fixed_worker_load(
+            plan,
+            client_factory=Client,
+            resource_sampler=sample_resources,
+        )
+    )
+    async with asyncio.timeout(0.5):
+        await all_requests_started.wait()
+    load_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await load_task
+
+    assert entered == {0, 1, 2}
+    assert exited == {0, 1, 2}
+    assert cancelled_requests == {0, 1, 2}
+    assert active_requests == 0
+    calls_after_return = sample_calls
+    await asyncio.sleep(0.005)
+    assert sample_calls == calls_after_return
+
+
 def test_fixed_worker_latency_histogram_is_bounded_and_validated() -> None:
     runner = _load_production_framework_runner()
     tracing_was_active = tracemalloc.is_tracing()
@@ -10857,6 +11196,14 @@ def test_fixed_worker_latency_histogram_is_bounded_and_validated() -> None:
             match="latency sample must be a finite non-negative number",
         ):
             histogram.observe(invalid)
+
+    pristine = histogram.to_record()
+    with pytest.raises(
+        runner.RunnerConfigurationError,
+        match="latency sample must be a finite non-negative number",
+    ):
+        histogram.observe(float.fromhex("0x1.fffffffffffffp+1023"))
+    assert histogram.to_record() == pristine
 
 
 def test_shell_runner_builds_one_isolated_wheel_and_never_logs_secrets() -> None:

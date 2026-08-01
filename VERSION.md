@@ -52,6 +52,21 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Production framework fixed-worker review RED
+
+- Added review-driven behavioral coverage proving that completed PASS
+  evidence is an immutable snapshot even when callers retain and manipulate
+  returned records or any formerly exposed accumulator surface.
+- Added event-driven request-timeout, resource-sampler-timeout and external
+  cancellation contracts that require privacy-safe propagation and complete
+  settlement of every client, request and monitor task.
+- Added a failing finite-input overflow contract preventing non-finite
+  latency totals from entering schema-1 JSON evidence. The snapshot and
+  overflow assertions intentionally precede their implementation fix.
+- These tests change no FastMssql/Tiberius runtime, package metadata,
+  displayed `0.7.7` version, release, published artifact or
+  original-repository state.
+
 ### Production framework fixed-worker load core
 
 - Added the Task 9 fixed-worker load core with one long-lived client context
