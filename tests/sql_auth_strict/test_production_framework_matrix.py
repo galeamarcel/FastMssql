@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 import json
+import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import subprocess
 
@@ -41,13 +43,16 @@ PROFILE_FAMILIES = {
     "flask-asgi-uvicorn-asyncio",
     "flask-asgi-uvicorn-uvloop",
 }
+NATIVE_ASGI_LABEL = "native ASGI: concurrent requests on persistent event loop"
+FLASK_WSGI_LABEL = "Flask WSGI: async view, occupied WSGI worker/thread"
+ADAPTED_FLASK_LABEL = (
+    "Flask via WsgiToAsgi: persistent ASGI loop, "
+    "thread-sensitive WSGI serialization per process"
+)
 APPROVED_LABELS = {
-    "native ASGI: concurrent requests on persistent event loop",
-    "Flask WSGI: async view, occupied WSGI worker/thread",
-    (
-        "Flask via WsgiToAsgi: persistent ASGI loop, "
-        "thread-sensitive WSGI serialization per process"
-    ),
+    NATIVE_ASGI_LABEL,
+    FLASK_WSGI_LABEL,
+    ADAPTED_FLASK_LABEL,
 }
 
 pytestmark = [
@@ -129,14 +134,89 @@ def _assert_not_applicable(
     assert scenario["not_applicable_reason"] == reason
 
 
+def _assert_exact_int(
+    value: object,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    assert type(value) is int
+    if minimum is not None:
+        assert value >= minimum
+    if maximum is not None:
+        assert value <= maximum
+    return value
+
+
+def _assert_finite_number(
+    value: object,
+    *,
+    minimum: float | None = None,
+) -> float:
+    assert type(value) in {int, float}
+    numeric = float(value)
+    assert math.isfinite(numeric)
+    if minimum is not None:
+        assert numeric >= minimum
+    return numeric
+
+
+def _import_path_key(
+    value: object,
+    *,
+    platform_system: str,
+) -> tuple[str, ...]:
+    assert isinstance(value, str)
+    assert value
+    assert len(value) <= 4_096
+    assert all(character.isprintable() for character in value)
+    if platform_system == "Windows":
+        path = PureWindowsPath(value)
+        assert path.is_absolute()
+        key = tuple(part.casefold() for part in path.parts)
+    else:
+        assert platform_system in {"Darwin", "Linux"}
+        assert "\\" not in value
+        path = PurePosixPath(value)
+        assert path.is_absolute()
+        key = tuple(path.parts)
+    assert not any(part in {".", ".."} for part in path.parts)
+    folded_parts = tuple(part.casefold() for part in path.parts)
+    assert "site-packages" in folded_parts
+    terminal = folded_parts[-2:] if platform_system == "Windows" else key[-2:]
+    assert terminal == ("fastmssql", "__init__.py")
+    return key
+
+
+def _assert_pid_list(
+    value: object,
+    *,
+    allow_empty: bool,
+) -> set[int]:
+    assert isinstance(value, list)
+    if not allow_empty:
+        assert value
+    pids = [_assert_exact_int(pid, minimum=1) for pid in value]
+    assert len(pids) == len(set(pids))
+    return set(pids)
+
+
 def _assert_clean_scenario_lifecycle(
     scenario: dict[str, object],
 ) -> None:
     assert scenario["graceful_stop"] is True
     assert scenario["forced_cleanup"] is False
     assert scenario["listening_sockets_after"] == []
-    assert scenario["sessions_after"] == 0
-    assert scenario["ready_pids"] == scenario["shutdown_pids"]
+    _assert_exact_int(scenario["manager_pid"], minimum=1)
+    _assert_pid_list(scenario["descendant_pids"], allow_empty=True)
+    assert _assert_exact_int(scenario["returncode"]) == 0
+    assert _assert_exact_int(scenario["sessions_after"], minimum=0) == 0
+    ready_pids = _assert_pid_list(scenario["ready_pids"], allow_empty=False)
+    shutdown_pids = _assert_pid_list(
+        scenario["shutdown_pids"],
+        allow_empty=False,
+    )
+    assert ready_pids == shutdown_pids
 
 
 def _assert_wsgi_occupancy(
@@ -148,30 +228,58 @@ def _assert_wsgi_occupancy(
 ) -> None:
     assert scenario["status"] == "PASS"
     assert scenario["worker_class"] == worker_class
-    assert scenario["workers"] == 1
-    assert scenario["execution_model"] in APPROVED_LABELS
-    assert scenario["thread_limit_per_worker"] == thread_limit
+    assert _assert_exact_int(scenario["workers"], minimum=1) == 1
+    assert scenario["execution_model"] == FLASK_WSGI_LABEL
+    assert _assert_exact_int(scenario["thread_limit_per_worker"], minimum=1) == (
+        thread_limit
+    )
     assert scenario["queued_request_proven"] is True
     assert scenario["loop_tokens_distinct_per_worker"] is True
-    assert scenario["maximum_active_requests"] == thread_limit
-    assert scenario["maximum_simultaneous_sql_requests"] == thread_limit
-    assert scenario["maximum_aggregate_sql_sessions"] <= (
-        evidence["configuration"]["global_connection_budget"]
+    assert _assert_exact_int(scenario["maximum_active_requests"], minimum=1) == (
+        thread_limit
     )
+    assert _assert_exact_int(
+        scenario["maximum_simultaneous_sql_requests"],
+        minimum=1,
+    ) == thread_limit
+    budget = _assert_exact_int(
+        evidence["configuration"]["global_connection_budget"],
+        minimum=1,
+    )
+    assert _assert_exact_int(
+        scenario["maximum_aggregate_sql_sessions"],
+        minimum=0,
+    ) <= budget
     values = scenario["values"]
-    assert scenario["request_count"] == len(values) == thread_limit + 1
+    request_count = _assert_exact_int(scenario["request_count"], minimum=1)
+    assert request_count == len(values) == thread_limit + 1
     assert all(type(value) is int for value in values)
     assert len(set(values)) == len(values)
-    assert scenario["sql_delay_seconds"] > 0
-    assert scenario["wave_seconds"] >= scenario["sql_delay_seconds"] * 1.5
+    sql_delay_seconds = _assert_finite_number(
+        scenario["sql_delay_seconds"],
+        minimum=0.0,
+    )
+    assert sql_delay_seconds > 0
+    wave_seconds = _assert_finite_number(scenario["wave_seconds"], minimum=0.0)
+    assert wave_seconds >= sql_delay_seconds * 1.5
+    _assert_clean_scenario_lifecycle(scenario)
     worker_execution = scenario["worker_execution"]
     assert len(worker_execution) == 1
-    assert worker_execution[0] == {
-        "maximum_active_requests": thread_limit,
-        "pid": scenario["ready_pids"][0],
-        "wsgi_thread_count": thread_limit,
+    execution = worker_execution[0]
+    assert set(execution) == {
+        "maximum_active_requests",
+        "pid",
+        "wsgi_thread_count",
     }
-    _assert_clean_scenario_lifecycle(scenario)
+    assert _assert_exact_int(execution["maximum_active_requests"], minimum=1) == (
+        thread_limit
+    )
+    assert _assert_exact_int(execution["pid"], minimum=1) in set(
+        scenario["ready_pids"]
+    )
+    assert _assert_exact_int(execution["wsgi_thread_count"], minimum=1) == (
+        thread_limit
+    )
 
 
 @case("FRAME-027")
@@ -204,16 +312,14 @@ def test_every_worker_imports_the_exact_isolated_wheel(
     assert re.fullmatch(r"[0-9a-f]{64}", wheel["sha256"])
     assert wheel["filename"].startswith("fastmssql-0.7.7-")
     platform = production_framework_evidence["platform"]["system"]
-    candidate_path = wheel["import_path"].replace("\\", "/")
-    if platform == "Windows":
-        candidate_path = candidate_path.casefold()
-    assert "site-packages" in candidate_path.casefold()
-    assert "fastmssql/python" not in candidate_path.casefold()
+    candidate_path = _import_path_key(
+        wheel["import_path"],
+        platform_system=platform,
+    )
     worker_paths = {
-        (
-            worker["fastmssql_import_path"].replace("\\", "/").casefold()
-            if platform == "Windows"
-            else worker["fastmssql_import_path"].replace("\\", "/")
+        _import_path_key(
+            worker["fastmssql_import_path"],
+            platform_system=platform,
         )
         for profile in _applicable(production_framework_evidence)
         for worker in profile["worker_records"]
@@ -417,6 +523,10 @@ def test_graceful_transaction_shutdown_has_deterministic_outcomes(
         assert record["transaction_holding_before_signal"] is True
         assert record["response_completed_after_signal"] is True
         assert record["transaction_settled"] is True
+        assert isinstance(record["context_token_sha256"], str)
+        assert re.fullmatch(r"[0-9a-f]{64}", record["context_token_sha256"])
+        assert _assert_exact_int(record["item_id"], minimum=1) > 0
+        assert _assert_exact_int(record["response_session_id"], minimum=1) > 0
         _assert_clean_scenario_lifecycle(record)
 
 
@@ -428,22 +538,34 @@ def test_saturated_pool_has_bounded_admission_and_recovers(
         production_framework_evidence,
         "saturation",
     )
-    pool_max = scenario["pool_max_per_worker"]
-    assert pool_max > 0
-    assert scenario["admitted_holders"] == pool_max
-    assert scenario["admitted_waiters"] == pool_max
-    assert scenario["admission_capacity"] == pool_max * 2
-    assert scenario["maximum_sql_sessions"] == pool_max
-    assert scenario["maximum_sql_requests"] == pool_max
-    assert scenario["observed_active_connections"] == pool_max
-    assert scenario["observed_pending_gets"] == pool_max
-    assert scenario["rejected_requests"] > 0
-    assert scenario["acquire_timeouts"] == pool_max
-    assert scenario["pool_get_timed_out_delta"] == pool_max
-    assert scenario["pool_active_after"] == 0
-    assert scenario["pool_pending_after"] == 0
-    assert scenario["admission_active_after"] == 0
-    assert scenario["recovery_value"] == 39
+    pool_max = _assert_exact_int(scenario["pool_max_per_worker"], minimum=1)
+    assert _assert_exact_int(scenario["admitted_holders"], minimum=1) == pool_max
+    assert _assert_exact_int(scenario["admitted_waiters"], minimum=1) == pool_max
+    assert _assert_exact_int(scenario["admission_capacity"], minimum=2) == (
+        pool_max * 2
+    )
+    assert _assert_exact_int(scenario["maximum_sql_sessions"], minimum=1) == (
+        pool_max
+    )
+    assert _assert_exact_int(scenario["maximum_sql_requests"], minimum=1) == (
+        pool_max
+    )
+    assert _assert_exact_int(
+        scenario["observed_active_connections"],
+        minimum=1,
+    ) == pool_max
+    assert _assert_exact_int(scenario["observed_pending_gets"], minimum=1) == (
+        pool_max
+    )
+    assert _assert_exact_int(scenario["rejected_requests"], minimum=1) > 0
+    assert _assert_exact_int(scenario["acquire_timeouts"], minimum=1) == pool_max
+    assert _assert_exact_int(scenario["pool_get_timed_out_delta"], minimum=1) == (
+        pool_max
+    )
+    assert _assert_exact_int(scenario["pool_active_after"], minimum=0) == 0
+    assert _assert_exact_int(scenario["pool_pending_after"], minimum=0) == 0
+    assert _assert_exact_int(scenario["admission_active_after"], minimum=0) == 0
+    assert _assert_exact_int(scenario["recovery_value"]) == 39
     _assert_clean_scenario_lifecycle(scenario)
 
 
@@ -525,18 +647,35 @@ def test_flask_one_request_can_gather_concurrent_sql(
         _assert_not_applicable(scenario, GUNICORN_NA)
         return
     assert scenario["status"] == "PASS"
-    assert scenario["execution_model"] in APPROVED_LABELS
-    assert scenario["wsgi_request_slots"] == 1
+    assert scenario["execution_model"] == FLASK_WSGI_LABEL
+    assert _assert_exact_int(scenario["wsgi_request_slots"], minimum=1) == 1
     assert scenario["values_exact"] is True
-    assert scenario["maximum_simultaneous_sql_requests"] == 4
-    assert scenario["concurrent_seconds"] < scenario["sequential_seconds"] * 0.70
-    assert scenario["sequential_seconds"] >= scenario["sql_delay_seconds"] * 3
-    assert scenario["concurrent_seconds"] >= scenario["sql_delay_seconds"] * 0.75
-    assert scenario["outer_response_seconds"] >= (
-        scenario["sequential_seconds"] + scenario["concurrent_seconds"]
-    ) * 0.90
-    assert scenario["pool_active_after"] == 0
-    assert scenario["pool_pending_after"] == 0
+    assert _assert_exact_int(
+        scenario["maximum_simultaneous_sql_requests"],
+        minimum=1,
+    ) == 4
+    sequential_seconds = _assert_finite_number(
+        scenario["sequential_seconds"],
+        minimum=0.0,
+    )
+    concurrent_seconds = _assert_finite_number(
+        scenario["concurrent_seconds"],
+        minimum=0.0,
+    )
+    sql_delay_seconds = _assert_finite_number(
+        scenario["sql_delay_seconds"],
+        minimum=0.0,
+    )
+    outer_response_seconds = _assert_finite_number(
+        scenario["outer_response_seconds"],
+        minimum=0.0,
+    )
+    assert concurrent_seconds < sequential_seconds * 0.70
+    assert sequential_seconds >= sql_delay_seconds * 3
+    assert concurrent_seconds >= sql_delay_seconds * 0.75
+    assert outer_response_seconds >= (sequential_seconds + concurrent_seconds) * 0.90
+    assert _assert_exact_int(scenario["pool_active_after"], minimum=0) == 0
+    assert _assert_exact_int(scenario["pool_pending_after"], minimum=0) == 0
     _assert_clean_scenario_lifecycle(scenario)
 
 
@@ -549,12 +688,15 @@ def test_adapted_flask_uses_persistent_worker_event_loop(
         "adapted_flask_persistent_loop",
     )
     assert scenario["server"] == "uvicorn"
-    assert scenario["execution_model"] in APPROVED_LABELS
-    assert scenario["maximum_serialized_wsgi_calls_per_process"] == 1
+    assert scenario["execution_model"] == ADAPTED_FLASK_LABEL
+    assert _assert_exact_int(
+        scenario["maximum_serialized_wsgi_calls_per_process"],
+        minimum=1,
+    ) == 1
     workers = scenario["workers"]
     loops = scenario["persistent_worker_loops"]
     worker_records = scenario["worker_records"]
-    assert workers > 0
+    workers = _assert_exact_int(workers, minimum=1)
     assert len(loops) == len(worker_records) == workers
     assert {record["pid"] for record in loops} == {
         worker["pid"] for worker in worker_records
@@ -570,16 +712,32 @@ def test_adapted_flask_uses_persistent_worker_event_loop(
             )
         )
     for worker in worker_records:
-        assert worker["pool_created_pid"] == worker["pid"]
-        assert worker["pool_connected_monotonic"] >= (
-            worker["process_started_monotonic"]
+        worker_pid = _assert_exact_int(worker["pid"], minimum=1)
+        assert _assert_exact_int(worker["pool_created_pid"], minimum=1) == worker_pid
+        connected = _assert_finite_number(
+            worker["pool_connected_monotonic"],
+            minimum=0.0,
         )
-    assert 1 <= scenario["maximum_simultaneous_sql_requests"] <= workers
-    assert scenario["maximum_aggregate_sql_sessions"] <= (
+        started = _assert_finite_number(
+            worker["process_started_monotonic"],
+            minimum=0.0,
+        )
+        assert connected >= started
+    maximum_requests = _assert_exact_int(
+        scenario["maximum_simultaneous_sql_requests"],
+        minimum=1,
+    )
+    assert maximum_requests <= workers
+    budget = _assert_exact_int(
         production_framework_evidence["configuration"][
             "global_connection_budget"
-        ]
+        ],
+        minimum=1,
     )
+    assert _assert_exact_int(
+        scenario["maximum_aggregate_sql_sessions"],
+        minimum=0,
+    ) <= budget
     _assert_clean_scenario_lifecycle(scenario)
 
 
@@ -591,20 +749,35 @@ def test_adapted_flask_is_thread_sensitive_serialized_per_process(
         production_framework_evidence,
         "adapted_flask_serialization",
     )
-    assert scenario["execution_model"] in APPROVED_LABELS
-    assert scenario["wsgi_calls_per_process"] == 1
-    assert scenario["maximum_simultaneous_sql_requests"] == 1
+    assert scenario["execution_model"] == ADAPTED_FLASK_LABEL
+    assert _assert_exact_int(scenario["wsgi_calls_per_process"], minimum=1) == 1
+    assert _assert_exact_int(
+        scenario["maximum_simultaneous_sql_requests"],
+        minimum=1,
+    ) == 1
     assert scenario["multi_process_scaling"] == "additional worker processes only"
     assert len(scenario["values"]) == 4
     assert all(type(value) is int for value in scenario["values"])
-    assert scenario["sequential_seconds"] > 0
-    assert scenario["concurrent_seconds"] > 0
-    assert 0.75 <= scenario["serialization_ratio"] <= 1.35
-    assert scenario["serialization_ratio"] == pytest.approx(
-        scenario["concurrent_seconds"] / scenario["sequential_seconds"]
+    sequential_seconds = _assert_finite_number(
+        scenario["sequential_seconds"],
+        minimum=0.0,
     )
-    assert scenario["pool_active_after"] == 0
-    assert scenario["pool_pending_after"] == 0
+    concurrent_seconds = _assert_finite_number(
+        scenario["concurrent_seconds"],
+        minimum=0.0,
+    )
+    assert sequential_seconds > 0
+    assert concurrent_seconds > 0
+    serialization_ratio = _assert_finite_number(
+        scenario["serialization_ratio"],
+        minimum=0.0,
+    )
+    assert 0.75 <= serialization_ratio <= 1.35
+    assert serialization_ratio == pytest.approx(
+        concurrent_seconds / sequential_seconds
+    )
+    assert _assert_exact_int(scenario["pool_active_after"], minimum=0) == 0
+    assert _assert_exact_int(scenario["pool_pending_after"], minimum=0) == 0
     _assert_clean_scenario_lifecycle(scenario)
 
 
@@ -646,19 +819,57 @@ def test_every_applicable_profile_executed_without_skip_or_swallow(
     )
 
 
+def _expected_fixed_worker_digest(
+    operations: int,
+    client_worker_count: int,
+) -> str:
+    combined = hashlib.sha256()
+    for worker_id in range(client_worker_count):
+        worker_digest = hashlib.sha256()
+        worker_count = 0
+        for operation_id in range(
+            worker_id + 1,
+            operations + 1,
+            client_worker_count,
+        ):
+            worker_digest.update(
+                f"{operation_id}:{operation_id}\n".encode("ascii")
+            )
+            worker_count += 1
+        combined.update(
+            f"{worker_id}:{worker_count}:{worker_digest.hexdigest()}\n".encode(
+                "ascii"
+            )
+        )
+    return combined.hexdigest()
+
+
 @case("FRAME-048")
 def test_fixed_worker_load_reaches_required_and_extended_profiles(
     production_framework_evidence,
 ) -> None:
     configuration = production_framework_evidence["configuration"]
-    assert configuration["required_operations"] == 1_000
+    assert _assert_exact_int(configuration["required_operations"], minimum=1) == (
+        1_000
+    )
     assert configuration["extended_operations"] == [10_000, 99_999]
     assert configuration["extended_requires_opt_in"] is True
+    assert type(configuration["allow_extended"]) is bool
+    configured_budget = _assert_exact_int(
+        configuration["global_connection_budget"],
+        minimum=1,
+    )
     load_profiles = production_framework_evidence["load_profiles"]
-    profiles = {
-        profile["operations"]: profile
-        for profile in load_profiles
-    }
+    assert isinstance(load_profiles, list)
+    profiles: dict[int, dict[str, object]] = {}
+    for profile in load_profiles:
+        operations = _assert_exact_int(
+            profile["operations"],
+            minimum=1,
+            maximum=99_999,
+        )
+        assert operations not in profiles
+        profiles[operations] = profile
     assert len(profiles) == len(load_profiles)
     expected_operations = {1_000}
     if configuration["allow_extended"]:
@@ -666,51 +877,93 @@ def test_fixed_worker_load_reaches_required_and_extended_profiles(
     assert set(profiles) == expected_operations
     for operations, profile in profiles.items():
         assert profile["status"] == "PASS"
-        assert profile["completed"] == operations
-        assert profile["errors"] == 0
+        assert _assert_exact_int(profile["completed"], minimum=0) == operations
+        assert _assert_exact_int(profile["errors"], minimum=0) == 0
         assert profile["fixed_client_workers"] is True
         assert profile["values_exact"] is True
-        assert profile["value_count"] == profile["expected_value_count"] == operations
-        assert profile["value_sum"] == profile["expected_value_sum"] == (
-            operations * (operations + 1) // 2
+        assert _assert_exact_int(profile["value_count"], minimum=0) == operations
+        assert _assert_exact_int(profile["expected_value_count"], minimum=0) == (
+            operations
         )
-        assert profile["value_digest"] == profile["expected_value_digest"]
-        assert re.fullmatch(r"[0-9a-f]{64}", profile["value_digest"])
+        expected_value_sum = operations * (operations + 1) // 2
+        assert _assert_exact_int(profile["value_sum"], minimum=0) == (
+            expected_value_sum
+        )
+        assert _assert_exact_int(profile["expected_value_sum"], minimum=0) == (
+            expected_value_sum
+        )
+        client_workers = _assert_exact_int(
+            profile["client_worker_count"],
+            minimum=1,
+            maximum=256,
+        )
+        expected_digest = _expected_fixed_worker_digest(
+            operations,
+            client_workers,
+        )
+        assert profile["value_digest"] == expected_digest
+        assert profile["expected_value_digest"] == expected_digest
         assert profile["value_digest_algorithm"] == "sha256-worker-stride-v1"
-        client_workers = profile["client_worker_count"]
-        assert 1 <= profile["maximum_active_requests"] <= client_workers <= 256
-        budget = profile["global_connection_budget"]
-        assert budget == configuration["global_connection_budget"]
-        assert profile["maximum_sql_sessions"] <= budget
-        assert profile["maximum_sql_requests"] <= budget
-        assert profile["maximum_pool_active"] <= budget
-        assert profile["maximum_pool_pending"] <= client_workers
-        server_workers = profile["server_worker_count"]
+        maximum_active_requests = _assert_exact_int(
+            profile["maximum_active_requests"],
+            minimum=1,
+        )
+        assert maximum_active_requests <= client_workers
+        budget = _assert_exact_int(
+            profile["global_connection_budget"],
+            minimum=1,
+        )
+        assert budget == configured_budget
+        assert _assert_exact_int(
+            profile["maximum_sql_sessions"],
+            minimum=0,
+        ) <= budget
+        assert _assert_exact_int(
+            profile["maximum_sql_requests"],
+            minimum=0,
+        ) <= budget
+        assert _assert_exact_int(
+            profile["maximum_pool_active"],
+            minimum=0,
+        ) <= budget
+        assert _assert_exact_int(
+            profile["maximum_pool_pending"],
+            minimum=0,
+        ) <= client_workers
+        server_workers = _assert_exact_int(
+            profile["server_worker_count"],
+            minimum=1,
+        )
         assert server_workers == 4
-        assert profile["server_child_count_start"] == server_workers
-        assert profile["maximum_server_child_count"] == server_workers
-        assert profile["server_child_count_end"] == server_workers
-        assert profile["process_count_start"] == server_workers
-        assert profile["process_count_end"] == server_workers
-        assert profile["resource_samples"] >= 2
-        assert profile["rss_peak_bytes"] >= max(
-            profile["rss_start_bytes"],
-            profile["rss_end_bytes"],
-        )
-        assert profile["rss_growth_bytes"] == (
-            profile["rss_peak_bytes"] - profile["rss_start_bytes"]
-        )
-        assert profile["sql_requests_start"] == 0
-        assert profile["sql_requests_end"] == 0
-        assert profile["sql_sessions_start"] <= budget
-        assert profile["sql_sessions_end"] <= budget
-        assert profile["pool_active_start"] == 0
-        assert profile["pool_active_after"] == 0
-        assert profile["pool_pending_start"] == 0
-        assert profile["pool_pending_after"] == 0
-        assert profile["pending_after"] == 0
+        for field_name in (
+            "server_child_count_start",
+            "maximum_server_child_count",
+            "server_child_count_end",
+            "process_count_start",
+            "process_count_end",
+        ):
+            assert _assert_exact_int(profile[field_name], minimum=0) == server_workers
+        assert _assert_exact_int(profile["resource_samples"], minimum=2) >= 2
+        rss_start = _assert_exact_int(profile["rss_start_bytes"], minimum=0)
+        rss_end = _assert_exact_int(profile["rss_end_bytes"], minimum=0)
+        rss_peak = _assert_exact_int(profile["rss_peak_bytes"], minimum=0)
+        rss_growth = _assert_exact_int(profile["rss_growth_bytes"], minimum=0)
+        assert rss_peak >= max(rss_start, rss_end)
+        assert rss_growth == rss_peak - rss_start
+        assert _assert_exact_int(profile["sql_requests_start"], minimum=0) == 0
+        assert _assert_exact_int(profile["sql_requests_end"], minimum=0) == 0
+        assert _assert_exact_int(profile["sql_sessions_start"], minimum=0) <= budget
+        assert _assert_exact_int(profile["sql_sessions_end"], minimum=0) <= budget
+        for field_name in (
+            "pool_active_start",
+            "pool_active_after",
+            "pool_pending_start",
+            "pool_pending_after",
+            "pending_after",
+        ):
+            assert _assert_exact_int(profile[field_name], minimum=0) == 0
         histogram = profile["latency_histogram"]
-        assert [bucket["upper_bound_ms"] for bucket in histogram["buckets"]] == [
+        expected_upper_bounds = [
             1,
             2,
             5,
@@ -725,14 +978,38 @@ def test_fixed_worker_load_reaches_required_and_extended_profiles(
             5_000,
             10_000,
         ]
-        assert histogram["count"] == operations
-        assert sum(bucket["count"] for bucket in histogram["buckets"]) + (
-            histogram["overflow_count"]
-        ) == operations
-        assert 0 <= histogram["minimum_ms"] <= histogram["maximum_ms"]
-        assert histogram["minimum_ms"] * operations <= histogram["sum_ms"]
-        assert histogram["sum_ms"] <= histogram["maximum_ms"] * operations
-        assert profile["duration_seconds"] >= 0
+        buckets = histogram["buckets"]
+        assert len(buckets) == len(expected_upper_bounds)
+        bucket_total = 0
+        for bucket, expected_upper_bound in zip(
+            buckets,
+            expected_upper_bounds,
+            strict=True,
+        ):
+            assert _assert_exact_int(bucket["upper_bound_ms"], minimum=1) == (
+                expected_upper_bound
+            )
+            bucket_total += _assert_exact_int(bucket["count"], minimum=0)
+        assert _assert_exact_int(histogram["count"], minimum=0) == operations
+        overflow_count = _assert_exact_int(
+            histogram["overflow_count"],
+            minimum=0,
+        )
+        assert bucket_total + overflow_count == operations
+        minimum_ms = _assert_finite_number(histogram["minimum_ms"], minimum=0.0)
+        maximum_ms = _assert_finite_number(histogram["maximum_ms"], minimum=0.0)
+        sum_ms = _assert_finite_number(histogram["sum_ms"], minimum=0.0)
+        assert minimum_ms <= maximum_ms
+        minimum_total = minimum_ms * operations
+        maximum_total = maximum_ms * operations
+        rounding_tolerance = operations * max(
+            math.ulp(minimum_total),
+            math.ulp(maximum_total),
+            math.ulp(sum_ms),
+        )
+        assert minimum_total - rounding_tolerance <= sum_ms
+        assert sum_ms <= maximum_total + rounding_tolerance
+        _assert_finite_number(profile["duration_seconds"], minimum=0.0)
 
 
 @case("FRAME-049")
@@ -1993,3 +2270,15 @@ def test_frame_048_accepts_finite_histogram_rounding_noise() -> None:
     histogram["maximum_ms"] = 0.1
     histogram["sum_ms"] = 100.00000000000001
     test_fixed_worker_load_reaches_required_and_extended_profiles(evidence)
+
+
+def test_frame_048_rejects_histogram_sum_beyond_ulp_bound() -> None:
+    """Reject a positive sum when every recorded latency bound is exactly zero."""
+
+    evidence = _runtime_shaped_case_evidence()
+    histogram = evidence["load_profiles"][0]["latency_histogram"]
+    histogram["minimum_ms"] = 0.0
+    histogram["maximum_ms"] = 0.0
+    histogram["sum_ms"] = 1e-10
+    with pytest.raises(AssertionError):
+        test_fixed_worker_load_reaches_required_and_extended_profiles(evidence)

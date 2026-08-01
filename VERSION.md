@@ -52,6 +52,18 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Production framework case-validator review fixes
+
+- Enforced platform-native absolute installed-wheel paths, exact Flask
+  execution-model ownership and fully reconciled positive process lifecycle
+  evidence for the affected `FRAME-028` and `FRAME-036`--`FRAME-045` cases.
+- Rejected booleans masquerading as integer counters, validated transaction
+  token/ID provenance for commit and rollback, and independently recomputed
+  fixed-worker stride digests from operation/worker cardinality.
+- Kept latency bounds strict while allowing only an operation-count-bounded
+  ULP tolerance for floating-point accumulation. No FastMssql/Tiberius
+  runtime or displayed `0.7.7` package version changed.
+
 ### Production framework case-validator review RED
 
 - Added behavioral review reproductions for platform-native absolute wheel
