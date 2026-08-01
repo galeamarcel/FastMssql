@@ -10979,6 +10979,9 @@ async def test_fixed_worker_sampler_timeout_cancels_clients_and_monitor(
             self.worker_id = worker_id
 
         async def __aenter__(self):
+            # Establish the sampler deadline before any request deadline so
+            # an event-loop stall cannot make the client timeout win first.
+            await sampler_blocked.wait()
             entered.add(self.worker_id)
             return self
 
@@ -10989,7 +10992,7 @@ async def test_fixed_worker_sampler_timeout_cancels_clients_and_monitor(
             nonlocal active_requests
             active_requests += 1
             try:
-                await asyncio.sleep(0.001)
+                await asyncio.sleep(0)
                 return Response(operation_id)
             except asyncio.CancelledError:
                 cancelled_clients.add(self.worker_id)
@@ -11021,8 +11024,8 @@ async def test_fixed_worker_sampler_timeout_cancels_clients_and_monitor(
             active_sampler_calls -= 1
 
     plan = runner.FixedWorkerLoadPlan(
-        operations=1_000,
-        allow_extended=False,
+        operations=99_999,
+        allow_extended=True,
         client_worker_count=2,
         server_worker_count=4,
         global_connection_budget=8,

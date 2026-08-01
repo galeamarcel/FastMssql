@@ -59,11 +59,26 @@ No release, package-version change, or artifact publication has occurred.
   returned records or any formerly exposed accumulator surface.
 - Added event-driven request-timeout, resource-sampler-timeout and external
   cancellation contracts that require privacy-safe propagation and complete
-  settlement of every client, request and monitor task.
+  settlement of every client, request and monitor task. The sampler deadline
+  is established before client request windows to avoid scheduler races.
 - Added a failing finite-input overflow contract preventing non-finite
   latency totals from entering schema-1 JSON evidence. The snapshot and
   overflow assertions intentionally precede their implementation fix.
 - These tests change no FastMssql/Tiberius runtime, package metadata,
+  displayed `0.7.7` version, release, published artifact or
+  original-repository state.
+
+### Production framework fixed-worker evidence snapshots
+
+- Replaced the completed load evidence's live latency/resource accumulators
+  with deeply immutable snapshots so no retained reference can alter a later
+  PASS serialization after the run has settled.
+- Rejected finite seconds values whose millisecond conversion is non-finite
+  before mutating histogram counters, preventing `Infinity` from entering
+  schema-1 JSON evidence.
+- Preserved request-timeout, sampler-timeout and caller-cancellation
+  settlement semantics under the new review-driven behavioral contracts.
+- This harness fix changes no FastMssql/Tiberius runtime, package metadata,
   displayed `0.7.7` version, release, published artifact or
   original-repository state.
 

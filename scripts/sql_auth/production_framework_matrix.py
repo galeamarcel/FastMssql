@@ -3919,6 +3919,10 @@ class BoundedLatencyHistogram:
                 "latency sample must be a finite non-negative number"
             )
         elapsed_ms = float(elapsed_seconds) * 1_000.0
+        if not math.isfinite(elapsed_ms):
+            raise RunnerConfigurationError(
+                "latency sample must be a finite non-negative number"
+            )
         self._count += 1
         self._sum_ms += elapsed_ms
         if self._minimum_ms is None or elapsed_ms < self._minimum_ms:
@@ -3946,6 +3950,44 @@ class BoundedLatencyHistogram:
             "minimum_ms": self._minimum_ms,
             "overflow_count": self._overflow_count,
             "sum_ms": self._sum_ms,
+        }
+
+    def snapshot(self) -> _LatencyHistogramSnapshot:
+        return _LatencyHistogramSnapshot(
+            buckets=tuple(
+                zip(self._UPPER_BOUNDS_MS, self._bucket_counts, strict=True)
+            ),
+            count=self._count,
+            maximum_ms=self._maximum_ms,
+            minimum_ms=self._minimum_ms,
+            overflow_count=self._overflow_count,
+            sum_ms=self._sum_ms,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _LatencyHistogramSnapshot:
+    buckets: tuple[tuple[int, int], ...]
+    count: int
+    maximum_ms: float | None
+    minimum_ms: float | None
+    overflow_count: int
+    sum_ms: float
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "buckets": [
+                {
+                    "count": count,
+                    "upper_bound_ms": upper_bound_ms,
+                }
+                for upper_bound_ms, count in self.buckets
+            ],
+            "count": self.count,
+            "maximum_ms": self.maximum_ms,
+            "minimum_ms": self.minimum_ms,
+            "overflow_count": self.overflow_count,
+            "sum_ms": self.sum_ms,
         }
 
 
@@ -4038,6 +4080,32 @@ class _LoadResourceAccumulator:
             sample.pool_pending,
         )
 
+    def snapshot(self) -> _LoadResourceSnapshot:
+        return _LoadResourceSnapshot(
+            start=self.start,
+            end=self.end,
+            sample_count=self.sample_count,
+            maximum_server_child_count=self.maximum_server_child_count,
+            maximum_sql_sessions=self.maximum_sql_sessions,
+            maximum_sql_requests=self.maximum_sql_requests,
+            rss_peak_bytes=self.rss_peak_bytes,
+            maximum_pool_active=self.maximum_pool_active,
+            maximum_pool_pending=self.maximum_pool_pending,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _LoadResourceSnapshot:
+    start: LoadResourceSample
+    end: LoadResourceSample
+    sample_count: int
+    maximum_server_child_count: int
+    maximum_sql_sessions: int
+    maximum_sql_requests: int
+    rss_peak_bytes: int
+    maximum_pool_active: int
+    maximum_pool_pending: int
+
 
 @dataclass(frozen=True, slots=True)
 class FixedWorkerLoadEvidence:
@@ -4050,8 +4118,8 @@ class FixedWorkerLoadEvidence:
     value_digest: str
     expected_value_digest: str
     maximum_active_requests: int
-    latency_histogram: BoundedLatencyHistogram = field(repr=False)
-    resources: _LoadResourceAccumulator = field(repr=False)
+    latency_histogram: _LatencyHistogramSnapshot = field(repr=False)
+    resources: _LoadResourceSnapshot = field(repr=False)
     duration_seconds: float
 
     def to_record(self) -> dict[str, object]:
@@ -4576,8 +4644,8 @@ async def run_fixed_worker_load(
             value_digest=value_digest,
             expected_value_digest=expected_value_digest,
             maximum_active_requests=state.maximum_active_requests,
-            latency_histogram=state.latency_histogram,
-            resources=resources,
+            latency_histogram=state.latency_histogram.snapshot(),
+            resources=resources.snapshot(),
             duration_seconds=max(0.0, clock() - started),
         )
     except asyncio.CancelledError:
