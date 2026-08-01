@@ -62,6 +62,12 @@ No release, package-version change, or artifact publication has occurred.
   admission, a fixed-size latency histogram, bounded start/peak/end process,
   SQL and pool sampling, plus fail-fast cancellation that exits every client
   context and preserves only a privacy-safe failure type.
+- Hardened the RED contract after scoped review with positive admission at
+  every required/extended boundary, in-flight task and payload bounds,
+  lifetime tracking for parsed values, differential whole-run memory and
+  retained histogram-memory bounds, corrupted-response detection, exact
+  sampling of every resource dimension and observable sampler settlement on
+  both success and failure.
 - These tests are intentionally committed before the Task 9 runner
   implementation. They change no FastMssql/Tiberius runtime, package
   metadata, displayed `0.7.7` version, release, published artifact or

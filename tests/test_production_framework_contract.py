@@ -16,6 +16,7 @@ import subprocess
 import sys
 import textwrap
 import time
+import tracemalloc
 import tomllib
 from types import SimpleNamespace
 from typing import Any
@@ -10193,6 +10194,25 @@ def test_runner_proves_wheel_isolation_and_privacy() -> None:
 def test_fixed_worker_load_is_opt_in_and_not_task_per_operation() -> None:
     runner = _load_production_framework_runner()
 
+    for operations, allow_extended in (
+        (1, False),
+        (1_000, False),
+        (1_001, True),
+        (10_000, True),
+        (99_999, True),
+    ):
+        plan = runner.FixedWorkerLoadPlan(
+            operations=operations,
+            allow_extended=allow_extended,
+            client_worker_count=8,
+            server_worker_count=4,
+            global_connection_budget=8,
+            request_timeout_seconds=1.0,
+            sample_interval_seconds=0.01,
+        )
+        assert plan.operations == operations
+        assert plan.allow_extended is allow_extended
+
     for invalid in (True, False, 0, -1, 100_000, 1.5, "1000"):
         with pytest.raises(
             runner.RunnerConfigurationError,
@@ -10277,12 +10297,32 @@ async def test_fixed_worker_load_uses_long_lived_partitioned_clients_and_bounded
     response_references: list[weakref.ReferenceType[object]] = []
     active_requests = 0
     maximum_active_requests = 0
-    sample_index = 0
-    samples = (
-        (4, 0, 0, 100, 0, 0),
-        (4, 3, 3, 140, 3, 1),
-        (4, 2, 2, 125, 2, 0),
-        (4, 0, 0, 110, 0, 0),
+    resource_sample_calls = 0
+    peak_sampled = asyncio.Event()
+    clients_exited = asyncio.Event()
+    start_sample = runner.LoadResourceSample(
+        server_child_count=4,
+        sql_sessions=0,
+        sql_requests=0,
+        rss_bytes=100,
+        pool_active=0,
+        pool_pending=0,
+    )
+    peak_sample = runner.LoadResourceSample(
+        server_child_count=4,
+        sql_sessions=3,
+        sql_requests=2,
+        rss_bytes=140,
+        pool_active=3,
+        pool_pending=1,
+    )
+    end_sample = runner.LoadResourceSample(
+        server_child_count=4,
+        sql_sessions=0,
+        sql_requests=0,
+        rss_bytes=110,
+        pool_active=0,
+        pool_pending=0,
     )
 
     class Response:
@@ -10302,6 +10342,8 @@ async def test_fixed_worker_load_uses_long_lived_partitioned_clients_and_bounded
 
         async def __aexit__(self, *_exc_info) -> None:
             exited.append(self.worker_id)
+            if len(exited) == 3:
+                clients_exited.set()
 
         async def request_value(self, operation_id: int):
             nonlocal active_requests, maximum_active_requests
@@ -10309,6 +10351,8 @@ async def test_fixed_worker_load_uses_long_lived_partitioned_clients_and_bounded
             active_requests += 1
             maximum_active_requests = max(maximum_active_requests, active_requests)
             try:
+                if operation_id <= 3:
+                    await peak_sampled.wait()
                 await asyncio.sleep(0.002 * (1 + operation_id % 3))
                 response = Response(operation_id)
                 response_references.append(weakref.ref(response))
@@ -10317,17 +10361,14 @@ async def test_fixed_worker_load_uses_long_lived_partitioned_clients_and_bounded
                 active_requests -= 1
 
     async def sample_resources():
-        nonlocal sample_index
-        values = samples[min(sample_index, len(samples) - 1)]
-        sample_index += 1
-        return runner.LoadResourceSample(
-            server_child_count=values[0],
-            sql_sessions=values[1],
-            sql_requests=values[2],
-            rss_bytes=values[3],
-            pool_active=values[4],
-            pool_pending=values[5],
-        )
+        nonlocal resource_sample_calls
+        resource_sample_calls += 1
+        if clients_exited.is_set():
+            return end_sample
+        if resource_sample_calls == 1:
+            return start_sample
+        peak_sampled.set()
+        return peak_sample
 
     plan = runner.FixedWorkerLoadPlan(
         operations=11,
@@ -10338,11 +10379,12 @@ async def test_fixed_worker_load_uses_long_lived_partitioned_clients_and_bounded
         request_timeout_seconds=1.0,
         sample_interval_seconds=0.001,
     )
-    evidence = await runner.run_fixed_worker_load(
-        plan,
-        client_factory=Client,
-        resource_sampler=sample_resources,
-    )
+    async with asyncio.timeout(1.0):
+        evidence = await runner.run_fixed_worker_load(
+            plan,
+            client_factory=Client,
+            resource_sampler=sample_resources,
+        )
     record = evidence.to_record()
 
     assert created == [0, 1, 2]
@@ -10371,21 +10413,287 @@ async def test_fixed_worker_load_uses_long_lived_partitioned_clients_and_bounded
     assert sum(
         bucket["count"] for bucket in record["latency_histogram"]["buckets"]
     ) + record["latency_histogram"]["overflow_count"] == 11
-    assert record["resource_samples"] >= 2
+    assert record["resource_samples"] >= 3
+    assert record["server_child_count_start"] == 4
     assert record["maximum_server_child_count"] == 4
-    assert record["maximum_sql_sessions"] <= 8
-    assert record["maximum_sql_requests"] <= 8
+    assert record["server_child_count_end"] == 4
+    assert record["sql_sessions_start"] == 0
+    assert record["maximum_sql_sessions"] == 3
+    assert record["sql_sessions_end"] == 0
+    assert record["sql_requests_start"] == 0
+    assert record["maximum_sql_requests"] == 2
+    assert record["sql_requests_end"] == 0
     assert record["rss_start_bytes"] == 100
     assert record["rss_peak_bytes"] == 140
     assert record["rss_end_bytes"] == 110
+    assert record["pool_active_start"] == 0
+    assert record["maximum_pool_active"] == 3
     assert record["pool_active_after"] == 0
+    assert record["pool_pending_start"] == 0
+    assert record["maximum_pool_pending"] == 1
     assert record["pool_pending_after"] == 0
     assert "values" not in record
     assert "responses" not in record
 
+    calls_after_return = resource_sample_calls
+    await asyncio.sleep(0.005)
+    assert resource_sample_calls == calls_after_return
     gc.collect()
     assert response_references
     assert all(reference() is None for reference in response_references)
+
+
+@pytest.mark.asyncio
+async def test_fixed_worker_load_keeps_tasks_and_payloads_bounded_during_run(
+) -> None:
+    runner = _load_production_framework_runner()
+    client_worker_count = 3
+    baseline_tasks = set(asyncio.all_tasks())
+    request_task_by_worker: dict[int, asyncio.Task[Any]] = {}
+    live_responses: weakref.WeakSet[object] = weakref.WeakSet()
+    live_value_tokens: weakref.WeakSet[object] = weakref.WeakSet()
+    entered: set[int] = set()
+    exited: set[int] = set()
+    peak_pending_tasks = 0
+    peak_live_responses = 0
+    peak_live_values = 0
+    resource_sample_calls = 0
+
+    class LifetimeToken:
+        __slots__ = ("__weakref__",)
+
+    class TrackedInt(int):
+        def __new__(cls, value: int):
+            tracked = super().__new__(cls, value)
+            tracked.lifetime_token = LifetimeToken()
+            return tracked
+
+    class Response:
+        __slots__ = ("value", "__weakref__")
+
+        def __init__(self, value: TrackedInt) -> None:
+            self.value = value
+
+    class Client:
+        def __init__(self, worker_id: int) -> None:
+            self.worker_id = worker_id
+
+        async def __aenter__(self):
+            entered.add(self.worker_id)
+            return self
+
+        async def __aexit__(self, *_exc_info) -> None:
+            exited.add(self.worker_id)
+
+        async def request_value(self, operation_id: int):
+            nonlocal peak_live_responses, peak_live_values, peak_pending_tasks
+            request_task = asyncio.current_task()
+            assert request_task is not None
+            first_request_task = request_task_by_worker.setdefault(
+                self.worker_id,
+                request_task,
+            )
+            assert request_task is first_request_task
+            pending_tasks = sum(
+                task not in baseline_tasks and not task.done()
+                for task in asyncio.all_tasks()
+            )
+            peak_pending_tasks = max(peak_pending_tasks, pending_tasks)
+            gc.collect()
+            peak_live_responses = max(peak_live_responses, len(live_responses))
+            peak_live_values = max(peak_live_values, len(live_value_tokens))
+            await asyncio.sleep(0)
+            value = TrackedInt(operation_id)
+            live_value_tokens.add(value.lifetime_token)
+            response = Response(value)
+            live_responses.add(response)
+            return response
+
+    async def sample_resources():
+        nonlocal resource_sample_calls
+        resource_sample_calls += 1
+        return runner.LoadResourceSample(
+            server_child_count=4,
+            sql_sessions=0,
+            sql_requests=0,
+            rss_bytes=100,
+            pool_active=0,
+            pool_pending=0,
+        )
+
+    plan = runner.FixedWorkerLoadPlan(
+        operations=257,
+        allow_extended=False,
+        client_worker_count=client_worker_count,
+        server_worker_count=4,
+        global_connection_budget=8,
+        request_timeout_seconds=1.0,
+        sample_interval_seconds=0.001,
+    )
+    async with asyncio.timeout(2.0):
+        evidence = await runner.run_fixed_worker_load(
+            plan,
+            client_factory=Client,
+            resource_sampler=sample_resources,
+        )
+
+    assert evidence.to_record()["completed"] == 257
+    assert entered == {0, 1, 2}
+    assert exited == {0, 1, 2}
+    assert set(request_task_by_worker) == {0, 1, 2}
+    assert len(set(request_task_by_worker.values())) == client_worker_count
+    assert peak_pending_tasks <= client_worker_count + 2
+    assert peak_live_responses <= client_worker_count
+    assert peak_live_values <= client_worker_count
+    calls_after_return = resource_sample_calls
+    await asyncio.sleep(0.005)
+    assert resource_sample_calls == calls_after_return
+    gc.collect()
+    assert len(live_responses) == 0
+    assert len(live_value_tokens) == 0
+
+
+@pytest.mark.asyncio
+async def test_fixed_worker_load_memory_growth_is_independent_of_operation_count(
+) -> None:
+    runner = _load_production_framework_runner()
+
+    async def measure_peak_growth(operations: int) -> tuple[int, int]:
+        class Response:
+            __slots__ = ("value",)
+
+            def __init__(self, value: int) -> None:
+                self.value = value
+
+        class Client:
+            def __init__(self, worker_id: int) -> None:
+                self.worker_id = worker_id
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc_info) -> None:
+                return None
+
+            async def request_value(self, operation_id: int):
+                await asyncio.sleep(0)
+                return Response(operation_id)
+
+        async def sample_resources():
+            return runner.LoadResourceSample(
+                server_child_count=4,
+                sql_sessions=0,
+                sql_requests=0,
+                rss_bytes=100,
+                pool_active=0,
+                pool_pending=0,
+            )
+
+        plan = runner.FixedWorkerLoadPlan(
+            operations=operations,
+            allow_extended=operations > 1_000,
+            client_worker_count=3,
+            server_worker_count=4,
+            global_connection_budget=8,
+            request_timeout_seconds=1.0,
+            sample_interval_seconds=0.001,
+        )
+        tracing_was_active = tracemalloc.is_tracing()
+        if not tracing_was_active:
+            tracemalloc.start()
+        gc.collect()
+        baseline_current_bytes, _ = tracemalloc.get_traced_memory()
+        tracemalloc.reset_peak()
+        try:
+            async with asyncio.timeout(10.0):
+                evidence = await runner.run_fixed_worker_load(
+                    plan,
+                    client_factory=Client,
+                    resource_sampler=sample_resources,
+                )
+            current_bytes, peak_bytes = tracemalloc.get_traced_memory()
+            assert evidence.to_record()["completed"] == operations
+            return (
+                max(0, peak_bytes - baseline_current_bytes),
+                max(0, current_bytes - baseline_current_bytes),
+            )
+        finally:
+            if not tracing_was_active:
+                tracemalloc.stop()
+
+    small_peak_bytes, small_retained_bytes = await measure_peak_growth(257)
+    gc.collect()
+    large_peak_bytes, large_retained_bytes = await measure_peak_growth(10_000)
+
+    assert large_peak_bytes <= small_peak_bytes + 192 * 1_024
+    assert large_retained_bytes <= small_retained_bytes + 64 * 1_024
+
+
+@pytest.mark.asyncio
+async def test_fixed_worker_load_rejects_corrupted_values_instead_of_synthesizing(
+) -> None:
+    runner = _load_production_framework_runner()
+    entered: set[int] = set()
+    exited: set[int] = set()
+    calls: list[int] = []
+
+    class Response:
+        __slots__ = ("value",)
+
+        def __init__(self, value: int) -> None:
+            self.value = value
+
+    class Client:
+        def __init__(self, worker_id: int) -> None:
+            self.worker_id = worker_id
+
+        async def __aenter__(self):
+            entered.add(self.worker_id)
+            return self
+
+        async def __aexit__(self, *_exc_info) -> None:
+            exited.add(self.worker_id)
+
+        async def request_value(self, operation_id: int):
+            calls.append(operation_id)
+            observed_value = operation_id
+            if operation_id == 5:
+                observed_value = 100_005
+            await asyncio.sleep(0)
+            return Response(observed_value)
+
+    async def sample_resources():
+        return runner.LoadResourceSample(
+            server_child_count=4,
+            sql_sessions=0,
+            sql_requests=0,
+            rss_bytes=100,
+            pool_active=0,
+            pool_pending=0,
+        )
+
+    plan = runner.FixedWorkerLoadPlan(
+        operations=9,
+        allow_extended=False,
+        client_worker_count=3,
+        server_worker_count=4,
+        global_connection_budget=8,
+        request_timeout_seconds=1.0,
+        sample_interval_seconds=0.001,
+    )
+    with pytest.raises(runner.FixedWorkerLoadError) as captured:
+        async with asyncio.timeout(0.5):
+            await runner.run_fixed_worker_load(
+                plan,
+                client_factory=Client,
+                resource_sampler=sample_resources,
+            )
+
+    assert captured.value.failure_type == "LoadValueMismatch"
+    assert "100005" not in str(captured.value)
+    assert 5 in calls
+    assert entered == {0, 1, 2}
+    assert exited == {0, 1, 2}
 
 
 @pytest.mark.asyncio
@@ -10395,8 +10703,13 @@ async def test_fixed_worker_load_fails_fast_and_settles_every_client() -> None:
     exited: set[int] = set()
     calls: list[int] = []
     all_entered = asyncio.Event()
-    never = asyncio.Event()
+    never_request = asyncio.Event()
+    never_sample = asyncio.Event()
+    sampler_blocked = asyncio.Event()
+    sampler_cancelled = asyncio.Event()
     active_requests = 0
+    active_sampler_calls = 0
+    resource_sample_calls = 0
 
     class SyntheticLoadFailure(RuntimeError):
         pass
@@ -10421,21 +10734,35 @@ async def test_fixed_worker_load_fails_fast_and_settles_every_client() -> None:
             try:
                 await all_entered.wait()
                 if operation_id == 2:
+                    await sampler_blocked.wait()
                     raise SyntheticLoadFailure("private failure payload")
-                await never.wait()
+                await never_request.wait()
                 raise AssertionError("blocked request unexpectedly resumed")
             finally:
                 active_requests -= 1
 
     async def sample_resources():
-        return runner.LoadResourceSample(
-            server_child_count=4,
-            sql_sessions=0,
-            sql_requests=0,
-            rss_bytes=100,
-            pool_active=0,
-            pool_pending=0,
-        )
+        nonlocal active_sampler_calls, resource_sample_calls
+        resource_sample_calls += 1
+        if resource_sample_calls == 1:
+            return runner.LoadResourceSample(
+                server_child_count=4,
+                sql_sessions=0,
+                sql_requests=0,
+                rss_bytes=100,
+                pool_active=0,
+                pool_pending=0,
+            )
+        active_sampler_calls += 1
+        sampler_blocked.set()
+        try:
+            await never_sample.wait()
+            raise AssertionError("blocked sampler unexpectedly resumed")
+        except asyncio.CancelledError:
+            sampler_cancelled.set()
+            raise
+        finally:
+            active_sampler_calls -= 1
 
     plan = runner.FixedWorkerLoadPlan(
         operations=40,
@@ -10447,11 +10774,12 @@ async def test_fixed_worker_load_fails_fast_and_settles_every_client() -> None:
         sample_interval_seconds=0.001,
     )
     with pytest.raises(runner.FixedWorkerLoadError) as captured:
-        await runner.run_fixed_worker_load(
-            plan,
-            client_factory=Client,
-            resource_sampler=sample_resources,
-        )
+        async with asyncio.timeout(0.5):
+            await runner.run_fixed_worker_load(
+                plan,
+                client_factory=Client,
+                resource_sampler=sample_resources,
+            )
 
     assert captured.value.failure_type == "SyntheticLoadFailure"
     assert "private failure payload" not in str(captured.value)
@@ -10459,15 +10787,42 @@ async def test_fixed_worker_load_fails_fast_and_settles_every_client() -> None:
     assert exited == {0, 1, 2, 3}
     assert sorted(calls) == [1, 2, 3, 4]
     assert active_requests == 0
+    assert resource_sample_calls >= 2
+    assert sampler_blocked.is_set()
+    assert sampler_cancelled.is_set()
+    assert active_sampler_calls == 0
 
 
 def test_fixed_worker_latency_histogram_is_bounded_and_validated() -> None:
     runner = _load_production_framework_runner()
-    histogram = runner.BoundedLatencyHistogram()
-    for elapsed_seconds in (0.0, 0.001, 0.0015, 0.02, 11.0):
-        histogram.observe(elapsed_seconds)
-    for _ in range(100_000):
-        histogram.observe(0.003)
+    tracing_was_active = tracemalloc.is_tracing()
+    if not tracing_was_active:
+        tracemalloc.start()
+    try:
+        histogram = runner.BoundedLatencyHistogram()
+        for elapsed_seconds in (0.0, 0.001, 0.0015, 0.02, 11.0):
+            histogram.observe(elapsed_seconds)
+        baseline_current_bytes, _ = tracemalloc.get_traced_memory()
+        tracemalloc.reset_peak()
+        for _ in range(100_000):
+            histogram.observe(0.003)
+        current_bytes, peak_bytes = tracemalloc.get_traced_memory()
+
+        assert current_bytes - baseline_current_bytes <= 64 * 1_024
+        assert peak_bytes - baseline_current_bytes <= 128 * 1_024
+        try:
+            state_values = tuple(vars(histogram).values())
+        except TypeError:
+            state_values = tuple(gc.get_referents(histogram))
+        for state_value in state_values:
+            if isinstance(
+                state_value,
+                (bytearray, dict, frozenset, list, set, tuple),
+            ):
+                assert len(state_value) <= 13
+    finally:
+        if not tracing_was_active:
+            tracemalloc.stop()
 
     record = histogram.to_record()
     assert [bucket["upper_bound_ms"] for bucket in record["buckets"]] == [
@@ -10495,7 +10850,6 @@ def test_fixed_worker_latency_histogram_is_bounded_and_validated() -> None:
     assert record["minimum_ms"] == 0.0
     assert record["maximum_ms"] == 11_000.0
     assert record["sum_ms"] == pytest.approx(311_022.5)
-    assert not hasattr(histogram, "samples")
 
     for invalid in (True, -0.001, float("nan"), float("inf")):
         with pytest.raises(
