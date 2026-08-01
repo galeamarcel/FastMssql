@@ -52,6 +52,18 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Production framework schema-1 review fixes
+
+- Enforced exact JSON scalar types, canonical dependency/tool/gate schemas,
+  complete scenario/load inventories and deterministic derived violations for
+  privacy, teardown, gates, scenarios, dependencies and load evidence.
+- Bound normalized absolute installed-wheel import paths to every passing
+  worker on Windows, Linux and macOS while rejecting source-tree, relative,
+  wrong-platform and control-character paths.
+- Added a portable staging-cleanup seam that preserves the primary exclusive
+  publication result and distinguishes successful publication with residue.
+  No FastMssql/Tiberius runtime or displayed `0.7.7` package version changed.
+
 ### Production framework schema-1 review RED
 
 - Added focused review reproductions for exact JSON scalar typing, complete

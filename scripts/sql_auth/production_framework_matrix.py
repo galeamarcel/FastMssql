@@ -14,7 +14,7 @@ import inspect
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import signal
 import shutil
@@ -4773,7 +4773,7 @@ APPLICATION_SOURCE_FILES = (
 )
 APPLICATION_DIRECTORY_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 WHEEL_FILENAME_PATTERN = re.compile(
-    r"fastmssql-(?P<version>[0-9]+\.[0-9]+\.[0-9]+)-.+\.whl"
+    r"fastmssql-(?P<version>[0-9]+\.[0-9]+\.[0-9]+)-[A-Za-z0-9_.-]+\.whl"
 )
 FASTMSSQL_IMPORT_PROVENANCE_SOURCE = "fastmssql.__file__"
 
@@ -4852,6 +4852,138 @@ PROFILE_INVENTORY_FIELDS = frozenset(
         "skipped",
     }
 )
+PROFILE_STATIC_IDENTITY_FIELDS = (
+    "app_factory",
+    "database_mode",
+    "family",
+    "loop",
+    "platform_system",
+    "preload_app",
+    "server",
+    "threads_per_worker",
+    "transport",
+    "worker_class",
+    "workers",
+)
+PRODUCTION_EVIDENCE_SCENARIOS = frozenset(
+    {
+        "adapted_flask_persistent_loop",
+        "adapted_flask_serialization",
+        "client_disconnect_cancellation",
+        "flask_gthread_occupancy",
+        "flask_internal_concurrency",
+        "flask_sync_occupancy",
+        "graceful_query_shutdown",
+        "graceful_transaction_shutdown",
+        "large_streaming",
+        "native_concurrency",
+        "saturation",
+    }
+)
+MINIMUM_LOAD_PROFILE_FIELDS = frozenset(
+    {
+        "completed",
+        "errors",
+        "fixed_client_workers",
+        "global_connection_budget",
+        "maximum_sql_sessions",
+        "operations",
+        "pending_after",
+        "process_count_end",
+        "process_count_start",
+        "status",
+        "values_exact",
+    }
+)
+CONNECTION_PATTERN_COUNT_FIELD = "connection" + "_string_patterns_checked"
+PRIVACY_EVIDENCE_FIELDS = frozenset(
+    {
+        "artifact_matches",
+        "command_matches",
+        CONNECTION_PATTERN_COUNT_FIELD,
+        "credential_values_checked",
+        "credential_values_expected",
+        "http_matches",
+        "log_matches",
+        "tracked_matches",
+    }
+)
+TEARDOWN_EVIDENCE_FIELDS = frozenset(
+    {
+        "active_pool_leases_after",
+        "child_processes_after",
+        "forced_cleanup_count",
+        "listening_sockets_after",
+        "pending_pool_waiters_after",
+        "sql_requests_after",
+        "sql_sessions_after",
+    }
+)
+CUMULATIVE_GATE_FIELDS = frozenset(
+    {
+        "code_review_graph",
+        "dependency_security",
+        "exact_sha",
+        "generated_reports",
+        "installed_wheel",
+        "original_local_regression",
+        "root_rust",
+        "sql_auth_runner",
+        "vendored_tiberius",
+    }
+)
+LOCKED_PRODUCTION_DEPENDENCIES = {
+    "asgiref": "3.12.1",
+    "fastapi": "0.139.2",
+    "flask": "3.1.3",
+    "gunicorn": "26.0.0",
+    "httpx": "0.28.1",
+    "uvicorn": "0.51.0",
+    "uvicorn-worker": "0.4.0",
+    "uvloop": "0.22.1",
+}
+POSIX_ONLY_PRODUCTION_DEPENDENCIES = (
+    "gunicorn",
+    "uvicorn-worker",
+    "uvloop",
+)
+HOSTED_GATE_EXPECTATIONS: dict[str, dict[str, object]] = {
+    "Linux": {
+        "database": "Microsoft SQL Server 2022 Docker",
+        "installed_wheel": True,
+        "real_sql_auth": True,
+        "required_profiles": "complete-posix",
+        "workflow_owned": True,
+    },
+    "Windows": {
+        "database": "Microsoft SQL Server 2022 Express",
+        "gunicorn": "N/A",
+        "installed_wheel": True,
+        "real_sql_auth": True,
+        "uvicorn_worker_counts": [1, 2, 4, 8],
+        "uvloop": "N/A",
+        "workflow_owned": True,
+    },
+    "macOS": {
+        "claim_boundary_explicit": True,
+        "hosted_sql_auth": False,
+        "installed_wheel": True,
+        "local_docker_sql_auth": True,
+        "real_server_processes": True,
+        "workflow_owned": True,
+    },
+}
+WINDOWS_NOT_APPLICABLE_SCENARIOS = {
+    "flask_gthread_occupancy": GUNICORN_WINDOWS_REASON,
+    "flask_internal_concurrency": GUNICORN_WINDOWS_REASON,
+    "flask_sync_occupancy": GUNICORN_WINDOWS_REASON,
+    "graceful_query_shutdown": (
+        "POSIX SIGTERM graceful shutdown is not supported on Windows"
+    ),
+    "graceful_transaction_shutdown": (
+        "POSIX SIGTERM graceful shutdown is not supported on Windows"
+    ),
+}
 VIOLATION_CODE_PATTERN = re.compile(
     r"[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*"
 )
@@ -4880,6 +5012,63 @@ def _evidence_mapping(value: object, *, label: str) -> dict[str, object]:
     ):
         raise EvidenceSchemaError(f"{label} schema must be a JSON object")
     return value
+
+
+def _matches_exact_json_value(actual: object, expected: object) -> bool:
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            _matches_exact_json_value(actual_item, expected_item)
+            for actual_item, expected_item in zip(actual, expected, strict=True)
+        )
+    if isinstance(expected, dict):
+        return set(actual) == set(expected) and all(
+            _matches_exact_json_value(actual[key], expected_value)
+            for key, expected_value in expected.items()
+        )
+    return actual == expected
+
+
+def _safe_evidence_string(
+    value: object,
+    *,
+    allow_empty: bool = False,
+    max_length: int = 4_096,
+) -> bool:
+    return (
+        isinstance(value, str)
+        and (allow_empty or bool(value))
+        and len(value) <= max_length
+        and all(character.isprintable() for character in value)
+    )
+
+
+def _candidate_import_path_key(
+    value: object,
+    *,
+    platform_system: str,
+) -> tuple[str, ...]:
+    if not _safe_evidence_string(value):
+        raise EvidenceSchemaError("wheel import path is invalid")
+    if platform_system == "Windows":
+        path = PureWindowsPath(value)
+        if not path.is_absolute():
+            raise EvidenceSchemaError("wheel import path is not absolute")
+        key = tuple(part.casefold() for part in path.parts)
+    else:
+        path = PurePosixPath(value)
+        if not path.is_absolute() or "\\" in value:
+            raise EvidenceSchemaError("wheel import path is not absolute")
+        key = tuple(path.parts)
+    if (
+        any(part in {".", ".."} for part in path.parts)
+        or "site-packages" not in tuple(part.casefold() for part in path.parts)
+        or tuple(part.casefold() for part in path.parts[-2:])
+        != ("fastmssql", "__init__.py")
+    ):
+        raise EvidenceSchemaError("wheel import path is not isolated package code")
+    return key
 
 
 def _require_exact_evidence_fields(
@@ -4964,17 +5153,11 @@ def _validate_profile_records(
     for profile_id in sorted(expected_by_id):
         record = records_by_id[profile_id]
         expected = expected_by_id[profile_id]
-        identity = {
-            "database_mode": expected.database_mode,
-            "family": expected.family,
-            "platform_system": expected.platform_system,
-            "workers": expected.workers,
-        }
-        for field_name, expected_value in identity.items():
-            actual = record.get(field_name)
-            if field_name == "workers" and isinstance(actual, bool):
-                raise EvidenceSchemaError("profile identity is inconsistent")
-            if actual != expected_value:
+        for field_name in PROFILE_STATIC_IDENTITY_FIELDS:
+            if not _matches_exact_json_value(
+                record.get(field_name),
+                getattr(expected, field_name),
+            ):
                 raise EvidenceSchemaError("profile identity is inconsistent")
 
         actual_applicable = record.get("applicable")
@@ -4991,7 +5174,11 @@ def _validate_profile_records(
                 raise EvidenceSchemaError(
                     "profile applicability reason is inconsistent"
                 )
-            if status not in {"FAIL", "PASS", "SKIPPED"}:
+            if not isinstance(status, str) or status not in {
+                "FAIL",
+                "PASS",
+                "SKIPPED",
+            }:
                 raise EvidenceSchemaError("profile final status is invalid")
             if status in {"FAIL", "PASS"}:
                 executed += 1
@@ -5026,7 +5213,43 @@ def _validate_profile_records(
     return normalized_records, inventory, sorted(derived_violations)
 
 
-def _validate_evidence_configuration(value: object) -> str:
+def _validate_worker_import_provenance(
+    profiles: Sequence[Mapping[str, object]],
+    *,
+    candidate_import_path: object,
+    platform_system: str,
+) -> None:
+    candidate_key = _candidate_import_path_key(
+        candidate_import_path,
+        platform_system=platform_system,
+    )
+    for profile in profiles:
+        if profile.get("status") != "PASS":
+            continue
+        workers = profile.get("workers")
+        worker_records = profile.get("worker_records")
+        if (
+            isinstance(workers, bool)
+            or not isinstance(workers, int)
+            or not isinstance(worker_records, list)
+            or len(worker_records) != workers
+        ):
+            raise EvidenceSchemaError("worker import path evidence is incomplete")
+        for raw_worker in worker_records:
+            worker = _evidence_mapping(raw_worker, label="worker import")
+            worker_key = _candidate_import_path_key(
+                worker.get("fastmssql_import_path"),
+                platform_system=platform_system,
+            )
+            if worker_key != candidate_key:
+                raise EvidenceSchemaError(
+                    "worker import path does not match candidate wheel"
+                )
+
+
+def _validate_evidence_configuration(
+    value: object,
+) -> tuple[str, tuple[int, ...]]:
     configuration = _evidence_mapping(value, label="configuration")
     expected_fields = frozenset(
         {
@@ -5045,20 +5268,29 @@ def _validate_evidence_configuration(value: object) -> str:
         expected_fields,
         label="configuration",
     )
-    if configuration.get("worker_counts") != list(WORKER_COUNTS):
+    if not _matches_exact_json_value(
+        configuration.get("worker_counts"),
+        list(WORKER_COUNTS),
+    ):
         raise EvidenceSchemaError("configuration worker counts are invalid")
-    if configuration.get("required_operations") != REQUIRED_OPERATIONS:
+    if not _matches_exact_json_value(
+        configuration.get("required_operations"),
+        REQUIRED_OPERATIONS,
+    ):
         raise EvidenceSchemaError("configuration required operations are invalid")
-    if configuration.get("extended_operations") != [
-        LARGE_OPERATIONS,
-        EXTENDED_OPERATIONS,
-    ]:
+    if not _matches_exact_json_value(
+        configuration.get("extended_operations"),
+        [LARGE_OPERATIONS, EXTENDED_OPERATIONS],
+    ):
         raise EvidenceSchemaError("configuration extended operations are invalid")
     if configuration.get("extended_requires_opt_in") is not True:
         raise EvidenceSchemaError("configuration extended opt-in is invalid")
 
     database_mode = configuration.get("database_mode")
-    if database_mode not in {"offline", "sql_auth"}:
+    if not isinstance(database_mode, str) or database_mode not in {
+        "offline",
+        "sql_auth",
+    }:
         raise EvidenceSchemaError("configuration database mode is invalid")
     allow_extended = configuration.get("allow_extended")
     if not isinstance(allow_extended, bool):
@@ -5089,10 +5321,323 @@ def _validate_evidence_configuration(value: object) -> str:
             )
     except RunnerConfigurationError:
         raise EvidenceSchemaError("configuration operations are invalid") from None
-    return database_mode
+    return database_mode, tuple(operations)
 
 
-def _validate_evidence_sections(document: Mapping[str, object]) -> str:
+def _validate_version_mapping(value: object, *, label: str) -> dict[str, object]:
+    versions = _evidence_mapping(value, label=label)
+    if not versions or any(
+        not _safe_evidence_string(name)
+        or not _safe_evidence_string(version)
+        for name, version in versions.items()
+    ):
+        raise EvidenceSchemaError(f"{label} schema is invalid")
+    return versions
+
+
+def _validate_dependency_evidence(
+    value: object,
+    *,
+    platform_system: str,
+) -> list[str]:
+    dependencies = _evidence_mapping(value, label="dependencies")
+    _require_exact_evidence_fields(
+        dependencies,
+        frozenset(
+            {"installed_versions", "locked_versions", "posix_only", "runtime"}
+        ),
+        label="dependencies",
+    )
+    locked_versions = _validate_version_mapping(
+        dependencies.get("locked_versions"),
+        label="locked dependency versions",
+    )
+    installed_versions = _validate_version_mapping(
+        dependencies.get("installed_versions"),
+        label="installed dependency versions",
+    )
+    posix_only = dependencies.get("posix_only")
+    if not isinstance(posix_only, list) or any(
+        not _safe_evidence_string(name) for name in posix_only
+    ):
+        raise EvidenceSchemaError("dependencies POSIX scope is invalid")
+    runtime = dependencies.get("runtime")
+    if not isinstance(runtime, list) or any(
+        not _safe_evidence_string(name) for name in runtime
+    ):
+        raise EvidenceSchemaError("dependencies runtime schema is invalid")
+
+    expected_installed = {
+        name: version
+        for name, version in LOCKED_PRODUCTION_DEPENDENCIES.items()
+        if platform_system != "Windows"
+        or name not in POSIX_ONLY_PRODUCTION_DEPENDENCIES
+    }
+    violations: list[str] = []
+    if not _matches_exact_json_value(
+        locked_versions,
+        LOCKED_PRODUCTION_DEPENDENCIES,
+    ):
+        violations.append("dependencies.locked_versions.mismatch")
+    if not _matches_exact_json_value(
+        posix_only,
+        list(POSIX_ONLY_PRODUCTION_DEPENDENCIES),
+    ):
+        violations.append("dependencies.posix_only.mismatch")
+    if not _matches_exact_json_value(installed_versions, expected_installed):
+        violations.append("dependencies.installed_versions.mismatch")
+    if runtime:
+        violations.append("dependencies.runtime.unlocked")
+    return violations
+
+
+def _validate_comparison_evidence(value: object) -> list[str]:
+    comparison = _evidence_mapping(value, label="comparison")
+    _require_exact_evidence_fields(
+        comparison,
+        frozenset({"labels", "rendered"}),
+        label="comparison",
+    )
+    labels = comparison.get("labels")
+    rendered = comparison.get("rendered")
+    if (
+        not isinstance(labels, list)
+        or any(not _safe_evidence_string(label) for label in labels)
+        or not _safe_evidence_string(rendered, max_length=16_777_216)
+    ):
+        raise EvidenceSchemaError("comparison schema is invalid")
+    violations: list[str] = []
+    if not _matches_exact_json_value(labels, list(EXECUTION_MODEL_LABELS)):
+        violations.append("comparison.labels.mismatch")
+    rendered_lower = rendered.lower()
+    if any(claim in rendered_lower for claim in FORBIDDEN_EXECUTION_MODEL_CLAIMS):
+        violations.append("comparison.rendered.forbidden")
+    return violations
+
+
+def _validate_scenario_evidence(
+    value: object,
+    *,
+    platform_system: str,
+) -> list[str]:
+    scenarios = _evidence_mapping(value, label="scenarios")
+    if set(scenarios) != PRODUCTION_EVIDENCE_SCENARIOS:
+        raise EvidenceSchemaError("scenarios schema is not exact")
+    violations: list[str] = []
+    for scenario_name in sorted(PRODUCTION_EVIDENCE_SCENARIOS):
+        scenario = _evidence_mapping(
+            scenarios[scenario_name],
+            label=f"scenario {scenario_name}",
+        )
+        status = scenario.get("status")
+        if not isinstance(status, str) or status not in {
+            "FAIL",
+            "N/A",
+            "PASS",
+            "SKIPPED",
+        }:
+            raise EvidenceSchemaError("scenario final status is invalid")
+        expected_reason = (
+            WINDOWS_NOT_APPLICABLE_SCENARIOS.get(scenario_name)
+            if platform_system == "Windows"
+            else None
+        )
+        reason = scenario.get("not_applicable_reason")
+        if status == "FAIL":
+            violations.append(f"scenario.{scenario_name}.failed")
+        elif status == "SKIPPED":
+            violations.append(f"scenario.{scenario_name}.skipped")
+        elif status == "N/A":
+            if not _safe_evidence_string(reason) or reason != expected_reason:
+                raise EvidenceSchemaError("scenario applicability is invalid")
+        else:
+            if reason is not None:
+                raise EvidenceSchemaError("scenario applicability is invalid")
+            if expected_reason is not None:
+                violations.append(f"scenario.{scenario_name}.applicability")
+    return violations
+
+
+def _validate_load_profile_evidence(
+    value: object,
+    *,
+    expected_operations: tuple[int, ...],
+) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise EvidenceSchemaError("load profiles schema is incomplete")
+    records_by_operation: dict[int, dict[str, object]] = {}
+    violations: list[str] = []
+    integer_fields = (
+        "completed",
+        "errors",
+        "global_connection_budget",
+        "maximum_sql_sessions",
+        "pending_after",
+        "process_count_end",
+        "process_count_start",
+    )
+    for raw_profile in value:
+        profile = _evidence_mapping(raw_profile, label="load profile")
+        if not MINIMUM_LOAD_PROFILE_FIELDS.issubset(profile):
+            raise EvidenceSchemaError("load profile schema is incomplete")
+        operation = profile.get("operations")
+        if (
+            isinstance(operation, bool)
+            or not isinstance(operation, int)
+            or operation in records_by_operation
+        ):
+            raise EvidenceSchemaError("load profile operations are invalid")
+        for field_name in integer_fields:
+            field_value = profile.get(field_name)
+            if (
+                isinstance(field_value, bool)
+                or not isinstance(field_value, int)
+                or field_value < 0
+            ):
+                raise EvidenceSchemaError("load profile schema is invalid")
+        if not isinstance(profile.get("fixed_client_workers"), bool) or not isinstance(
+            profile.get("values_exact"), bool
+        ):
+            raise EvidenceSchemaError("load profile schema is invalid")
+        status = profile.get("status")
+        if not isinstance(status, str) or status not in {
+            "FAIL",
+            "PASS",
+            "SKIPPED",
+        }:
+            raise EvidenceSchemaError("load profile status is invalid")
+        records_by_operation[operation] = profile
+        if status == "FAIL":
+            violations.append(f"load.{operation}.failed")
+        elif status == "SKIPPED":
+            violations.append(f"load.{operation}.skipped")
+        elif (
+            profile["completed"] != operation
+            or profile["errors"] != 0
+            or profile["fixed_client_workers"] is not True
+            or profile["values_exact"] is not True
+            or profile["maximum_sql_sessions"]
+            > profile["global_connection_budget"]
+            or profile["process_count_end"] != profile["process_count_start"]
+            or profile["pending_after"] != 0
+        ):
+            violations.append(f"load.{operation}.contract")
+    if set(records_by_operation) != set(expected_operations):
+        raise EvidenceSchemaError("load profile operations do not match configuration")
+    return violations
+
+
+def _validate_privacy_evidence(value: object) -> list[str]:
+    privacy = _evidence_mapping(value, label="privacy")
+    _require_exact_evidence_fields(
+        privacy,
+        PRIVACY_EVIDENCE_FIELDS,
+        label="privacy",
+    )
+    match_fields = (
+        "artifact_matches",
+        "command_matches",
+        "http_matches",
+        "log_matches",
+        "tracked_matches",
+    )
+    violations: list[str] = []
+    for field_name in match_fields:
+        matches = privacy.get(field_name)
+        if not isinstance(matches, list) or any(
+            not _safe_evidence_string(match) for match in matches
+        ):
+            raise EvidenceSchemaError("privacy schema is invalid")
+        if matches:
+            violations.append(f"privacy.{field_name}.detected")
+    counts: dict[str, int] = {}
+    for field_name in (
+        CONNECTION_PATTERN_COUNT_FIELD,
+        "credential_values_checked",
+        "credential_values_expected",
+    ):
+        count = privacy.get(field_name)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise EvidenceSchemaError("privacy schema is invalid")
+        counts[field_name] = count
+    if (
+        counts["credential_values_expected"] < 1
+        or counts["credential_values_checked"]
+        != counts["credential_values_expected"]
+        or counts[CONNECTION_PATTERN_COUNT_FIELD] < 1
+    ):
+        violations.append("privacy.coverage.incomplete")
+    return violations
+
+
+def _validate_teardown_evidence(value: object) -> list[str]:
+    teardown = _evidence_mapping(value, label="teardown")
+    _require_exact_evidence_fields(
+        teardown,
+        TEARDOWN_EVIDENCE_FIELDS,
+        label="teardown",
+    )
+    violations: list[str] = []
+    for field_name in sorted(TEARDOWN_EVIDENCE_FIELDS):
+        count = teardown.get(field_name)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise EvidenceSchemaError("teardown schema is invalid")
+        if count:
+            violations.append(f"teardown.{field_name}.nonzero")
+    return violations
+
+
+def _validate_gate_evidence(document: Mapping[str, object]) -> list[str]:
+    cumulative = _evidence_mapping(
+        document["cumulative_gate_contracts"],
+        label="cumulative gate contracts",
+    )
+    _require_exact_evidence_fields(
+        cumulative,
+        CUMULATIVE_GATE_FIELDS,
+        label="cumulative gate contracts",
+    )
+    violations: list[str] = []
+    for field_name in sorted(CUMULATIVE_GATE_FIELDS):
+        value = cumulative.get(field_name)
+        if not isinstance(value, bool):
+            raise EvidenceSchemaError("cumulative gate schema is invalid")
+        if not value:
+            violations.append(f"gate.cumulative.{field_name}.failed")
+
+    hosted = _evidence_mapping(
+        document["hosted_gate_contracts"],
+        label="hosted gate contracts",
+    )
+    if set(hosted) != set(HOSTED_GATE_EXPECTATIONS):
+        raise EvidenceSchemaError("hosted gate schema is not exact")
+    for platform_name, expected in HOSTED_GATE_EXPECTATIONS.items():
+        record = _evidence_mapping(
+            hosted[platform_name],
+            label=f"hosted {platform_name} gate",
+        )
+        _require_exact_evidence_fields(
+            record,
+            frozenset(expected),
+            label=f"hosted {platform_name} gate",
+        )
+        for field_name, expected_value in expected.items():
+            if not _matches_exact_json_value(
+                record.get(field_name),
+                expected_value,
+            ):
+                violations.append(
+                    "gate.hosted."
+                    f"{platform_name.lower()}.{field_name}.mismatch"
+                )
+    return violations
+
+
+def _validate_evidence_sections(
+    document: Mapping[str, object],
+    *,
+    expected_operations: tuple[int, ...],
+) -> tuple[str, list[str]]:
     platform_record = _evidence_mapping(
         document["platform"],
         label="platform",
@@ -5104,7 +5649,7 @@ def _validate_evidence_sections(document: Mapping[str, object]) -> str:
     )
     for field_name in ("machine", "python_implementation", "system"):
         value = platform_record.get(field_name)
-        if not isinstance(value, str) or not value:
+        if not _safe_evidence_string(value):
             raise EvidenceSchemaError("platform schema contains an empty field")
     try:
         platform_system = normalize_platform(platform_record["system"])
@@ -5114,70 +5659,35 @@ def _validate_evidence_sections(document: Mapping[str, object]) -> str:
         raise EvidenceSchemaError("platform schema is not canonical")
 
     tools = _evidence_mapping(document["tools"], label="tools")
-    if not tools or any(
-        not isinstance(value, str) or not value for value in tools.values()
+    _require_exact_evidence_fields(
+        tools,
+        frozenset({"python", "rust", "sql_server"}),
+        label="tools",
+    )
+    if any(
+        not _safe_evidence_string(value) for value in tools.values()
     ):
         raise EvidenceSchemaError("tools schema is invalid")
 
-    dependencies = _evidence_mapping(
-        document["dependencies"],
-        label="dependencies",
-    )
-    installed_versions = _evidence_mapping(
-        dependencies.get("installed_versions"),
-        label="dependency versions",
-    )
-    if any(
-        not isinstance(value, str) or not value
-        for value in installed_versions.values()
-    ) or not isinstance(dependencies.get("runtime"), list):
-        raise EvidenceSchemaError("dependencies schema is invalid")
-
-    comparison = _evidence_mapping(
-        document["comparison"],
-        label="comparison",
-    )
-    labels = comparison.get("labels")
-    if (
-        not isinstance(labels, list)
-        or not labels
-        or any(not isinstance(label, str) or not label for label in labels)
-        or not isinstance(comparison.get("rendered"), str)
-    ):
-        raise EvidenceSchemaError("comparison schema is invalid")
-
-    for field_name in (
-        "cumulative_gate_contracts",
-        "hosted_gate_contracts",
-        "privacy",
-        "scenarios",
-        "teardown",
-    ):
-        _evidence_mapping(document[field_name], label=field_name)
-    privacy = document["privacy"]
-    if not isinstance(privacy, dict) or any(
-        not isinstance(privacy.get(field_name), list)
-        for field_name in ("artifact_matches", "tracked_matches")
-    ):
-        raise EvidenceSchemaError("privacy schema is invalid")
-    teardown = document["teardown"]
-    if not isinstance(teardown, dict):
-        raise EvidenceSchemaError("teardown schema is invalid")
-    for field_name in ("child_processes_after", "sql_sessions_after"):
-        value = teardown.get(field_name)
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, int)
-            or value < 0
-        ):
-            raise EvidenceSchemaError("teardown schema is invalid")
-
-    load_profiles = document["load_profiles"]
-    if not isinstance(load_profiles, list) or any(
-        not isinstance(profile, dict) for profile in load_profiles
-    ):
-        raise EvidenceSchemaError("load profiles schema is invalid")
-    return platform_system
+    violations = [
+        *_validate_dependency_evidence(
+            document["dependencies"],
+            platform_system=platform_system,
+        ),
+        *_validate_comparison_evidence(document["comparison"]),
+        *_validate_scenario_evidence(
+            document["scenarios"],
+            platform_system=platform_system,
+        ),
+        *_validate_load_profile_evidence(
+            document["load_profiles"],
+            expected_operations=expected_operations,
+        ),
+        *_validate_privacy_evidence(document["privacy"]),
+        *_validate_teardown_evidence(document["teardown"]),
+        *_validate_gate_evidence(document),
+    ]
+    return platform_system, sorted(set(violations))
 
 
 def validate_production_framework_evidence(
@@ -5195,8 +5705,9 @@ def validate_production_framework_evidence(
         PRODUCTION_EVIDENCE_TOP_LEVEL_FIELDS,
         label="top-level",
     )
-    if document.get("schema_version") != SCHEMA_VERSION or isinstance(
-        document.get("schema_version"), bool
+    if not _matches_exact_json_value(
+        document.get("schema_version"),
+        SCHEMA_VERSION,
     ):
         raise EvidenceSchemaError("schema version is invalid")
 
@@ -5226,9 +5737,8 @@ def validate_production_framework_evidence(
     wheel_sha256 = wheel.get("sha256")
     if (
         not isinstance(filename, str)
+        or len(filename) > 255
         or WHEEL_FILENAME_PATTERN.fullmatch(filename) is None
-        or not isinstance(import_path, str)
-        or not import_path
         or not isinstance(wheel_sha256, str)
         or SHA256_PATTERN.fullmatch(wheel_sha256) is None
     ):
@@ -5249,9 +5759,14 @@ def validate_production_framework_evidence(
     ):
         raise EvidenceSchemaError("harness SHA does not match expected SHA")
 
-    database_mode = _validate_evidence_configuration(document["configuration"])
-    platform_system = _validate_evidence_sections(document)
-    profiles, expected_inventory, derived_violations = (
+    database_mode, expected_operations = _validate_evidence_configuration(
+        document["configuration"]
+    )
+    platform_system, auxiliary_violations = _validate_evidence_sections(
+        document,
+        expected_operations=expected_operations,
+    )
+    profiles, expected_inventory, profile_violations = (
         _validate_profile_records(
             document["profiles"],
             platform_system=platform_system,
@@ -5260,6 +5775,11 @@ def validate_production_framework_evidence(
     )
     if profiles != document["profiles"]:
         raise EvidenceSchemaError("profile ordering is not deterministic")
+    _validate_worker_import_provenance(
+        profiles,
+        candidate_import_path=import_path,
+        platform_system=platform_system,
+    )
 
     inventory = _evidence_mapping(
         document["profile_inventory"],
@@ -5285,12 +5805,14 @@ def validate_production_framework_evidence(
         document["violations"],
         require_canonical_order=True,
     )
-    derived_set = set(derived_violations)
+    profile_violation_set = set(profile_violations)
     recorded_profile_violations = {
         violation for violation in violations if violation.startswith("profile.")
     }
-    if recorded_profile_violations != derived_set:
+    if recorded_profile_violations != profile_violation_set:
         raise EvidenceSchemaError("profile violations are inconsistent")
+    if not set(auxiliary_violations).issubset(violations):
+        raise EvidenceSchemaError("auxiliary violations are inconsistent")
     overall = document.get("overall")
     expected_overall = "PASS" if not violations else "FAIL"
     if overall != expected_overall:
@@ -5334,7 +5856,7 @@ def build_production_framework_evidence(
         cloned_violations,
         require_canonical_order=False,
     )
-    aggregate_violations = sorted(
+    base_violations = sorted(
         set(explicit_violations) | set(profile_violations)
     )
     raw_document: dict[str, object] = {
@@ -5362,7 +5884,7 @@ def build_production_framework_evidence(
         "harness": {"git_sha": harness_sha},
         "hosted_gate_contracts": hosted_gate_contracts,
         "load_profiles": load_profiles,
-        "overall": "PASS" if not aggregate_violations else "FAIL",
+        "overall": "PASS" if not base_violations else "FAIL",
         "platform": platform_record,
         "privacy": privacy,
         "profile_inventory": inventory,
@@ -5371,13 +5893,30 @@ def build_production_framework_evidence(
         "schema_version": SCHEMA_VERSION,
         "teardown": teardown,
         "tools": tool_versions,
-        "violations": aggregate_violations,
+        "violations": base_violations,
     }
     cloned_document = _clone_evidence_json(
         raw_document,
         label="evidence",
     )
     document = _evidence_mapping(cloned_document, label="top-level")
+    _, expected_operations = _validate_evidence_configuration(
+        document["configuration"]
+    )
+    platform_system, auxiliary_violations = _validate_evidence_sections(
+        document,
+        expected_operations=expected_operations,
+    )
+    _validate_worker_import_provenance(
+        normalized_profiles,
+        candidate_import_path=candidate_import_path,
+        platform_system=platform_system,
+    )
+    aggregate_violations = sorted(
+        set(base_violations) | set(auxiliary_violations)
+    )
+    document["violations"] = aggregate_violations
+    document["overall"] = "PASS" if not aggregate_violations else "FAIL"
     validate_production_framework_evidence(
         document,
         expected_candidate_sha=config.candidate_sha,
@@ -5402,6 +5941,13 @@ def _publish_evidence_exclusively(
         raise EvidenceArtifactError("evidence artifact publication failed") from None
 
 
+def _cleanup_evidence_staging(staged_path: Path) -> None:
+    try:
+        staged_path.unlink(missing_ok=True)
+    except OSError:
+        raise EvidenceArtifactError("evidence staging cleanup failed") from None
+
+
 def write_production_framework_evidence(
     output: Path,
     evidence: Mapping[str, object],
@@ -5418,6 +5964,8 @@ def write_production_framework_evidence(
     validate_production_framework_evidence(document)
 
     temporary_path: Path | None = None
+    primary_error: BaseException | None = None
+    publication_succeeded = False
     try:
         with tempfile.NamedTemporaryFile(
             mode="w",
@@ -5438,18 +5986,35 @@ def write_production_framework_evidence(
             temporary.flush()
             os.fsync(temporary.fileno())
         _publish_evidence_exclusively(temporary_path, output)
-    except EvidenceArtifactError:
-        raise
+        publication_succeeded = True
+    except EvidenceArtifactError as error:
+        primary_error = error
     except (OSError, TypeError, ValueError):
-        raise EvidenceArtifactError("evidence artifact write failed") from None
-    finally:
-        if temporary_path is not None:
-            try:
-                temporary_path.unlink(missing_ok=True)
-            except OSError:
-                raise EvidenceArtifactError(
-                    "evidence staging cleanup failed"
-                ) from None
+        primary_error = EvidenceArtifactError("evidence artifact write failed")
+    except BaseException as error:
+        primary_error = error
+
+    cleanup_failed = False
+    if temporary_path is not None:
+        try:
+            _cleanup_evidence_staging(temporary_path)
+        except (EvidenceArtifactError, OSError):
+            cleanup_failed = True
+    if cleanup_failed:
+        if primary_error is not None:
+            primary_error.add_note("evidence staging cleanup also failed")
+        elif publication_succeeded:
+            primary_error = EvidenceArtifactError(
+                "evidence artifact published but staging cleanup failed"
+            )
+        else:
+            primary_error = EvidenceArtifactError(
+                "evidence staging cleanup failed"
+            )
+    if primary_error is not None:
+        if isinstance(primary_error, EvidenceArtifactError):
+            raise primary_error from None
+        raise primary_error
 
 
 def verify_isolated_application(
