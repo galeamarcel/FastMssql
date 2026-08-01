@@ -3712,6 +3712,60 @@ upstream fără aprobarea explicită a proprietarului forkului.
 
 ## Starea verificată curentă
 
+### Feature 21 — production framework matrix, Task 8/16 închis local
+
+- Feature-ul enterprise activ este `21/21`, iar Task 8 din cele 16 taskuri ale
+  feature-ului este închis tehnic. Taskurile 9--16 rămân obligatorii înainte
+  ca itemul 21 și criteriul final Uvicorn/Gunicorn/wheel să poată fi bifate.
+- Branch cumulativ Task 8: `feat/production-framework-flask-models`; HEAD
+  tehnic verificat:
+  `5ba1d9e9f945fab9b7e5f1be36822c195e62ff6e`.
+- Separarea RED/fix este păstrată în ancestry: `4a7f611` pentru contractul
+  Flask, `0c5ae45`/`388d97f` pentru worker evidence dinamic și
+  `8c71fc4`/`5ba1d9e` pentru mascarea excepției HTTP și lifecycle false-PASS.
+  Branch-urile corective au fost publicate numai pe
+  `galeamarcel/FastMssql`; nu s-a făcut nicio acțiune pe repository-ul
+  original.
+- Contractul implementat a trecut `175/175`, cu exact opt gate-uri viitoare
+  Task 9--11 deselectate. Cele trei reproduceri corective au trecut `3/3`,
+  Ruff, `py_compile`, `git diff --check` și scanarea celor patru parole au
+  ieșit cu status zero.
+- Matricea reală instalată din wheel, cu SQL authentication către containerul
+  Docker `fastmssql-sql-auth-dev`, a trecut toate cele opt profile Gunicorn
+  WSGI, scenariul `/gather`, toate cele opt profile Flask adaptat-ASGI și
+  scenariul de serializare. Fiecare rezultat are `status=PASS`,
+  `graceful_stop=true`, `forced_cleanup=false`, zero sesiuni după teardown și
+  niciun proces Gunicorn/Uvicorn rezidual. Artefact:
+  `.artifacts/sql-auth/task8-real-wk9f5sjh/task8-real-evidence.json`.
+- `/gather` a măsurat `1,0122 s` secvențial față de `0,2648 s` concurent,
+  patru requesturi SQL simultane în interiorul unui singur slot WSGI. Aceasta
+  dovedește concurență internă într-un singur view async, nu concurență ASGI
+  între requesturi Flask sub WSGI.
+- Flask prin `WsgiToAsgi` a măsurat `1,0851 s` secvențial față de `1,0713 s`
+  concurent, maximum un request SQL și un apel WSGI activ per proces. Modelul
+  păstrează event loop-ul ASGI, dar adaptorul este thread-sensitive și
+  serializează apelurile WSGI per proces; scalarea multiproces este raportată
+  separat și nu este declarată echivalentă cu FastAPI true-async.
+- Helperul comun modificat a fost regresat prin toate cele `12/12` profile
+  native FastAPI/Uvicorn/Gunicorn: maximum opt sesiuni, toate profilele PASS,
+  fără forced cleanup și zero sesiuni după teardown. Artefactele sunt în
+  `.artifacts/sql-auth/task7-matrix-5xdq5lq7/`.
+- Cele două re-review-uri scoped au închis ambele constatări Important:
+  excepția HTTP primară nu mai poate fi mascată de observer, iar un proces
+  ieșit autonom cu cod zero nu mai poate produce PASS fără shutdown controlat
+  de harness. Nu a fost găsit un defect nou al runtime-ului FastMssql sau al
+  Tiberius în Task 8.
+- Limita de proveniență rămasă este explicită: artefactul incremental Task 8
+  leagă wheel-ul/runtime-ul candidat, dar schema sa nu conține încă un câmp
+  independent pentru commitul harnessului. Task 9 trebuie să închidă această
+  limită prin schema-1 fail-closed înainte de acceptarea finală.
+- Graful MCP a fost reconstruit pe `5ba1d9e`: 196 fișiere, 5.001 noduri și
+  60.918 muchii, cu `head_matches_build=true`. Legăturile `TESTED_BY` pentru
+  runnerul încărcat dinamic prin `importlib` nu sunt inferate de graf; testele
+  directe și rulările reale de mai sus reconciliază acel gap static.
+
+### Baseline enterprise verificat anterior — feature 20
+
 - Fork: `https://github.com/galeamarcel/FastMssql.git`
 - Branch de status: `docs/named-instance-status`
 - HEAD tehnic verificat:

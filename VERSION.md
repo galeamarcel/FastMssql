@@ -52,6 +52,22 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Production framework Task 8 live-status integration
+
+- Closed Task 8 of the production-framework plan on cumulative branch
+  `feat/production-framework-flask-models` at technical commit `5ba1d9e`,
+  retaining separate Flask RED, dynamic-worker RED/fix and
+  observer/lifecycle RED/fix histories.
+- Updated the executable plan and production-readiness live audit with the
+  exact local contract, installed-wheel Docker/MSSQL evidence, FastAPI
+  regression, review verdicts and the measured Flask WSGI/adapted-ASGI
+  limitations. The final feature-21 acceptance remains open because Tasks
+  9--16, including schema-1 provenance, load, hosted gates and status closure,
+  have not yet run.
+- This status integration changes documentation only. It changes no
+  FastMssql/Tiberius runtime, package metadata, displayed `0.7.7` version,
+  release, published artifact or original-repository state.
+
 ### Production framework SQL-auth routes and observer
 
 - Added worker-local SQL-auth routes for readiness, SQL principal/application

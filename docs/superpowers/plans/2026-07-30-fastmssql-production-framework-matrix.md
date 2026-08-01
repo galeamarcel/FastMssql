@@ -799,8 +799,8 @@ FastMssql runtime change.
 
 ## Task 8: implement Flask WSGI and adapted-ASGI scenarios
 
-**Branch:** `feat/production-framework-matrix` unless a defect branch is
-required.
+**Branch:** `feat/production-framework-flask-models`, with focused RED/fix
+branches for every defect discovered during real execution and review.
 
 **Files:**
 
@@ -809,7 +809,7 @@ required.
 - modify: `scripts/sql_auth/production_framework_matrix.py`
 - modify: `VERSION.md`
 
-- [ ] **Step 8.1: Gunicorn sync matrix**
+- [x] **Step 8.1: Gunicorn sync matrix**
 
 At `1/2/4/8` workers:
 
@@ -821,7 +821,7 @@ At `1/2/4/8` workers:
 - aggregate pool/session budget;
 - exact worker-exit teardown.
 
-- [ ] **Step 8.2: Gunicorn gthread matrix**
+- [x] **Step 8.2: Gunicorn gthread matrix**
 
 At `1/2/4/8`, four threads each:
 
@@ -831,13 +831,13 @@ At `1/2/4/8`, four threads each:
 - exact results across per-request loops and threads;
 - process/pool/session bounds and teardown.
 
-- [ ] **Step 8.3: one-request internal concurrency**
+- [x] **Step 8.3: one-request internal concurrency**
 
 Over real Gunicorn HTTP, `/gather` compares four sequential vs concurrent SQL
 waits in one Flask async view. Require the conservative same-view ratio and
 one occupied WSGI request slot.
 
-- [ ] **Step 8.4: adapted Flask matrix**
+- [x] **Step 8.4: adapted Flask matrix**
 
 Under Uvicorn asyncio on all OS and uvloop on POSIX at `1/2/4/8`:
 
@@ -847,7 +847,7 @@ Under Uvicorn asyncio on all OS and uvloop on POSIX at `1/2/4/8`:
 - pool/session budget;
 - lifecycle shutdown.
 
-- [ ] **Step 8.5: thread-sensitive serialization**
+- [x] **Step 8.5: thread-sensitive serialization**
 
 On one adapted worker:
 
@@ -857,18 +857,53 @@ On one adapted worker:
 - prove only one WSGI call active in that process;
 - report multi-process scaling separately.
 
-- [ ] **Step 8.6: comparison language contract**
+- [x] **Step 8.6: comparison language contract**
 
 Generate only the three approved execution-model labels. Add static
 forbidden-claim tests.
 
-- [ ] **Step 8.7: verify and commit**
+- [x] **Step 8.7: verify and commit**
 
 Commit:
 
 ```bash
 git commit -m "test: cover production Flask execution models"
 ```
+
+Actual history retained the required separation:
+
+- Task 8 RED: `test/production-framework-flask-models` at `4a7f611`;
+- dynamic shared-listener RED/fix: `test/framework-dynamic-worker-evidence`
+  at `0c5ae45` and `fix/framework-dynamic-worker-evidence` at `388d97f`;
+- observer/lifecycle false-PASS RED/fix:
+  `test/framework-observation-lifecycle-evidence` at `8c71fc4` and
+  `fix/framework-observation-lifecycle-evidence` at `5ba1d9e`;
+- cumulative Task 8 feature branch:
+  `feat/production-framework-flask-models`, advanced only by fast-forward.
+
+Fresh closure evidence on `5ba1d9e`:
+
+- the three focused false-PASS reproductions passed;
+- the implemented contract passed `175/175`, with exactly eight future
+  Task 9--11 gates deselected;
+- installed-wheel Docker SQL-auth evidence at
+  `.artifacts/sql-auth/task8-real-wk9f5sjh/task8-real-evidence.json` passed
+  eight WSGI profiles, `/gather`, eight adapted-ASGI profiles and adapted
+  serialization, all with harness-controlled graceful shutdown, no forced
+  cleanup and zero final sessions;
+- `/gather` measured `1.0122 s` sequential versus `0.2648 s` concurrent,
+  four simultaneous SQL requests and one occupied WSGI request slot;
+- adapted Flask measured `1.0851 s` sequential versus `1.0713 s`
+  concurrent, one simultaneous SQL request and one serialized WSGI call per
+  process;
+- the affected Task 7 native matrix passed all `12/12` profiles with maximum
+  eight sessions and zero after teardown;
+- both scoped re-reviews closed their Important findings with no new
+  Critical/Important issue.
+
+The real runs found repository-owned evidence-harness defects, not a new
+FastMssql/Tiberius runtime defect. Task 9 remains responsible for the final
+schema-1 artifact that independently binds the harness/candidate provenance.
 
 ---
 
