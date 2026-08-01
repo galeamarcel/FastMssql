@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import textwrap
+import time
 import tomllib
 from types import SimpleNamespace
 from typing import Any
@@ -1888,6 +1889,250 @@ class _FakeConnection:
             raise self.disconnect_error
 
 
+class _FakeQueryResult:
+    def __init__(self, row: dict[str, object] | None) -> None:
+        self._row = row
+
+    def fetchone(self) -> dict[str, object] | None:
+        return self._row
+
+
+class _FakeTransaction:
+    def __init__(self, events: list[object], session_id: int) -> None:
+        self.events = events
+        self.session_id = session_id
+
+    async def __aenter__(self):
+        self.events.append(("transaction_enter", self.session_id))
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback) -> bool:
+        self.events.append(
+            (
+                "transaction_exit",
+                None if exc_type is None else exc_type.__name__,
+            )
+        )
+        return False
+
+    async def execute(
+        self,
+        sql: str,
+        params: list[object] | None = None,
+    ) -> int:
+        self.events.append(("transaction_execute", sql, list(params or ())))
+        return 1
+
+    async def query(
+        self,
+        sql: str,
+        params: list[object] | None = None,
+    ) -> _FakeQueryResult:
+        self.events.append(("transaction_query", sql, list(params or ())))
+        return _FakeQueryResult({"session_id": self.session_id})
+
+    async def commit(self) -> None:
+        self.events.append(("transaction_commit", self.session_id))
+
+    async def rollback(self) -> None:
+        self.events.append(("transaction_rollback", self.session_id))
+
+
+class _FakeResultSet:
+    def __init__(
+        self,
+        index: int,
+        rows: list[dict[str, object]],
+    ) -> None:
+        self.index = index
+        self.column_names = tuple(rows[0]) if rows else ("value",)
+        self._rows = iter(rows)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> dict[str, object]:
+        try:
+            return next(self._rows)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+
+class _FakeResultStream:
+    def __init__(self, result_sets: list[_FakeResultSet]) -> None:
+        self._result_sets = iter(result_sets)
+        self.entered = False
+        self.exited = False
+        self.exit_type: type[BaseException] | None = None
+
+    async def __aenter__(self):
+        self.entered = True
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback) -> None:
+        self.exited = True
+        self.exit_type = exc_type
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> _FakeResultSet:
+        try:
+            return next(self._result_sets)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+
+class _FailingResultSet:
+    index = 0
+    column_names = ("value",)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> dict[str, object]:
+        raise RuntimeError("intentional stream failure")
+
+
+class _BlockingResultSet:
+    index = 0
+    column_names = ("value",)
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> dict[str, object]:
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+        raise AssertionError("unreachable")
+
+
+class _RouteConnection(_FakeConnection):
+    def __init__(
+        self,
+        events: list[object],
+        *,
+        block_queries: bool = False,
+        query_delay_seconds: float = 0,
+        query_error: BaseException | None = None,
+        stream_rows: list[dict[str, object]] | None = None,
+    ) -> None:
+        super().__init__(events)
+        self.block_queries = block_queries
+        self.query_delay_seconds = query_delay_seconds
+        self.query_error = query_error
+        self.query_started = asyncio.Event()
+        self.query_release = asyncio.Event()
+        self.query_cancelled = asyncio.Event()
+        self.transactions: list[_FakeTransaction] = []
+        self.stream_result = _FakeResultStream(
+            [_FakeResultSet(0, stream_rows or [{"value": 1}, {"value": 2}])]
+        )
+
+    async def query(
+        self,
+        sql: str,
+        params: list[object] | None = None,
+    ) -> _FakeQueryResult:
+        arguments = list(params or ())
+        self.events.append(("query", sql, arguments))
+        self.query_started.set()
+        if self.query_error is not None:
+            raise self.query_error
+        if self.block_queries:
+            try:
+                await self.query_release.wait()
+            except asyncio.CancelledError:
+                self.query_cancelled.set()
+                raise
+        if self.query_delay_seconds:
+            await asyncio.sleep(self.query_delay_seconds)
+        if "SUSER_SNAME" in sql:
+            row = {
+                "application_name": f"framework_app_01-{os.getpid()}",
+                "principal": "fastmssql_owner",
+                "session_id": 701,
+            }
+        else:
+            value = arguments[0] if arguments else 0
+            if isinstance(value, bytes):
+                value = value.decode("ascii")
+            row = {
+                "value": value,
+                "token": value,
+                "session_id": 702,
+            }
+        return _FakeQueryResult(row)
+
+    async def pool_stats(self) -> dict[str, object]:
+        self.events.append("pool_stats")
+        return {
+            "connected": True,
+            "connections": 2,
+            "idle_connections": 2,
+            "active_connections": 0,
+            "max_size": 4,
+            "min_idle": 0,
+            "get_started": 3,
+            "get_direct": 3,
+            "get_waited": 0,
+            "get_timed_out": 0,
+            "pending_gets": 0,
+            "get_wait_time_seconds": 0.0,
+            "connections_created": 2,
+            "connections_closed_broken": 0,
+            "connections_closed_invalid": 0,
+            "connections_closed_max_lifetime": 0,
+            "connections_closed_idle_timeout": 0,
+        }
+
+    async def operation_stats(self) -> dict[str, object]:
+        self.events.append("operation_stats")
+        return {
+            "schema_version": 2,
+            "enabled": True,
+            "bucket_bounds_seconds": [0.001, 0.01, 0.1, 1.0],
+            "operations": {},
+        }
+
+    def transaction(self) -> _FakeTransaction:
+        transaction = _FakeTransaction(
+            self.events,
+            session_id=800 + len(self.transactions),
+        )
+        self.transactions.append(transaction)
+        self.events.append("connection_transaction")
+        return transaction
+
+    async def stream(
+        self,
+        sql: str,
+        params: list[object] | None = None,
+        *,
+        buffer_size: int,
+    ) -> _FakeResultStream:
+        self.events.append(
+            ("stream", sql, list(params or ()), buffer_size)
+        )
+        return self.stream_result
+
+
+def _route_query_events(events: list[object]) -> list[tuple[object, ...]]:
+    return [
+        event
+        for event in events
+        if isinstance(event, tuple) and event and event[0] == "query"
+    ]
+
+
 def _connection_factory(
     connection: _FakeConnection,
     events: list[object],
@@ -1909,6 +2154,1017 @@ def _worker_record(
         Path(environment["FASTMSSQL_FRAMEWORK_ARTIFACT_DIR"])
         / f"{phase}-{worker_pid}.json"
     )
+
+
+@pytest.mark.asyncio
+async def test_fastapi_sql_auth_identity_value_wait_and_pool_routes_are_bounded(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    events: list[object] = []
+    connection = _RouteConnection(events)
+    application = framework_app.create_fastapi_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            ready = await client.get("/ready")
+            principal = await client.get("/principal")
+            value = await client.get("/value/731947")
+            overflow = await client.get("/value/9223372036854775808")
+            underflow = await client.get("/value/-9223372036854775809")
+            waited = await client.get("/wait/842059")
+            pool = await client.get("/pool")
+
+    assert ready.status_code == 200
+    assert ready.json() == {
+        "application_name": (
+            f"{environment['FASTMSSQL_FRAMEWORK_APPLICATION_NAME']}-{os.getpid()}"
+        ),
+        "pid": os.getpid(),
+        "pool_identity": f"{os.getpid()}-{id(connection):x}",
+        "state": "ready",
+    }
+    assert principal.json() == {
+        "application_name": ready.json()["application_name"],
+        "pid": os.getpid(),
+        "principal": "fastmssql_owner",
+        "session_id": 701,
+    }
+    assert value.json() == {"session_id": 702, "value": 731947}
+    assert overflow.status_code == 422
+    assert underflow.status_code == 422
+    assert waited.json() == {
+        "delay_ms": 100,
+        "session_id": 702,
+        "value": 842059,
+    }
+    assert pool.json() == {
+        "admission": {
+            "active": 0,
+            "capacity": 8,
+            "rejected": 0,
+        },
+        "application_name": ready.json()["application_name"],
+        "operations": {
+            "bucket_bounds_seconds": [0.001, 0.01, 0.1, 1.0],
+            "enabled": True,
+            "operations": {},
+            "schema_version": 2,
+        },
+        "pid": os.getpid(),
+        "pool": {
+            "active_connections": 0,
+            "connected": True,
+            "connections": 2,
+            "connections_closed_broken": 0,
+            "connections_closed_idle_timeout": 0,
+            "connections_closed_invalid": 0,
+            "connections_closed_max_lifetime": 0,
+            "connections_created": 2,
+            "get_direct": 3,
+            "get_started": 3,
+            "get_timed_out": 0,
+            "get_wait_time_seconds": 0.0,
+            "get_waited": 0,
+            "idle_connections": 2,
+            "max_size": 4,
+            "min_idle": 0,
+            "pending_gets": 0,
+        },
+    }
+
+    query_events = _route_query_events(events)
+    assert len(query_events) == 3
+    principal_sql, principal_params = query_events[0][1:]
+    assert "SUSER_SNAME" in principal_sql
+    assert principal_params == []
+    value_sql, value_params = query_events[1][1:]
+    assert "@P1" in value_sql
+    assert "731947" not in value_sql
+    assert value_params == [731947]
+    wait_sql, wait_params = query_events[2][1:]
+    assert "WAITFOR DELAY '00:00:00.100'" in wait_sql
+    assert "842059" not in wait_sql
+    assert wait_params == [842059]
+    rendered = "\n".join(
+        response.text for response in (ready, principal, value, waited, pool)
+    )
+    assert environment["FASTMSSQL_SQL_AUTH_OWNER_PASSWORD"] not in rendered
+    assert "SELECT" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_fastapi_transaction_route_uses_the_worker_pool_and_explicit_outcome(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    events: list[object] = []
+    connection = _RouteConnection(events)
+    application = framework_app.create_fastapi_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            committed = await client.post(
+                "/transaction/81471",
+                params={"outcome": "commit"},
+            )
+            rolled_back = await client.post(
+                "/transaction/92583",
+                params={"outcome": "rollback"},
+            )
+            invalid = await client.post(
+                "/transaction/1",
+                params={"outcome": "discard"},
+            )
+            invalid_item = await client.post(
+                "/transaction/0",
+                params={"outcome": "commit"},
+            )
+
+    assert committed.status_code == 200
+    assert committed.json() == {
+        "item_id": 81471,
+        "outcome": "commit",
+        "session_id": 800,
+    }
+    assert rolled_back.status_code == 200
+    assert rolled_back.json() == {
+        "item_id": 92583,
+        "outcome": "rollback",
+        "session_id": 801,
+    }
+    assert invalid.status_code == 422
+    assert invalid_item.status_code == 422
+    assert events.count("connection_transaction") == 2
+    assert ("transaction_commit", 800) in events
+    assert ("transaction_rollback", 801) in events
+    execute_events = [
+        event
+        for event in events
+        if isinstance(event, tuple) and event[0] == "transaction_execute"
+    ]
+    assert len(execute_events) == 2
+    for expected_item_id, event in zip((81471, 92583), execute_events):
+        _, sql, params = event
+        assert environment["FASTMSSQL_FRAMEWORK_TABLE"] in sql
+        assert "@P1" in sql and "@P2" in sql
+        assert str(expected_item_id) not in sql
+        assert params == [expected_item_id, "transaction"]
+
+
+class _DisconnectingRequest:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def is_disconnected(self) -> bool:
+        self.calls += 1
+        await asyncio.sleep(0)
+        return self.calls >= 2
+
+
+class _ConnectedRequest:
+    async def is_disconnected(self) -> bool:
+        await asyncio.sleep(0)
+        return False
+
+
+@pytest.mark.asyncio
+async def test_fastapi_cancel_route_settles_the_sql_task_after_disconnect(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    events: list[object] = []
+    connection = _RouteConnection(events, block_queries=True)
+    application = framework_app.create_fastapi_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+    )
+    endpoint = next(
+        route.endpoint
+        for route in application.routes
+        if getattr(route, "path", None) == "/cancel/{token}"
+    )
+
+    async with application.router.lifespan_context(application):
+        payload = await asyncio.wait_for(
+            endpoint(
+                request=_DisconnectingRequest(),
+                token="cancel_token_42",
+            ),
+            timeout=1,
+        )
+
+    assert payload == {"cancelled": True}
+    assert connection.query_cancelled.is_set()
+    query_event = _route_query_events(events)[0]
+    _, sql, params = query_event
+    assert "cancel_token_42" not in sql
+    assert params in ([b"cancel_token_42"], ["cancel_token_42"])
+
+
+@pytest.mark.asyncio
+async def test_fastapi_cancel_route_never_reflects_the_context_token(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    events: list[object] = []
+    connection = _RouteConnection(events)
+    application = framework_app.create_fastapi_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+    )
+    endpoint = next(
+        route.endpoint
+        for route in application.routes
+        if getattr(route, "path", None) == "/cancel/{token}"
+    )
+
+    async with application.router.lifespan_context(application):
+        payload = await endpoint(
+            request=_ConnectedRequest(),
+            token="never_reflect_this_token",
+        )
+
+    assert payload == {"cancelled": False, "session_id": 702}
+    assert "never_reflect_this_token" not in json.dumps(payload)
+
+
+@pytest.mark.asyncio
+async def test_fastapi_saturation_rejects_excess_and_recovers_capacity(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    environment["FASTMSSQL_FRAMEWORK_WORKER_COUNT"] = "1"
+    environment["FASTMSSQL_FRAMEWORK_GLOBAL_CONNECTION_BUDGET"] = "1"
+    events: list[object] = []
+    connection = _RouteConnection(events, block_queries=True)
+    application = framework_app.create_fastapi_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            holder = asyncio.create_task(client.get("/saturated/31"))
+            await asyncio.wait_for(connection.query_started.wait(), timeout=1)
+            waiter = asyncio.create_task(client.get("/saturated/47"))
+            deadline = time.monotonic() + 1
+            while len(_route_query_events(events)) < 2:
+                assert time.monotonic() < deadline
+                await asyncio.sleep(0.001)
+            started = time.monotonic()
+            rejected = await client.get("/saturated/53")
+            rejection_seconds = time.monotonic() - started
+            connection.query_release.set()
+            holder_response = await asyncio.wait_for(holder, timeout=1)
+            waiter_response = await asyncio.wait_for(waiter, timeout=1)
+            recovered = await client.get("/saturated/59")
+            pool = await client.get("/pool")
+
+    assert holder_response.status_code == 200
+    assert holder_response.json() == {"session_id": 702, "value": 31}
+    assert waiter_response.status_code == 200
+    assert waiter_response.json() == {"session_id": 702, "value": 47}
+    assert rejected.status_code == 503
+    assert rejected.json() == {"error": "saturated"}
+    assert rejection_seconds < 0.5
+    assert recovered.status_code == 200
+    assert recovered.json() == {"session_id": 702, "value": 59}
+    assert pool.json()["admission"] == {
+        "active": 0,
+        "capacity": 2,
+        "rejected": 1,
+    }
+    query_events = _route_query_events(events)
+    assert [event[2] for event in query_events] == [
+        [31],
+        [47],
+        [59],
+    ]
+    assert all(
+        "WAITFOR DELAY '00:00:00.100'" in str(event[1])
+        for event in query_events
+    )
+
+
+@pytest.mark.asyncio
+async def test_fastapi_stream_route_closes_bounded_result_stream(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    events: list[object] = []
+    connection = _RouteConnection(
+        events,
+        stream_rows=[{"value": 11}, {"value": 13}],
+    )
+    application = framework_app.create_fastapi_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/stream", params={"rows": 173})
+            invalid = await client.get("/stream", params={"rows": 0})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith(
+        "application/x-ndjson"
+    )
+    assert [json.loads(line) for line in response.text.splitlines()] == [
+        {"result_set": 0, "row": {"value": 11}},
+        {"result_set": 0, "row": {"value": 13}},
+    ]
+    assert invalid.status_code == 422
+    stream_event = next(event for event in events if event[0] == "stream")
+    _, sql, params, buffer_size = stream_event
+    assert "@P1" in sql
+    assert "173" not in sql
+    assert params == [173]
+    assert buffer_size == 8
+    assert connection.stream_result.entered is True
+    assert connection.stream_result.exited is True
+
+
+@pytest.mark.asyncio
+async def test_fastapi_stream_closes_driver_stream_when_generator_is_closed(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    events: list[object] = []
+    connection = _RouteConnection(
+        events,
+        stream_rows=[{"value": 11}, {"value": 13}],
+    )
+    application = framework_app.create_fastapi_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+    )
+    endpoint = next(
+        route.endpoint
+        for route in application.routes
+        if getattr(route, "path", None) == "/stream"
+    )
+
+    async with application.router.lifespan_context(application):
+        response = await endpoint(rows=2)
+        iterator = response.body_iterator
+        first = await anext(iterator)
+        await iterator.aclose()
+
+    assert json.loads(first) == {"result_set": 0, "row": {"value": 11}}
+    assert connection.stream_result.entered is True
+    assert connection.stream_result.exited is True
+    assert connection.stream_result.exit_type is GeneratorExit
+
+
+@pytest.mark.asyncio
+async def test_fastapi_stream_closes_driver_stream_on_iteration_error(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    events: list[object] = []
+    connection = _RouteConnection(events)
+    connection.stream_result = _FakeResultStream([_FailingResultSet()])
+    application = framework_app.create_fastapi_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+    )
+    endpoint = next(
+        route.endpoint
+        for route in application.routes
+        if getattr(route, "path", None) == "/stream"
+    )
+
+    async with application.router.lifespan_context(application):
+        response = await endpoint(rows=1)
+        with pytest.raises(RuntimeError, match="intentional stream failure"):
+            await anext(response.body_iterator)
+
+    assert connection.stream_result.entered is True
+    assert connection.stream_result.exited is True
+    assert connection.stream_result.exit_type is RuntimeError
+
+
+@pytest.mark.asyncio
+async def test_fastapi_stream_closes_driver_stream_on_task_cancellation(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    events: list[object] = []
+    blocking_result_set = _BlockingResultSet()
+    connection = _RouteConnection(events)
+    connection.stream_result = _FakeResultStream([blocking_result_set])
+    application = framework_app.create_fastapi_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+    )
+    endpoint = next(
+        route.endpoint
+        for route in application.routes
+        if getattr(route, "path", None) == "/stream"
+    )
+
+    async with application.router.lifespan_context(application):
+        response = await endpoint(rows=1)
+        pending_row = asyncio.create_task(anext(response.body_iterator))
+        await asyncio.wait_for(blocking_result_set.started.wait(), timeout=1)
+        pending_row.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending_row
+
+    assert blocking_result_set.cancelled.is_set()
+    assert connection.stream_result.entered is True
+    assert connection.stream_result.exited is True
+    assert connection.stream_result.exit_type is asyncio.CancelledError
+
+
+@pytest.mark.asyncio
+async def test_fastapi_error_response_never_exposes_exception_or_credentials(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    secret = environment["FASTMSSQL_SQL_AUTH_OWNER_PASSWORD"]
+    sql_sentinel = "SELECT private_framework_payload"
+    events: list[object] = []
+    connection = _RouteConnection(
+        events,
+        query_error=RuntimeError(f"password={secret}; {sql_sentinel}"),
+    )
+    application = framework_app.create_fastapi_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(
+            app=application,
+            raise_app_exceptions=False,
+        )
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+                response = await client.get("/error")
+
+    assert response.status_code == 500
+    assert response.json() == {"error": "internal_error"}
+    assert secret not in response.text
+    assert sql_sentinel not in response.text
+
+
+def test_flask_loop_gather_and_errors_preserve_wsgi_contract(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    events: list[object] = []
+    connection = _RouteConnection(events, query_delay_seconds=0.015)
+    application = framework_app.create_flask_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+    )
+    worker = SimpleNamespace(wsgi=application, pid=os.getpid())
+    gunicorn_conf.post_worker_init(worker)
+    try:
+        client = application.test_client()
+        ready = client.get("/ready")
+        principal = client.get("/principal")
+        value = client.get("/value/19")
+        waited = client.get("/wait/23")
+        pool = client.get("/pool")
+        loop = client.get("/loop")
+        gathered = client.get("/gather")
+    finally:
+        gunicorn_conf.worker_exit(None, worker)
+
+    assert ready.status_code == 200
+    assert ready.get_json()["state"] == "ready"
+    assert principal.get_json()["principal"] == "fastmssql_owner"
+    assert value.get_json() == {"session_id": 702, "value": 19}
+    assert waited.get_json() == {
+        "delay_ms": 100,
+        "session_id": 702,
+        "value": 23,
+    }
+    assert pool.get_json()["admission"] == {
+        "active": 0,
+        "capacity": 8,
+        "rejected": 0,
+    }
+    assert loop.status_code == 200
+    assert loop.get_json()["loop_id"] > 0
+    assert loop.get_json()["value"] == 17
+    assert gathered.status_code == 200
+    payload = gathered.get_json()
+    assert payload["sequential"] == [0, 1, 2, 3]
+    assert payload["concurrent"] == [0, 1, 2, 3]
+    assert payload["concurrent_seconds"] < payload["sequential_seconds"] * 0.6
+
+    error_environment = _valid_worker_environment(tmp_path / "error")
+    secret = error_environment["FASTMSSQL_SQL_AUTH_OWNER_PASSWORD"]
+    error_connection = _RouteConnection(
+        [],
+        query_error=RuntimeError(f"password={secret}; SELECT private_payload"),
+    )
+    error_application = framework_app.create_flask_app(
+        environment=error_environment,
+        connection_factory=_connection_factory(error_connection, []),
+    )
+    error_worker = SimpleNamespace(wsgi=error_application, pid=os.getpid())
+    gunicorn_conf.post_worker_init(error_worker)
+    try:
+        error_response = error_application.test_client().get("/error")
+    finally:
+        gunicorn_conf.worker_exit(None, error_worker)
+    assert error_response.status_code == 500
+    assert error_response.get_json() == {"error": "internal_error"}
+    assert secret not in error_response.get_data(as_text=True)
+
+
+def test_flask_numeric_routes_enforce_sql_bigint_bounds(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    events: list[object] = []
+    connection = _RouteConnection(events)
+    application = framework_app.create_flask_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+    )
+    worker = SimpleNamespace(wsgi=application, pid=os.getpid())
+    gunicorn_conf.post_worker_init(worker)
+    try:
+        client = application.test_client()
+        minimum_value = client.get(f"/value/{-(2**63)}")
+        maximum_wait = client.get(f"/wait/{2**63 - 1}")
+        maximum_item = client.post(
+            f"/transaction/{2**63 - 1}?outcome=rollback"
+        )
+        invalid = [
+            client.get(f"/value/{-(2**63) - 1}"),
+            client.get(f"/value/{2**63}"),
+            client.get(f"/wait/{-(2**63) - 1}"),
+            client.get(f"/wait/{2**63}"),
+            client.post("/transaction/0?outcome=commit"),
+            client.post(f"/transaction/{2**63}?outcome=commit"),
+            client.get(f"/value/{'9' * 4_301}"),
+        ]
+    finally:
+        gunicorn_conf.worker_exit(None, worker)
+
+    assert minimum_value.status_code == 200
+    assert minimum_value.get_json()["value"] == -(2**63)
+    assert maximum_wait.status_code == 200
+    assert maximum_wait.get_json()["value"] == 2**63 - 1
+    assert maximum_item.status_code == 200
+    assert maximum_item.get_json()["item_id"] == 2**63 - 1
+    assert all(response.status_code == 422 for response in invalid)
+    assert all(
+        response.get_json() == {"error": "invalid_bigint"}
+        for response in invalid
+    )
+
+
+class _FakeObserverQueryResult:
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self._rows = rows
+
+    def all(self) -> list[dict[str, object]]:
+        return list(self._rows)
+
+
+class _FakeObserverSource:
+    def __init__(
+        self,
+        samples: list[list[dict[str, object]]],
+    ) -> None:
+        self._samples = iter(samples)
+        self._last: list[dict[str, object]] = []
+        self.calls: list[tuple[str, list[object]]] = []
+
+    async def query(
+        self,
+        sql: str,
+        params: list[object] | None = None,
+    ) -> _FakeObserverQueryResult:
+        self.calls.append((sql, list(params or ())))
+        try:
+            self._last = next(self._samples)
+        except StopIteration:
+            pass
+        return _FakeObserverQueryResult(self._last)
+
+
+def _observer_rows(prefix: str, observer_name: str) -> list[dict[str, object]]:
+    return [
+        {
+            "application_name": f"{prefix}-101",
+            "context_info": b"cancel_token_42\0\0",
+            "has_request": 1,
+            "host_process_id": 0,
+            "session_id": 701,
+            "sql_text": "SELECT private_framework_payload",
+        },
+        {
+            "application_name": f"{prefix}-101",
+            "context_info": b"",
+            "has_request": 0,
+            "host_process_id": 0,
+            "session_id": 702,
+        },
+        {
+            "application_name": f"{prefix}-202",
+            "context_info": b"transaction:8:commit\0",
+            "has_request": 1,
+            "host_process_id": 0,
+            "session_id": 703,
+        },
+        {
+            "application_name": f"{prefix}ish-303",
+            "context_info": b"near-prefix",
+            "has_request": 1,
+            "host_process_id": 303,
+            "session_id": 704,
+        },
+        {
+            "application_name": observer_name,
+            "context_info": b"observer",
+            "has_request": 1,
+            "host_process_id": os.getpid(),
+            "session_id": 705,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sql_observer_filters_exact_workers_tracks_maxima_and_is_private() -> None:
+    runner = _load_production_framework_runner()
+    prefix = "fm-run-native"
+    observer_name = f"{prefix}-observer"
+    first_rows = _observer_rows(prefix, observer_name)
+    second_rows = [first_rows[2]]
+    source = _FakeObserverSource([first_rows, second_rows])
+    observer = runner.SqlServerObserver(
+        source=source,
+        worker_prefix=prefix,
+        observer_application_name=observer_name,
+    )
+
+    first = await observer.sample()
+    second = await observer.sample()
+
+    assert first.to_record() == {
+        "applications": [
+            {
+                "application_name": f"{prefix}-101",
+                "host_process_ids": [0],
+                "requests": 1,
+                "sessions": 2,
+            },
+            {
+                "application_name": f"{prefix}-202",
+                "host_process_ids": [0],
+                "requests": 1,
+                "sessions": 1,
+            },
+        ],
+        "current_requests": 2,
+        "current_sessions": 3,
+        "maximum_requests": 2,
+        "maximum_sessions": 3,
+        "request_context_token_sha256": [
+            hashlib.sha256(b"cancel_token_42").hexdigest(),
+            hashlib.sha256(b"transaction:8:commit").hexdigest(),
+        ],
+    }
+    assert first.request_context_tokens == (
+        "cancel_token_42",
+        "transaction:8:commit",
+    )
+    assert second.current_sessions == 1
+    assert second.current_requests == 1
+    assert second.maximum_sessions == 3
+    assert second.maximum_requests == 2
+
+    query_sql, query_params = source.calls[0]
+    assert "sys.dm_exec_sessions" in query_sql
+    assert "sys.dm_exec_requests" in query_sql
+    assert "dm_exec_sql_text" not in query_sql
+    assert prefix not in query_sql
+    assert query_params == [f"{prefix}-", observer_name]
+    persisted = json.dumps(first.to_record(), sort_keys=True)
+    assert "sql_text" not in persisted
+    assert "private_framework_payload" not in persisted
+    assert "cancel_token_42" not in persisted
+    assert "transaction:8:commit" not in persisted
+    assert observer_name not in persisted
+    assert f"{prefix}ish-303" not in persisted
+
+    ready_records = [
+        {
+            "phase": "ready",
+            "pid": 101,
+            "worker_application_name": f"{prefix}-101",
+        },
+        {
+            "phase": "ready",
+            "pid": 202,
+            "worker_application_name": f"{prefix}-202",
+        },
+    ]
+    assert runner.reconcile_worker_sessions(first, ready_records) == (
+        (f"{prefix}-101", 101),
+        (f"{prefix}-202", 202),
+    )
+    mismatched = [*ready_records]
+    mismatched[1] = {**mismatched[1], "pid": 999}
+    with pytest.raises(
+        runner.WorkerEvidenceError,
+        match="worker SQL sessions do not match ready records",
+    ):
+        runner.reconcile_worker_sessions(first, mismatched)
+
+
+@pytest.mark.asyncio
+async def test_sql_observer_zero_session_wait_is_bounded() -> None:
+    runner = _load_production_framework_runner()
+    prefix = "fm-run-native"
+    observer_name = f"{prefix}-observer"
+    clock_value = 0.0
+
+    def clock() -> float:
+        return clock_value
+
+    async def advance(delay: float) -> None:
+        nonlocal clock_value
+        clock_value += delay
+
+    clearing_source = _FakeObserverSource(
+        [_observer_rows(prefix, observer_name), []]
+    )
+    clearing = runner.SqlServerObserver(
+        source=clearing_source,
+        worker_prefix=prefix,
+        observer_application_name=observer_name,
+        poll_interval_seconds=0.01,
+        clock=clock,
+        sleep=advance,
+    )
+    zero = await clearing.wait_for_zero_sessions(timeout_seconds=0.05)
+    assert zero.current_sessions == 0
+    assert len(clearing_source.calls) == 2
+
+    clock_value = 0.0
+    persistent_source = _FakeObserverSource(
+        [_observer_rows(prefix, observer_name)]
+    )
+    persistent = runner.SqlServerObserver(
+        source=persistent_source,
+        worker_prefix=prefix,
+        observer_application_name=observer_name,
+        poll_interval_seconds=0.01,
+        clock=clock,
+        sleep=advance,
+    )
+    with pytest.raises(
+        runner.ReadinessTimeoutError,
+        match="worker SQL sessions did not reach zero within the bound",
+    ) as captured:
+        await persistent.wait_for_zero_sessions(timeout_seconds=0.025)
+    assert clock_value == pytest.approx(0.025)
+    assert "SELECT" not in str(captured.value)
+    assert "password" not in str(captured.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_sql_observer_deadline_cancels_a_hanging_sample() -> None:
+    runner = _load_production_framework_runner()
+
+    class HangingSource:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.cancelled = asyncio.Event()
+
+        async def query(
+            self,
+            sql: str,
+            params: list[object] | None = None,
+        ) -> _FakeObserverQueryResult:
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+            raise AssertionError("unreachable")
+
+    source = HangingSource()
+    observer = runner.SqlServerObserver(
+        source=source,
+        worker_prefix="fm-run-native",
+        observer_application_name="fm-run-native-observer",
+        poll_interval_seconds=0.01,
+    )
+
+    with pytest.raises(
+        runner.ReadinessTimeoutError,
+        match="worker SQL sessions did not reach zero within the bound",
+    ):
+        await asyncio.wait_for(
+            observer.wait_for_zero_sessions(timeout_seconds=0.01),
+            timeout=0.5,
+        )
+
+    assert source.started.is_set()
+    assert source.cancelled.is_set()
+
+
+def test_observer_connection_factory_lazily_uses_one_installed_wheel_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _load_production_framework_runner()
+    imports: list[str] = []
+    constructor: dict[str, object] = {}
+
+    class FakeConfig:
+        def __init__(self, **values: object) -> None:
+            self.values = values
+
+    class FakeSslConfig:
+        @staticmethod
+        def development() -> str:
+            return "development-tls"
+
+    def fake_connection(**values: object) -> object:
+        constructor.update(values)
+        return object()
+
+    fake_driver = SimpleNamespace(
+        Connection=fake_connection,
+        LifecycleConfig=FakeConfig,
+        PoolConfig=FakeConfig,
+        SslConfig=FakeSslConfig,
+        TimeoutConfig=FakeConfig,
+    )
+
+    def fake_import(name: str):
+        imports.append(name)
+        return fake_driver
+
+    monkeypatch.setattr(runner.importlib, "import_module", fake_import)
+    settings = runner.SqlAuthObserverSettings(
+        host="127.0.0.1",
+        port=14334,
+        database="fastmssql_validation",
+        username="fastmssql_observer",
+        password="private-observer-password",
+    )
+    connection = runner.create_observer_connection(
+        settings,
+        application_name="fm-run-native-observer",
+    )
+
+    assert connection is not None
+    assert imports == ["fastmssql"]
+    assert constructor["application_name"] == "fm-run-native-observer"
+    assert constructor["password"] == "private-observer-password"
+    assert constructor["pool_config"].values == {
+        "connection_timeout_secs": 5,
+        "idle_timeout_secs": None,
+        "max_lifetime_secs": None,
+        "max_size": 1,
+        "min_idle": 0,
+        "retry_connection": False,
+    }
+    assert "private-observer-password" not in repr(settings)
+
+
+def test_observer_configuration_and_ready_records_fail_closed() -> None:
+    runner = _load_production_framework_runner()
+    valid = {
+        "host": "127.0.0.1",
+        "port": 14334,
+        "database": "fastmssql_validation",
+        "username": "fastmssql_owner",
+        "password": "private-observer-password",
+    }
+    invalid_values = (
+        ("host", object()),
+        ("host", "server;unsafe"),
+        ("port", True),
+        ("database", 7),
+        ("username", "unsafe user"),
+        ("password", 7),
+        ("password", "contains\0nul"),
+    )
+    for field_name, value in invalid_values:
+        with pytest.raises(runner.RunnerConfigurationError) as captured:
+            runner.SqlAuthObserverSettings(**{**valid, field_name: value})
+        assert valid["password"] not in str(captured.value)
+
+    source = _FakeObserverSource([[]])
+    with pytest.raises(runner.RunnerConfigurationError):
+        runner.SqlServerObserver(
+            source=source,
+            worker_prefix=object(),
+            observer_application_name="fm-run-observer",
+        )
+    with pytest.raises(runner.RunnerConfigurationError):
+        runner.create_observer_connection(
+            runner.SqlAuthObserverSettings(**valid),
+            application_name=None,
+        )
+
+    empty = runner.SqlObserverSample(
+        applications=(),
+        current_sessions=0,
+        current_requests=0,
+        maximum_sessions=0,
+        maximum_requests=0,
+        request_context_tokens=(),
+    )
+    for malformed in (
+        [],
+        [
+            {
+                "phase": "ready",
+                "pid": True,
+                "worker_application_name": "fm-run-1",
+            }
+        ],
+        [
+            {
+                "phase": "ready",
+                "pid": 1,
+                "worker_application_name": 1,
+            }
+        ],
+    ):
+        with pytest.raises(
+            runner.WorkerEvidenceError,
+            match="worker SQL sessions do not match ready records",
+        ):
+            runner.reconcile_worker_sessions(empty, malformed)
+
+
+@pytest.mark.asyncio
+async def test_worker_application_name_is_recorded_and_bounded(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    events: list[object] = []
+    connection = _FakeConnection(events)
+    application = framework_app.create_fastapi_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+    )
+    async with application.router.lifespan_context(application):
+        ready = json.loads(
+            _worker_record(environment, "ready").read_text(encoding="utf-8")
+        )
+    assert ready["worker_application_name"] == (
+        f"{environment['FASTMSSQL_FRAMEWORK_APPLICATION_NAME']}-{os.getpid()}"
+    )
+
+    overlong = _valid_worker_environment(tmp_path / "overlong")
+    overlong["FASTMSSQL_FRAMEWORK_APPLICATION_NAME"] = "a" * 128
+    rejected_events: list[object] = []
+    rejected = framework_app.create_fastapi_app(
+        environment=overlong,
+        connection_factory=_connection_factory(
+            _FakeConnection(rejected_events),
+            rejected_events,
+        ),
+    )
+    with pytest.raises(
+        framework_app.ConfigurationError,
+        match="worker application name exceeds SQL Server's 128-character limit",
+    ):
+        async with rejected.router.lifespan_context(rejected):
+            pytest.fail("overlong worker application name became ready")
+    assert rejected_events == []
 
 
 @pytest.mark.asyncio

@@ -52,6 +52,50 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Production framework SQL-auth routes and observer
+
+- Added worker-local SQL-auth routes for readiness, SQL principal/application
+  identity, bounded BIGINT values and allowlisted delays, pool/operation
+  snapshots, pooled commit/rollback transactions, disconnect-aware native
+  ASGI cancellation, deterministic `P + Q` admission backed by an allowlisted
+  SQL wait with structured 503, bounded NDJSON `ResultStream` output with
+  cleanup on exhaustion, close, error and cancellation, and privacy-safe
+  errors.
+- Added the Flask WSGI compatibility routes, including per-request event-loop
+  identity and a measured sequential-versus-`asyncio.gather` SQL workload;
+  these routes make no inter-request ASGI-concurrency claim. Flask value/wait
+  paths enforce the complete signed SQL `BIGINT` interval and transaction IDs
+  enforce `1..BIGINT_MAX`, with deterministic 422 rejection before the driver.
+- Worker records now include the exact validated `prefix-PID` SQL Server
+  application name. Names that would exceed SQL Server's 128-character limit
+  fail before connection construction or false readiness.
+- Added an independent, lazily imported installed-wheel FastMssql observer
+  with a size-one pool. It queries only `sys.dm_exec_sessions` and
+  `sys.dm_exec_requests`, filters the exact run prefix twice, excludes its own
+  session, tracks aggregate maxima, reconciles worker names/PIDs and performs
+  bounded zero-session waits whose deadline includes each DMV query, without
+  persisting SQL text, raw context tokens or credentials.
+- Vendored Tiberius currently emits LOGIN7 `client_pid=0`, so OS PID evidence
+  is correctly reconciled from the application-name suffix and atomic ready
+  record; DMV `host_process_id` is retained only as diagnostic data.
+- Focused route/observer tests passed, and the cumulative implemented Task 6
+  contract passed 107 tests with only nine future-task gates deselected. The
+  dedicated Docker SQL Server 2022 smoke passed one real Uvicorn/asyncio
+  worker with SQL authentication: principal and parameterized value were
+  exact, a size-one driver pool exposed exactly one pending waiter at
+  application admission capacity two, the surplus request received 503 and
+  recovery succeeded, observer maximum was one worker session,
+  ready/shutdown PIDs reconciled, and post-run checks found zero matching SQL
+  sessions and no Uvicorn process.
+- Context7 was checked for current FastAPI lifespan/streaming/disconnect and
+  Flask async-view behavior. The real smoke found no FastMssql runtime defect;
+  its initial harness failures were isolated to selecting the wrong local
+  venv and then using the supervisor's live-wait API after controlled exit.
+- This task changes only the repository-owned production-framework harness,
+  runner and tests. It changes no FastMssql/Tiberius runtime, package metadata,
+  displayed `0.7.7` version, release, published artifact or
+  original-repository state.
+
 ### Production framework external-process supervisor
 
 - Added a schema-1, fail-closed process runner with closed operation bounds,

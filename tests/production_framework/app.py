@@ -1,24 +1,27 @@
 """Worker-local application interfaces for the production framework matrix.
 
-The structural ``/package`` route proves installed-wheel provenance without a
-database. SQL-auth behavior routes are introduced by the next TDD task. The
-shared lifecycle keeps connection construction outside module import.
+The routes exercise one worker-owned FastMssql pool through real framework
+servers. The shared lifecycle keeps connection construction outside module
+import and every response is intentionally safe to persist as test evidence.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 import importlib.metadata
 import json
+import logging
 import os
 from pathlib import Path
 import re
 import sys
 import tempfile
-from typing import Any, Protocol
+import time
+from typing import Any, Literal, Protocol
 
 from asgiref.wsgi import WsgiToAsgi
 import fastmssql
@@ -30,8 +33,10 @@ from fastmssql import (
     SslConfig,
     TimeoutConfig,
 )
-from fastapi import FastAPI
-from flask import Flask
+from fastapi import FastAPI, HTTPException, Path as PathParameter, Query, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from flask import Flask, request as flask_request
+from werkzeug.exceptions import HTTPException as WerkzeugHttpException
 
 
 COMMON_ENVIRONMENT_KEYS = (
@@ -60,9 +65,67 @@ SQL_DELAY_MILLISECONDS = frozenset({0, 50, 100, 200, 250, 500, 1_000, 2_000, 5_0
 SAFE_RUN_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 SAFE_SQL_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 SAFE_SERVER = re.compile(r"[A-Za-z0-9][A-Za-z0-9.:[\]_-]{0,252}")
+SAFE_CANCEL_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}")
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 WHEEL_FILENAME_PATTERN = re.compile(r"fastmssql-[0-9]+\.[0-9]+\.[0-9]+-.+\.whl")
+ADMITTED_WAITER_RATIO = 1
+STREAM_BUFFER_ROWS = 8
+MAX_STREAM_ROWS = 10_000
+MAX_SQL_SERVER_APPLICATION_NAME = 128
+MIN_SQL_BIGINT = -(2**63)
+MAX_SQL_BIGINT = 2**63 - 1
+SIGNED_DECIMAL_INTEGER = re.compile(r"-?[0-9]+")
+LOGGER = logging.getLogger("fastmssql.production_framework")
+
+WAIT_PREFIX_BY_MILLISECONDS = {
+    0: "",
+    50: "WAITFOR DELAY '00:00:00.050'; ",
+    100: "WAITFOR DELAY '00:00:00.100'; ",
+    200: "WAITFOR DELAY '00:00:00.200'; ",
+    250: "WAITFOR DELAY '00:00:00.250'; ",
+    500: "WAITFOR DELAY '00:00:00.500'; ",
+    1_000: "WAITFOR DELAY '00:00:01.000'; ",
+    2_000: "WAITFOR DELAY '00:00:02.000'; ",
+    5_000: "WAITFOR DELAY '00:00:05.000'; ",
+}
+
+PRINCIPAL_SQL = (
+    "SELECT CAST(SUSER_SNAME() AS NVARCHAR(128)) AS principal, "
+    "CAST(APP_NAME() AS NVARCHAR(128)) AS application_name, "
+    "@@SPID AS session_id"
+)
+VALUE_SQL = "SELECT CAST(@P1 AS BIGINT) AS value, @@SPID AS session_id"
+CANCEL_SQL = (
+    "SET CONTEXT_INFO @P1; "
+    "WAITFOR DELAY '00:00:05.000'; "
+    "SELECT @@SPID AS session_id"
+)
+STREAM_SQL = """
+WITH generated AS (
+    SELECT CAST(1 AS BIGINT) AS value
+    UNION ALL
+    SELECT value + 1 FROM generated WHERE value < @P1
+)
+SELECT value FROM generated ORDER BY value OPTION (MAXRECURSION 0)
+""".strip()
+ERROR_SQL = "SELECT value FROM dbo.fastmssql_framework_intentional_missing_table"
+
+
+def _bounded_sql_bigint(
+    raw_value: str,
+    *,
+    minimum: int = MIN_SQL_BIGINT,
+) -> int | None:
+    if (
+        len(raw_value) > len(str(MIN_SQL_BIGINT))
+        or SIGNED_DECIMAL_INTEGER.fullmatch(raw_value) is None
+    ):
+        return None
+    value = int(raw_value)
+    if value < minimum or value > MAX_SQL_BIGINT:
+        return None
+    return value
 
 
 class ConfigurationError(ValueError):
@@ -107,6 +170,26 @@ class DriverConnection(Protocol):
     async def connect(self, *, validate: bool = True) -> None: ...
 
     async def disconnect(self) -> None: ...
+
+    async def query(
+        self,
+        sql: str,
+        params: list[object] | None = None,
+    ) -> Any: ...
+
+    async def pool_stats(self) -> dict[str, object]: ...
+
+    async def operation_stats(self) -> dict[str, object]: ...
+
+    def transaction(self) -> Any: ...
+
+    async def stream(
+        self,
+        sql: str,
+        params: list[object] | None = None,
+        *,
+        buffer_size: int,
+    ) -> Any: ...
 
 
 class ConnectionFactory(Protocol):
@@ -465,13 +548,22 @@ def _default_connection_factory(
         database=database.database,
         username=database.username,
         password=database.password,
-        application_name=f"{config.application_name}-{pid}",
+        application_name=_worker_application_name(config, pid),
         ssl_config=SslConfig.development(),
         pool_config=driver.pool,
         lifecycle_config=driver.lifecycle,
         timeout_config=driver.timeouts,
         operation_metrics_config=driver.operation_metrics,
     )
+
+
+def _worker_application_name(config: WorkerConfig, pid: int) -> str:
+    application_name = f"{config.application_name}-{pid}"
+    if len(application_name) > MAX_SQL_SERVER_APPLICATION_NAME:
+        raise ConfigurationError(
+            "worker application name exceeds SQL Server's 128-character limit"
+        )
+    return application_name
 
 
 @dataclass
@@ -488,6 +580,7 @@ class WorkerLifecycle:
         repr=False,
     )
     pool_identity: str | None = field(default=None, init=False)
+    worker_application_name: str | None = field(default=None, init=False)
 
     def _record(self, phase: str) -> None:
         destination = self.config.artifact_directory / f"{phase}-{self.pid}.json"
@@ -500,6 +593,7 @@ class WorkerLifecycle:
             "phase": phase,
             "pid": self.pid,
             "pool_identity": self.pool_identity,
+            "worker_application_name": self.worker_application_name,
         }
         temporary_path: Path | None = None
         try:
@@ -536,6 +630,10 @@ class WorkerLifecycle:
             )
         self.state = WorkerState.STARTING
         try:
+            self.worker_application_name = _worker_application_name(
+                self.config,
+                self.pid,
+            )
             if self.config.database_mode is DatabaseMode.SQL_AUTH:
                 connection = self.connection_factory(self.config, self.pid)
                 self.connection = connection
@@ -581,6 +679,14 @@ class WorkerLifecycle:
         if self.state is not WorkerState.READY:
             raise WorkerLifecycleError("worker lifecycle is not ready")
 
+    def require_connection(self) -> DriverConnection:
+        self.ensure_ready()
+        if self.connection is None:
+            raise WorkerLifecycleError(
+                "SQL-auth route is unavailable in offline mode"
+            )
+        return self.connection
+
     @asynccontextmanager
     async def lifespan(self) -> AsyncIterator[WorkerLifecycle]:
         await self.start()
@@ -603,6 +709,267 @@ async def worker_lifespan(
         await lifecycle.stop()
 
 
+def _result_row(result: Any) -> Any:
+    row = result.fetchone()
+    if row is None:
+        raise WorkerLifecycleError("SQL query returned no row")
+    return row
+
+
+def _stream_row_record(row: Any, column_names: tuple[str, ...]) -> dict[str, Any]:
+    if isinstance(row, Mapping):
+        return dict(row)
+    to_dict = getattr(row, "to_dict", None)
+    if callable(to_dict):
+        converted = to_dict()
+        if isinstance(converted, dict):
+            return converted
+    return {name: row[index] for index, name in enumerate(column_names)}
+
+
+async def _cancel_and_settle(task: asyncio.Task[Any]) -> None:
+    if not task.done():
+        task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        return
+
+
+async def _wait_for_disconnect(request: Request) -> None:
+    while True:
+        if await request.is_disconnected():
+            return
+        await asyncio.sleep(0.01)
+
+
+@dataclass(slots=True)
+class WorkerRouteState:
+    """Common SQL behavior backed by exactly one worker-local pool."""
+
+    config: WorkerConfig
+    lifecycle: WorkerLifecycle
+    admission: asyncio.BoundedSemaphore = field(init=False, repr=False)
+    admission_active: int = field(default=0, init=False)
+    admission_rejected: int = field(default=0, init=False)
+
+    def __post_init__(self) -> None:
+        self.admission = asyncio.BoundedSemaphore(self.admission_capacity)
+
+    @property
+    def application_name(self) -> str:
+        application_name = self.lifecycle.worker_application_name
+        if application_name is None:
+            raise WorkerLifecycleError("worker application name is unavailable")
+        return application_name
+
+    @property
+    def admission_capacity(self) -> int:
+        waiter_capacity = (
+            self.config.pool_max_per_worker * ADMITTED_WAITER_RATIO
+        )
+        return self.config.pool_max_per_worker + waiter_capacity
+
+    def ready_payload(self) -> dict[str, object]:
+        self.lifecycle.ensure_ready()
+        return {
+            "application_name": self.application_name,
+            "pid": self.lifecycle.pid,
+            "pool_identity": self.lifecycle.pool_identity,
+            "state": self.lifecycle.state.value,
+        }
+
+    async def principal_payload(self) -> dict[str, object]:
+        connection = self.lifecycle.require_connection()
+        row = _result_row(await connection.query(PRINCIPAL_SQL))
+        database_application_name = str(row["application_name"])
+        if database_application_name != self.application_name:
+            raise WorkerLifecycleError(
+                "SQL session application name does not match its worker"
+            )
+        return {
+            "application_name": database_application_name,
+            "pid": self.lifecycle.pid,
+            "principal": str(row["principal"]),
+            "session_id": int(row["session_id"]),
+        }
+
+    async def value_payload(self, value: int) -> dict[str, int]:
+        connection = self.lifecycle.require_connection()
+        row = _result_row(await connection.query(VALUE_SQL, [value]))
+        return {
+            "session_id": int(row["session_id"]),
+            "value": int(row["value"]),
+        }
+
+    async def wait_payload(self, value: int) -> dict[str, int]:
+        connection = self.lifecycle.require_connection()
+        delay_prefix = WAIT_PREFIX_BY_MILLISECONDS[self.config.sql_delay_ms]
+        row = _result_row(
+            await connection.query(f"{delay_prefix}{VALUE_SQL}", [value])
+        )
+        return {
+            "delay_ms": self.config.sql_delay_ms,
+            "session_id": int(row["session_id"]),
+            "value": int(row["value"]),
+        }
+
+    async def pool_payload(self) -> dict[str, object]:
+        connection = self.lifecycle.require_connection()
+        pool = await connection.pool_stats()
+        operations = await connection.operation_stats()
+        return {
+            "admission": {
+                "active": self.admission_active,
+                "capacity": self.admission_capacity,
+                "rejected": self.admission_rejected,
+            },
+            "application_name": self.application_name,
+            "operations": dict(operations),
+            "pid": self.lifecycle.pid,
+            "pool": dict(pool),
+        }
+
+    async def transaction_payload(
+        self,
+        item_id: int,
+        outcome: Literal["commit", "rollback"],
+    ) -> dict[str, object]:
+        connection = self.lifecycle.require_connection()
+        delay_prefix = WAIT_PREFIX_BY_MILLISECONDS[self.config.sql_delay_ms]
+        table_name = self.config.table_name
+        async with connection.transaction() as transaction:
+            await transaction.execute(
+                f"INSERT INTO {table_name} (id, value) VALUES (@P1, @P2)",
+                [item_id, "transaction"],
+            )
+            context_token = f"transaction:{item_id}:{outcome}".encode("ascii")
+            row = _result_row(
+                await transaction.query(
+                    (
+                        f"SET CONTEXT_INFO @P1; {delay_prefix}"
+                        "SELECT @@SPID AS session_id"
+                    ),
+                    [context_token],
+                )
+            )
+            if outcome == "commit":
+                await transaction.commit()
+            else:
+                await transaction.rollback()
+        return {
+            "item_id": item_id,
+            "outcome": outcome,
+            "session_id": int(row["session_id"]),
+        }
+
+    async def cancel_payload(
+        self,
+        request: Request,
+        token: str,
+    ) -> dict[str, object]:
+        if SAFE_CANCEL_TOKEN.fullmatch(token) is None:
+            raise HTTPException(status_code=422, detail="invalid cancellation token")
+        connection = self.lifecycle.require_connection()
+        query_task = asyncio.create_task(
+            connection.query(CANCEL_SQL, [token.encode("ascii")])
+        )
+        disconnect_task = asyncio.create_task(_wait_for_disconnect(request))
+        try:
+            completed, _ = await asyncio.wait(
+                {query_task, disconnect_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if query_task in completed:
+                await _cancel_and_settle(disconnect_task)
+                row = _result_row(await query_task)
+                return {
+                    "cancelled": False,
+                    "session_id": int(row["session_id"]),
+                }
+            await disconnect_task
+            await _cancel_and_settle(query_task)
+            return {"cancelled": True}
+        finally:
+            if not query_task.done():
+                await _cancel_and_settle(query_task)
+            if not disconnect_task.done():
+                await _cancel_and_settle(disconnect_task)
+
+    async def admitted_value_payload(
+        self,
+        value: int,
+    ) -> dict[str, int] | None:
+        if self.admission.locked():
+            self.admission_rejected += 1
+            return None
+        await self.admission.acquire()
+        self.admission_active += 1
+        try:
+            payload = await self.wait_payload(value)
+            return {
+                "session_id": payload["session_id"],
+                "value": payload["value"],
+            }
+        finally:
+            self.admission_active -= 1
+            self.admission.release()
+
+    async def stream_records(self, rows: int) -> AsyncIterator[str]:
+        connection = self.lifecycle.require_connection()
+        stream = await connection.stream(
+            STREAM_SQL,
+            [rows],
+            buffer_size=STREAM_BUFFER_ROWS,
+        )
+        async with stream:
+            async for result_set in stream:
+                async for row in result_set:
+                    payload = {
+                        "result_set": int(result_set.index),
+                        "row": _stream_row_record(row, result_set.column_names),
+                    }
+                    yield json.dumps(
+                        payload,
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ) + "\n"
+                    await asyncio.sleep(0)
+
+    async def error_probe(self) -> None:
+        connection = self.lifecycle.require_connection()
+        await connection.query(ERROR_SQL)
+        raise WorkerLifecycleError("intentional SQL error route unexpectedly passed")
+
+    async def loop_payload(self) -> dict[str, int]:
+        value = await self.value_payload(17)
+        return {
+            "loop_id": id(asyncio.get_running_loop()),
+            "value": value["value"],
+        }
+
+    async def gather_payload(self) -> dict[str, object]:
+        values = list(range(4))
+        sequential_started = time.perf_counter()
+        sequential = [
+            (await self.wait_payload(value))["value"] for value in values
+        ]
+        sequential_seconds = time.perf_counter() - sequential_started
+
+        concurrent_started = time.perf_counter()
+        concurrent_rows = await asyncio.gather(
+            *(self.wait_payload(value) for value in values)
+        )
+        concurrent_seconds = time.perf_counter() - concurrent_started
+        return {
+            "concurrent": [row["value"] for row in concurrent_rows],
+            "concurrent_seconds": concurrent_seconds,
+            "sequential": sequential,
+            "sequential_seconds": sequential_seconds,
+        }
+
+
 def _worker_config(
     environment: Mapping[str, str] | None,
 ) -> WorkerConfig:
@@ -623,6 +990,7 @@ def create_fastapi_app(
         config=config,
         connection_factory=connection_factory,
     )
+    routes = WorkerRouteState(config=config, lifecycle=lifecycle)
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
@@ -633,10 +1001,88 @@ def create_fastapi_app(
     application = FastAPI(lifespan=lifespan)
     application.state.fastmssql_worker = lifecycle
 
+    @application.exception_handler(Exception)
+    async def safe_internal_error(
+        request: Request,
+        error: Exception,
+    ) -> JSONResponse:
+        del request
+        LOGGER.error(
+            "production framework request failed: error_type=%s",
+            type(error).__name__,
+        )
+        return JSONResponse(
+            {"error": "internal_error"},
+            status_code=500,
+        )
+
     @application.get("/package")
     async def package_probe() -> dict[str, object]:
         lifecycle.ensure_ready()
         return package_record(config)
+
+    @application.get("/ready")
+    async def ready_probe() -> dict[str, object]:
+        return routes.ready_payload()
+
+    @application.get("/principal")
+    async def principal_probe() -> dict[str, object]:
+        return await routes.principal_payload()
+
+    @application.get("/value/{value}")
+    async def value_probe(
+        value: int = PathParameter(ge=MIN_SQL_BIGINT, le=MAX_SQL_BIGINT),
+    ) -> dict[str, int]:
+        return await routes.value_payload(value)
+
+    @application.get("/pool")
+    async def pool_probe() -> dict[str, object]:
+        return await routes.pool_payload()
+
+    @application.get("/wait/{value}")
+    async def wait_probe(
+        value: int = PathParameter(ge=MIN_SQL_BIGINT, le=MAX_SQL_BIGINT),
+    ) -> dict[str, int]:
+        return await routes.wait_payload(value)
+
+    @application.get("/cancel/{token}")
+    async def cancel_probe(
+        request: Request,
+        token: str,
+    ) -> dict[str, object]:
+        return await routes.cancel_payload(request, token)
+
+    @application.post("/transaction/{item_id}")
+    async def transaction_probe(
+        item_id: int = PathParameter(ge=1, le=MAX_SQL_BIGINT),
+        outcome: Literal["commit", "rollback"] = Query(default="commit"),
+    ) -> dict[str, object]:
+        return await routes.transaction_payload(item_id, outcome)
+
+    @application.get("/saturated/{value}")
+    async def saturated_probe(
+        value: int = PathParameter(ge=MIN_SQL_BIGINT, le=MAX_SQL_BIGINT),
+    ):
+        payload = await routes.admitted_value_payload(value)
+        if payload is None:
+            return JSONResponse(
+                {"error": "saturated"},
+                status_code=503,
+            )
+        return payload
+
+    @application.get("/stream")
+    async def stream_probe(
+        rows: int = Query(default=1_000, ge=1, le=MAX_STREAM_ROWS),
+    ) -> StreamingResponse:
+        return StreamingResponse(
+            routes.stream_records(rows),
+            media_type="application/x-ndjson",
+        )
+
+    @application.get("/error")
+    async def error_probe() -> None:
+        await routes.error_probe()
 
     return application
 
@@ -654,12 +1100,71 @@ def create_flask_app(
         config=config,
         connection_factory=connection_factory,
     )
+    routes = WorkerRouteState(config=config, lifecycle=lifecycle)
     application.extensions["fastmssql_worker"] = lifecycle
+
+    @application.errorhandler(Exception)
+    def safe_internal_error(error: Exception):
+        if isinstance(error, WerkzeugHttpException):
+            return error
+        LOGGER.error(
+            "production framework request failed: error_type=%s",
+            type(error).__name__,
+        )
+        return {"error": "internal_error"}, 500
 
     @application.get("/package")
     def package_probe() -> dict[str, object]:
         lifecycle.ensure_ready()
         return package_record(config)
+
+    @application.get("/ready")
+    def ready_probe() -> dict[str, object]:
+        return routes.ready_payload()
+
+    @application.get("/principal")
+    async def principal_probe() -> dict[str, object]:
+        return await routes.principal_payload()
+
+    @application.get("/value/<value>")
+    async def value_probe(value: str):
+        parsed = _bounded_sql_bigint(value)
+        if parsed is None:
+            return {"error": "invalid_bigint"}, 422
+        return await routes.value_payload(parsed)
+
+    @application.get("/pool")
+    async def pool_probe() -> dict[str, object]:
+        return await routes.pool_payload()
+
+    @application.get("/wait/<value>")
+    async def wait_probe(value: str):
+        parsed = _bounded_sql_bigint(value)
+        if parsed is None:
+            return {"error": "invalid_bigint"}, 422
+        return await routes.wait_payload(parsed)
+
+    @application.post("/transaction/<item_id>")
+    async def transaction_probe(item_id: str):
+        parsed = _bounded_sql_bigint(item_id, minimum=1)
+        if parsed is None:
+            return {"error": "invalid_bigint"}, 422
+        outcome = flask_request.args.get("outcome", "commit")
+        if outcome not in {"commit", "rollback"}:
+            return {"error": "invalid_outcome"}, 422
+        return await routes.transaction_payload(parsed, outcome)
+
+    @application.get("/loop")
+    async def loop_probe() -> dict[str, int]:
+        return await routes.loop_payload()
+
+    @application.get("/gather")
+    async def gather_probe() -> dict[str, object]:
+        return await routes.gather_payload()
+
+    @application.get("/error")
+    async def error_probe() -> None:
+        await routes.error_probe()
 
     return application
 

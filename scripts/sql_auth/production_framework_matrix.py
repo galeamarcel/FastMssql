@@ -6,9 +6,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import hashlib
 import http.client
+import importlib
 import inspect
 import json
 import math
@@ -22,7 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Sequence
+from typing import Any, Protocol, Sequence
 
 import psutil
 
@@ -37,6 +38,23 @@ GUNICORN_WINDOWS_REASON = "Gunicorn is not supported on Windows"
 UVLOOP_WINDOWS_REASON = "uvloop is not supported on Windows"
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+SQL_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
+SQL_SERVER_HOST_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9.:[\]_-]{0,252}")
+OBSERVER_CONTEXT_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
+MAX_SQL_SERVER_APPLICATION_NAME = 128
+OBSERVER_SESSION_SQL = """
+SELECT
+    CAST(s.program_name AS NVARCHAR(128)) AS application_name,
+    s.host_process_id,
+    s.session_id,
+    CASE WHEN r.session_id IS NULL THEN 0 ELSE 1 END AS has_request,
+    s.context_info
+FROM sys.dm_exec_sessions AS s
+LEFT JOIN sys.dm_exec_requests AS r ON r.session_id = s.session_id
+WHERE s.is_user_process = 1
+  AND LEFT(s.program_name, LEN(@P1)) = @P1
+  AND s.program_name <> @P2
+""".strip()
 
 
 class RunnerConfigurationError(ValueError):
@@ -193,6 +211,344 @@ class OfflineSmokeResult:
 
     def to_record(self) -> dict[str, object]:
         return asdict(self)
+
+
+class ObserverResultSource(Protocol):
+    async def query(
+        self,
+        sql: str,
+        params: list[object] | None = None,
+    ) -> Any: ...
+
+
+@dataclass(frozen=True, slots=True)
+class SqlAuthObserverSettings:
+    host: str
+    port: int
+    database: str
+    username: str
+    password: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.host, str)
+            or SQL_SERVER_HOST_PATTERN.fullmatch(self.host) is None
+        ):
+            raise RunnerConfigurationError("observer host is invalid")
+        if (
+            isinstance(self.port, bool)
+            or not isinstance(self.port, int)
+            or not 1 <= self.port <= 65_535
+        ):
+            raise RunnerConfigurationError("observer port is invalid")
+        for field_name in ("database", "username"):
+            value = getattr(self, field_name)
+            if (
+                not isinstance(value, str)
+                or SQL_IDENTIFIER_PATTERN.fullmatch(value) is None
+            ):
+                raise RunnerConfigurationError(
+                    f"observer {field_name} is invalid"
+                )
+        if (
+            not isinstance(self.password, str)
+            or not self.password
+            or "\0" in self.password
+        ):
+            raise RunnerConfigurationError("observer password is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ObserverApplicationSample:
+    application_name: str
+    host_process_ids: tuple[int, ...]
+    sessions: int
+    requests: int
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "application_name": self.application_name,
+            "host_process_ids": list(self.host_process_ids),
+            "requests": self.requests,
+            "sessions": self.sessions,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SqlObserverSample:
+    applications: tuple[ObserverApplicationSample, ...]
+    current_sessions: int
+    current_requests: int
+    maximum_sessions: int
+    maximum_requests: int
+    request_context_tokens: tuple[str, ...] = field(repr=False)
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "applications": [
+                application.to_record() for application in self.applications
+            ],
+            "current_requests": self.current_requests,
+            "current_sessions": self.current_sessions,
+            "maximum_requests": self.maximum_requests,
+            "maximum_sessions": self.maximum_sessions,
+            "request_context_token_sha256": [
+                hashlib.sha256(token.encode("ascii")).hexdigest()
+                for token in self.request_context_tokens
+            ],
+        }
+
+
+def _observer_context_token(value: object) -> str | None:
+    if isinstance(value, bytes):
+        raw = value.rstrip(b"\0")
+        if not raw:
+            return None
+        try:
+            token = raw.decode("ascii")
+        except UnicodeDecodeError:
+            return "<noncanonical>"
+    elif isinstance(value, str):
+        token = value.rstrip("\0")
+    else:
+        return None
+    if not token:
+        return None
+    if OBSERVER_CONTEXT_TOKEN_PATTERN.fullmatch(token) is None:
+        return "<noncanonical>"
+    return token
+
+
+@dataclass(slots=True)
+class SqlServerObserver:
+    """Aggregate only this run's worker DMV state without retaining SQL text."""
+
+    source: ObserverResultSource = field(repr=False)
+    worker_prefix: str
+    observer_application_name: str
+    poll_interval_seconds: float = 0.025
+    clock: Callable[[], float] = field(default=time.monotonic, repr=False)
+    sleep: Callable[[float], Awaitable[None]] = field(
+        default=asyncio.sleep,
+        repr=False,
+    )
+    maximum_sessions: int = field(default=0, init=False)
+    maximum_requests: int = field(default=0, init=False)
+
+    def __post_init__(self) -> None:
+        for field_name in ("worker_prefix", "observer_application_name"):
+            value = getattr(self, field_name)
+            if (
+                not isinstance(value, str)
+                or APPLICATION_DIRECTORY_PATTERN.fullmatch(value) is None
+                or len(value) > MAX_SQL_SERVER_APPLICATION_NAME
+            ):
+                raise RunnerConfigurationError(
+                    f"observer {field_name.replace('_', ' ')} is invalid"
+                )
+        if self.worker_prefix == self.observer_application_name:
+            raise RunnerConfigurationError(
+                "observer application name must differ from the worker prefix"
+            )
+        if (
+            isinstance(self.poll_interval_seconds, bool)
+            or not isinstance(self.poll_interval_seconds, (int, float))
+            or not math.isfinite(self.poll_interval_seconds)
+            or self.poll_interval_seconds <= 0
+        ):
+            raise RunnerConfigurationError(
+                "observer poll interval must be a finite positive number"
+            )
+
+    async def sample(self) -> SqlObserverSample:
+        worker_prefix = f"{self.worker_prefix}-"
+        result = await self.source.query(
+            OBSERVER_SESSION_SQL,
+            [worker_prefix, self.observer_application_name],
+        )
+        rows = result.all()
+        if not isinstance(rows, list):
+            raise WorkerEvidenceError("SQL observer returned malformed rows")
+
+        session_ids: dict[str, set[int]] = {}
+        request_ids: dict[str, set[int]] = {}
+        process_ids: dict[str, set[int]] = {}
+        context_tokens: set[str] = set()
+        try:
+            for row in rows:
+                application_name = str(row["application_name"])
+                if (
+                    not application_name.startswith(worker_prefix)
+                    or application_name == self.observer_application_name
+                ):
+                    continue
+                session_id = int(row["session_id"])
+                host_process_id = int(row["host_process_id"])
+                session_ids.setdefault(application_name, set()).add(session_id)
+                process_ids.setdefault(application_name, set()).add(
+                    host_process_id
+                )
+                if int(row["has_request"]):
+                    request_ids.setdefault(application_name, set()).add(
+                        session_id
+                    )
+                    token = _observer_context_token(row.get("context_info"))
+                    if token is not None:
+                        context_tokens.add(token)
+        except (KeyError, TypeError, ValueError):
+            raise WorkerEvidenceError(
+                "SQL observer returned malformed worker identity data"
+            ) from None
+
+        applications = tuple(
+            ObserverApplicationSample(
+                application_name=application_name,
+                host_process_ids=tuple(sorted(process_ids[application_name])),
+                sessions=len(sessions),
+                requests=len(request_ids.get(application_name, set())),
+            )
+            for application_name, sessions in sorted(session_ids.items())
+        )
+        current_sessions = sum(application.sessions for application in applications)
+        current_requests = sum(application.requests for application in applications)
+        self.maximum_sessions = max(self.maximum_sessions, current_sessions)
+        self.maximum_requests = max(self.maximum_requests, current_requests)
+        return SqlObserverSample(
+            applications=applications,
+            current_sessions=current_sessions,
+            current_requests=current_requests,
+            maximum_sessions=self.maximum_sessions,
+            maximum_requests=self.maximum_requests,
+            request_context_tokens=tuple(sorted(context_tokens)),
+        )
+
+    async def wait_for_zero_sessions(
+        self,
+        *,
+        timeout_seconds: float,
+    ) -> SqlObserverSample:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+        ):
+            raise RunnerConfigurationError(
+                "observer timeout must be a finite positive number"
+            )
+        deadline = self.clock() + timeout_seconds
+        while True:
+            remaining = deadline - self.clock()
+            if remaining <= 0:
+                raise ReadinessTimeoutError(
+                    "worker SQL sessions did not reach zero within the bound"
+                )
+            try:
+                sample = await asyncio.wait_for(
+                    self.sample(),
+                    timeout=remaining,
+                )
+            except TimeoutError:
+                raise ReadinessTimeoutError(
+                    "worker SQL sessions did not reach zero within the bound"
+                ) from None
+            if self.clock() > deadline:
+                raise ReadinessTimeoutError(
+                    "worker SQL sessions did not reach zero within the bound"
+                )
+            if sample.current_sessions == 0:
+                return sample
+            remaining = deadline - self.clock()
+            if remaining <= 0:
+                raise ReadinessTimeoutError(
+                    "worker SQL sessions did not reach zero within the bound"
+                )
+            await self.sleep(min(self.poll_interval_seconds, remaining))
+
+
+def reconcile_worker_sessions(
+    sample: SqlObserverSample,
+    ready_records: Sequence[Mapping[str, object]],
+) -> tuple[tuple[str, int], ...]:
+    if not ready_records:
+        raise WorkerEvidenceError(
+            "worker SQL sessions do not match ready records"
+        )
+    expected: dict[str, int] = {}
+    try:
+        for record in ready_records:
+            if record["phase"] != "ready":
+                raise ValueError
+            application_name = record["worker_application_name"]
+            pid = record["pid"]
+            if (
+                not isinstance(application_name, str)
+                or APPLICATION_DIRECTORY_PATTERN.fullmatch(application_name) is None
+                or not isinstance(pid, int)
+                or isinstance(pid, bool)
+                or pid <= 0
+                or application_name in expected
+                or application_name != f"{application_name.rsplit('-', 1)[0]}-{pid}"
+            ):
+                raise ValueError
+            expected[application_name] = pid
+    except (KeyError, TypeError, ValueError):
+        raise WorkerEvidenceError(
+            "worker SQL sessions do not match ready records"
+        ) from None
+
+    observed_names = {
+        application.application_name for application in sample.applications
+    }
+    if observed_names != set(expected):
+        raise WorkerEvidenceError(
+            "worker SQL sessions do not match ready records"
+        )
+    return tuple(sorted(expected.items()))
+
+
+def create_observer_connection(
+    settings: SqlAuthObserverSettings,
+    *,
+    application_name: str,
+) -> Any:
+    """Construct one independent connection from the installed wheel lazily."""
+
+    if (
+        not isinstance(application_name, str)
+        or APPLICATION_DIRECTORY_PATTERN.fullmatch(application_name) is None
+        or len(application_name) > MAX_SQL_SERVER_APPLICATION_NAME
+    ):
+        raise RunnerConfigurationError("observer application name is invalid")
+    driver = importlib.import_module("fastmssql")
+    return driver.Connection(
+        server=settings.host,
+        port=settings.port,
+        database=settings.database,
+        username=settings.username,
+        password=settings.password,
+        application_name=application_name,
+        ssl_config=driver.SslConfig.development(),
+        pool_config=driver.PoolConfig(
+            max_size=1,
+            min_idle=0,
+            max_lifetime_secs=None,
+            idle_timeout_secs=None,
+            connection_timeout_secs=5,
+            retry_connection=False,
+        ),
+        lifecycle_config=driver.LifecycleConfig(
+            shutdown_timeout_secs=10,
+            force_timeout_secs=5,
+        ),
+        timeout_config=driver.TimeoutConfig(
+            connect_timeout_secs=10,
+            acquire_timeout_secs=5,
+            operation_timeout_secs=10,
+            transaction_timeout_secs=10,
+            rollback_timeout_secs=5,
+        ),
+    )
 
 
 @dataclass(slots=True)

@@ -609,7 +609,7 @@ git commit -m "feat: supervise real framework server processes"
 - modify: `tests/test_production_framework_contract.py`
 - modify: `VERSION.md`
 
-- [ ] **Step 6.1: write failing route/source contracts**
+- [x] **Step 6.1: write failing route/source contracts**
 
 Require parameterized:
 
@@ -625,7 +625,7 @@ Require parameterized:
 
 Reject raw parameter interpolation and arbitrary delay/identifier input.
 
-- [ ] **Step 6.2: implement common worker state and routes**
+- [x] **Step 6.2: implement common worker state and routes**
 
 Use:
 
@@ -636,7 +636,7 @@ Use:
 - `OperationMetricsConfig(enabled=True)`;
 - per-worker application names containing a sanitized run ID and PID.
 
-- [ ] **Step 6.3: write failing SQL observer tests**
+- [x] **Step 6.3: write failing SQL observer tests**
 
 With a fake result source, verify:
 
@@ -647,12 +647,12 @@ With a fake result source, verify:
 - no credential/SQL text persistence; and
 - zero-session wait is bounded.
 
-- [ ] **Step 6.4: implement observer**
+- [x] **Step 6.4: implement observer**
 
 Use an independently named installed-wheel FastMssql connection. Do not use
 ODBC, SQLAlchemy or synchronous database clients.
 
-- [ ] **Step 6.5: first real Docker SQL-auth smoke**
+- [x] **Step 6.5: first real Docker SQL-auth smoke**
 
 Start/provision only the dedicated container:
 
@@ -669,7 +669,7 @@ smoke, not wheel acceptance.
 If a FastMssql defect appears, stop feature implementation and execute the
 focused defect branch protocol below.
 
-- [ ] **Step 6.6: verify and commit**
+- [x] **Step 6.6: verify and commit**
 
 Commit:
 
