@@ -3264,13 +3264,18 @@ def test_flask_execution_evidence_is_request_scoped_and_privacy_safe(
     gunicorn_conf.post_worker_init(worker)
     try:
         client = application.test_client()
+        ready = client.get("/ready")
+        pool = client.get("/pool")
         first_loop = client.get("/loop")
         second_loop = client.get("/loop")
         wait = client.get("/execution/wait/31")
         settled = client.get("/execution/state")
+        settled_again = client.get("/execution/state")
     finally:
         gunicorn_conf.worker_exit(None, worker)
 
+    assert ready.status_code == 200
+    assert pool.status_code == 200
     assert first_loop.status_code == 200
     assert second_loop.status_code == 200
     assert first_loop.get_json()["loop_token"] != second_loop.get_json()[
@@ -3313,6 +3318,8 @@ def test_flask_execution_evidence_is_request_scoped_and_privacy_safe(
         "pid": os.getpid(),
         "wsgi_thread_count": 1,
     }
+    assert settled_again.status_code == 200
+    assert settled_again.get_json() == settled.get_json()
     assert secret not in wait.get_data(as_text=True)
     assert secret not in settled.get_data(as_text=True)
 
@@ -6142,6 +6149,66 @@ async def test_collect_worker_payloads_uses_bounded_parallel_probe_waves() -> No
 
     assert tuple(payload["pid"] for payload in payloads) == (101, 202)
     assert maximum_active == 2
+
+
+@pytest.mark.asyncio
+async def test_collect_worker_payloads_accepts_only_declared_monotonic_counter(
+) -> None:
+    """Catch rejection of valid loop evidence or acceptance of identity drift."""
+
+    runner = _load_production_framework_runner()
+    observations = iter(
+        (
+            {"loop_token": 22, "pid": 202, "request_sequence": 1},
+            {"loop_token": 22, "pid": 202, "request_sequence": 2},
+            {"loop_token": 11, "pid": 101, "request_sequence": 2},
+            {"loop_token": 11, "pid": 101, "request_sequence": 1},
+        )
+    )
+
+    async def changing_counter(port: int, path: str, **kwargs):
+        assert port == 8123
+        assert path == "/loop"
+        assert kwargs["timeout_seconds"] > 0
+        return next(observations)
+
+    payloads = await runner.collect_worker_payloads(
+        8123,
+        "/loop",
+        expected_pids=(101, 202),
+        timeout_seconds=0.1,
+        request_json=changing_counter,
+        monotonic_counter="request_sequence",
+    )
+
+    assert payloads == (
+        {"loop_token": 11, "pid": 101, "request_sequence": 2},
+        {"loop_token": 22, "pid": 202, "request_sequence": 2},
+    )
+
+    identity_drift = iter(
+        (
+            {"loop_token": 22, "pid": 202, "request_sequence": 1},
+            {"loop_token": 99, "pid": 202, "request_sequence": 2},
+        )
+    )
+
+    async def changing_identity(port: int, path: str, **kwargs):
+        del port, path, kwargs
+        return next(identity_drift)
+
+    with pytest.raises(
+        runner.WorkerEvidenceError,
+        match="stable evidence changed",
+    ):
+        await runner.collect_worker_payloads(
+            8123,
+            "/loop",
+            expected_pids=(101, 202),
+            timeout_seconds=0.1,
+            request_json=changing_identity,
+            monotonic_counter="request_sequence",
+        )
 
 
 def test_native_scaling_evidence_reconciles_workers_pool_and_sql_budget(

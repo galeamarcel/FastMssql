@@ -169,6 +169,25 @@ No release, package-version change, or artifact publication has occurred.
   no FastMssql/Tiberius runtime, package metadata, displayed `0.7.7` version,
   release, published artifact or original-repository state.
 
+### Dynamic Flask worker evidence RED
+
+- The remediated shared-listener profile reached its SQL overlap gate, then a
+  second real `gthread-w8` run exposed a distinct evidence defect: repeated
+  `/execution/state` probes for the same worker advanced
+  `completed_requests` from six to seven, and the generic collector rejected
+  that legitimate request-local change as worker identity drift.
+- Root-cause tracing also showed that control endpoints were counted as WSGI
+  workload. This could inflate `request_sequence`, completed-request and
+  maximum-active evidence, so a fan-out probe could falsely strengthen the
+  execution-model claim it was measuring.
+- Added RED contracts requiring control/state probes not to perturb workload
+  evidence, repeated settled snapshots to remain identical, and dynamic
+  `/loop` collection to accept only one explicitly declared monotonic counter
+  while still rejecting changes to stable worker identity fields.
+- This focused RED changes only repository-owned tests and documentation. It
+  changes no FastMssql/Tiberius runtime, package metadata, displayed `0.7.7`
+  version, release, published artifact or original-repository state.
+
 ### Production framework external-process supervisor
 
 - Added a schema-1, fail-closed process runner with closed operation bounds,
