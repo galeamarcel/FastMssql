@@ -52,6 +52,21 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Production framework schema-1 evidence
+
+- Implemented the detached schema-1 evidence builder with independent
+  candidate/harness provenance, verified wheel hashing, sanitized
+  configuration, deterministic cross-platform profile inventory and derived
+  PASS/FAIL violations.
+- Added a fail-closed validator that recomputes the exact 28-profile universe,
+  identity/applicability/status counts and profile violations, rejects stale
+  SHAs and partial/extra schemas, and enforces PASS exactly when violations are
+  empty.
+- Added same-directory staged writes with file `fsync`, atomic exclusive
+  hard-link publication, no-overwrite race handling, privacy-safe errors and
+  residue cleanup. No FastMssql/Tiberius runtime or displayed `0.7.7` package
+  version changed, and no release or artifact was published.
+
 ### Production framework schema-1 evidence RED
 
 - Added behavioral RED contracts for one exact top-level schema with
