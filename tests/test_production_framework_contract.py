@@ -3247,6 +3247,76 @@ def test_flask_loop_gather_and_errors_preserve_wsgi_contract(
     assert secret not in error_response.get_data(as_text=True)
 
 
+def test_flask_execution_evidence_is_request_scoped_and_privacy_safe(
+    tmp_path: Path,
+) -> None:
+    """Catch loss of the WSGI slot/thread/loop evidence used by Task 8."""
+
+    environment = _valid_worker_environment(tmp_path)
+    secret = environment["FASTMSSQL_SQL_AUTH_OWNER_PASSWORD"]
+    events: list[object] = []
+    connection = _RouteConnection(events)
+    application = framework_app.create_flask_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+    )
+    worker = SimpleNamespace(wsgi=application, pid=os.getpid())
+    gunicorn_conf.post_worker_init(worker)
+    try:
+        client = application.test_client()
+        first_loop = client.get("/loop")
+        second_loop = client.get("/loop")
+        wait = client.get("/execution/wait/31")
+        settled = client.get("/execution/state")
+    finally:
+        gunicorn_conf.worker_exit(None, worker)
+
+    assert first_loop.status_code == 200
+    assert second_loop.status_code == 200
+    assert first_loop.get_json()["loop_token"] != second_loop.get_json()[
+        "loop_token"
+    ]
+
+    assert wait.status_code == 200
+    wait_payload = wait.get_json()
+    assert wait_payload == {
+        "async_thread_token": wait_payload["async_thread_token"],
+        "delay_ms": 100,
+        "execution_model": (
+            "Flask WSGI: async view, occupied WSGI worker/thread"
+        ),
+        "loop_token": wait_payload["loop_token"],
+        "pid": os.getpid(),
+        "request_sequence": 3,
+        "session_id": 702,
+        "value": 31,
+        "wsgi_active_requests": 1,
+        "wsgi_maximum_active_requests": 1,
+        "wsgi_thread_token": wait_payload["wsgi_thread_token"],
+    }
+    for token_name in (
+        "async_thread_token",
+        "loop_token",
+        "wsgi_thread_token",
+    ):
+        assert isinstance(wait_payload[token_name], int)
+        assert wait_payload[token_name] > 0
+
+    assert settled.status_code == 200
+    assert settled.get_json() == {
+        "active_other_requests": 0,
+        "completed_requests": 3,
+        "execution_model": (
+            "Flask WSGI: async view, occupied WSGI worker/thread"
+        ),
+        "maximum_active_requests": 1,
+        "pid": os.getpid(),
+        "wsgi_thread_count": 1,
+    }
+    assert secret not in wait.get_data(as_text=True)
+    assert secret not in settled.get_data(as_text=True)
+
+
 def test_flask_numeric_routes_enforce_sql_bigint_bounds(
     tmp_path: Path,
 ) -> None:
@@ -6803,6 +6873,1945 @@ async def test_native_concurrency_scenario_measures_same_server_and_cleans_up(
     assert record["shutdown_pids"] == [101]
     assert record["sessions_after"] == 0
     assert events == ["observer-connect", "server-stop", "observer-disconnect"]
+
+
+def test_shared_listener_minimum_does_not_require_perfect_worker_dispatch(
+) -> None:
+    """Catch a shared-listener gate that assumes one request per worker."""
+
+    runner = _load_production_framework_runner()
+    cases = (
+        ("flask-gunicorn-sync", 1, 2, 1),
+        ("flask-gunicorn-gthread", 1, 5, 4),
+        ("flask-gunicorn-sync", 8, 8, 2),
+        ("flask-gunicorn-gthread", 8, 8, 2),
+        ("flask-asgi-uvicorn-asyncio", 1, 4, 1),
+        ("flask-asgi-uvicorn-asyncio", 8, 8, 2),
+    )
+    for family, workers, request_count, expected in cases:
+        profile = _profile_by_family(runner, family, workers=workers)
+        assert (
+            runner.shared_listener_sql_request_minimum(
+                profile,
+                request_count=request_count,
+            )
+            == expected
+        )
+
+
+@pytest.mark.asyncio
+async def test_observed_request_wave_surfaces_http_failure_and_settles(
+) -> None:
+    """Catch an observer timeout that hides the primary HTTP exception."""
+
+    runner = _load_production_framework_runner()
+    observer_cancelled = asyncio.Event()
+    pending_request_cancelled = asyncio.Event()
+
+    class WaitingObserver:
+        async def wait_for_minimum_requests(
+            self,
+            minimum_requests: int,
+            *,
+            timeout_seconds: float,
+        ) -> None:
+            assert minimum_requests == 2
+            assert timeout_seconds == 1.0
+            try:
+                await asyncio.Event().wait()
+            finally:
+                observer_cancelled.set()
+
+    async def failing_request():
+        raise runner.HttpProbeError("primary HTTP failure")
+
+    async def pending_request():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            pending_request_cancelled.set()
+
+    tasks = (
+        asyncio.create_task(failing_request()),
+        asyncio.create_task(pending_request()),
+    )
+    try:
+        with pytest.raises(
+            runner.HttpProbeError,
+            match="primary HTTP failure",
+        ):
+            await runner.await_observed_request_wave(
+                WaitingObserver(),
+                tasks,
+                minimum_requests=2,
+                timeout_seconds=1.0,
+            )
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert observer_cancelled.is_set()
+    assert pending_request_cancelled.is_set()
+    assert all(task.done() for task in tasks)
+
+
+def test_flask_wsgi_profile_selection_is_posix_only_and_complete() -> None:
+    """Catch a missing worker count, WSGI class, or false Windows claim."""
+
+    runner = _load_production_framework_runner()
+    for platform_name in ("linux", "darwin"):
+        profiles = runner.flask_wsgi_profiles(platform_name)
+        assert tuple(profile.id for profile in profiles) == tuple(
+            sorted(
+                f"flask-gunicorn-{worker_class}-w{workers}"
+                for worker_class in ("gthread", "sync")
+                for workers in (1, 2, 4, 8)
+            )
+        )
+        assert {profile.worker_class for profile in profiles} == {
+            "gthread",
+            "sync",
+        }
+        assert all(profile.applicable for profile in profiles)
+        assert all(profile.database_mode == "sql_auth" for profile in profiles)
+
+    assert runner.flask_wsgi_profiles("win32") == ()
+
+
+def _flask_execution_payload(
+    *,
+    value: int,
+    sequence: int,
+    loop_token: int,
+    wsgi_thread_token: int,
+    active: int,
+    maximum_active: int,
+    async_thread_token: int | None = None,
+    delay_ms: int = 250,
+    execution_model: str = (
+        "Flask WSGI: async view, occupied WSGI worker/thread"
+    ),
+) -> dict[str, object]:
+    return {
+        "async_thread_token": (
+            sequence if async_thread_token is None else async_thread_token
+        ),
+        "delay_ms": delay_ms,
+        "execution_model": execution_model,
+        "loop_token": loop_token,
+        "pid": 101,
+        "request_sequence": sequence,
+        "session_id": 50 + sequence,
+        "value": value,
+        "wsgi_active_requests": active,
+        "wsgi_maximum_active_requests": maximum_active,
+        "wsgi_thread_token": wsgi_thread_token,
+    }
+
+
+def _flask_observer_sample(
+    runner,
+    *,
+    maximum_requests: int,
+) -> object:
+    return runner.SqlObserverSample(
+        applications=(
+            runner.ObserverApplicationSample(
+                application_name="fm-flask-wsgi-101",
+                host_process_ids=(101,),
+                sessions=maximum_requests,
+                requests=0,
+            ),
+        ),
+        current_sessions=maximum_requests,
+        current_requests=0,
+        maximum_sessions=maximum_requests,
+        maximum_requests=maximum_requests,
+        request_context_tokens=(),
+    )
+
+
+def test_sync_wsgi_wave_requires_one_request_slot_and_distinct_loops(
+    tmp_path: Path,
+) -> None:
+    """Catch accidental inter-request concurrency claims for sync workers."""
+
+    runner = _load_production_framework_runner()
+    config = replace(
+        _config_with_actual_wheel_hash(runner, tmp_path),
+        database_mode="sql_auth",
+        global_connection_budget=8,
+    )
+    profile = replace(
+        _profile_by_family(runner, "flask-gunicorn-sync", workers=1),
+        database_mode="sql_auth",
+        platform_system=config.platform_system,
+    )
+    ready_records = (
+        {
+            "phase": "ready",
+            "pid": 101,
+            "worker_application_name": "fm-flask-wsgi-101",
+        },
+    )
+    payloads = tuple(
+        _flask_execution_payload(
+            value=value,
+            sequence=sequence,
+            loop_token=sequence,
+            wsgi_thread_token=1,
+            active=1,
+            maximum_active=1,
+        )
+        for sequence, value in enumerate((751_001, 751_002), start=1)
+    )
+    settled = (
+        {
+            "active_other_requests": 0,
+            "completed_requests": 2,
+            "execution_model": (
+                "Flask WSGI: async view, occupied WSGI worker/thread"
+            ),
+            "maximum_active_requests": 1,
+            "pid": 101,
+            "wsgi_thread_count": 1,
+        },
+    )
+
+    evidence = runner.validate_flask_wsgi_wave_evidence(
+        config=config,
+        profile=profile,
+        ready_records=ready_records,
+        response_payloads=payloads,
+        settled_records=settled,
+        expected_values=(751_001, 751_002),
+        wave_seconds=0.53,
+        sql_delay_ms=250,
+        observer_sample=_flask_observer_sample(
+            runner,
+            maximum_requests=1,
+        ),
+    )
+
+    assert evidence.to_record() == {
+        "execution_model": (
+            "Flask WSGI: async view, occupied WSGI worker/thread"
+        ),
+        "loop_tokens_distinct_per_worker": True,
+        "maximum_aggregate_sql_sessions": 1,
+        "maximum_simultaneous_sql_requests": 1,
+        "profile_id": profile.id,
+        "queued_request_proven": True,
+        "request_count": 2,
+        "sql_delay_seconds": 0.25,
+        "status": "PASS",
+        "thread_limit_per_worker": 1,
+        "values": [751_001, 751_002],
+        "wave_seconds": 0.53,
+        "worker_execution": [
+            {
+                "maximum_active_requests": 1,
+                "pid": 101,
+                "wsgi_thread_count": 1,
+            }
+        ],
+    }
+
+    duplicated_loop = (payloads[0], {**payloads[1], "loop_token": 1})
+    with pytest.raises(
+        runner.WorkerEvidenceError,
+        match="per-request event loops are not distinct",
+    ):
+        runner.validate_flask_wsgi_wave_evidence(
+            config=config,
+            profile=profile,
+            ready_records=ready_records,
+            response_payloads=duplicated_loop,
+            settled_records=settled,
+            expected_values=(751_001, 751_002),
+            wave_seconds=0.53,
+            sql_delay_ms=250,
+            observer_sample=_flask_observer_sample(
+                runner,
+                maximum_requests=1,
+            ),
+        )
+
+
+def test_gthread_wsgi_wave_requires_four_threads_and_queues_fifth(
+    tmp_path: Path,
+) -> None:
+    """Catch a gthread wave that exceeds or never occupies its four slots."""
+
+    runner = _load_production_framework_runner()
+    config = replace(
+        _config_with_actual_wheel_hash(runner, tmp_path),
+        database_mode="sql_auth",
+        global_connection_budget=8,
+    )
+    profile = replace(
+        _profile_by_family(runner, "flask-gunicorn-gthread", workers=1),
+        database_mode="sql_auth",
+        platform_system=config.platform_system,
+    )
+    ready_records = (
+        {
+            "phase": "ready",
+            "pid": 101,
+            "worker_application_name": "fm-flask-wsgi-101",
+        },
+    )
+    values = (752_001, 752_002, 752_003, 752_004, 752_005)
+    payloads = tuple(
+        _flask_execution_payload(
+            value=value,
+            sequence=sequence,
+            loop_token=sequence,
+            wsgi_thread_token=((sequence - 1) % 4) + 1,
+            active=4,
+            maximum_active=4,
+        )
+        for sequence, value in enumerate(values, start=1)
+    )
+    settled = (
+        {
+            "active_other_requests": 0,
+            "completed_requests": 5,
+            "execution_model": (
+                "Flask WSGI: async view, occupied WSGI worker/thread"
+            ),
+            "maximum_active_requests": 4,
+            "pid": 101,
+            "wsgi_thread_count": 4,
+        },
+    )
+
+    evidence = runner.validate_flask_wsgi_wave_evidence(
+        config=config,
+        profile=profile,
+        ready_records=ready_records,
+        response_payloads=payloads,
+        settled_records=settled,
+        expected_values=values,
+        wave_seconds=0.54,
+        sql_delay_ms=250,
+        observer_sample=_flask_observer_sample(
+            runner,
+            maximum_requests=4,
+        ),
+    )
+
+    record = evidence.to_record()
+    assert record["thread_limit_per_worker"] == 4
+    assert record["request_count"] == 5
+    assert record["queued_request_proven"] is True
+    assert record["maximum_simultaneous_sql_requests"] == 4
+    assert record["worker_execution"] == [
+        {
+            "maximum_active_requests": 4,
+            "pid": 101,
+            "wsgi_thread_count": 4,
+        }
+    ]
+
+    excessive = ({**settled[0], "maximum_active_requests": 5},)
+    with pytest.raises(
+        runner.WorkerEvidenceError,
+        match="gthread WSGI concurrency exceeded four threads",
+    ):
+        runner.validate_flask_wsgi_wave_evidence(
+            config=config,
+            profile=profile,
+            ready_records=ready_records,
+            response_payloads=payloads,
+            settled_records=excessive,
+            expected_values=values,
+            wave_seconds=0.54,
+            sql_delay_ms=250,
+            observer_sample=_flask_observer_sample(
+                runner,
+                maximum_requests=4,
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_flask_wsgi_profile_runs_every_layer_and_tears_down(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch a WSGI runner that skips SQL evidence or worker teardown."""
+
+    runner = _load_production_framework_runner()
+    config = replace(
+        _config_with_actual_wheel_hash(runner, tmp_path),
+        database_mode="sql_auth",
+        global_connection_budget=8,
+    )
+    profile = replace(
+        _profile_by_family(runner, "flask-gunicorn-sync", workers=1),
+        database_mode="sql_auth",
+        platform_system=config.platform_system,
+    )
+    isolated = runner.prepare_isolated_application(
+        config,
+        source_directory=ROOT / "tests/production_framework",
+        directory_name="flask-wsgi-profile-test",
+    )
+    settings = runner.SqlAuthObserverSettings(
+        host="127.0.0.1",
+        port=14334,
+        database="fastmssql_validation",
+        username="fastmssql_owner",
+        password="private-owner-password",
+    )
+    ready_record = {
+        "candidate_sha": config.candidate_sha,
+        "phase": "ready",
+        "pid": 101,
+        "pool_connected_monotonic": 12.0,
+        "pool_created_monotonic": 11.0,
+        "pool_created_pid": 101,
+        "pool_identity": "pool-101",
+        "pool_max_per_worker": 8,
+        "process_started_monotonic": 10.0,
+        "run_id": "flask-sync",
+        "worker_application_name": "fm-flask-wsgi-101",
+        "wheel_filename": config.wheel.name,
+        "wheel_sha256": config.wheel_sha256,
+    }
+    shutdown_record = {**ready_record, "phase": "shutdown"}
+    busy_sample = _flask_observer_sample(runner, maximum_requests=1)
+    zero_sample = replace(
+        busy_sample,
+        applications=(),
+        current_sessions=0,
+        current_requests=0,
+    )
+    events: list[str] = []
+
+    class FakeObserverConnection:
+        async def connect(self, *, validate: bool) -> None:
+            assert validate is True
+            events.append("observer-connect")
+
+        async def disconnect(self) -> None:
+            events.append("observer-disconnect")
+
+    class FakeObserver:
+        def __init__(self, **kwargs) -> None:
+            assert kwargs["worker_prefix"].startswith("fm-")
+
+        async def wait_for_ready_workers(self, records, *, timeout_seconds):
+            assert tuple(records) == (ready_record,)
+            assert timeout_seconds > 0
+            return busy_sample
+
+        async def wait_for_minimum_requests(self, minimum, *, timeout_seconds):
+            assert minimum == 1
+            assert timeout_seconds > 0
+            events.append("wave-observed")
+            return busy_sample
+
+        async def sample(self):
+            return busy_sample
+
+        async def wait_for_zero_sessions(self, *, timeout_seconds):
+            assert timeout_seconds > 0
+            events.append("zero-sessions")
+            return zero_sample
+
+    outcome = runner.ProcessOutcome(
+        pid=90,
+        returncode=0,
+        stdout="",
+        stderr="",
+        output_truncated=False,
+        descendant_pids=(101,),
+        graceful_stop=True,
+        forced_cleanup=False,
+    )
+
+    class FakeSupervisor:
+        pid = 90
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            del args
+
+        async def wait_for_worker_records(self, **kwargs):
+            assert kwargs["expected_count"] == 1
+            assert kwargs["expected_run_id"] == "flask-sync"
+            return (ready_record,)
+
+        def read_worker_records(self, **kwargs):
+            assert kwargs["phase"] == "shutdown"
+            return (shutdown_record,)
+
+        async def stop(self):
+            events.append("server-stop")
+            return outcome
+
+    async def fake_launch(**kwargs):
+        assert await kwargs["readiness_probe"](8125)
+        return runner.ServerLaunch(
+            supervisor=FakeSupervisor(),
+            port=8125,
+            attempts=1,
+            sanitized_command=(sys.executable, "-m", "gunicorn"),
+        )
+
+    async def fake_get(port: int, path: str, **kwargs):
+        assert port == 8125
+        assert path == "/ready"
+        assert kwargs["timeout_seconds"] > 0
+        return {"pid": 101, "state": "ready"}
+
+    async def fake_collect(port: int, path: str, **kwargs):
+        assert port == 8125
+        assert kwargs["expected_pids"] == (101,)
+        if path == "/package":
+            return (
+                {
+                    "candidate_sha": config.candidate_sha,
+                    "fastmssql_import_path": "/site-packages/fastmssql.so",
+                    "pid": 101,
+                    "wheel_filename": config.wheel.name,
+                    "wheel_sha256": config.wheel_sha256,
+                },
+            )
+        if path == "/principal":
+            return (
+                {
+                    "application_name": "fm-flask-wsgi-101",
+                    "pid": 101,
+                    "principal": "fastmssql_owner",
+                    "session_id": 51,
+                },
+            )
+        if path == "/execution/state":
+            return (
+                {
+                    "active_other_requests": 0,
+                    "completed_requests": 8,
+                    "execution_model": (
+                        "Flask WSGI: async view, occupied WSGI worker/thread"
+                    ),
+                    "maximum_active_requests": 1,
+                    "pid": 101,
+                    "wsgi_thread_count": 1,
+                },
+            )
+        assert path == "/pool"
+        return (
+            {
+                "admission": {"active": 0, "capacity": 16, "rejected": 0},
+                "application_name": "fm-flask-wsgi-101",
+                "operations": {},
+                "pid": 101,
+                "pool": {
+                    "active_connections": 0,
+                    "connections": 1,
+                    "idle_connections": 1,
+                    "max_size": 8,
+                    "pending_gets": 0,
+                },
+            },
+        )
+
+    request_lock = asyncio.Lock()
+
+    async def fake_request(port: int, path: str, **kwargs):
+        assert port == 8125
+        assert kwargs["expected_statuses"] == (200,)
+        value = int(path.removeprefix("/execution/wait/"))
+        sequence = value - 753_000
+        async with request_lock:
+            await asyncio.sleep(0.2)
+            return runner.LoopbackJsonResponse(
+                status_code=200,
+                payload=_flask_execution_payload(
+                    value=value,
+                    sequence=sequence,
+                    loop_token=sequence,
+                    wsgi_thread_token=1,
+                    active=1,
+                    maximum_active=1,
+                ),
+                elapsed_seconds=0.2,
+            )
+
+    async def fake_port_not_listening(port: int) -> bool:
+        assert port == 8125
+        return False
+
+    def fake_shared_listener_minimum(profile_arg, *, request_count):
+        assert profile_arg is profile
+        assert request_count == 2
+        events.append("minimum-selected")
+        return 1
+
+    monkeypatch.setattr(
+        runner,
+        "create_observer_connection",
+        lambda *args, **kwargs: FakeObserverConnection(),
+    )
+    monkeypatch.setattr(runner, "SqlServerObserver", FakeObserver)
+    monkeypatch.setattr(runner, "launch_with_port_retry", fake_launch)
+    monkeypatch.setattr(runner, "http_get_json", fake_get)
+    monkeypatch.setattr(runner, "collect_worker_payloads", fake_collect)
+    monkeypatch.setattr(runner, "http_request_json", fake_request)
+    monkeypatch.setattr(
+        runner,
+        "shared_listener_sql_request_minimum",
+        fake_shared_listener_minimum,
+    )
+    monkeypatch.setattr(
+        runner,
+        "validate_package_record",
+        lambda *args, **kwargs: dict(args[2]),
+    )
+    monkeypatch.setattr(
+        runner,
+        "loopback_port_is_listening",
+        fake_port_not_listening,
+    )
+
+    result = await runner.run_flask_wsgi_profile(
+        config,
+        isolated,
+        profile,
+        repository_root=ROOT,
+        run_id="flask-sync",
+        policy=runner.SupervisorPolicy(),
+        sql_auth_settings=settings,
+        table_name="framework_items_flask",
+        wave_values=(753_001, 753_002),
+        sql_delay_ms=250,
+    )
+
+    record = result.to_record()
+    assert record["status"] == "PASS"
+    assert record["profile_id"] == profile.id
+    assert record["ready_pids"] == [101]
+    assert record["shutdown_pids"] == [101]
+    assert record["maximum_active_requests"] == 1
+    assert record["queued_request_proven"] is True
+    assert record["sessions_after"] == 0
+    assert record["forced_cleanup"] is False
+    assert events == [
+        "observer-connect",
+        "minimum-selected",
+        "wave-observed",
+        "server-stop",
+        "zero-sessions",
+        "observer-disconnect",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_flask_wsgi_matrix_sizes_each_real_worker_model_deterministically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch a matrix that skips counts or overloads a WSGI model."""
+
+    runner = _load_production_framework_runner()
+    config = replace(
+        _config_with_actual_wheel_hash(runner, tmp_path),
+        database_mode="sql_auth",
+        global_connection_budget=8,
+    )
+    profiles = tuple(
+        replace(
+            _profile_by_family(runner, family, workers=workers),
+            database_mode="sql_auth",
+            platform_system=config.platform_system,
+        )
+        for family, workers in (
+            ("flask-gunicorn-gthread", 1),
+            ("flask-gunicorn-gthread", 2),
+            ("flask-gunicorn-sync", 1),
+            ("flask-gunicorn-sync", 4),
+        )
+    )
+    settings = runner.SqlAuthObserverSettings(
+        host="127.0.0.1",
+        port=14334,
+        database="fastmssql_validation",
+        username="fastmssql_owner",
+        password="private-owner-password",
+    )
+    calls: list[dict[str, object]] = []
+
+    async def fake_profile(config_arg, isolated, profile, **kwargs):
+        assert config_arg is config
+        assert isolated.root.is_relative_to(config.run_root)
+        calls.append({"profile": profile, **kwargs})
+        return profile.id
+
+    monkeypatch.setattr(runner, "flask_wsgi_profiles", lambda platform: profiles)
+    monkeypatch.setattr(runner, "run_flask_wsgi_profile", fake_profile)
+
+    results = await runner.run_flask_wsgi_matrix(
+        config,
+        repository_root=ROOT,
+        source_directory=ROOT / "tests/production_framework",
+        sql_auth_settings=settings,
+        table_name="framework_items_flask",
+        policy=runner.SupervisorPolicy(),
+    )
+
+    assert results == tuple(profile.id for profile in profiles)
+    assert [call["run_id"] for call in calls] == [
+        "fwsgi-aaaaaaaa-1",
+        "fwsgi-aaaaaaaa-2",
+        "fwsgi-aaaaaaaa-3",
+        "fwsgi-aaaaaaaa-4",
+    ]
+    assert [len(call["wave_values"]) for call in calls] == [5, 8, 2, 4]
+    assert [call["wave_values"][0] for call in calls] == [
+        753_101,
+        753_201,
+        753_301,
+        753_401,
+    ]
+    assert len(
+        {
+            value
+            for call in calls
+            for value in call["wave_values"]
+        }
+    ) == sum(len(call["wave_values"]) for call in calls)
+
+
+def test_flask_gather_evidence_proves_internal_overlap_in_one_wsgi_slot() -> None:
+    """Catch an internal-concurrency claim without SQL overlap or slot proof."""
+
+    runner = _load_production_framework_runner()
+    response = runner.LoopbackJsonResponse(
+        status_code=200,
+        payload={
+            "async_thread_token": 2,
+            "concurrent": [0, 1, 2, 3],
+            "concurrent_seconds": 0.28,
+            "execution_model": (
+                "Flask WSGI: async view, occupied WSGI worker/thread"
+            ),
+            "loop_token": 7,
+            "pid": 101,
+            "request_sequence": 9,
+            "sequential": [0, 1, 2, 3],
+            "sequential_seconds": 1.05,
+            "wsgi_active_requests": 1,
+            "wsgi_maximum_active_requests": 1,
+            "wsgi_thread_token": 1,
+        },
+        elapsed_seconds=1.34,
+    )
+    state = {
+        "active_other_requests": 0,
+        "completed_requests": 9,
+        "execution_model": (
+            "Flask WSGI: async view, occupied WSGI worker/thread"
+        ),
+        "maximum_active_requests": 1,
+        "pid": 101,
+        "wsgi_thread_count": 1,
+    }
+    observer = _flask_observer_sample(runner, maximum_requests=4)
+    pool = {
+        "pid": 101,
+        "pool": {
+            "active_connections": 0,
+            "connections": 4,
+            "idle_connections": 4,
+            "max_size": 8,
+            "pending_gets": 0,
+        },
+    }
+
+    evidence = runner.validate_flask_gather_evidence(
+        response=response,
+        state_record=state,
+        observer_sample=observer,
+        pool_record=pool,
+        sql_delay_ms=250,
+    )
+
+    assert evidence.to_record() == {
+        "concurrent_seconds": 0.28,
+        "execution_model": (
+            "Flask WSGI: async view, occupied WSGI worker/thread"
+        ),
+        "loop_token": 7,
+        "maximum_simultaneous_sql_requests": 4,
+        "outer_response_seconds": 1.34,
+        "pool_active_after": 0,
+        "pool_pending_after": 0,
+        "sequential_seconds": 1.05,
+        "sql_delay_seconds": 0.25,
+        "status": "PASS",
+        "values_exact": True,
+        "wsgi_request_slots": 1,
+    }
+
+    slow_concurrent = replace(
+        response,
+        payload={**response.payload, "concurrent_seconds": 0.8},
+    )
+    with pytest.raises(
+        runner.WorkerEvidenceError,
+        match="same-view concurrent SQL did not beat",
+    ):
+        runner.validate_flask_gather_evidence(
+            response=slow_concurrent,
+            state_record=state,
+            observer_sample=observer,
+            pool_record=pool,
+            sql_delay_ms=250,
+        )
+
+
+@pytest.mark.asyncio
+async def test_flask_gather_scenario_uses_real_server_lifecycle_and_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch a /gather scenario that omits supervision or zero-session proof."""
+
+    runner = _load_production_framework_runner()
+    config = replace(
+        _config_with_actual_wheel_hash(runner, tmp_path),
+        database_mode="sql_auth",
+        global_connection_budget=8,
+    )
+    profile = replace(
+        _profile_by_family(runner, "flask-gunicorn-sync", workers=1),
+        database_mode="sql_auth",
+        platform_system=config.platform_system,
+    )
+    isolated = runner.prepare_isolated_application(
+        config,
+        source_directory=ROOT / "tests/production_framework",
+        directory_name="flask-gather-test",
+    )
+    settings = runner.SqlAuthObserverSettings(
+        host="127.0.0.1",
+        port=14334,
+        database="fastmssql_validation",
+        username="fastmssql_owner",
+        password="private-owner-password",
+    )
+    ready_record = {
+        "phase": "ready",
+        "pid": 101,
+        "run_id": "flask-gather",
+        "worker_application_name": "fm-flask-gather-101",
+    }
+    shutdown_record = {**ready_record, "phase": "shutdown"}
+    busy_sample = runner.SqlObserverSample(
+        applications=(
+            runner.ObserverApplicationSample(
+                application_name="fm-flask-gather-101",
+                host_process_ids=(101,),
+                sessions=4,
+                requests=4,
+            ),
+        ),
+        current_sessions=4,
+        current_requests=4,
+        maximum_sessions=4,
+        maximum_requests=4,
+        request_context_tokens=(),
+    )
+    zero_sample = replace(
+        busy_sample,
+        applications=(),
+        current_sessions=0,
+        current_requests=0,
+    )
+    events: list[str] = []
+
+    class FakeConnection:
+        async def connect(self, *, validate: bool) -> None:
+            assert validate is True
+            events.append("observer-connect")
+
+        async def disconnect(self) -> None:
+            events.append("observer-disconnect")
+
+    class FakeObserver:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        async def wait_for_ready_workers(self, records, *, timeout_seconds):
+            assert tuple(records) == (ready_record,)
+            assert timeout_seconds > 0
+            return busy_sample
+
+        async def wait_for_minimum_requests(self, minimum, *, timeout_seconds):
+            assert minimum == 4
+            assert timeout_seconds > 0
+            events.append("gather-observed")
+            return busy_sample
+
+        async def wait_for_zero_sessions(self, *, timeout_seconds):
+            assert timeout_seconds > 0
+            events.append("zero-sessions")
+            return zero_sample
+
+    outcome = runner.ProcessOutcome(
+        pid=90,
+        returncode=0,
+        stdout="",
+        stderr="",
+        output_truncated=False,
+        descendant_pids=(101,),
+        graceful_stop=True,
+        forced_cleanup=False,
+    )
+
+    class FakeSupervisor:
+        pid = 90
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            del args
+
+        async def wait_for_worker_records(self, **kwargs):
+            assert kwargs["expected_count"] == 1
+            return (ready_record,)
+
+        def read_worker_records(self, **kwargs):
+            assert kwargs["phase"] == "shutdown"
+            return (shutdown_record,)
+
+        async def stop(self):
+            events.append("server-stop")
+            return outcome
+
+    async def fake_launch(**kwargs):
+        assert await kwargs["readiness_probe"](8126)
+        return runner.ServerLaunch(
+            supervisor=FakeSupervisor(),
+            port=8126,
+            attempts=1,
+            sanitized_command=(sys.executable, "-m", "gunicorn"),
+        )
+
+    async def fake_get(port: int, path: str, **kwargs):
+        assert port == 8126
+        assert path == "/ready"
+        assert kwargs["timeout_seconds"] > 0
+        return {"pid": 101, "state": "ready"}
+
+    async def fake_request(port: int, path: str, **kwargs):
+        assert port == 8126
+        assert kwargs["expected_statuses"] == (200,)
+        if path == "/gather":
+            await asyncio.sleep(0.01)
+            payload = {
+                "async_thread_token": 2,
+                "concurrent": [0, 1, 2, 3],
+                "concurrent_seconds": 0.28,
+                "execution_model": (
+                    "Flask WSGI: async view, occupied WSGI worker/thread"
+                ),
+                "loop_token": 7,
+                "pid": 101,
+                "request_sequence": 9,
+                "sequential": [0, 1, 2, 3],
+                "sequential_seconds": 1.05,
+                "wsgi_active_requests": 1,
+                "wsgi_maximum_active_requests": 1,
+                "wsgi_thread_token": 1,
+            }
+            elapsed = 1.34
+        elif path == "/execution/state":
+            payload = {
+                "active_other_requests": 0,
+                "completed_requests": 9,
+                "execution_model": (
+                    "Flask WSGI: async view, occupied WSGI worker/thread"
+                ),
+                "maximum_active_requests": 1,
+                "pid": 101,
+                "wsgi_thread_count": 1,
+            }
+            elapsed = 0.01
+        else:
+            assert path == "/pool"
+            payload = {
+                "pid": 101,
+                "pool": {
+                    "active_connections": 0,
+                    "connections": 4,
+                    "idle_connections": 4,
+                    "max_size": 8,
+                    "pending_gets": 0,
+                },
+            }
+            elapsed = 0.01
+        return runner.LoopbackJsonResponse(
+            status_code=200,
+            payload=payload,
+            elapsed_seconds=elapsed,
+        )
+
+    async def fake_port_not_listening(port: int) -> bool:
+        assert port == 8126
+        return False
+
+    monkeypatch.setattr(
+        runner,
+        "create_observer_connection",
+        lambda *args, **kwargs: FakeConnection(),
+    )
+    monkeypatch.setattr(runner, "SqlServerObserver", FakeObserver)
+    monkeypatch.setattr(runner, "launch_with_port_retry", fake_launch)
+    monkeypatch.setattr(runner, "http_get_json", fake_get)
+    monkeypatch.setattr(runner, "http_request_json", fake_request)
+    monkeypatch.setattr(
+        runner,
+        "loopback_port_is_listening",
+        fake_port_not_listening,
+    )
+
+    result = await runner.run_flask_gather_scenario(
+        config,
+        isolated,
+        profile,
+        run_id="flask-gather",
+        policy=runner.SupervisorPolicy(),
+        sql_auth_settings=settings,
+        table_name="framework_items_flask",
+        sql_delay_ms=250,
+    )
+
+    record = result.to_record()
+    assert record["status"] == "PASS"
+    assert record["profile_id"] == profile.id
+    assert record["wsgi_request_slots"] == 1
+    assert record["maximum_simultaneous_sql_requests"] == 4
+    assert record["ready_pids"] == [101]
+    assert record["shutdown_pids"] == [101]
+    assert record["sessions_after"] == 0
+    assert events == [
+        "observer-connect",
+        "gather-observed",
+        "server-stop",
+        "zero-sessions",
+        "observer-disconnect",
+    ]
+
+
+def test_adapted_flask_profile_selection_matches_platform_capabilities() -> None:
+    """Catch a missing asyncio/uvloop count or an invalid Windows uvloop gate."""
+
+    runner = _load_production_framework_runner()
+    posix = runner.adapted_flask_profiles("darwin")
+    assert tuple(profile.id for profile in posix) == tuple(
+        sorted(
+            f"flask-asgi-uvicorn-{loop}-w{workers}"
+            for loop in ("asyncio", "uvloop")
+            for workers in (1, 2, 4, 8)
+        )
+    )
+    windows = runner.adapted_flask_profiles("win32")
+    assert tuple(profile.id for profile in windows) == tuple(
+        f"flask-asgi-uvicorn-asyncio-w{workers}"
+        for workers in (1, 2, 4, 8)
+    )
+    assert all(profile.applicable for profile in (*posix, *windows))
+    assert all(profile.database_mode == "sql_auth" for profile in (*posix, *windows))
+
+
+def _adapted_loop_payload(
+    *,
+    sequence: int,
+    loop_token: int = 7,
+) -> dict[str, object]:
+    return {
+        "async_thread_token": 2,
+        "execution_model": (
+            "Flask via WsgiToAsgi: persistent ASGI loop, thread-sensitive "
+            "WSGI serialization per process"
+        ),
+        "loop_id": 999,
+        "loop_token": loop_token,
+        "pid": 101,
+        "request_sequence": sequence,
+        "value": 17,
+        "wsgi_active_requests": 1,
+        "wsgi_maximum_active_requests": 1,
+        "wsgi_thread_token": 1,
+    }
+
+
+def test_adapted_flask_scaling_evidence_requires_persistent_worker_loop(
+    tmp_path: Path,
+) -> None:
+    """Catch per-request loop recreation or parallel WSGI calls in the adapter."""
+
+    runner = _load_production_framework_runner()
+    config = replace(
+        _config_with_actual_wheel_hash(runner, tmp_path),
+        database_mode="sql_auth",
+        global_connection_budget=8,
+    )
+    profile = replace(
+        _profile_by_family(
+            runner,
+            "flask-asgi-uvicorn-asyncio",
+            workers=1,
+        ),
+        database_mode="sql_auth",
+        platform_system=config.platform_system,
+    )
+    ready_records = (
+        {
+            "phase": "ready",
+            "pid": 101,
+            "worker_application_name": "fm-adapted-flask-101",
+        },
+    )
+    execution_model = (
+        "Flask via WsgiToAsgi: persistent ASGI loop, thread-sensitive WSGI "
+        "serialization per process"
+    )
+    values = (761_001, 761_002)
+    responses = tuple(
+        _flask_execution_payload(
+            value=value,
+            sequence=sequence,
+            loop_token=7,
+            wsgi_thread_token=1,
+            active=1,
+            maximum_active=1,
+            async_thread_token=2,
+            execution_model=execution_model,
+        )
+        for sequence, value in enumerate(values, start=3)
+    )
+    settled = (
+        {
+            "active_other_requests": 0,
+            "completed_requests": 4,
+            "execution_model": execution_model,
+            "maximum_active_requests": 1,
+            "pid": 101,
+            "wsgi_thread_count": 1,
+        },
+    )
+    observer = runner.SqlObserverSample(
+        applications=(
+            runner.ObserverApplicationSample(
+                application_name="fm-adapted-flask-101",
+                host_process_ids=(101,),
+                sessions=1,
+                requests=0,
+            ),
+        ),
+        current_sessions=1,
+        current_requests=0,
+        maximum_sessions=1,
+        maximum_requests=1,
+        request_context_tokens=(),
+    )
+
+    evidence = runner.validate_adapted_flask_scaling_evidence(
+        config=config,
+        profile=profile,
+        ready_records=ready_records,
+        first_loop_records=(_adapted_loop_payload(sequence=1),),
+        second_loop_records=(_adapted_loop_payload(sequence=2),),
+        response_payloads=responses,
+        settled_records=settled,
+        observer_sample=observer,
+    )
+
+    assert evidence.to_record() == {
+        "execution_model": execution_model,
+        "maximum_aggregate_sql_sessions": 1,
+        "maximum_serialized_wsgi_calls_per_process": 1,
+        "maximum_simultaneous_sql_requests": 1,
+        "persistent_worker_loops": [
+            {
+                "async_thread_token": 2,
+                "loop_token": 7,
+                "pid": 101,
+                "wsgi_thread_token": 1,
+            }
+        ],
+        "profile_id": profile.id,
+        "status": "PASS",
+    }
+
+    changed_loop = (_adapted_loop_payload(sequence=2, loop_token=8),)
+    with pytest.raises(
+        runner.WorkerEvidenceError,
+        match="persistent ASGI loop changed",
+    ):
+        runner.validate_adapted_flask_scaling_evidence(
+            config=config,
+            profile=profile,
+            ready_records=ready_records,
+            first_loop_records=(_adapted_loop_payload(sequence=1),),
+            second_loop_records=changed_loop,
+            response_payloads=responses,
+            settled_records=settled,
+            observer_sample=observer,
+        )
+
+
+@pytest.mark.asyncio
+async def test_adapted_flask_profile_reconciles_loops_pool_and_teardown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch an adapted profile that skips persistent-loop or cleanup proof."""
+
+    runner = _load_production_framework_runner()
+    config = replace(
+        _config_with_actual_wheel_hash(runner, tmp_path),
+        database_mode="sql_auth",
+        global_connection_budget=8,
+    )
+    profile = replace(
+        _profile_by_family(
+            runner,
+            "flask-asgi-uvicorn-asyncio",
+            workers=1,
+        ),
+        database_mode="sql_auth",
+        platform_system=config.platform_system,
+    )
+    isolated = runner.prepare_isolated_application(
+        config,
+        source_directory=ROOT / "tests/production_framework",
+        directory_name="adapted-flask-profile-test",
+    )
+    settings = runner.SqlAuthObserverSettings(
+        host="127.0.0.1",
+        port=14334,
+        database="fastmssql_validation",
+        username="fastmssql_owner",
+        password="private-owner-password",
+    )
+    ready_record = {
+        "candidate_sha": config.candidate_sha,
+        "phase": "ready",
+        "pid": 101,
+        "pool_connected_monotonic": 12.0,
+        "pool_created_monotonic": 11.0,
+        "pool_created_pid": 101,
+        "pool_identity": "pool-101",
+        "pool_max_per_worker": 8,
+        "process_started_monotonic": 10.0,
+        "run_id": "adapted-flask",
+        "worker_application_name": "fm-adapted-flask-101",
+        "wheel_filename": config.wheel.name,
+        "wheel_sha256": config.wheel_sha256,
+    }
+    shutdown_record = {**ready_record, "phase": "shutdown"}
+    busy_sample = runner.SqlObserverSample(
+        applications=(
+            runner.ObserverApplicationSample(
+                application_name="fm-adapted-flask-101",
+                host_process_ids=(101,),
+                sessions=1,
+                requests=0,
+            ),
+        ),
+        current_sessions=1,
+        current_requests=0,
+        maximum_sessions=1,
+        maximum_requests=1,
+        request_context_tokens=(),
+    )
+    zero_sample = replace(
+        busy_sample,
+        applications=(),
+        current_sessions=0,
+        current_requests=0,
+    )
+    execution_model = (
+        "Flask via WsgiToAsgi: persistent ASGI loop, thread-sensitive WSGI "
+        "serialization per process"
+    )
+    events: list[str] = []
+
+    class FakeConnection:
+        async def connect(self, *, validate: bool) -> None:
+            assert validate is True
+            events.append("observer-connect")
+
+        async def disconnect(self) -> None:
+            events.append("observer-disconnect")
+
+    class FakeObserver:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        async def wait_for_ready_workers(self, records, *, timeout_seconds):
+            assert tuple(records) == (ready_record,)
+            assert timeout_seconds > 0
+            return busy_sample
+
+        async def wait_for_minimum_requests(self, minimum, *, timeout_seconds):
+            assert minimum == 1
+            assert timeout_seconds > 0
+            events.append("wave-observed")
+            return busy_sample
+
+        async def sample(self):
+            return busy_sample
+
+        async def wait_for_zero_sessions(self, *, timeout_seconds):
+            assert timeout_seconds > 0
+            events.append("zero-sessions")
+            return zero_sample
+
+    outcome = runner.ProcessOutcome(
+        pid=90,
+        returncode=0,
+        stdout="",
+        stderr="",
+        output_truncated=False,
+        descendant_pids=(101,),
+        graceful_stop=True,
+        forced_cleanup=False,
+    )
+
+    class FakeSupervisor:
+        pid = 90
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            del args
+
+        async def wait_for_worker_records(self, **kwargs):
+            assert kwargs["expected_count"] == 1
+            return (ready_record,)
+
+        def read_worker_records(self, **kwargs):
+            assert kwargs["phase"] == "shutdown"
+            return (shutdown_record,)
+
+        async def stop(self):
+            events.append("server-stop")
+            return outcome
+
+    async def fake_launch(**kwargs):
+        assert await kwargs["readiness_probe"](8127)
+        return runner.ServerLaunch(
+            supervisor=FakeSupervisor(),
+            port=8127,
+            attempts=1,
+            sanitized_command=(sys.executable, "-m", "uvicorn"),
+        )
+
+    async def fake_get(port: int, path: str, **kwargs):
+        assert port == 8127
+        assert path == "/ready"
+        assert kwargs["timeout_seconds"] > 0
+        return {"pid": 101, "state": "ready"}
+
+    loop_collection = 0
+
+    async def fake_collect(port: int, path: str, **kwargs):
+        nonlocal loop_collection
+        assert port == 8127
+        assert kwargs["expected_pids"] == (101,)
+        if path == "/package":
+            return (
+                {
+                    "candidate_sha": config.candidate_sha,
+                    "fastmssql_import_path": "/site-packages/fastmssql.so",
+                    "pid": 101,
+                    "wheel_filename": config.wheel.name,
+                    "wheel_sha256": config.wheel_sha256,
+                },
+            )
+        if path == "/principal":
+            return (
+                {
+                    "application_name": "fm-adapted-flask-101",
+                    "pid": 101,
+                    "principal": "fastmssql_owner",
+                    "session_id": 51,
+                },
+            )
+        if path == "/loop":
+            loop_collection += 1
+            return (_adapted_loop_payload(sequence=loop_collection),)
+        if path == "/execution/state":
+            return (
+                {
+                    "active_other_requests": 0,
+                    "completed_requests": 4,
+                    "execution_model": execution_model,
+                    "maximum_active_requests": 1,
+                    "pid": 101,
+                    "wsgi_thread_count": 1,
+                },
+            )
+        assert path == "/pool"
+        return (
+            {
+                "admission": {"active": 0, "capacity": 16, "rejected": 0},
+                "application_name": "fm-adapted-flask-101",
+                "operations": {},
+                "pid": 101,
+                "pool": {
+                    "active_connections": 0,
+                    "connections": 1,
+                    "idle_connections": 1,
+                    "max_size": 8,
+                    "pending_gets": 0,
+                },
+            },
+        )
+
+    async def fake_request(port: int, path: str, **kwargs):
+        assert port == 8127
+        assert kwargs["expected_statuses"] == (200,)
+        value = int(path.removeprefix("/execution/wait/"))
+        sequence = value - 762_000 + 2
+        return runner.LoopbackJsonResponse(
+            status_code=200,
+            payload=_flask_execution_payload(
+                value=value,
+                sequence=sequence,
+                loop_token=7,
+                wsgi_thread_token=1,
+                active=1,
+                maximum_active=1,
+                async_thread_token=2,
+                execution_model=execution_model,
+            ),
+            elapsed_seconds=0.25,
+        )
+
+    async def fake_port_not_listening(port: int) -> bool:
+        assert port == 8127
+        return False
+
+    monkeypatch.setattr(
+        runner,
+        "create_observer_connection",
+        lambda *args, **kwargs: FakeConnection(),
+    )
+    monkeypatch.setattr(runner, "SqlServerObserver", FakeObserver)
+    monkeypatch.setattr(runner, "launch_with_port_retry", fake_launch)
+    monkeypatch.setattr(runner, "http_get_json", fake_get)
+    monkeypatch.setattr(runner, "collect_worker_payloads", fake_collect)
+    monkeypatch.setattr(runner, "http_request_json", fake_request)
+    monkeypatch.setattr(
+        runner,
+        "validate_package_record",
+        lambda *args, **kwargs: dict(args[2]),
+    )
+    monkeypatch.setattr(
+        runner,
+        "loopback_port_is_listening",
+        fake_port_not_listening,
+    )
+
+    result = await runner.run_adapted_flask_profile(
+        config,
+        isolated,
+        profile,
+        repository_root=ROOT,
+        run_id="adapted-flask",
+        policy=runner.SupervisorPolicy(),
+        sql_auth_settings=settings,
+        table_name="framework_items_flask",
+        wave_values=(762_001, 762_002),
+        sql_delay_ms=250,
+    )
+
+    record = result.to_record()
+    assert record["status"] == "PASS"
+    assert record["profile_id"] == profile.id
+    assert record["persistent_worker_loops"] == [
+        {
+            "async_thread_token": 2,
+            "loop_token": 7,
+            "pid": 101,
+            "wsgi_thread_token": 1,
+        }
+    ]
+    assert record["ready_pids"] == [101]
+    assert record["shutdown_pids"] == [101]
+    assert record["sessions_after"] == 0
+    assert events == [
+        "observer-connect",
+        "wave-observed",
+        "server-stop",
+        "zero-sessions",
+        "observer-disconnect",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_adapted_flask_matrix_runs_every_selected_loop_and_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch a matrix that skips an adapted loop or worker-count profile."""
+
+    runner = _load_production_framework_runner()
+    config = replace(
+        _config_with_actual_wheel_hash(runner, tmp_path),
+        database_mode="sql_auth",
+        global_connection_budget=8,
+    )
+    profiles = tuple(
+        replace(
+            _profile_by_family(runner, family, workers=workers),
+            database_mode="sql_auth",
+            platform_system=config.platform_system,
+        )
+        for family, workers in (
+            ("flask-asgi-uvicorn-asyncio", 1),
+            ("flask-asgi-uvicorn-asyncio", 4),
+            ("flask-asgi-uvicorn-uvloop", 2),
+            ("flask-asgi-uvicorn-uvloop", 8),
+        )
+    )
+    settings = runner.SqlAuthObserverSettings(
+        host="127.0.0.1",
+        port=14334,
+        database="fastmssql_validation",
+        username="fastmssql_owner",
+        password="private-owner-password",
+    )
+    calls: list[dict[str, object]] = []
+
+    async def fake_profile(config_arg, isolated, profile, **kwargs):
+        assert config_arg is config
+        assert isolated.root.is_relative_to(config.run_root)
+        calls.append({"profile": profile, **kwargs})
+        return profile.id
+
+    monkeypatch.setattr(
+        runner,
+        "adapted_flask_profiles",
+        lambda platform: profiles,
+    )
+    monkeypatch.setattr(runner, "run_adapted_flask_profile", fake_profile)
+
+    results = await runner.run_adapted_flask_matrix(
+        config,
+        repository_root=ROOT,
+        source_directory=ROOT / "tests/production_framework",
+        sql_auth_settings=settings,
+        table_name="framework_items_flask",
+        policy=runner.SupervisorPolicy(),
+    )
+
+    assert results == tuple(profile.id for profile in profiles)
+    assert [call["run_id"] for call in calls] == [
+        "fasgi-aaaaaaaa-1",
+        "fasgi-aaaaaaaa-2",
+        "fasgi-aaaaaaaa-3",
+        "fasgi-aaaaaaaa-4",
+    ]
+    assert [len(call["wave_values"]) for call in calls] == [2, 4, 2, 8]
+    assert [call["wave_values"][0] for call in calls] == [
+        762_101,
+        762_201,
+        762_301,
+        762_401,
+    ]
+
+
+def test_adapted_flask_serialization_evidence_rejects_parallel_claims() -> None:
+    """Catch a WsgiToAsgi result mislabeled as concurrent per process."""
+
+    runner = _load_production_framework_runner()
+    execution_model = (
+        "Flask via WsgiToAsgi: persistent ASGI loop, thread-sensitive WSGI "
+        "serialization per process"
+    )
+    values = (763_001, 763_002, 763_003, 763_004)
+
+    def payloads(start_sequence: int) -> tuple[dict[str, object], ...]:
+        return tuple(
+            _flask_execution_payload(
+                value=value,
+                sequence=start_sequence + offset,
+                loop_token=7,
+                wsgi_thread_token=1,
+                active=1,
+                maximum_active=1,
+                async_thread_token=2,
+                execution_model=execution_model,
+            )
+            for offset, value in enumerate(values)
+        )
+
+    state = {
+        "active_other_requests": 0,
+        "completed_requests": 8,
+        "execution_model": execution_model,
+        "maximum_active_requests": 1,
+        "pid": 101,
+        "wsgi_thread_count": 1,
+    }
+    observer = runner.SqlObserverSample(
+        applications=(
+            runner.ObserverApplicationSample(
+                application_name="fm-adapted-serialization-101",
+                host_process_ids=(101,),
+                sessions=1,
+                requests=0,
+            ),
+        ),
+        current_sessions=1,
+        current_requests=0,
+        maximum_sessions=1,
+        maximum_requests=1,
+        request_context_tokens=(),
+    )
+    pool = {
+        "pid": 101,
+        "pool": {
+            "active_connections": 0,
+            "connections": 1,
+            "idle_connections": 1,
+            "max_size": 8,
+            "pending_gets": 0,
+        },
+    }
+
+    evidence = runner.validate_adapted_flask_serialization_evidence(
+        sequential_payloads=payloads(1),
+        concurrent_payloads=payloads(5),
+        expected_values=values,
+        sequential_seconds=1.04,
+        concurrent_seconds=1.07,
+        state_record=state,
+        observer_sample=observer,
+        pool_record=pool,
+        sql_delay_ms=250,
+    )
+
+    assert evidence.to_record() == {
+        "concurrent_seconds": 1.07,
+        "execution_model": execution_model,
+        "loop_token": 7,
+        "maximum_simultaneous_sql_requests": 1,
+        "multi_process_scaling": "additional worker processes only",
+        "pool_active_after": 0,
+        "pool_pending_after": 0,
+        "sequential_seconds": 1.04,
+        "serialization_ratio": pytest.approx(1.07 / 1.04),
+        "sql_delay_seconds": 0.25,
+        "status": "PASS",
+        "values": [763_001, 763_002, 763_003, 763_004],
+        "wsgi_calls_per_process": 1,
+    }
+
+    with pytest.raises(
+        runner.WorkerEvidenceError,
+        match="thread-sensitive serialization timing",
+    ):
+        runner.validate_adapted_flask_serialization_evidence(
+            sequential_payloads=payloads(1),
+            concurrent_payloads=payloads(5),
+            expected_values=values,
+            sequential_seconds=1.04,
+            concurrent_seconds=0.5,
+            state_record=state,
+            observer_sample=observer,
+            pool_record=pool,
+            sql_delay_ms=250,
+        )
+
+
+@pytest.mark.asyncio
+async def test_adapted_flask_serialization_scenario_is_supervised_and_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch serialization evidence detached from a real server lifecycle."""
+
+    runner = _load_production_framework_runner()
+    config = replace(
+        _config_with_actual_wheel_hash(runner, tmp_path),
+        database_mode="sql_auth",
+        global_connection_budget=8,
+    )
+    profile = replace(
+        _profile_by_family(
+            runner,
+            "flask-asgi-uvicorn-asyncio",
+            workers=1,
+        ),
+        database_mode="sql_auth",
+        platform_system=config.platform_system,
+    )
+    isolated = runner.prepare_isolated_application(
+        config,
+        source_directory=ROOT / "tests/production_framework",
+        directory_name="adapted-serialization-test",
+    )
+    settings = runner.SqlAuthObserverSettings(
+        host="127.0.0.1",
+        port=14334,
+        database="fastmssql_validation",
+        username="fastmssql_owner",
+        password="private-owner-password",
+    )
+    ready_record = {
+        "phase": "ready",
+        "pid": 101,
+        "run_id": "adapted-serialization",
+        "worker_application_name": "fm-adapted-serialization-101",
+    }
+    shutdown_record = {**ready_record, "phase": "shutdown"}
+    busy_sample = runner.SqlObserverSample(
+        applications=(
+            runner.ObserverApplicationSample(
+                application_name="fm-adapted-serialization-101",
+                host_process_ids=(101,),
+                sessions=1,
+                requests=1,
+            ),
+        ),
+        current_sessions=1,
+        current_requests=1,
+        maximum_sessions=1,
+        maximum_requests=1,
+        request_context_tokens=(),
+    )
+    zero_sample = replace(
+        busy_sample,
+        applications=(),
+        current_sessions=0,
+        current_requests=0,
+    )
+    execution_model = (
+        "Flask via WsgiToAsgi: persistent ASGI loop, thread-sensitive WSGI "
+        "serialization per process"
+    )
+    events: list[str] = []
+
+    class FakeConnection:
+        async def connect(self, *, validate: bool) -> None:
+            assert validate is True
+            events.append("observer-connect")
+
+        async def disconnect(self) -> None:
+            events.append("observer-disconnect")
+
+    class FakeObserver:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        async def wait_for_ready_workers(self, records, *, timeout_seconds):
+            assert tuple(records) == (ready_record,)
+            assert timeout_seconds > 0
+            return busy_sample
+
+        async def wait_for_minimum_requests(self, minimum, *, timeout_seconds):
+            assert minimum == 1
+            assert timeout_seconds > 0
+            events.append("concurrent-wave-observed")
+            return busy_sample
+
+        async def wait_for_zero_sessions(self, *, timeout_seconds):
+            assert timeout_seconds > 0
+            events.append("zero-sessions")
+            return zero_sample
+
+    outcome = runner.ProcessOutcome(
+        pid=90,
+        returncode=0,
+        stdout="",
+        stderr="",
+        output_truncated=False,
+        descendant_pids=(101,),
+        graceful_stop=True,
+        forced_cleanup=False,
+    )
+
+    class FakeSupervisor:
+        pid = 90
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            del args
+
+        async def wait_for_worker_records(self, **kwargs):
+            assert kwargs["expected_count"] == 1
+            return (ready_record,)
+
+        def read_worker_records(self, **kwargs):
+            assert kwargs["phase"] == "shutdown"
+            return (shutdown_record,)
+
+        async def stop(self):
+            events.append("server-stop")
+            return outcome
+
+    async def fake_launch(**kwargs):
+        assert await kwargs["readiness_probe"](8128)
+        return runner.ServerLaunch(
+            supervisor=FakeSupervisor(),
+            port=8128,
+            attempts=1,
+            sanitized_command=(sys.executable, "-m", "uvicorn"),
+        )
+
+    async def fake_get(port: int, path: str, **kwargs):
+        assert port == 8128
+        assert path == "/ready"
+        assert kwargs["timeout_seconds"] > 0
+        return {"pid": 101, "state": "ready"}
+
+    request_lock = asyncio.Lock()
+    request_sequence = 0
+
+    async def fake_request(port: int, path: str, **kwargs):
+        nonlocal request_sequence
+        assert port == 8128
+        assert kwargs["expected_statuses"] == (200,)
+        if path.startswith("/execution/wait/"):
+            value = int(path.removeprefix("/execution/wait/"))
+            async with request_lock:
+                request_sequence += 1
+                sequence = request_sequence
+                await asyncio.sleep(0.04)
+            payload = _flask_execution_payload(
+                value=value,
+                sequence=sequence,
+                loop_token=7,
+                wsgi_thread_token=1,
+                active=1,
+                maximum_active=1,
+                async_thread_token=2,
+                delay_ms=50,
+                execution_model=execution_model,
+            )
+        elif path == "/execution/state":
+            payload = {
+                "active_other_requests": 0,
+                "completed_requests": 8,
+                "execution_model": execution_model,
+                "maximum_active_requests": 1,
+                "pid": 101,
+                "wsgi_thread_count": 1,
+            }
+        else:
+            assert path == "/pool"
+            payload = {
+                "pid": 101,
+                "pool": {
+                    "active_connections": 0,
+                    "connections": 1,
+                    "idle_connections": 1,
+                    "max_size": 8,
+                    "pending_gets": 0,
+                },
+            }
+        return runner.LoopbackJsonResponse(
+            status_code=200,
+            payload=payload,
+            elapsed_seconds=0.04,
+        )
+
+    async def fake_port_not_listening(port: int) -> bool:
+        assert port == 8128
+        return False
+
+    monkeypatch.setattr(
+        runner,
+        "create_observer_connection",
+        lambda *args, **kwargs: FakeConnection(),
+    )
+    monkeypatch.setattr(runner, "SqlServerObserver", FakeObserver)
+    monkeypatch.setattr(runner, "launch_with_port_retry", fake_launch)
+    monkeypatch.setattr(runner, "http_get_json", fake_get)
+    monkeypatch.setattr(runner, "http_request_json", fake_request)
+    monkeypatch.setattr(
+        runner,
+        "loopback_port_is_listening",
+        fake_port_not_listening,
+    )
+
+    result = await runner.run_adapted_flask_serialization_scenario(
+        config,
+        isolated,
+        profile,
+        run_id="adapted-serialization",
+        policy=runner.SupervisorPolicy(),
+        sql_auth_settings=settings,
+        table_name="framework_items_flask",
+        values=(764_001, 764_002, 764_003, 764_004),
+        sql_delay_ms=50,
+    )
+
+    record = result.to_record()
+    assert record["status"] == "PASS"
+    assert record["profile_id"] == profile.id
+    assert record["wsgi_calls_per_process"] == 1
+    assert 0.75 <= record["serialization_ratio"] <= 1.35
+    assert record["maximum_simultaneous_sql_requests"] == 1
+    assert record["ready_pids"] == [101]
+    assert record["shutdown_pids"] == [101]
+    assert record["sessions_after"] == 0
+    assert events == [
+        "observer-connect",
+        "concurrent-wave-observed",
+        "server-stop",
+        "zero-sessions",
+        "observer-disconnect",
+    ]
+
+
+def test_execution_model_language_is_exact_and_rejects_equivalence_claims() -> None:
+    """Catch report language that erases the measured framework differences."""
+
+    runner = _load_production_framework_runner()
+    labels = runner.execution_model_labels()
+    assert labels == (
+        "native ASGI: concurrent requests on persistent event loop",
+        "Flask WSGI: async view, occupied WSGI worker/thread",
+        (
+            "Flask via WsgiToAsgi: persistent ASGI loop, thread-sensitive "
+            "WSGI serialization per process"
+        ),
+    )
+    assert framework_app.FLASK_WSGI_EXECUTION_MODEL == labels[1]
+    assert framework_app.ADAPTED_FLASK_EXECUTION_MODEL == labels[2]
+    assert runner.validate_execution_model_language(labels) == labels
+
+    for forbidden in (
+        "All modes are equivalent",
+        "They have the same throughput",
+        "This is fully async Flask",
+        "This makes true-async Flask",
+        "Flask is now native ASGI Flask",
+    ):
+        with pytest.raises(
+            runner.WorkerEvidenceError,
+            match="forbidden execution-model claim",
+        ):
+            runner.validate_execution_model_language((*labels, forbidden))
 
 
 def test_observer_connection_factory_lazily_uses_one_installed_wheel_pool(

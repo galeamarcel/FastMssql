@@ -147,6 +147,28 @@ No release, package-version change, or artifact publication has occurred.
   It changes no FastMssql/Tiberius runtime, package metadata, displayed
   `0.7.7` version, release, published artifact or original-repository state.
 
+### Production framework Flask execution-model RED
+
+- Added focused Task 8 contracts for Gunicorn `sync` and `gthread` at
+  `1/2/4/8` workers, one-request internal `asyncio.gather`, Flask adapted
+  through `WsgiToAsgi`, persistent-loop evidence, thread-sensitive
+  serialization and the three exact comparison labels. These contracts are
+  intentionally committed before their application/runner implementation.
+- A real installed-wheel Docker SQL-auth diagnostic reproduced a harness
+  defect at `flask-gunicorn-gthread-w8`: all eight parameterized SQL requests
+  returned correctly and teardown reached zero sessions, but the shared
+  Gunicorn listener dispatched two requests to one worker and none to another,
+  so SQL Server observed a legitimate maximum of seven concurrent requests.
+  Requiring exactly one request per worker was therefore nondeterministic and
+  did not indicate a FastMssql driver failure.
+- Added explicit RED contracts requiring a conservative shared-listener SQL
+  observation threshold while retaining the exact one-worker slot/thread
+  proof, and requiring the primary HTTP exception to propagate with complete
+  task settlement instead of being hidden by an observer timeout.
+- This RED changes only repository-owned tests and documentation. It changes
+  no FastMssql/Tiberius runtime, package metadata, displayed `0.7.7` version,
+  release, published artifact or original-repository state.
+
 ### Production framework external-process supervisor
 
 - Added a schema-1, fail-closed process runner with closed operation bounds,
