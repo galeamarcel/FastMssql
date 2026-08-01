@@ -25,6 +25,7 @@ import tempfile
 import time
 from typing import Any, Protocol, Sequence
 
+import httpx
 import psutil
 
 
@@ -34,6 +35,11 @@ REQUIRED_OPERATIONS = 1_000
 LARGE_OPERATIONS = 10_000
 EXTENDED_OPERATIONS = 99_999
 MAX_OPERATIONS = 99_999
+MIN_SQL_BIGINT = -(2**63)
+MAX_SQL_BIGINT = 2**63 - 1
+MAX_HTTP_STREAM_ROWS = 10_000
+MAX_NDJSON_LINE_BYTES = 256
+EXPECTED_STREAM_BUFFER_ROWS = 8
 GUNICORN_WINDOWS_REASON = "Gunicorn is not supported on Windows"
 UVLOOP_WINDOWS_REASON = "uvloop is not supported on Windows"
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
@@ -42,6 +48,10 @@ SQL_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 SQL_SERVER_HOST_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9.:[\]_-]{0,252}")
 OBSERVER_CONTEXT_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
 MAX_SQL_SERVER_APPLICATION_NAME = 128
+SQL_DELAY_MILLISECONDS = frozenset(
+    {0, 50, 100, 200, 250, 500, 1_000, 2_000, 5_000}
+)
+ACQUIRE_TIMEOUT_MILLISECONDS = frozenset({100, 250, 500, 1_000, 5_000})
 OBSERVER_SESSION_SQL = """
 SELECT
     CAST(s.program_name AS NVARCHAR(128)) AS application_name,
@@ -116,6 +126,80 @@ class IsolatedApplicationError(ProcessSupervisorError):
 
 class HttpProbeError(ProcessSupervisorError):
     """A bounded loopback HTTP probe failed or returned invalid data."""
+
+
+@dataclass(frozen=True, slots=True)
+class LoopbackJsonResponse:
+    """Bounded status-aware JSON evidence from one loopback request."""
+
+    status_code: int
+    payload: dict[str, object]
+    elapsed_seconds: float
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "elapsed_seconds": self.elapsed_seconds,
+            "payload": self.payload,
+            "status_code": self.status_code,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class FullNdjsonObservation:
+    status_code: int
+    content_type: str
+    row_count: int
+    value_digest: str
+    bytes_received: int
+    first_data_seconds: float
+    elapsed_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class EarlyCloseNdjsonObservation:
+    status_code: int
+    content_type: str
+    requested_rows: int
+    prefix_rows: int
+    prefix_digest: str
+    bytes_received: int
+    first_data_seconds: float
+    close_seconds: float
+
+
+@dataclass(slots=True, repr=False)
+class RawLoopbackRequest:
+    """One raw request whose peer remains connected until explicit close."""
+
+    _reader: asyncio.StreamReader = field(repr=False)
+    _writer: asyncio.StreamWriter = field(repr=False)
+    _closed: bool = field(default=False, init=False, repr=False)
+
+    def __repr__(self) -> str:
+        return f"RawLoopbackRequest(closed={self._closed})"
+
+    async def close(self, *, timeout_seconds: float) -> None:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+        ):
+            raise RunnerConfigurationError(
+                "raw HTTP close timeout must be a finite positive number"
+            )
+        if self._closed:
+            return
+        self._closed = True
+        self._writer.close()
+        try:
+            await asyncio.wait_for(
+                self._writer.wait_closed(),
+                timeout=timeout_seconds,
+            )
+        except (OSError, TimeoutError):
+            self._writer.transport.abort()
+            raise HttpProbeError("raw loopback HTTP close failed") from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,6 +297,242 @@ class OfflineSmokeResult:
         return asdict(self)
 
 
+@dataclass(frozen=True, slots=True)
+class NativeScalingProfileResult:
+    profile: ProcessProfile
+    evidence: NativeScalingEvidence
+    port: int
+    launch_attempts: int
+    sanitized_command: tuple[str, ...]
+    shutdown_pids: tuple[int, ...]
+    manager_pid: int
+    descendant_pids: tuple[int, ...]
+    returncode: int
+    graceful_stop: bool
+    forced_cleanup: bool
+    listening_sockets_after: tuple[int, ...]
+    sessions_after: int
+
+    def to_record(self) -> dict[str, object]:
+        record = self.profile.to_record()
+        record.update(self.evidence.to_record())
+        record.update(
+            {
+                "descendant_pids": list(self.descendant_pids),
+                "forced_cleanup": self.forced_cleanup,
+                "graceful_stop": self.graceful_stop,
+                "launch_attempts": self.launch_attempts,
+                "listening_sockets_after": list(self.listening_sockets_after),
+                "manager_pid": self.manager_pid,
+                "port": self.port,
+                "returncode": self.returncode,
+                "sanitized_command": list(self.sanitized_command),
+                "sessions_after": self.sessions_after,
+                "shutdown_pids": list(self.shutdown_pids),
+                "status": "PASS",
+            }
+        )
+        return record
+
+
+@dataclass(frozen=True, slots=True)
+class NativeConcurrencyScenarioResult:
+    profile_id: str
+    evidence: NativeConcurrencyEvidence
+    ready_pids: tuple[int, ...]
+    shutdown_pids: tuple[int, ...]
+    manager_pid: int
+    descendant_pids: tuple[int, ...]
+    returncode: int
+    graceful_stop: bool
+    forced_cleanup: bool
+    listening_sockets_after: tuple[int, ...]
+    sessions_after: int
+
+    def to_record(self) -> dict[str, object]:
+        record = self.evidence.to_record()
+        record.update(
+            {
+                "descendant_pids": list(self.descendant_pids),
+                "forced_cleanup": self.forced_cleanup,
+                "graceful_stop": self.graceful_stop,
+                "listening_sockets_after": list(self.listening_sockets_after),
+                "manager_pid": self.manager_pid,
+                "profile_id": self.profile_id,
+                "ready_pids": list(self.ready_pids),
+                "returncode": self.returncode,
+                "sessions_after": self.sessions_after,
+                "shutdown_pids": list(self.shutdown_pids),
+            }
+        )
+        return record
+
+
+@dataclass(frozen=True, slots=True)
+class NativeDisconnectScenarioResult:
+    profile_id: str
+    evidence: DisconnectEvidence
+    ready_pids: tuple[int, ...]
+    shutdown_pids: tuple[int, ...]
+    manager_pid: int
+    descendant_pids: tuple[int, ...]
+    returncode: int
+    graceful_stop: bool
+    forced_cleanup: bool
+    listening_sockets_after: tuple[int, ...]
+    sessions_after: int
+
+    def to_record(self) -> dict[str, object]:
+        record = self.evidence.to_record()
+        record.update(
+            {
+                "descendant_pids": list(self.descendant_pids),
+                "forced_cleanup": self.forced_cleanup,
+                "graceful_stop": self.graceful_stop,
+                "listening_sockets_after": list(self.listening_sockets_after),
+                "manager_pid": self.manager_pid,
+                "profile_id": self.profile_id,
+                "ready_pids": list(self.ready_pids),
+                "returncode": self.returncode,
+                "sessions_after": self.sessions_after,
+                "shutdown_pids": list(self.shutdown_pids),
+            }
+        )
+        return record
+
+
+@dataclass(frozen=True, slots=True)
+class NativeGracefulQueryScenarioResult:
+    profile_id: str
+    evidence: GracefulQueryEvidence
+    ready_pids: tuple[int, ...]
+    shutdown_pids: tuple[int, ...]
+    manager_pid: int
+    descendant_pids: tuple[int, ...]
+    returncode: int
+    graceful_stop: bool
+    forced_cleanup: bool
+    listening_sockets_after: tuple[int, ...]
+    sessions_after: int
+
+    def to_record(self) -> dict[str, object]:
+        record = self.evidence.to_record()
+        record.update(
+            {
+                "descendant_pids": list(self.descendant_pids),
+                "forced_cleanup": self.forced_cleanup,
+                "graceful_stop": self.graceful_stop,
+                "listening_sockets_after": list(self.listening_sockets_after),
+                "manager_pid": self.manager_pid,
+                "profile_id": self.profile_id,
+                "ready_pids": list(self.ready_pids),
+                "returncode": self.returncode,
+                "sessions_after": self.sessions_after,
+                "shutdown_pids": list(self.shutdown_pids),
+            }
+        )
+        return record
+
+
+@dataclass(frozen=True, slots=True)
+class NativeGracefulTransactionScenarioResult:
+    profile_id: str
+    evidence: GracefulTransactionEvidence
+    ready_pids: tuple[int, ...]
+    shutdown_pids: tuple[int, ...]
+    manager_pid: int
+    descendant_pids: tuple[int, ...]
+    returncode: int
+    graceful_stop: bool
+    forced_cleanup: bool
+    listening_sockets_after: tuple[int, ...]
+    sessions_after: int
+
+    def to_record(self) -> dict[str, object]:
+        record = self.evidence.to_record()
+        record.update(
+            {
+                "descendant_pids": list(self.descendant_pids),
+                "forced_cleanup": self.forced_cleanup,
+                "graceful_stop": self.graceful_stop,
+                "listening_sockets_after": list(self.listening_sockets_after),
+                "manager_pid": self.manager_pid,
+                "profile_id": self.profile_id,
+                "ready_pids": list(self.ready_pids),
+                "returncode": self.returncode,
+                "sessions_after": self.sessions_after,
+                "shutdown_pids": list(self.shutdown_pids),
+            }
+        )
+        return record
+
+
+@dataclass(frozen=True, slots=True)
+class NativeSaturationScenarioResult:
+    profile_id: str
+    evidence: NativeSaturationEvidence
+    ready_pids: tuple[int, ...]
+    shutdown_pids: tuple[int, ...]
+    manager_pid: int
+    descendant_pids: tuple[int, ...]
+    returncode: int
+    graceful_stop: bool
+    forced_cleanup: bool
+    listening_sockets_after: tuple[int, ...]
+    sessions_after: int
+
+    def to_record(self) -> dict[str, object]:
+        record = self.evidence.to_record()
+        record.update(
+            {
+                "descendant_pids": list(self.descendant_pids),
+                "forced_cleanup": self.forced_cleanup,
+                "graceful_stop": self.graceful_stop,
+                "listening_sockets_after": list(self.listening_sockets_after),
+                "manager_pid": self.manager_pid,
+                "profile_id": self.profile_id,
+                "ready_pids": list(self.ready_pids),
+                "returncode": self.returncode,
+                "sessions_after": self.sessions_after,
+                "shutdown_pids": list(self.shutdown_pids),
+            }
+        )
+        return record
+
+
+@dataclass(frozen=True, slots=True)
+class NativeStreamingScenarioResult:
+    profile_id: str
+    evidence: NativeStreamingEvidence
+    ready_pids: tuple[int, ...]
+    shutdown_pids: tuple[int, ...]
+    manager_pid: int
+    descendant_pids: tuple[int, ...]
+    returncode: int
+    graceful_stop: bool
+    forced_cleanup: bool
+    listening_sockets_after: tuple[int, ...]
+    sessions_after: int
+
+    def to_record(self) -> dict[str, object]:
+        record = self.evidence.to_record()
+        record.update(
+            {
+                "descendant_pids": list(self.descendant_pids),
+                "forced_cleanup": self.forced_cleanup,
+                "graceful_stop": self.graceful_stop,
+                "listening_sockets_after": list(self.listening_sockets_after),
+                "manager_pid": self.manager_pid,
+                "profile_id": self.profile_id,
+                "ready_pids": list(self.ready_pids),
+                "returncode": self.returncode,
+                "sessions_after": self.sessions_after,
+                "shutdown_pids": list(self.shutdown_pids),
+            }
+        )
+        return record
+
+
 class ObserverResultSource(Protocol):
     async def query(
         self,
@@ -296,6 +616,223 @@ class SqlObserverSample:
                 hashlib.sha256(token.encode("ascii")).hexdigest()
                 for token in self.request_context_tokens
             ],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class NativeScalingEvidence:
+    """Validated cross-process evidence for one native FastAPI profile."""
+
+    profile_id: str
+    ready_pids: tuple[int, ...]
+    worker_records: tuple[dict[str, object], ...]
+    parameter_values: tuple[int, ...]
+    pool_max_per_worker: int
+    global_connection_budget: int
+    maximum_aggregate_sql_sessions: int
+    maximum_simultaneous_sql_requests: int
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "global_connection_budget": self.global_connection_budget,
+            "maximum_aggregate_sql_sessions": (
+                self.maximum_aggregate_sql_sessions
+            ),
+            "maximum_simultaneous_sql_requests": (
+                self.maximum_simultaneous_sql_requests
+            ),
+            "parameter_values": list(self.parameter_values),
+            "pool_max_per_worker": self.pool_max_per_worker,
+            "profile_id": self.profile_id,
+            "ready_pids": list(self.ready_pids),
+            "worker_records": [dict(record) for record in self.worker_records],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class NativeConcurrencyEvidence:
+    sequential_seconds: float
+    concurrent_seconds: float
+    health_seconds: float
+    sql_delay_seconds: float
+    maximum_simultaneous_sql_requests: int
+    pool_active_after: int
+    pool_pending_after: int
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "concurrent_seconds": self.concurrent_seconds,
+            "health_seconds": self.health_seconds,
+            "maximum_simultaneous_sql_requests": (
+                self.maximum_simultaneous_sql_requests
+            ),
+            "pool_active_after": self.pool_active_after,
+            "pool_pending_after": self.pool_pending_after,
+            "sequential_seconds": self.sequential_seconds,
+            "sql_delay_seconds": self.sql_delay_seconds,
+            "status": "PASS",
+            "values_exact": True,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class DisconnectEvidence:
+    context_token_sha256: str
+    sql_requests_after: int
+    pool_active_after: int
+    pool_pending_after: int
+    recovery_value: int
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "connection_replaced": True,
+            "context_token_sha256": self.context_token_sha256,
+            "pool_active_after": self.pool_active_after,
+            "pool_pending_after": self.pool_pending_after,
+            "recovery_value": self.recovery_value,
+            "sql_observed_before_close": True,
+            "sql_requests_after": self.sql_requests_after,
+            "status": "PASS",
+            "transport": "raw-tcp-client-close",
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class GracefulQueryEvidence:
+    context_token_sha256: str
+    response_session_id: int
+    response_value: int
+    sql_delay_seconds: float
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "context_token_sha256": self.context_token_sha256,
+            "response_completed_after_signal": True,
+            "response_session_id": self.response_session_id,
+            "response_value": self.response_value,
+            "sql_delay_seconds": self.sql_delay_seconds,
+            "sql_observed_before_signal": True,
+            "status": "PASS",
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class GracefulTransactionEvidence:
+    context_token_sha256: str
+    item_id: int
+    outcome: str
+    response_session_id: int
+    durable_result: str
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "context_token_sha256": self.context_token_sha256,
+            "durable_result": self.durable_result,
+            "item_id": self.item_id,
+            "outcome": self.outcome,
+            "response_completed_after_signal": True,
+            "response_session_id": self.response_session_id,
+            "sql_observed_before_signal": True,
+            "status": "PASS",
+            "transaction_holding_before_signal": True,
+            "transaction_settled": True,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class NativeSaturationEvidence:
+    pool_max_per_worker: int
+    admitted_holders: int
+    admitted_waiters: int
+    admission_capacity: int
+    rejected_requests: int
+    acquire_timeouts: int
+    maximum_sql_sessions: int
+    maximum_sql_requests: int
+    observed_active_connections: int
+    observed_pending_gets: int
+    pool_get_timed_out_delta: int
+    pool_active_after: int
+    pool_pending_after: int
+    admission_active_after: int
+    recovery_value: int
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "acquire_timeouts": self.acquire_timeouts,
+            "admission_active_after": self.admission_active_after,
+            "admission_capacity": self.admission_capacity,
+            "admitted_holders": self.admitted_holders,
+            "admitted_waiters": self.admitted_waiters,
+            "maximum_sql_requests": self.maximum_sql_requests,
+            "maximum_sql_sessions": self.maximum_sql_sessions,
+            "observed_active_connections": (
+                self.observed_active_connections
+            ),
+            "observed_pending_gets": self.observed_pending_gets,
+            "pool_active_after": self.pool_active_after,
+            "pool_get_timed_out_delta": self.pool_get_timed_out_delta,
+            "pool_max_per_worker": self.pool_max_per_worker,
+            "pool_pending_after": self.pool_pending_after,
+            "recovery_value": self.recovery_value,
+            "rejected_requests": self.rejected_requests,
+            "status": "PASS",
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class NativeStreamingEvidence:
+    driver_buffer_rows: int
+    full_rows: int
+    full_value_digest: str
+    full_bytes_received: int
+    full_first_data_seconds: float
+    full_elapsed_seconds: float
+    full_pool_active_after: int
+    full_pool_pending_after: int
+    early_requested_rows: int
+    early_prefix_rows: int
+    early_prefix_digest: str
+    early_bytes_received: int
+    early_first_data_seconds: float
+    early_close_seconds: float
+    early_sql_requests_after: int
+    early_pool_active_after: int
+    early_pool_pending_after: int
+    rss_start_bytes: int
+    rss_peak_bytes: int
+    rss_end_bytes: int
+    rss_growth_limit_bytes: int
+    recovery_value: int
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "driver_buffer_rows": self.driver_buffer_rows,
+            "early_bytes_received": self.early_bytes_received,
+            "early_client_closed": True,
+            "early_close_seconds": self.early_close_seconds,
+            "early_first_data_seconds": self.early_first_data_seconds,
+            "early_pool_active_after": self.early_pool_active_after,
+            "early_pool_pending_after": self.early_pool_pending_after,
+            "early_prefix_digest": self.early_prefix_digest,
+            "early_prefix_rows": self.early_prefix_rows,
+            "early_requested_rows": self.early_requested_rows,
+            "early_sql_requests_after": self.early_sql_requests_after,
+            "full_bytes_received": self.full_bytes_received,
+            "full_elapsed_seconds": self.full_elapsed_seconds,
+            "full_first_data_seconds": self.full_first_data_seconds,
+            "full_pool_active_after": self.full_pool_active_after,
+            "full_pool_pending_after": self.full_pool_pending_after,
+            "full_rows": self.full_rows,
+            "full_value_digest": self.full_value_digest,
+            "incremental_first_data": True,
+            "recovery_value": self.recovery_value,
+            "rss_end_bytes": self.rss_end_bytes,
+            "rss_growth_bytes": self.rss_peak_bytes - self.rss_start_bytes,
+            "rss_growth_limit_bytes": self.rss_growth_limit_bytes,
+            "rss_peak_bytes": self.rss_peak_bytes,
+            "rss_start_bytes": self.rss_start_bytes,
+            "status": "PASS",
         }
 
 
@@ -427,6 +964,109 @@ class SqlServerObserver:
         *,
         timeout_seconds: float,
     ) -> SqlObserverSample:
+        return await self._wait_for_sample(
+            lambda sample: sample.current_sessions == 0,
+            timeout_seconds=timeout_seconds,
+            timeout_message=(
+                "worker SQL sessions did not reach zero within the bound"
+            ),
+        )
+
+    async def wait_for_zero_requests(
+        self,
+        *,
+        timeout_seconds: float,
+    ) -> SqlObserverSample:
+        return await self._wait_for_sample(
+            lambda sample: sample.current_requests == 0,
+            timeout_seconds=timeout_seconds,
+            timeout_message=(
+                "worker SQL requests did not reach zero within the bound"
+            ),
+        )
+
+    async def wait_for_context_token(
+        self,
+        token: str,
+        *,
+        present: bool,
+        timeout_seconds: float,
+    ) -> SqlObserverSample:
+        if (
+            not isinstance(token, str)
+            or OBSERVER_CONTEXT_TOKEN_PATTERN.fullmatch(token) is None
+        ):
+            raise RunnerConfigurationError("observer context token is invalid")
+        if not isinstance(present, bool):
+            raise RunnerConfigurationError(
+                "observer context-token presence must be boolean"
+            )
+        return await self._wait_for_sample(
+            lambda sample: (token in sample.request_context_tokens) is present,
+            timeout_seconds=timeout_seconds,
+            timeout_message=(
+                "worker SQL context token did not reach the expected state "
+                "within the bound"
+            ),
+        )
+
+    async def wait_for_minimum_requests(
+        self,
+        minimum_requests: int,
+        *,
+        timeout_seconds: float,
+    ) -> SqlObserverSample:
+        if (
+            isinstance(minimum_requests, bool)
+            or not isinstance(minimum_requests, int)
+            or minimum_requests <= 0
+        ):
+            raise RunnerConfigurationError(
+                "observer minimum requests must be a positive integer"
+            )
+        return await self._wait_for_sample(
+            lambda sample: sample.current_requests >= minimum_requests,
+            timeout_seconds=timeout_seconds,
+            timeout_message=(
+                "worker SQL requests did not reach the required minimum "
+                "within the bound"
+            ),
+        )
+
+    async def wait_for_ready_workers(
+        self,
+        ready_records: Sequence[Mapping[str, object]],
+        *,
+        timeout_seconds: float,
+    ) -> SqlObserverSample:
+        expected = frozenset(_ready_worker_map(ready_records))
+
+        def every_worker_is_visible(sample: SqlObserverSample) -> bool:
+            observed = {
+                application.application_name
+                for application in sample.applications
+            }
+            if not observed.issubset(expected):
+                raise WorkerEvidenceError(
+                    "SQL observer found an unexpected worker identity"
+                )
+            return observed == expected
+
+        return await self._wait_for_sample(
+            every_worker_is_visible,
+            timeout_seconds=timeout_seconds,
+            timeout_message=(
+                "not every ready worker SQL session appeared within the bound"
+            ),
+        )
+
+    async def _wait_for_sample(
+        self,
+        predicate: Callable[[SqlObserverSample], bool],
+        *,
+        timeout_seconds: float,
+        timeout_message: str,
+    ) -> SqlObserverSample:
         if (
             isinstance(timeout_seconds, bool)
             or not isinstance(timeout_seconds, (int, float))
@@ -440,36 +1080,27 @@ class SqlServerObserver:
         while True:
             remaining = deadline - self.clock()
             if remaining <= 0:
-                raise ReadinessTimeoutError(
-                    "worker SQL sessions did not reach zero within the bound"
-                )
+                raise ReadinessTimeoutError(timeout_message)
             try:
                 sample = await asyncio.wait_for(
                     self.sample(),
                     timeout=remaining,
                 )
             except TimeoutError:
-                raise ReadinessTimeoutError(
-                    "worker SQL sessions did not reach zero within the bound"
-                ) from None
+                raise ReadinessTimeoutError(timeout_message) from None
             if self.clock() > deadline:
-                raise ReadinessTimeoutError(
-                    "worker SQL sessions did not reach zero within the bound"
-                )
-            if sample.current_sessions == 0:
+                raise ReadinessTimeoutError(timeout_message)
+            if predicate(sample):
                 return sample
             remaining = deadline - self.clock()
             if remaining <= 0:
-                raise ReadinessTimeoutError(
-                    "worker SQL sessions did not reach zero within the bound"
-                )
+                raise ReadinessTimeoutError(timeout_message)
             await self.sleep(min(self.poll_interval_seconds, remaining))
 
 
-def reconcile_worker_sessions(
-    sample: SqlObserverSample,
+def _ready_worker_map(
     ready_records: Sequence[Mapping[str, object]],
-) -> tuple[tuple[str, int], ...]:
+) -> dict[str, int]:
     if not ready_records:
         raise WorkerEvidenceError(
             "worker SQL sessions do not match ready records"
@@ -496,6 +1127,14 @@ def reconcile_worker_sessions(
         raise WorkerEvidenceError(
             "worker SQL sessions do not match ready records"
         ) from None
+    return expected
+
+
+def reconcile_worker_sessions(
+    sample: SqlObserverSample,
+    ready_records: Sequence[Mapping[str, object]],
+) -> tuple[tuple[str, int], ...]:
+    expected = _ready_worker_map(ready_records)
 
     observed_names = {
         application.application_name for application in sample.applications
@@ -505,6 +1144,1009 @@ def reconcile_worker_sessions(
             "worker SQL sessions do not match ready records"
         )
     return tuple(sorted(expected.items()))
+
+
+def _evidence_records_by_pid(
+    records: Sequence[Mapping[str, object]],
+    *,
+    expected_pids: tuple[int, ...],
+    record_name: str,
+) -> dict[int, Mapping[str, object]]:
+    selected: dict[int, Mapping[str, object]] = {}
+    try:
+        for record in records:
+            pid = record["pid"]
+            if (
+                isinstance(pid, bool)
+                or not isinstance(pid, int)
+                or pid <= 0
+                or pid in selected
+            ):
+                raise ValueError
+            selected[pid] = record
+    except (KeyError, TypeError, ValueError):
+        raise WorkerEvidenceError(f"{record_name} worker evidence is malformed") from None
+    if tuple(sorted(selected)) != expected_pids:
+        raise WorkerEvidenceError(
+            f"{record_name} worker evidence does not match ready PIDs"
+        )
+    return selected
+
+
+def _finite_monotonic(record: Mapping[str, object], name: str) -> float:
+    value = record.get(name)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise WorkerEvidenceError("worker pool lifecycle evidence is malformed")
+    return float(value)
+
+
+def _nonnegative_metric(record: Mapping[str, object], name: str) -> int:
+    value = record.get(name)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise WorkerEvidenceError("worker pool metrics are malformed")
+    return value
+
+
+def validate_native_scaling_evidence(
+    *,
+    config: RunnerConfig,
+    profile: ProcessProfile,
+    ready_records: Sequence[Mapping[str, object]],
+    package_records: Sequence[Mapping[str, object]],
+    principal_records: Sequence[Mapping[str, object]],
+    pool_records: Sequence[Mapping[str, object]],
+    parameter_payloads: Sequence[Mapping[str, object]],
+    expected_values: Sequence[int],
+    expected_principal: str,
+    observer_sample: SqlObserverSample,
+) -> NativeScalingEvidence:
+    """Fail closed unless every worker/process/pool/SQL layer reconciles."""
+
+    if (
+        config.database_mode != "sql_auth"
+        or profile.database_mode != "sql_auth"
+        or not profile.applicable
+        or not profile.family.startswith("fastapi-")
+        or profile.workers not in WORKER_COUNTS
+        or config.global_connection_budget % profile.workers
+    ):
+        raise RunnerConfigurationError(
+            "native scaling evidence requires an applicable SQL-auth profile"
+        )
+    if (
+        not isinstance(expected_principal, str)
+        or SQL_IDENTIFIER_PATTERN.fullmatch(expected_principal) is None
+    ):
+        raise RunnerConfigurationError("expected SQL principal is invalid")
+    if (
+        not expected_values
+        or any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in expected_values
+        )
+    ):
+        raise RunnerConfigurationError("expected parameter values are invalid")
+
+    ready_map = _ready_worker_map(ready_records)
+    expected_pids = tuple(sorted(ready_map.values()))
+    if len(expected_pids) != profile.workers:
+        raise WorkerEvidenceError("ready worker count does not match the profile")
+    ready_by_pid = _evidence_records_by_pid(
+        ready_records,
+        expected_pids=expected_pids,
+        record_name="ready",
+    )
+    package_by_pid = _evidence_records_by_pid(
+        package_records,
+        expected_pids=expected_pids,
+        record_name="package",
+    )
+    principal_by_pid = _evidence_records_by_pid(
+        principal_records,
+        expected_pids=expected_pids,
+        record_name="principal",
+    )
+    pool_by_pid = _evidence_records_by_pid(
+        pool_records,
+        expected_pids=expected_pids,
+        record_name="pool",
+    )
+    pool_max = config.global_connection_budget // profile.workers
+    pool_identities: set[str] = set()
+    worker_records: list[dict[str, object]] = []
+
+    for pid in expected_pids:
+        ready = ready_by_pid[pid]
+        package = package_by_pid[pid]
+        principal = principal_by_pid[pid]
+        pool_record = pool_by_pid[pid]
+        application_name = next(
+            name for name, ready_pid in ready_map.items() if ready_pid == pid
+        )
+        if (
+            ready.get("candidate_sha") != config.candidate_sha
+            or ready.get("wheel_filename") != config.wheel.name
+            or ready.get("wheel_sha256") != config.wheel_sha256
+            or ready.get("pool_max_per_worker") != pool_max
+            or ready.get("pool_created_pid") != pid
+        ):
+            raise WorkerEvidenceError("worker ready provenance is inconsistent")
+        process_started = _finite_monotonic(
+            ready,
+            "process_started_monotonic",
+        )
+        pool_created = _finite_monotonic(ready, "pool_created_monotonic")
+        pool_connected = _finite_monotonic(
+            ready,
+            "pool_connected_monotonic",
+        )
+        if not process_started <= pool_created <= pool_connected:
+            raise WorkerEvidenceError("worker pool lifecycle ordering is invalid")
+        pool_identity = ready.get("pool_identity")
+        if (
+            not isinstance(pool_identity, str)
+            or not pool_identity
+            or pool_identity in pool_identities
+        ):
+            raise WorkerEvidenceError("worker pool identity is invalid")
+        pool_identities.add(pool_identity)
+
+        import_path = package.get("fastmssql_import_path")
+        if (
+            package.get("candidate_sha") != config.candidate_sha
+            or package.get("wheel_filename") != config.wheel.name
+            or package.get("wheel_sha256") != config.wheel_sha256
+            or not isinstance(import_path, str)
+            or not import_path
+        ):
+            raise WorkerEvidenceError("worker package provenance is inconsistent")
+        session_id = principal.get("session_id")
+        if (
+            principal.get("application_name") != application_name
+            or principal.get("principal") != expected_principal
+            or isinstance(session_id, bool)
+            or not isinstance(session_id, int)
+            or session_id <= 0
+        ):
+            raise WorkerEvidenceError("worker SQL principal evidence is inconsistent")
+
+        if pool_record.get("application_name") != application_name:
+            raise WorkerEvidenceError("worker pool identity is inconsistent")
+        pool = pool_record.get("pool")
+        admission = pool_record.get("admission")
+        operations = pool_record.get("operations")
+        if (
+            not isinstance(pool, Mapping)
+            or not isinstance(admission, Mapping)
+            or not isinstance(operations, Mapping)
+        ):
+            raise WorkerEvidenceError("worker pool evidence is malformed")
+        connections = _nonnegative_metric(pool, "connections")
+        idle_connections = _nonnegative_metric(pool, "idle_connections")
+        active_connections = _nonnegative_metric(pool, "active_connections")
+        pending_gets = _nonnegative_metric(pool, "pending_gets")
+        if (
+            pool.get("max_size") != pool_max
+            or connections > pool_max
+            or idle_connections > connections
+            or active_connections != connections - idle_connections
+            or active_connections != 0
+            or pending_gets != 0
+            or admission.get("active") != 0
+            or admission.get("capacity") != pool_max * 2
+        ):
+            raise WorkerEvidenceError("worker pool did not settle within its bounds")
+        worker_records.append(
+            {
+                "application_name": application_name,
+                "fastmssql_import_path": import_path,
+                "pid": pid,
+                "pool_connected_monotonic": pool_connected,
+                "pool_created_monotonic": pool_created,
+                "pool_created_pid": pid,
+                "pool_identity": pool_identity,
+                "principal": expected_principal,
+                "process_started_monotonic": process_started,
+            }
+        )
+
+    if len(parameter_payloads) != len(expected_values):
+        raise WorkerEvidenceError("parameter wave response count is inconsistent")
+    parameter_values: list[int] = []
+    for payload, expected_value in zip(
+        parameter_payloads,
+        expected_values,
+        strict=True,
+    ):
+        value = payload.get("value")
+        session_id = payload.get("session_id")
+        if (
+            value != expected_value
+            or isinstance(session_id, bool)
+            or not isinstance(session_id, int)
+            or session_id <= 0
+        ):
+            raise WorkerEvidenceError("parameter wave returned inconsistent SQL data")
+        parameter_values.append(value)
+
+    reconcile_worker_sessions(observer_sample, ready_records)
+    if observer_sample.maximum_sessions > config.global_connection_budget:
+        raise WorkerEvidenceError("observed SQL sessions exceeded the global connection budget")
+    if observer_sample.maximum_requests <= 0:
+        raise WorkerEvidenceError("parameter wave had no observed SQL request")
+    return NativeScalingEvidence(
+        profile_id=profile.id,
+        ready_pids=expected_pids,
+        worker_records=tuple(worker_records),
+        parameter_values=tuple(parameter_values),
+        pool_max_per_worker=pool_max,
+        global_connection_budget=config.global_connection_budget,
+        maximum_aggregate_sql_sessions=observer_sample.maximum_sessions,
+        maximum_simultaneous_sql_requests=observer_sample.maximum_requests,
+    )
+
+
+def validate_native_concurrency_evidence(
+    *,
+    sequential_payloads: Sequence[Mapping[str, object]],
+    concurrent_payloads: Sequence[Mapping[str, object]],
+    expected_values: Sequence[int],
+    sequential_seconds: float,
+    concurrent_seconds: float,
+    health_seconds: float,
+    sql_delay_ms: int,
+    observer_sample: SqlObserverSample,
+    pool_record: Mapping[str, object],
+) -> NativeConcurrencyEvidence:
+    """Validate same-run overlap without encoding an absolute throughput gate."""
+
+    if sql_delay_ms not in SQL_DELAY_MILLISECONDS or sql_delay_ms <= 0:
+        raise RunnerConfigurationError(
+            "native concurrency requires a positive allowlisted SQL delay"
+        )
+    if (
+        not expected_values
+        or len(sequential_payloads) != len(expected_values)
+        or len(concurrent_payloads) != len(expected_values)
+    ):
+        raise WorkerEvidenceError("native concurrency response count is inconsistent")
+    for payloads in (sequential_payloads, concurrent_payloads):
+        for payload, expected_value in zip(
+            payloads,
+            expected_values,
+            strict=True,
+        ):
+            session_id = payload.get("session_id")
+            if (
+                payload.get("value") != expected_value
+                or payload.get("delay_ms") != sql_delay_ms
+                or isinstance(session_id, bool)
+                or not isinstance(session_id, int)
+                or session_id <= 0
+            ):
+                raise WorkerEvidenceError(
+                    "native concurrency returned inconsistent SQL data"
+                )
+    for name, value in (
+        ("sequential", sequential_seconds),
+        ("concurrent", concurrent_seconds),
+        ("health", health_seconds),
+    ):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+            or (name != "health" and value == 0)
+        ):
+            raise WorkerEvidenceError(
+                "native concurrency timing evidence is malformed"
+            )
+    if concurrent_seconds >= sequential_seconds * 0.70:
+        raise WorkerEvidenceError(
+            "concurrent SQL wave did not beat its same-run sequential baseline"
+        )
+    sql_delay_seconds = sql_delay_ms / 1_000
+    if health_seconds >= sql_delay_seconds:
+        raise WorkerEvidenceError(
+            "native event-loop health request did not remain responsive"
+        )
+    if observer_sample.maximum_requests <= 1:
+        raise WorkerEvidenceError(
+            "SQL Server did not observe overlapping native requests"
+        )
+    pool = pool_record.get("pool")
+    if not isinstance(pool, Mapping):
+        raise WorkerEvidenceError("native concurrency pool evidence is malformed")
+    active = _nonnegative_metric(pool, "active_connections")
+    pending = _nonnegative_metric(pool, "pending_gets")
+    connections = _nonnegative_metric(pool, "connections")
+    max_size = _nonnegative_metric(pool, "max_size")
+    if active != 0 or pending != 0 or max_size <= 0 or connections > max_size:
+        raise WorkerEvidenceError(
+            "native concurrency pool did not settle within its bounds"
+        )
+    return NativeConcurrencyEvidence(
+        sequential_seconds=float(sequential_seconds),
+        concurrent_seconds=float(concurrent_seconds),
+        health_seconds=float(health_seconds),
+        sql_delay_seconds=sql_delay_seconds,
+        maximum_simultaneous_sql_requests=observer_sample.maximum_requests,
+        pool_active_after=active,
+        pool_pending_after=pending,
+    )
+
+
+def validate_disconnect_evidence(
+    *,
+    token: str,
+    observed_sample: SqlObserverSample,
+    settled_sample: SqlObserverSample,
+    before_pool: Mapping[str, object],
+    after_pool: Mapping[str, object],
+    recovery_payload: Mapping[str, object],
+) -> DisconnectEvidence:
+    """Validate real-peer cancellation and physical connection replacement."""
+
+    if (
+        not isinstance(token, str)
+        or OBSERVER_CONTEXT_TOKEN_PATTERN.fullmatch(token) is None
+    ):
+        raise RunnerConfigurationError("disconnect context token is invalid")
+    if (
+        token not in observed_sample.request_context_tokens
+        or observed_sample.current_requests <= 0
+    ):
+        raise WorkerEvidenceError(
+            "disconnect SQL request was not observed before client close"
+        )
+    if (
+        token in settled_sample.request_context_tokens
+        or settled_sample.current_requests != 0
+    ):
+        raise WorkerEvidenceError(
+            "disconnect SQL request did not settle after client close"
+        )
+    before_created = _nonnegative_metric(before_pool, "connections_created")
+    after_created = _nonnegative_metric(after_pool, "connections_created")
+    before_broken = _nonnegative_metric(
+        before_pool,
+        "connections_closed_broken",
+    )
+    after_broken = _nonnegative_metric(
+        after_pool,
+        "connections_closed_broken",
+    )
+    if (
+        after_created != before_created + 1
+        or after_broken != before_broken + 1
+    ):
+        raise WorkerEvidenceError(
+            "disconnect replacement counters are inconsistent"
+        )
+    active = _nonnegative_metric(after_pool, "active_connections")
+    pending = _nonnegative_metric(after_pool, "pending_gets")
+    connections = _nonnegative_metric(after_pool, "connections")
+    max_size = _nonnegative_metric(after_pool, "max_size")
+    if active != 0 or pending != 0 or connections > max_size:
+        raise WorkerEvidenceError(
+            "disconnect recovery pool did not settle within its bounds"
+        )
+    session_id = recovery_payload.get("session_id")
+    if (
+        recovery_payload.get("value") != 36
+        or isinstance(session_id, bool)
+        or not isinstance(session_id, int)
+        or session_id <= 0
+    ):
+        raise WorkerEvidenceError("disconnect recovery query is inconsistent")
+    return DisconnectEvidence(
+        context_token_sha256=hashlib.sha256(token.encode("ascii")).hexdigest(),
+        sql_requests_after=settled_sample.current_requests,
+        pool_active_after=active,
+        pool_pending_after=pending,
+        recovery_value=36,
+    )
+
+
+def validate_graceful_query_evidence(
+    *,
+    token: str,
+    observed_sample: SqlObserverSample,
+    response_payload: Mapping[str, object],
+    expected_value: int,
+    sql_delay_ms: int,
+) -> GracefulQueryEvidence:
+    """Bind an active identified SQL request to its post-signal response."""
+
+    if (
+        not isinstance(token, str)
+        or OBSERVER_CONTEXT_TOKEN_PATTERN.fullmatch(token) is None
+    ):
+        raise RunnerConfigurationError("graceful query context token is invalid")
+    if (
+        token not in observed_sample.request_context_tokens
+        or observed_sample.current_requests <= 0
+    ):
+        raise WorkerEvidenceError(
+            "graceful query token was not active before the shutdown signal"
+        )
+    if (
+        isinstance(expected_value, bool)
+        or not isinstance(expected_value, int)
+        or not MIN_SQL_BIGINT <= expected_value <= MAX_SQL_BIGINT
+        or sql_delay_ms not in SQL_DELAY_MILLISECONDS
+        or sql_delay_ms <= 0
+    ):
+        raise RunnerConfigurationError(
+            "graceful query value or SQL delay is invalid"
+        )
+    session_id = response_payload.get("session_id")
+    if (
+        response_payload.get("value") != expected_value
+        or response_payload.get("delay_ms") != sql_delay_ms
+        or isinstance(session_id, bool)
+        or not isinstance(session_id, int)
+        or session_id <= 0
+    ):
+        raise WorkerEvidenceError(
+            "graceful query response is inconsistent"
+        )
+    try:
+        serialized_response = json.dumps(
+            dict(response_payload),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError):
+        raise WorkerEvidenceError(
+            "graceful query response is not serializable"
+        ) from None
+    if token in serialized_response:
+        raise WorkerEvidenceError(
+            "graceful query token appeared in the HTTP response"
+        )
+    return GracefulQueryEvidence(
+        context_token_sha256=hashlib.sha256(token.encode("ascii")).hexdigest(),
+        response_session_id=session_id,
+        response_value=expected_value,
+        sql_delay_seconds=sql_delay_ms / 1_000,
+    )
+
+
+def validate_graceful_transaction_evidence(
+    *,
+    token: str,
+    item_id: int,
+    outcome: str,
+    holding_record: Mapping[str, object],
+    settled_record: Mapping[str, object],
+    observed_sample: SqlObserverSample,
+    response_payload: Mapping[str, object],
+    durable_rows: Sequence[Mapping[str, object]],
+) -> GracefulTransactionEvidence:
+    """Validate structural phases and SQL durability for one shutdown case."""
+
+    if (
+        outcome not in {"commit", "rollback"}
+        or isinstance(item_id, bool)
+        or not isinstance(item_id, int)
+        or not 1 <= item_id <= MAX_SQL_BIGINT
+        or token != f"transaction:{item_id}:{outcome}"
+        or OBSERVER_CONTEXT_TOKEN_PATTERN.fullmatch(token) is None
+    ):
+        raise RunnerConfigurationError(
+            "graceful transaction identity is invalid"
+        )
+    if (
+        token not in observed_sample.request_context_tokens
+        or observed_sample.current_requests <= 0
+    ):
+        raise WorkerEvidenceError(
+            "graceful transaction token was not active before the shutdown signal"
+        )
+    token_sha256 = hashlib.sha256(token.encode("ascii")).hexdigest()
+    for expected_phase, record in (
+        ("holding", holding_record),
+        ("settled", settled_record),
+    ):
+        pid = record.get("pid")
+        if (
+            record.get("context_token_sha256") != token_sha256
+            or record.get("item_id") != item_id
+            or record.get("outcome") != outcome
+            or record.get("phase") != "transaction"
+            or record.get("transaction_phase") != expected_phase
+            or isinstance(pid, bool)
+            or not isinstance(pid, int)
+            or pid <= 0
+            or not isinstance(record.get("run_id"), str)
+            or not isinstance(record.get("worker_application_name"), str)
+        ):
+            raise WorkerEvidenceError(
+                "graceful transaction phase evidence is inconsistent"
+            )
+    if (
+        holding_record.get("pid") != settled_record.get("pid")
+        or holding_record.get("run_id") != settled_record.get("run_id")
+        or holding_record.get("worker_application_name")
+        != settled_record.get("worker_application_name")
+    ):
+        raise WorkerEvidenceError(
+            "graceful transaction phase identities do not reconcile"
+        )
+    session_id = response_payload.get("session_id")
+    if (
+        response_payload.get("item_id") != item_id
+        or response_payload.get("outcome") != outcome
+        or isinstance(session_id, bool)
+        or not isinstance(session_id, int)
+        or session_id <= 0
+    ):
+        raise WorkerEvidenceError(
+            "graceful transaction response is inconsistent"
+        )
+    if isinstance(durable_rows, (str, bytes)):
+        raise WorkerEvidenceError(
+            "graceful transaction durable outcome is malformed"
+        )
+    normalized_rows = tuple(durable_rows)
+    if outcome == "commit":
+        durable_result = "row-present"
+        durable_matches = (
+            len(normalized_rows) == 1
+            and normalized_rows[0].get("value") == "transaction"
+        )
+    else:
+        durable_result = "row-absent"
+        durable_matches = not normalized_rows
+    if not durable_matches:
+        raise WorkerEvidenceError(
+            "graceful transaction durable outcome is inconsistent"
+        )
+    try:
+        public_inputs = json.dumps(
+            {
+                "holding": dict(holding_record),
+                "response": dict(response_payload),
+                "settled": dict(settled_record),
+            },
+            sort_keys=True,
+        )
+    except (TypeError, ValueError):
+        raise WorkerEvidenceError(
+            "graceful transaction evidence is not serializable"
+        ) from None
+    if token in public_inputs:
+        raise WorkerEvidenceError(
+            "graceful transaction token appeared in public evidence"
+        )
+    return GracefulTransactionEvidence(
+        context_token_sha256=token_sha256,
+        item_id=item_id,
+        outcome=outcome,
+        response_session_id=session_id,
+        durable_result=durable_result,
+    )
+
+
+def validate_native_saturation_evidence(
+    *,
+    expected_pid: int,
+    expected_application_name: str,
+    holder_values: Sequence[int],
+    waiter_values: Sequence[int],
+    excess_values: Sequence[int],
+    recovery_value: int,
+    acquire_timeout_ms: int,
+    busy_sample: SqlObserverSample,
+    baseline_pool_record: Mapping[str, object],
+    saturated_pool_record: Mapping[str, object],
+    settled_pool_record: Mapping[str, object],
+    holder_responses: Sequence[LoopbackJsonResponse],
+    waiter_responses: Sequence[LoopbackJsonResponse],
+    rejection_responses: Sequence[LoopbackJsonResponse],
+    recovery_response: LoopbackJsonResponse,
+) -> NativeSaturationEvidence:
+    """Prove exact application admission and driver pool saturation bounds."""
+
+    pool_max = len(holder_values)
+    all_values = (
+        *holder_values,
+        *waiter_values,
+        *excess_values,
+        recovery_value,
+    )
+    if (
+        isinstance(expected_pid, bool)
+        or not isinstance(expected_pid, int)
+        or expected_pid <= 0
+        or not isinstance(expected_application_name, str)
+        or APPLICATION_DIRECTORY_PATTERN.fullmatch(
+            expected_application_name
+        )
+        is None
+        or pool_max <= 0
+        or len(waiter_values) != pool_max
+        or not excess_values
+        or acquire_timeout_ms not in ACQUIRE_TIMEOUT_MILLISECONDS
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not MIN_SQL_BIGINT <= value <= MAX_SQL_BIGINT
+            for value in all_values
+        )
+        or len(set(all_values)) != len(all_values)
+    ):
+        raise RunnerConfigurationError(
+            "native saturation identity or workload is invalid"
+        )
+    if (
+        len(holder_responses) != pool_max
+        or len(waiter_responses) != pool_max
+        or len(rejection_responses) != len(excess_values)
+    ):
+        raise WorkerEvidenceError(
+            "native saturation response count is inconsistent"
+        )
+
+    applications = busy_sample.applications
+    if (
+        len(applications) != 1
+        or applications[0].application_name != expected_application_name
+        or len(applications[0].host_process_ids) != 1
+        or applications[0].host_process_ids[0] not in {0, expected_pid}
+        or applications[0].sessions != pool_max
+        or applications[0].requests != pool_max
+        or busy_sample.current_sessions != pool_max
+        or busy_sample.current_requests != pool_max
+        or busy_sample.maximum_sessions != pool_max
+        or busy_sample.maximum_requests != pool_max
+        or busy_sample.request_context_tokens
+    ):
+        raise WorkerEvidenceError(
+            "native saturation SQL bounds are inconsistent"
+        )
+
+    def sections(
+        record: Mapping[str, object],
+    ) -> tuple[Mapping[str, object], Mapping[str, object]]:
+        pool = record.get("pool")
+        admission = record.get("admission")
+        if (
+            record.get("pid") != expected_pid
+            or not isinstance(pool, Mapping)
+            or not isinstance(admission, Mapping)
+        ):
+            raise WorkerEvidenceError(
+                "native saturation pool evidence is malformed"
+            )
+        return pool, admission
+
+    baseline_pool, baseline_admission = sections(baseline_pool_record)
+    saturated_pool, saturated_admission = sections(saturated_pool_record)
+    settled_pool, settled_admission = sections(settled_pool_record)
+    admission_capacity = pool_max * 2
+    baseline_connections = _nonnegative_metric(
+        baseline_pool,
+        "connections",
+    )
+    baseline_idle = _nonnegative_metric(
+        baseline_pool,
+        "idle_connections",
+    )
+    baseline_timed_out = _nonnegative_metric(
+        baseline_pool,
+        "get_timed_out",
+    )
+    saturated_connections = _nonnegative_metric(
+        saturated_pool,
+        "connections",
+    )
+    saturated_idle = _nonnegative_metric(
+        saturated_pool,
+        "idle_connections",
+    )
+    saturated_active = _nonnegative_metric(
+        saturated_pool,
+        "active_connections",
+    )
+    saturated_pending = _nonnegative_metric(
+        saturated_pool,
+        "pending_gets",
+    )
+    settled_connections = _nonnegative_metric(
+        settled_pool,
+        "connections",
+    )
+    settled_idle = _nonnegative_metric(
+        settled_pool,
+        "idle_connections",
+    )
+    settled_active = _nonnegative_metric(
+        settled_pool,
+        "active_connections",
+    )
+    settled_pending = _nonnegative_metric(
+        settled_pool,
+        "pending_gets",
+    )
+    settled_timed_out = _nonnegative_metric(
+        settled_pool,
+        "get_timed_out",
+    )
+    if (
+        baseline_pool.get("max_size") != pool_max
+        or baseline_connections > pool_max
+        or baseline_idle != baseline_connections
+        or _nonnegative_metric(baseline_pool, "active_connections") != 0
+        or _nonnegative_metric(baseline_pool, "pending_gets") != 0
+        or baseline_admission.get("active") != 0
+        or baseline_admission.get("capacity") != admission_capacity
+        or baseline_admission.get("rejected") != 0
+        or saturated_pool.get("max_size") != pool_max
+        or saturated_connections != pool_max
+        or saturated_idle != 0
+        or saturated_active != pool_max
+        or saturated_pending != pool_max
+        or _nonnegative_metric(saturated_pool, "get_timed_out")
+        != baseline_timed_out
+        or saturated_admission.get("active") != admission_capacity
+        or saturated_admission.get("capacity") != admission_capacity
+        or saturated_admission.get("rejected") != 0
+        or settled_pool.get("max_size") != pool_max
+        or settled_connections > pool_max
+        or settled_idle != settled_connections
+        or settled_active != 0
+        or settled_pending != 0
+        or settled_timed_out - baseline_timed_out != pool_max
+        or settled_admission.get("active") != 0
+        or settled_admission.get("capacity") != admission_capacity
+        or settled_admission.get("rejected") != len(excess_values)
+    ):
+        raise WorkerEvidenceError(
+            "native saturation bounds are inconsistent"
+        )
+
+    holder_session_ids: set[int] = set()
+    for response, expected_value in zip(
+        holder_responses,
+        holder_values,
+        strict=True,
+    ):
+        session_id = response.payload.get("session_id")
+        if (
+            response.status_code != 200
+            or set(response.payload) != {"session_id", "value"}
+            or response.payload.get("value") != expected_value
+            or isinstance(session_id, bool)
+            or not isinstance(session_id, int)
+            or session_id <= 0
+            or session_id in holder_session_ids
+        ):
+            raise WorkerEvidenceError(
+                "native saturation holder response is inconsistent"
+            )
+        holder_session_ids.add(session_id)
+
+    timeout_payload = {
+        "error": "pool_acquire_timeout",
+        "operation": "query",
+        "phase": "acquire",
+        "retryable": True,
+    }
+    if any(
+        response.status_code != 504
+        or response.payload != timeout_payload
+        for response in waiter_responses
+    ):
+        raise WorkerEvidenceError(
+            "native saturation acquire timeout is inconsistent"
+        )
+    rejection_limit_seconds = acquire_timeout_ms / 1_000
+    if any(
+        response.status_code != 503
+        or response.payload != {"error": "saturated"}
+        or response.elapsed_seconds >= rejection_limit_seconds
+        for response in rejection_responses
+    ):
+        raise WorkerEvidenceError(
+            "native saturation rejection is inconsistent"
+        )
+    recovery_session_id = recovery_response.payload.get("session_id")
+    if (
+        recovery_response.status_code != 200
+        or set(recovery_response.payload) != {"session_id", "value"}
+        or recovery_response.payload.get("value") != recovery_value
+        or isinstance(recovery_session_id, bool)
+        or not isinstance(recovery_session_id, int)
+        or recovery_session_id <= 0
+    ):
+        raise WorkerEvidenceError(
+            "native saturation recovery response is inconsistent"
+        )
+    return NativeSaturationEvidence(
+        pool_max_per_worker=pool_max,
+        admitted_holders=pool_max,
+        admitted_waiters=pool_max,
+        admission_capacity=admission_capacity,
+        rejected_requests=len(excess_values),
+        acquire_timeouts=pool_max,
+        maximum_sql_sessions=busy_sample.maximum_sessions,
+        maximum_sql_requests=busy_sample.maximum_requests,
+        observed_active_connections=saturated_active,
+        observed_pending_gets=saturated_pending,
+        pool_get_timed_out_delta=settled_timed_out - baseline_timed_out,
+        pool_active_after=settled_active,
+        pool_pending_after=settled_pending,
+        admission_active_after=int(settled_admission["active"]),
+        recovery_value=recovery_value,
+    )
+
+
+def validate_native_streaming_evidence(
+    *,
+    expected_pid: int,
+    pool_max: int,
+    full_observation: FullNdjsonObservation,
+    early_observation: EarlyCloseNdjsonObservation,
+    driver_buffer_rows: int,
+    rss_start_bytes: int,
+    rss_peak_bytes: int,
+    rss_end_bytes: int,
+    rss_growth_limit_bytes: int,
+    full_settled_pool_record: Mapping[str, object],
+    early_settled_pool_record: Mapping[str, object],
+    early_settled_sample: SqlObserverSample,
+    recovery_value: int,
+    recovery_response: LoopbackJsonResponse,
+) -> NativeStreamingEvidence:
+    """Validate incremental delivery, bounded RSS and early-close recovery."""
+
+    if (
+        isinstance(expected_pid, bool)
+        or not isinstance(expected_pid, int)
+        or expected_pid <= 0
+        or isinstance(pool_max, bool)
+        or not isinstance(pool_max, int)
+        or pool_max <= 0
+        or driver_buffer_rows != EXPECTED_STREAM_BUFFER_ROWS
+        or isinstance(recovery_value, bool)
+        or not isinstance(recovery_value, int)
+        or not MIN_SQL_BIGINT <= recovery_value <= MAX_SQL_BIGINT
+    ):
+        raise RunnerConfigurationError(
+            "native streaming identity, buffer or recovery value is invalid"
+        )
+    if (
+        full_observation.status_code != 200
+        or not full_observation.content_type.lower().startswith(
+            "application/x-ndjson"
+        )
+        or not 2 <= full_observation.row_count <= MAX_HTTP_STREAM_ROWS
+        or SHA256_PATTERN.fullmatch(full_observation.value_digest) is None
+        or full_observation.bytes_received <= 0
+        or not 0 <= full_observation.first_data_seconds
+        < full_observation.elapsed_seconds
+        or early_observation.status_code != 200
+        or not early_observation.content_type.lower().startswith(
+            "application/x-ndjson"
+        )
+        or not 2 <= early_observation.requested_rows
+        <= MAX_HTTP_STREAM_ROWS
+        or not 1 <= early_observation.prefix_rows
+        < early_observation.requested_rows
+        or SHA256_PATTERN.fullmatch(early_observation.prefix_digest) is None
+        or early_observation.bytes_received <= 0
+        or not 0 <= early_observation.first_data_seconds
+        < early_observation.close_seconds
+    ):
+        raise WorkerEvidenceError(
+            "native streaming HTTP evidence is inconsistent"
+        )
+    if (
+        any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+            for value in (
+                rss_start_bytes,
+                rss_peak_bytes,
+                rss_end_bytes,
+                rss_growth_limit_bytes,
+            )
+        )
+        or rss_peak_bytes < max(rss_start_bytes, rss_end_bytes)
+        or rss_peak_bytes - rss_start_bytes > rss_growth_limit_bytes
+    ):
+        raise WorkerEvidenceError(
+            "native streaming RSS evidence exceeded its bound"
+        )
+
+    def settled_pool(
+        record: Mapping[str, object],
+    ) -> tuple[int, int]:
+        pool = record.get("pool")
+        admission = record.get("admission")
+        if (
+            record.get("pid") != expected_pid
+            or not isinstance(pool, Mapping)
+            or not isinstance(admission, Mapping)
+        ):
+            raise WorkerEvidenceError(
+                "native streaming pool evidence is malformed"
+            )
+        connections = _nonnegative_metric(pool, "connections")
+        idle = _nonnegative_metric(pool, "idle_connections")
+        active = _nonnegative_metric(pool, "active_connections")
+        pending = _nonnegative_metric(pool, "pending_gets")
+        if (
+            pool.get("max_size") != pool_max
+            or connections > pool_max
+            or idle != connections
+            or active != 0
+            or pending != 0
+            or admission.get("active") != 0
+            or admission.get("capacity") != pool_max * 2
+        ):
+            raise WorkerEvidenceError(
+                "native streaming pool did not settle within its bounds"
+            )
+        return active, pending
+
+    full_active, full_pending = settled_pool(full_settled_pool_record)
+    early_active, early_pending = settled_pool(early_settled_pool_record)
+    if (
+        early_settled_sample.current_requests != 0
+        or early_settled_sample.maximum_requests < 1
+        or early_settled_sample.maximum_requests > pool_max
+        or early_settled_sample.current_sessions > pool_max
+        or early_settled_sample.maximum_sessions > pool_max
+        or early_settled_sample.request_context_tokens
+    ):
+        raise WorkerEvidenceError(
+            "native streaming early-close SQL did not settle"
+        )
+    recovery_session_id = recovery_response.payload.get("session_id")
+    if (
+        recovery_response.status_code != 200
+        or set(recovery_response.payload) != {"session_id", "value"}
+        or recovery_response.payload.get("value") != recovery_value
+        or isinstance(recovery_session_id, bool)
+        or not isinstance(recovery_session_id, int)
+        or recovery_session_id <= 0
+    ):
+        raise WorkerEvidenceError(
+            "native streaming recovery response is inconsistent"
+        )
+    return NativeStreamingEvidence(
+        driver_buffer_rows=driver_buffer_rows,
+        full_rows=full_observation.row_count,
+        full_value_digest=full_observation.value_digest,
+        full_bytes_received=full_observation.bytes_received,
+        full_first_data_seconds=full_observation.first_data_seconds,
+        full_elapsed_seconds=full_observation.elapsed_seconds,
+        full_pool_active_after=full_active,
+        full_pool_pending_after=full_pending,
+        early_requested_rows=early_observation.requested_rows,
+        early_prefix_rows=early_observation.prefix_rows,
+        early_prefix_digest=early_observation.prefix_digest,
+        early_bytes_received=early_observation.bytes_received,
+        early_first_data_seconds=early_observation.first_data_seconds,
+        early_close_seconds=early_observation.close_seconds,
+        early_sql_requests_after=early_settled_sample.current_requests,
+        early_pool_active_after=early_active,
+        early_pool_pending_after=early_pending,
+        rss_start_bytes=rss_start_bytes,
+        rss_peak_bytes=rss_peak_bytes,
+        rss_end_bytes=rss_end_bytes,
+        rss_growth_limit_bytes=rss_growth_limit_bytes,
+        recovery_value=recovery_value,
+    )
 
 
 def create_observer_connection(
@@ -799,6 +2441,37 @@ def offline_smoke_profiles(
     ):
         raise RunnerConfigurationError("offline smoke profile selection is incomplete")
     return selected
+
+
+def native_fastapi_profiles(
+    platform_name: str,
+) -> tuple[ProcessProfile, ...]:
+    """Select every applicable native FastAPI SQL-auth scaling profile."""
+
+    profiles = tuple(
+        profile
+        for profile in expand_profiles(
+            platform_name,
+            database_mode="sql_auth",
+        )
+        if profile.family.startswith("fastapi-") and profile.applicable
+    )
+    expected_families = {"fastapi-uvicorn-asyncio"}
+    if normalize_platform(platform_name) != "Windows":
+        expected_families.update(
+            {
+                "fastapi-uvicorn-uvloop",
+                "fastapi-gunicorn-uvicorn-worker",
+            }
+        )
+    if (
+        {profile.family for profile in profiles} != expected_families
+        or {profile.workers for profile in profiles} != set(WORKER_COUNTS)
+    ):
+        raise RunnerConfigurationError(
+            "native FastAPI profile selection is incomplete"
+        )
+    return profiles
 
 
 def profiles_json(profiles: Sequence[ProcessProfile]) -> str:
@@ -1294,12 +2967,16 @@ def build_profile_environment(
     *,
     run_id: str,
     artifact_directory: Path,
+    sql_auth_settings: SqlAuthObserverSettings | None = None,
+    table_name: str | None = None,
+    sql_delay_ms: int = 0,
+    acquire_timeout_ms: int = 5_000,
 ) -> dict[str, str]:
-    """Build one closed, credential-free offline worker environment."""
+    """Build one closed profile environment without persisting credentials."""
 
-    if config.database_mode != "offline" or profile.database_mode != "offline":
+    if profile.database_mode != config.database_mode:
         raise RunnerConfigurationError(
-            "offline profile environment requires offline database mode"
+            "profile database mode does not match the runner configuration"
         )
     if not profile.applicable:
         raise RunnerConfigurationError(
@@ -1307,6 +2984,31 @@ def build_profile_environment(
         )
     if APPLICATION_DIRECTORY_PATTERN.fullmatch(run_id) is None:
         raise RunnerConfigurationError("framework run ID is unsafe")
+    if sql_delay_ms not in SQL_DELAY_MILLISECONDS:
+        raise RunnerConfigurationError("SQL delay is outside the closed allowlist")
+    if acquire_timeout_ms not in ACQUIRE_TIMEOUT_MILLISECONDS:
+        raise RunnerConfigurationError(
+            "acquire timeout is outside the closed allowlist"
+        )
+    if config.database_mode == "offline":
+        if sql_auth_settings is not None or table_name is not None or sql_delay_ms != 0:
+            raise RunnerConfigurationError(
+                "offline profile environment forbids SQL-auth settings"
+            )
+        selected_table = f"framework_items_{config.candidate_sha[:12]}"
+    elif config.database_mode == "sql_auth":
+        if sql_auth_settings is None:
+            raise RunnerConfigurationError(
+                "SQL-auth profile environment requires database settings"
+            )
+        if (
+            not isinstance(table_name, str)
+            or SQL_IDENTIFIER_PATTERN.fullmatch(table_name) is None
+        ):
+            raise RunnerConfigurationError("SQL-auth profile table name is invalid")
+        selected_table = table_name
+    else:
+        raise RunnerConfigurationError("database mode must be sql_auth or offline")
     verify_isolated_application(isolated)
     if not isolated.root.is_relative_to(config.run_root):
         raise RunnerConfigurationError("isolated application is outside the run root")
@@ -1333,27 +3035,35 @@ def build_profile_environment(
         raise RunnerConfigurationError(
             "generated framework application name is too long"
         )
-    return build_child_environment(
-        {
-            "FASTMSSQL_FRAMEWORK_DATABASE_MODE": "offline",
-            "FASTMSSQL_FRAMEWORK_WORKER_COUNT": str(profile.workers),
-            "FASTMSSQL_FRAMEWORK_GLOBAL_CONNECTION_BUDGET": str(
-                config.global_connection_budget
-            ),
-            "FASTMSSQL_FRAMEWORK_APPLICATION_NAME": application_name,
-            "FASTMSSQL_FRAMEWORK_RUN_ID": run_id,
-            "FASTMSSQL_FRAMEWORK_RUN_ROOT": str(config.run_root),
-            "FASTMSSQL_FRAMEWORK_ARTIFACT_DIR": str(resolved_artifacts),
-            "FASTMSSQL_FRAMEWORK_TABLE": (
-                f"framework_items_{config.candidate_sha[:12]}"
-            ),
-            "FASTMSSQL_FRAMEWORK_SQL_DELAY_MS": "0",
-            "FASTMSSQL_FRAMEWORK_CANDIDATE_SHA": config.candidate_sha,
-            "FASTMSSQL_FRAMEWORK_WHEEL_FILENAME": config.wheel.name,
-            "FASTMSSQL_FRAMEWORK_WHEEL_SHA256": config.wheel_sha256,
-            "FASTMSSQL_FRAMEWORK_GUNICORN_LIFECYCLE_OWNER": lifecycle_owner,
-        }
-    )
+    overrides = {
+        "FASTMSSQL_FRAMEWORK_DATABASE_MODE": config.database_mode,
+        "FASTMSSQL_FRAMEWORK_WORKER_COUNT": str(profile.workers),
+        "FASTMSSQL_FRAMEWORK_GLOBAL_CONNECTION_BUDGET": str(
+            config.global_connection_budget
+        ),
+        "FASTMSSQL_FRAMEWORK_APPLICATION_NAME": application_name,
+        "FASTMSSQL_FRAMEWORK_RUN_ID": run_id,
+        "FASTMSSQL_FRAMEWORK_RUN_ROOT": str(config.run_root),
+        "FASTMSSQL_FRAMEWORK_ARTIFACT_DIR": str(resolved_artifacts),
+        "FASTMSSQL_FRAMEWORK_TABLE": selected_table,
+        "FASTMSSQL_FRAMEWORK_SQL_DELAY_MS": str(sql_delay_ms),
+        "FASTMSSQL_FRAMEWORK_ACQUIRE_TIMEOUT_MS": str(acquire_timeout_ms),
+        "FASTMSSQL_FRAMEWORK_CANDIDATE_SHA": config.candidate_sha,
+        "FASTMSSQL_FRAMEWORK_WHEEL_FILENAME": config.wheel.name,
+        "FASTMSSQL_FRAMEWORK_WHEEL_SHA256": config.wheel_sha256,
+        "FASTMSSQL_FRAMEWORK_GUNICORN_LIFECYCLE_OWNER": lifecycle_owner,
+    }
+    if sql_auth_settings is not None:
+        overrides.update(
+            {
+                "FASTMSSQL_SQL_AUTH_HOST": sql_auth_settings.host,
+                "FASTMSSQL_SQL_AUTH_PORT": str(sql_auth_settings.port),
+                "FASTMSSQL_SQL_AUTH_DATABASE": sql_auth_settings.database,
+                "FASTMSSQL_SQL_AUTH_OWNER_USER": sql_auth_settings.username,
+                "FASTMSSQL_SQL_AUTH_OWNER_PASSWORD": sql_auth_settings.password,
+            }
+        )
+    return build_child_environment(overrides)
 
 
 def sanitize_command(command: Sequence[str]) -> tuple[str, ...]:
@@ -1868,19 +3578,24 @@ class ProcessSupervisor:
                     forced_cleanup = True
                     await self._force_process_tree()
 
+            accepted_signal_exit = (
+                requested_graceful_stop
+                and os.name == "posix"
+                and self._process.returncode == -signal.SIGTERM
+            )
             outcome = await self._finalize(
                 graceful_stop=(
                     requested_graceful_stop
-                    and os.name == "posix"
                     and not forced_cleanup
-                    and self._process.returncode == 0
+                    and (
+                        self._process.returncode == 0
+                        or accepted_signal_exit
+                    )
                 ),
                 forced_cleanup=forced_cleanup,
             )
-            self._requested_stop_exit_accepted = outcome.returncode == 0 or (
-                requested_graceful_stop
-                and os.name == "posix"
-                and outcome.returncode == -signal.SIGTERM
+            self._requested_stop_exit_accepted = (
+                outcome.returncode == 0 or accepted_signal_exit
             )
             if forced_cleanup:
                 raise ForcedProcessCleanupError(outcome)
@@ -1914,6 +3629,98 @@ class ProcessSupervisor:
                 ) from None
             raise
         return False
+
+
+async def wait_for_transaction_phase_record(
+    supervisor: ProcessSupervisor,
+    *,
+    directory: Path,
+    expected_run_id: str,
+    expected_pid: int,
+    expected_worker_application_name: str,
+    item_id: int,
+    outcome: str,
+    transaction_phase: str,
+    timeout_seconds: float,
+) -> dict[str, object]:
+    """Wait for one exact, fresh, privacy-safe transaction phase record."""
+
+    if (
+        not directory.is_dir()
+        or APPLICATION_DIRECTORY_PATTERN.fullmatch(expected_run_id) is None
+        or APPLICATION_DIRECTORY_PATTERN.fullmatch(
+            expected_worker_application_name
+        )
+        is None
+        or isinstance(expected_pid, bool)
+        or not isinstance(expected_pid, int)
+        or expected_pid <= 0
+        or isinstance(item_id, bool)
+        or not isinstance(item_id, int)
+        or not 1 <= item_id <= MAX_SQL_BIGINT
+        or outcome not in {"commit", "rollback"}
+        or transaction_phase not in {"holding", "settled"}
+    ):
+        raise RunnerConfigurationError(
+            "transaction phase wait identity is invalid"
+        )
+    token = f"transaction:{item_id}:{outcome}"
+    token_sha256 = hashlib.sha256(token.encode("ascii")).hexdigest()
+    path = directory / (
+        f"transaction-{transaction_phase}-{outcome}-"
+        f"{expected_pid}-{item_id}.json"
+    )
+    selected: dict[str, object] | None = None
+
+    def record_is_ready() -> bool:
+        nonlocal selected
+        if not path.is_file():
+            return False
+        if path.stat().st_mtime_ns <= supervisor.started_wall_time_ns:
+            raise WorkerEvidenceError(
+                "transaction phase record predates the supervised process"
+            )
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise WorkerEvidenceError(
+                "transaction phase record is not valid JSON"
+            ) from error
+        if not isinstance(payload, dict):
+            raise WorkerEvidenceError(
+                "transaction phase record must be a JSON object"
+            )
+        if (
+            payload.get("context_token_sha256") != token_sha256
+            or payload.get("item_id") != item_id
+            or payload.get("outcome") != outcome
+            or payload.get("phase") != "transaction"
+            or payload.get("pid") != expected_pid
+            or payload.get("run_id") != expected_run_id
+            or payload.get("transaction_phase") != transaction_phase
+            or payload.get("worker_application_name")
+            != expected_worker_application_name
+        ):
+            raise WorkerEvidenceError(
+                "transaction phase record is inconsistent"
+            )
+        if token in json.dumps(payload, sort_keys=True):
+            raise WorkerEvidenceError(
+                "transaction phase record exposed its raw context token"
+            )
+        selected = dict(payload)
+        return True
+
+    if not record_is_ready():
+        await supervisor.wait_for_readiness(
+            record_is_ready,
+            timeout_seconds=timeout_seconds,
+        )
+    if selected is None:
+        raise WorkerEvidenceError(
+            "transaction phase wait completed without a record"
+        )
+    return selected
 
 
 def reserve_loopback_port() -> int:
@@ -2008,6 +3815,681 @@ async def launch_with_port_retry(
 
 
 MAX_HTTP_PROBE_BYTES = 1_048_576
+MAX_WORKER_PROBE_CONCURRENCY = 16
+
+
+def _validate_http_probe(
+    port: int,
+    path: str,
+    timeout_seconds: float,
+) -> None:
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65_535:
+        raise RunnerConfigurationError("port must be between 1 and 65,535")
+    if (
+        not isinstance(path, str)
+        or not path.startswith("/")
+        or "\r" in path
+        or "\n" in path
+        or " " in path
+    ):
+        raise RunnerConfigurationError("HTTP probe path is unsafe")
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(timeout_seconds)
+        or timeout_seconds <= 0
+    ):
+        raise RunnerConfigurationError(
+            "HTTP probe timeout must be a finite positive number"
+        )
+
+
+async def http_request_json(
+    port: int,
+    path: str,
+    *,
+    method: str = "GET",
+    expected_statuses: Sequence[int] = (200,),
+    timeout_seconds: float = 1.0,
+    context_token: str | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> LoopbackJsonResponse:
+    """Issue one hard-bounded loopback request without retaining its URL."""
+
+    _validate_http_probe(port, path, timeout_seconds)
+    if method not in {"GET", "POST"}:
+        raise RunnerConfigurationError("HTTP probe method is unsupported")
+    if context_token is not None and (
+        not isinstance(context_token, str)
+        or OBSERVER_CONTEXT_TOKEN_PATTERN.fullmatch(context_token) is None
+    ):
+        raise RunnerConfigurationError("HTTP probe context token is invalid")
+    if (
+        isinstance(expected_statuses, (str, bytes))
+        or not expected_statuses
+        or any(
+            isinstance(status, bool)
+            or not isinstance(status, int)
+            or not 100 <= status <= 599
+            for status in expected_statuses
+        )
+        or len(set(expected_statuses)) != len(expected_statuses)
+    ):
+        raise RunnerConfigurationError("HTTP probe expected statuses are invalid")
+
+    async def request() -> LoopbackJsonResponse:
+        started = time.monotonic()
+        headers = {
+            "Accept": "application/json",
+            "Connection": "close",
+        }
+        if context_token is not None:
+            headers["X-FastMssql-Context-Token"] = context_token
+        try:
+            async with httpx.AsyncClient(
+                base_url=f"http://127.0.0.1:{port}",
+                timeout=timeout_seconds,
+                transport=transport,
+                trust_env=False,
+            ) as client:
+                async with client.stream(
+                    method,
+                    path,
+                    headers=headers,
+                ) as response:
+                    if response.status_code not in expected_statuses:
+                        raise HttpProbeError(
+                            "loopback HTTP probe returned status "
+                            f"{response.status_code}"
+                        )
+                    body = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        body.extend(chunk)
+                        if len(body) > MAX_HTTP_PROBE_BYTES:
+                            raise HttpProbeError(
+                                "loopback HTTP response exceeded its byte limit"
+                            )
+        except HttpProbeError:
+            raise
+        except (httpx.HTTPError, TimeoutError):
+            raise HttpProbeError("loopback HTTP probe failed") from None
+
+        try:
+            payload = json.loads(body)
+        except (UnicodeError, json.JSONDecodeError):
+            raise HttpProbeError(
+                "loopback HTTP response is not valid JSON"
+            ) from None
+        if not isinstance(payload, dict):
+            raise HttpProbeError("loopback HTTP response must be a JSON object")
+        return LoopbackJsonResponse(
+            status_code=response.status_code,
+            payload=payload,
+            elapsed_seconds=max(0.0, time.monotonic() - started),
+        )
+
+    try:
+        return await asyncio.wait_for(request(), timeout=timeout_seconds + 0.5)
+    except HttpProbeError:
+        raise
+    except TimeoutError:
+        raise HttpProbeError("loopback HTTP probe failed") from None
+
+
+async def open_raw_http_request(
+    port: int,
+    path: str,
+    *,
+    timeout_seconds: float = 1.0,
+) -> RawLoopbackRequest:
+    """Send one raw GET and retain the socket without reading its response."""
+
+    _validate_http_probe(port, path, timeout_seconds)
+    try:
+        request_target = path.encode("ascii")
+    except UnicodeEncodeError:
+        raise RunnerConfigurationError("HTTP probe path must be ASCII") from None
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection("127.0.0.1", port),
+            timeout=timeout_seconds,
+        )
+        writer.write(
+            b"GET "
+            + request_target
+            + b" HTTP/1.1\r\n"
+            + f"Host: 127.0.0.1:{port}\r\n".encode("ascii")
+            + b"Accept: application/json\r\n"
+            + b"Connection: close\r\n\r\n"
+        )
+        await asyncio.wait_for(writer.drain(), timeout=timeout_seconds)
+    except (OSError, TimeoutError):
+        if "writer" in locals():
+            writer.close()
+        raise HttpProbeError("raw loopback HTTP request failed") from None
+    return RawLoopbackRequest(_reader=reader, _writer=writer)
+
+
+def _ndjson_stream_value(line: str, *, expected_value: int) -> int:
+    try:
+        encoded = line.encode("ascii")
+    except UnicodeEncodeError:
+        raise HttpProbeError("NDJSON stream line is not ASCII") from None
+    if not encoded or len(encoded) > MAX_NDJSON_LINE_BYTES:
+        raise HttpProbeError("NDJSON stream line exceeded its byte limit")
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        raise HttpProbeError("NDJSON stream line is not valid JSON") from None
+    expected = {
+        "result_set": 0,
+        "row": {"value": expected_value},
+    }
+    if payload != expected:
+        raise HttpProbeError("NDJSON stream row is out of order or malformed")
+    return expected_value
+
+
+async def consume_ndjson_stream(
+    port: int,
+    path: str,
+    *,
+    expected_rows: int,
+    timeout_seconds: float,
+) -> FullNdjsonObservation:
+    """Consume one real NDJSON response under one wall-clock deadline."""
+
+    _validate_http_probe(port, path, timeout_seconds)
+    try:
+        return await asyncio.wait_for(
+            _consume_ndjson_stream(
+                port,
+                path,
+                expected_rows=expected_rows,
+                timeout_seconds=timeout_seconds,
+            ),
+            timeout=timeout_seconds,
+        )
+    except TimeoutError:
+        raise HttpProbeError(
+            "NDJSON stream exceeded its global deadline"
+        ) from None
+
+
+async def _consume_ndjson_stream(
+    port: int,
+    path: str,
+    *,
+    expected_rows: int,
+    timeout_seconds: float,
+) -> FullNdjsonObservation:
+    """Implement incremental NDJSON consumption for the bounded wrapper."""
+
+    _validate_http_probe(port, path, timeout_seconds)
+    if (
+        isinstance(expected_rows, bool)
+        or not isinstance(expected_rows, int)
+        or not 2 <= expected_rows <= MAX_HTTP_STREAM_ROWS
+    ):
+        raise RunnerConfigurationError(
+            "full NDJSON row count must be between 2 and 10,000"
+        )
+    started = time.monotonic()
+    first_data_seconds: float | None = None
+    row_count = 0
+    bytes_received = 0
+    digest = hashlib.sha256()
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout_seconds),
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            async with client.stream(
+                "GET",
+                f"http://127.0.0.1:{port}{path}",
+                headers={
+                    "Accept": "application/x-ndjson",
+                    "Connection": "close",
+                },
+            ) as response:
+                content_type = response.headers.get("content-type", "")
+                if response.status_code != 200:
+                    raise HttpProbeError(
+                        "NDJSON stream returned an unexpected status"
+                    )
+                if not content_type.lower().startswith(
+                    "application/x-ndjson"
+                ):
+                    raise HttpProbeError(
+                        "NDJSON stream returned an unexpected content type"
+                    )
+                async for line in response.aiter_lines():
+                    expected_value = row_count + 1
+                    value = _ndjson_stream_value(
+                        line,
+                        expected_value=expected_value,
+                    )
+                    row_count += 1
+                    encoded_value = f"{value}\n".encode("ascii")
+                    digest.update(encoded_value)
+                    bytes_received += len(line.encode("ascii")) + 1
+                    if first_data_seconds is None:
+                        first_data_seconds = max(
+                            0.0,
+                            time.monotonic() - started,
+                        )
+                    if row_count > expected_rows:
+                        raise HttpProbeError(
+                            "NDJSON stream returned excess rows"
+                        )
+        elapsed_seconds = max(0.0, time.monotonic() - started)
+    except HttpProbeError:
+        raise
+    except httpx.HTTPError:
+        raise HttpProbeError("NDJSON stream request failed") from None
+    if row_count != expected_rows or first_data_seconds is None:
+        raise HttpProbeError("NDJSON stream row count is inconsistent")
+    if first_data_seconds >= elapsed_seconds:
+        raise HttpProbeError("NDJSON stream was not delivered incrementally")
+    return FullNdjsonObservation(
+        status_code=200,
+        content_type=content_type,
+        row_count=row_count,
+        value_digest=digest.hexdigest(),
+        bytes_received=bytes_received,
+        first_data_seconds=first_data_seconds,
+        elapsed_seconds=elapsed_seconds,
+    )
+
+
+async def read_ndjson_prefix_and_close(
+    port: int,
+    path: str,
+    *,
+    requested_rows: int,
+    prefix_rows: int,
+    timeout_seconds: float,
+    before_read: Callable[[], Awaitable[None]] | None = None,
+) -> EarlyCloseNdjsonObservation:
+    """Read and close an NDJSON prefix under one wall-clock deadline."""
+
+    _validate_http_probe(port, path, timeout_seconds)
+    try:
+        return await asyncio.wait_for(
+            _read_ndjson_prefix_and_close(
+                port,
+                path,
+                requested_rows=requested_rows,
+                prefix_rows=prefix_rows,
+                timeout_seconds=timeout_seconds,
+                before_read=before_read,
+            ),
+            timeout=timeout_seconds,
+        )
+    except TimeoutError:
+        raise HttpProbeError(
+            "early-close NDJSON stream exceeded its global deadline"
+        ) from None
+
+
+async def _read_ndjson_prefix_and_close(
+    port: int,
+    path: str,
+    *,
+    requested_rows: int,
+    prefix_rows: int,
+    timeout_seconds: float,
+    before_read: Callable[[], Awaitable[None]] | None = None,
+) -> EarlyCloseNdjsonObservation:
+    """Implement prefix consumption for the bounded public wrapper."""
+
+    _validate_http_probe(port, path, timeout_seconds)
+    if (
+        isinstance(requested_rows, bool)
+        or not isinstance(requested_rows, int)
+        or not 2 <= requested_rows <= MAX_HTTP_STREAM_ROWS
+        or isinstance(prefix_rows, bool)
+        or not isinstance(prefix_rows, int)
+        or not 1 <= prefix_rows < requested_rows
+    ):
+        raise RunnerConfigurationError(
+            "early-close NDJSON row bounds are invalid"
+        )
+    started = time.monotonic()
+    first_data_seconds: float | None = None
+    observed_rows = 0
+    bytes_received = 0
+    digest = hashlib.sha256()
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout_seconds),
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            async with client.stream(
+                "GET",
+                f"http://127.0.0.1:{port}{path}",
+                headers={
+                    "Accept": "application/x-ndjson",
+                    "Connection": "close",
+                },
+            ) as response:
+                content_type = response.headers.get("content-type", "")
+                if response.status_code != 200:
+                    raise HttpProbeError(
+                        "early-close NDJSON stream returned an unexpected status"
+                    )
+                if not content_type.lower().startswith(
+                    "application/x-ndjson"
+                ):
+                    raise HttpProbeError(
+                        "early-close NDJSON stream returned an unexpected "
+                        "content type"
+                    )
+                if before_read is not None:
+                    await before_read()
+                async for line in response.aiter_lines():
+                    expected_value = observed_rows + 1
+                    value = _ndjson_stream_value(
+                        line,
+                        expected_value=expected_value,
+                    )
+                    observed_rows += 1
+                    digest.update(f"{value}\n".encode("ascii"))
+                    bytes_received += len(line.encode("ascii")) + 1
+                    if first_data_seconds is None:
+                        first_data_seconds = max(
+                            0.0,
+                            time.monotonic() - started,
+                        )
+                    if observed_rows == prefix_rows:
+                        break
+        close_seconds = max(0.0, time.monotonic() - started)
+    except HttpProbeError:
+        raise
+    except httpx.HTTPError:
+        raise HttpProbeError(
+            "early-close NDJSON stream request failed"
+        ) from None
+    if observed_rows != prefix_rows or first_data_seconds is None:
+        raise HttpProbeError(
+            "early-close NDJSON prefix count is inconsistent"
+        )
+    if first_data_seconds >= close_seconds:
+        raise HttpProbeError(
+            "early-close NDJSON prefix was not delivered incrementally"
+        )
+    return EarlyCloseNdjsonObservation(
+        status_code=200,
+        content_type=content_type,
+        requested_rows=requested_rows,
+        prefix_rows=observed_rows,
+        prefix_digest=digest.hexdigest(),
+        bytes_received=bytes_received,
+        first_data_seconds=first_data_seconds,
+        close_seconds=close_seconds,
+    )
+
+
+def process_rss_bytes(pids: tuple[int, ...]) -> int:
+    """Return aggregate RSS for one exact live worker PID set."""
+
+    if (
+        not pids
+        or len(set(pids)) != len(pids)
+        or any(
+            isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0
+            for pid in pids
+        )
+    ):
+        raise RunnerConfigurationError("RSS worker PID set is invalid")
+    try:
+        rss = sum(psutil.Process(pid).memory_info().rss for pid in pids)
+    except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess) as error:
+        raise ProcessSupervisorError(
+            "worker RSS could not be sampled"
+        ) from error
+    if isinstance(rss, bool) or not isinstance(rss, int) or rss <= 0:
+        raise ProcessSupervisorError("worker RSS sample is invalid")
+    return rss
+
+
+async def monitor_process_rss(
+    pids: tuple[int, ...],
+    *,
+    stop: asyncio.Event,
+    poll_interval_seconds: float,
+    rss_sampler: Callable[[tuple[int, ...]], int] = process_rss_bytes,
+) -> int:
+    """Record peak aggregate RSS until the caller signals completion."""
+
+    if (
+        isinstance(poll_interval_seconds, bool)
+        or not isinstance(poll_interval_seconds, (int, float))
+        or not math.isfinite(poll_interval_seconds)
+        or poll_interval_seconds <= 0
+    ):
+        raise RunnerConfigurationError(
+            "RSS poll interval must be a finite positive number"
+        )
+    peak = 0
+    while True:
+        current = rss_sampler(pids)
+        if (
+            isinstance(current, bool)
+            or not isinstance(current, int)
+            or current <= 0
+        ):
+            raise ProcessSupervisorError("worker RSS sample is invalid")
+        peak = max(peak, current)
+        if stop.is_set():
+            return peak
+        try:
+            await asyncio.wait_for(
+                stop.wait(),
+                timeout=poll_interval_seconds,
+            )
+        except TimeoutError:
+            continue
+
+
+async def wait_for_pool_settlement(
+    port: int,
+    *,
+    expected_pid: int,
+    timeout_seconds: float,
+    poll_interval_seconds: float = 0.025,
+    request_json: Callable[..., Awaitable[LoopbackJsonResponse]] | None = None,
+) -> dict[str, object]:
+    """Poll privacy-safe pool state until no request or waiter remains."""
+
+    _validate_http_probe(port, "/pool", timeout_seconds)
+    if (
+        isinstance(expected_pid, bool)
+        or not isinstance(expected_pid, int)
+        or expected_pid <= 0
+    ):
+        raise RunnerConfigurationError("expected pool worker PID is invalid")
+    if (
+        isinstance(poll_interval_seconds, bool)
+        or not isinstance(poll_interval_seconds, (int, float))
+        or not math.isfinite(poll_interval_seconds)
+        or poll_interval_seconds <= 0
+    ):
+        raise RunnerConfigurationError(
+            "pool settlement poll interval must be a finite positive number"
+        )
+    requester = http_request_json if request_json is None else request_json
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ReadinessTimeoutError(
+                "worker pool did not settle within the bound"
+            )
+        try:
+            response = await asyncio.wait_for(
+                requester(
+                    port,
+                    "/pool",
+                    expected_statuses=(200,),
+                    timeout_seconds=remaining,
+                ),
+                timeout=remaining,
+            )
+        except TimeoutError:
+            raise ReadinessTimeoutError(
+                "worker pool did not settle within the bound"
+            ) from None
+        if not isinstance(response, LoopbackJsonResponse):
+            raise WorkerEvidenceError("pool settlement response is malformed")
+        payload = response.payload
+        pool = payload.get("pool")
+        admission = payload.get("admission")
+        if (
+            payload.get("pid") != expected_pid
+            or not isinstance(pool, Mapping)
+            or not isinstance(admission, Mapping)
+        ):
+            raise WorkerEvidenceError("pool settlement evidence is malformed")
+        active = _nonnegative_metric(pool, "active_connections")
+        pending = _nonnegative_metric(pool, "pending_gets")
+        admission_active = admission.get("active")
+        if (
+            isinstance(admission_active, bool)
+            or not isinstance(admission_active, int)
+            or admission_active < 0
+        ):
+            raise WorkerEvidenceError("pool settlement evidence is malformed")
+        if active == 0 and pending == 0 and admission_active == 0:
+            return dict(payload)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ReadinessTimeoutError(
+                "worker pool did not settle within the bound"
+            )
+        await asyncio.sleep(min(poll_interval_seconds, remaining))
+
+
+async def wait_for_saturation_state(
+    port: int,
+    *,
+    expected_pid: int,
+    pool_max: int,
+    expected_waiters: int,
+    timeout_seconds: float,
+    poll_interval_seconds: float = 0.025,
+    request_json: Callable[..., Awaitable[LoopbackJsonResponse]] | None = None,
+) -> dict[str, object]:
+    """Poll until both application admission and pool acquisition are full."""
+
+    _validate_http_probe(port, "/pool", timeout_seconds)
+    if (
+        isinstance(expected_pid, bool)
+        or not isinstance(expected_pid, int)
+        or expected_pid <= 0
+        or isinstance(pool_max, bool)
+        or not isinstance(pool_max, int)
+        or pool_max <= 0
+        or isinstance(expected_waiters, bool)
+        or not isinstance(expected_waiters, int)
+        or expected_waiters <= 0
+    ):
+        raise RunnerConfigurationError(
+            "saturation pool identity or bounds are invalid"
+        )
+    if (
+        isinstance(poll_interval_seconds, bool)
+        or not isinstance(poll_interval_seconds, (int, float))
+        or not math.isfinite(poll_interval_seconds)
+        or poll_interval_seconds <= 0
+    ):
+        raise RunnerConfigurationError(
+            "saturation poll interval must be a finite positive number"
+        )
+    requester = http_request_json if request_json is None else request_json
+    admission_capacity = pool_max + expected_waiters
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ReadinessTimeoutError(
+                "worker pool did not reach saturation within the bound"
+            )
+        try:
+            response = await asyncio.wait_for(
+                requester(
+                    port,
+                    "/pool",
+                    expected_statuses=(200,),
+                    timeout_seconds=remaining,
+                ),
+                timeout=remaining,
+            )
+        except TimeoutError:
+            raise ReadinessTimeoutError(
+                "worker pool did not reach saturation within the bound"
+            ) from None
+        if not isinstance(response, LoopbackJsonResponse):
+            raise WorkerEvidenceError(
+                "pool saturation response is malformed"
+            )
+        payload = response.payload
+        pool = payload.get("pool")
+        admission = payload.get("admission")
+        if (
+            payload.get("pid") != expected_pid
+            or not isinstance(pool, Mapping)
+            or not isinstance(admission, Mapping)
+        ):
+            raise WorkerEvidenceError(
+                "pool saturation evidence is malformed"
+            )
+        connections = _nonnegative_metric(pool, "connections")
+        idle = _nonnegative_metric(pool, "idle_connections")
+        active = _nonnegative_metric(pool, "active_connections")
+        pending = _nonnegative_metric(pool, "pending_gets")
+        admission_active = admission.get("active")
+        capacity = admission.get("capacity")
+        rejected = admission.get("rejected")
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            for value in (admission_active, capacity, rejected)
+        ):
+            raise WorkerEvidenceError(
+                "pool saturation evidence is malformed"
+            )
+        if (
+            pool.get("max_size") != pool_max
+            or connections > pool_max
+            or idle > connections
+            or active != connections - idle
+            or active > pool_max
+            or pending > expected_waiters
+            or capacity != admission_capacity
+            or admission_active > admission_capacity
+            or rejected != 0
+        ):
+            raise WorkerEvidenceError(
+                "pool saturation exceeded its configured bounds"
+            )
+        if (
+            connections == pool_max
+            and idle == 0
+            and active == pool_max
+            and pending == expected_waiters
+            and admission_active == admission_capacity
+        ):
+            return dict(payload)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ReadinessTimeoutError(
+                "worker pool did not reach saturation within the bound"
+            )
+        await asyncio.sleep(min(poll_interval_seconds, remaining))
 
 
 def _http_get_json_sync(
@@ -2055,19 +4537,7 @@ async def http_get_json(
     *,
     timeout_seconds: float = 1.0,
 ) -> dict[str, object]:
-    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65_535:
-        raise RunnerConfigurationError("port must be between 1 and 65,535")
-    if not path.startswith("/") or "\r" in path or "\n" in path or " " in path:
-        raise RunnerConfigurationError("HTTP probe path is unsafe")
-    if (
-        isinstance(timeout_seconds, bool)
-        or not isinstance(timeout_seconds, (int, float))
-        or not math.isfinite(timeout_seconds)
-        or timeout_seconds <= 0
-    ):
-        raise RunnerConfigurationError(
-            "HTTP probe timeout must be a finite positive number"
-        )
+    _validate_http_probe(port, path, timeout_seconds)
     return await asyncio.wait_for(
         asyncio.to_thread(
             _http_get_json_sync,
@@ -2077,6 +4547,1977 @@ async def http_get_json(
         ),
         timeout=timeout_seconds + 0.5,
     )
+
+
+async def collect_worker_payloads(
+    port: int,
+    path: str,
+    *,
+    expected_pids: Sequence[int],
+    timeout_seconds: float,
+    request_json: Callable[..., Awaitable[dict[str, object]]] | None = None,
+) -> tuple[dict[str, object], ...]:
+    """Reach every expected worker through bounded load-balancer dispatch."""
+
+    _validate_http_probe(port, path, timeout_seconds)
+    if (
+        not expected_pids
+        or any(
+            isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0
+            for pid in expected_pids
+        )
+        or len(set(expected_pids)) != len(expected_pids)
+    ):
+        raise RunnerConfigurationError("expected worker PIDs are invalid")
+    requester = http_get_json if request_json is None else request_json
+    expected = frozenset(expected_pids)
+    observed: dict[int, dict[str, object]] = {}
+    deadline = time.monotonic() + timeout_seconds
+    while observed.keys() != expected:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ReadinessTimeoutError(
+                "not every expected worker returned evidence within the bound"
+            )
+        probe_tasks = tuple(
+            asyncio.create_task(
+                requester(port, path, timeout_seconds=remaining)
+            )
+            for _ in range(
+                min(len(expected), MAX_WORKER_PROBE_CONCURRENCY)
+            )
+        )
+        try:
+            payloads = await asyncio.wait_for(
+                asyncio.gather(*probe_tasks),
+                timeout=remaining,
+            )
+        except TimeoutError:
+            raise ReadinessTimeoutError(
+                "not every expected worker returned evidence within the bound"
+            ) from None
+        finally:
+            for task in probe_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*probe_tasks, return_exceptions=True)
+        for payload in payloads:
+            if not isinstance(payload, dict):
+                raise WorkerEvidenceError("worker HTTP evidence is malformed")
+            pid = payload.get("pid")
+            if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+                raise WorkerEvidenceError(
+                    "worker HTTP evidence has an invalid PID"
+                )
+            if pid not in expected:
+                raise WorkerEvidenceError(
+                    "worker HTTP evidence has an unexpected worker PID"
+                )
+            prior = observed.get(pid)
+            if prior is not None and prior != payload:
+                raise WorkerEvidenceError(
+                    "worker HTTP evidence changed for one PID"
+                )
+            observed[pid] = dict(payload)
+    return tuple(observed[pid] for pid in sorted(observed))
+
+
+async def run_native_scaling_profile(
+    config: RunnerConfig,
+    isolated: IsolatedApplication,
+    profile: ProcessProfile,
+    *,
+    repository_root: Path,
+    run_id: str,
+    policy: SupervisorPolicy,
+    sql_auth_settings: SqlAuthObserverSettings,
+    table_name: str,
+    wave_values: Sequence[int],
+    sql_delay_ms: int = 250,
+) -> NativeScalingProfileResult:
+    """Run one exact-worker native FastAPI SQL-auth scaling profile."""
+
+    if (
+        config.database_mode != "sql_auth"
+        or profile.database_mode != "sql_auth"
+        or profile not in native_fastapi_profiles(config.platform_system)
+    ):
+        raise RunnerConfigurationError(
+            "native scaling requires a selected SQL-auth FastAPI profile"
+        )
+    if (
+        not wave_values
+        or len(wave_values) > config.global_connection_budget
+        or any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in wave_values
+        )
+    ):
+        raise RunnerConfigurationError("native scaling wave values are invalid")
+
+    artifact_directory = (
+        config.run_root / "worker-records" / profile.id
+    ).resolve()
+    environment = build_profile_environment(
+        config,
+        isolated,
+        profile,
+        run_id=run_id,
+        artifact_directory=artifact_directory,
+        sql_auth_settings=sql_auth_settings,
+        table_name=table_name,
+        sql_delay_ms=sql_delay_ms,
+    )
+    worker_prefix = environment["FASTMSSQL_FRAMEWORK_APPLICATION_NAME"]
+    observer_application_name = f"{worker_prefix}-observer"
+    if len(observer_application_name) > MAX_SQL_SERVER_APPLICATION_NAME:
+        raise RunnerConfigurationError(
+            "generated observer application name is too long"
+        )
+    observer_connection = create_observer_connection(
+        sql_auth_settings,
+        application_name=observer_application_name,
+    )
+    await observer_connection.connect(validate=True)
+
+    async def execute() -> NativeScalingProfileResult:
+        observer = SqlServerObserver(
+            source=observer_connection,
+            worker_prefix=worker_prefix,
+            observer_application_name=observer_application_name,
+            poll_interval_seconds=policy.poll_interval_seconds,
+        )
+
+        async def worker_is_ready(port: int) -> bool:
+            try:
+                payload = await http_get_json(
+                    port,
+                    "/ready",
+                    timeout_seconds=0.5,
+                )
+            except HttpProbeError:
+                return False
+            return payload.get("state") == "ready"
+
+        launch = await launch_with_port_retry(
+            command_builder=lambda port: build_server_command(
+                config,
+                profile,
+                port=port,
+            ),
+            cwd=isolated.root,
+            environment=environment,
+            readiness_probe=worker_is_ready,
+            policy=policy,
+        )
+        supervisor = launch.supervisor
+        async with supervisor:
+            ready_records = await supervisor.wait_for_worker_records(
+                directory=artifact_directory,
+                phase="ready",
+                expected_run_id=run_id,
+                expected_count=profile.workers,
+            )
+            ready_pids = tuple(
+                sorted(int(record["pid"]) for record in ready_records)
+            )
+            package_records = await collect_worker_payloads(
+                launch.port,
+                "/package",
+                expected_pids=ready_pids,
+                timeout_seconds=policy.startup_timeout_seconds,
+            )
+            validated_packages = tuple(
+                validate_package_record(
+                    config,
+                    isolated,
+                    package,
+                    repository_root=repository_root,
+                )
+                for package in package_records
+            )
+            principal_records = await collect_worker_payloads(
+                launch.port,
+                "/principal",
+                expected_pids=ready_pids,
+                timeout_seconds=policy.startup_timeout_seconds,
+            )
+            await observer.wait_for_ready_workers(
+                ready_records,
+                timeout_seconds=policy.startup_timeout_seconds,
+            )
+
+            wave_timeout = max(5.0, sql_delay_ms / 1_000 + 2.0)
+            wave_tasks = tuple(
+                asyncio.create_task(
+                    http_request_json(
+                        launch.port,
+                        f"/wait/{value}",
+                        expected_statuses=(200,),
+                        timeout_seconds=wave_timeout,
+                    )
+                )
+                for value in wave_values
+            )
+            try:
+                await observer.wait_for_minimum_requests(
+                    min(2, len(wave_tasks)),
+                    timeout_seconds=wave_timeout,
+                )
+                wave_responses = await asyncio.wait_for(
+                    asyncio.gather(*wave_tasks),
+                    timeout=wave_timeout,
+                )
+            finally:
+                for task in wave_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*wave_tasks, return_exceptions=True)
+
+            pool_records = await collect_worker_payloads(
+                launch.port,
+                "/pool",
+                expected_pids=ready_pids,
+                timeout_seconds=policy.startup_timeout_seconds,
+            )
+            observer_sample = await observer.sample()
+            evidence = validate_native_scaling_evidence(
+                config=config,
+                profile=profile,
+                ready_records=ready_records,
+                package_records=validated_packages,
+                principal_records=principal_records,
+                pool_records=pool_records,
+                parameter_payloads=tuple(
+                    response.payload for response in wave_responses
+                ),
+                expected_values=wave_values,
+                expected_principal=sql_auth_settings.username,
+                observer_sample=observer_sample,
+            )
+            outcome = await supervisor.stop()
+
+        shutdown_records = supervisor.read_worker_records(
+            directory=artifact_directory,
+            phase="shutdown",
+            expected_run_id=run_id,
+            expected_count=profile.workers,
+        )
+        shutdown_pids = tuple(
+            sorted(int(record["pid"]) for record in shutdown_records)
+        )
+        if evidence.ready_pids != shutdown_pids:
+            raise WorkerEvidenceError(
+                "ready and shutdown worker PIDs do not reconcile"
+            )
+        listening_sockets_after = (
+            (launch.port,)
+            if await loopback_port_is_listening(launch.port)
+            else ()
+        )
+        if listening_sockets_after:
+            raise ProcessSupervisorError(
+                "loopback listener survived supervised shutdown"
+            )
+        zero_sample = await observer.wait_for_zero_sessions(
+            timeout_seconds=policy.graceful_timeout_seconds,
+        )
+        verify_isolated_application(isolated)
+        return NativeScalingProfileResult(
+            profile=profile,
+            evidence=evidence,
+            port=launch.port,
+            launch_attempts=launch.attempts,
+            sanitized_command=launch.sanitized_command,
+            shutdown_pids=shutdown_pids,
+            manager_pid=outcome.pid,
+            descendant_pids=outcome.descendant_pids,
+            returncode=outcome.returncode,
+            graceful_stop=outcome.graceful_stop,
+            forced_cleanup=outcome.forced_cleanup,
+            listening_sockets_after=listening_sockets_after,
+            sessions_after=zero_sample.current_sessions,
+        )
+
+    try:
+        result = await execute()
+    except BaseException as operation_error:
+        try:
+            await observer_connection.disconnect()
+        except BaseException as cleanup_error:
+            raise BaseExceptionGroup(
+                "native scaling profile and observer cleanup both failed",
+                [operation_error, cleanup_error],
+            ) from None
+        raise
+    await observer_connection.disconnect()
+    return result
+
+
+async def run_native_scaling_matrix(
+    config: RunnerConfig,
+    *,
+    repository_root: Path,
+    source_directory: Path,
+    sql_auth_settings: SqlAuthObserverSettings,
+    table_name: str,
+    policy: SupervisorPolicy | None = None,
+) -> tuple[NativeScalingProfileResult, ...]:
+    """Run all applicable native FastAPI server/count combinations once."""
+
+    if config.database_mode != "sql_auth":
+        raise RunnerConfigurationError(
+            "native scaling matrix requires SQL-auth database mode"
+        )
+    selected_policy = policy or SupervisorPolicy()
+    isolated = prepare_isolated_application(
+        config,
+        source_directory=source_directory,
+        directory_name="native-scaling-application",
+    )
+    results: list[NativeScalingProfileResult] = []
+    for index, profile in enumerate(
+        native_fastapi_profiles(config.platform_system),
+        start=1,
+    ):
+        wave_size = max(2, profile.workers)
+        if wave_size > config.global_connection_budget:
+            raise RunnerConfigurationError(
+                "native scaling wave exceeds the global connection budget"
+            )
+        wave_values = tuple(
+            731_000 + index * 100 + offset
+            for offset in range(1, wave_size + 1)
+        )
+        results.append(
+            await run_native_scaling_profile(
+                config,
+                isolated,
+                profile,
+                repository_root=repository_root,
+                run_id=f"nscale-{config.candidate_sha[:8]}-{index}",
+                policy=selected_policy,
+                sql_auth_settings=sql_auth_settings,
+                table_name=table_name,
+                wave_values=wave_values,
+            )
+        )
+    verify_isolated_application(isolated)
+    return tuple(results)
+
+
+async def run_native_concurrency_scenario(
+    config: RunnerConfig,
+    isolated: IsolatedApplication,
+    profile: ProcessProfile,
+    *,
+    run_id: str,
+    policy: SupervisorPolicy,
+    sql_auth_settings: SqlAuthObserverSettings,
+    table_name: str,
+    values: Sequence[int],
+    sql_delay_ms: int = 250,
+) -> NativeConcurrencyScenarioResult:
+    """Measure same-server sequential/concurrent waits and event-loop health."""
+
+    expected_profile = next(
+        (
+            candidate
+            for candidate in native_fastapi_profiles(config.platform_system)
+            if candidate.family == "fastapi-uvicorn-asyncio"
+            and candidate.workers == 1
+        ),
+        None,
+    )
+    if (
+        config.database_mode != "sql_auth"
+        or profile != expected_profile
+        or len(values) < 2
+        or len(values) > config.global_connection_budget
+    ):
+        raise RunnerConfigurationError(
+            "native concurrency requires one SQL-auth Uvicorn asyncio worker"
+        )
+    artifact_directory = (
+        config.run_root / "worker-records" / "native-concurrency"
+    ).resolve()
+    environment = build_profile_environment(
+        config,
+        isolated,
+        profile,
+        run_id=run_id,
+        artifact_directory=artifact_directory,
+        sql_auth_settings=sql_auth_settings,
+        table_name=table_name,
+        sql_delay_ms=sql_delay_ms,
+    )
+    worker_prefix = environment["FASTMSSQL_FRAMEWORK_APPLICATION_NAME"]
+    observer_application_name = f"{worker_prefix}-observer"
+    if len(observer_application_name) > MAX_SQL_SERVER_APPLICATION_NAME:
+        raise RunnerConfigurationError(
+            "generated observer application name is too long"
+        )
+    observer_connection = create_observer_connection(
+        sql_auth_settings,
+        application_name=observer_application_name,
+    )
+    await observer_connection.connect(validate=True)
+
+    async def execute() -> NativeConcurrencyScenarioResult:
+        observer = SqlServerObserver(
+            source=observer_connection,
+            worker_prefix=worker_prefix,
+            observer_application_name=observer_application_name,
+            poll_interval_seconds=policy.poll_interval_seconds,
+        )
+
+        async def worker_is_ready(port: int) -> bool:
+            try:
+                payload = await http_get_json(
+                    port,
+                    "/ready",
+                    timeout_seconds=0.5,
+                )
+            except HttpProbeError:
+                return False
+            return payload.get("state") == "ready"
+
+        launch = await launch_with_port_retry(
+            command_builder=lambda port: build_server_command(
+                config,
+                profile,
+                port=port,
+            ),
+            cwd=isolated.root,
+            environment=environment,
+            readiness_probe=worker_is_ready,
+            policy=policy,
+        )
+        supervisor = launch.supervisor
+        request_timeout = max(5.0, sql_delay_ms / 1_000 + 2.0)
+        async with supervisor:
+            ready_records = await supervisor.wait_for_worker_records(
+                directory=artifact_directory,
+                phase="ready",
+                expected_run_id=run_id,
+                expected_count=1,
+            )
+            ready_pids = tuple(
+                sorted(int(record["pid"]) for record in ready_records)
+            )
+            await observer.wait_for_ready_workers(
+                ready_records,
+                timeout_seconds=policy.startup_timeout_seconds,
+            )
+
+            sequential_started = time.perf_counter()
+            sequential_responses = tuple(
+                [
+                    await http_request_json(
+                        launch.port,
+                        f"/wait/{value}",
+                        expected_statuses=(200,),
+                        timeout_seconds=request_timeout,
+                    )
+                    for value in values
+                ]
+            )
+            sequential_seconds = time.perf_counter() - sequential_started
+
+            concurrent_started = time.perf_counter()
+            concurrent_tasks = tuple(
+                asyncio.create_task(
+                    http_request_json(
+                        launch.port,
+                        f"/wait/{value}",
+                        expected_statuses=(200,),
+                        timeout_seconds=request_timeout,
+                    )
+                )
+                for value in values
+            )
+            try:
+                busy_sample = await observer.wait_for_minimum_requests(
+                    2,
+                    timeout_seconds=request_timeout,
+                )
+                health_started = time.perf_counter()
+                health = await http_request_json(
+                    launch.port,
+                    "/ready",
+                    expected_statuses=(200,),
+                    timeout_seconds=request_timeout,
+                )
+                health_seconds = time.perf_counter() - health_started
+                if health.payload.get("state") != "ready":
+                    raise WorkerEvidenceError(
+                        "native event-loop health response is inconsistent"
+                    )
+                concurrent_responses = await asyncio.wait_for(
+                    asyncio.gather(*concurrent_tasks),
+                    timeout=request_timeout,
+                )
+                concurrent_seconds = time.perf_counter() - concurrent_started
+            finally:
+                for task in concurrent_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*concurrent_tasks, return_exceptions=True)
+
+            pool_response = await http_request_json(
+                launch.port,
+                "/pool",
+                expected_statuses=(200,),
+                timeout_seconds=request_timeout,
+            )
+            if pool_response.payload.get("pid") != ready_pids[0]:
+                raise WorkerEvidenceError(
+                    "native concurrency pool response PID is inconsistent"
+                )
+            evidence = validate_native_concurrency_evidence(
+                sequential_payloads=tuple(
+                    response.payload for response in sequential_responses
+                ),
+                concurrent_payloads=tuple(
+                    response.payload for response in concurrent_responses
+                ),
+                expected_values=values,
+                sequential_seconds=sequential_seconds,
+                concurrent_seconds=concurrent_seconds,
+                health_seconds=health_seconds,
+                sql_delay_ms=sql_delay_ms,
+                observer_sample=busy_sample,
+                pool_record=pool_response.payload,
+            )
+            outcome = await supervisor.stop()
+
+        shutdown_records = supervisor.read_worker_records(
+            directory=artifact_directory,
+            phase="shutdown",
+            expected_run_id=run_id,
+            expected_count=1,
+        )
+        shutdown_pids = tuple(
+            sorted(int(record["pid"]) for record in shutdown_records)
+        )
+        if ready_pids != shutdown_pids:
+            raise WorkerEvidenceError(
+                "ready and shutdown worker PIDs do not reconcile"
+            )
+        listening_sockets_after = (
+            (launch.port,)
+            if await loopback_port_is_listening(launch.port)
+            else ()
+        )
+        if listening_sockets_after:
+            raise ProcessSupervisorError(
+                "loopback listener survived supervised shutdown"
+            )
+        zero_sample = await observer.wait_for_zero_sessions(
+            timeout_seconds=policy.graceful_timeout_seconds,
+        )
+        verify_isolated_application(isolated)
+        return NativeConcurrencyScenarioResult(
+            profile_id=profile.id,
+            evidence=evidence,
+            ready_pids=ready_pids,
+            shutdown_pids=shutdown_pids,
+            manager_pid=outcome.pid,
+            descendant_pids=outcome.descendant_pids,
+            returncode=outcome.returncode,
+            graceful_stop=outcome.graceful_stop,
+            forced_cleanup=outcome.forced_cleanup,
+            listening_sockets_after=listening_sockets_after,
+            sessions_after=zero_sample.current_sessions,
+        )
+
+    try:
+        result = await execute()
+    except BaseException as operation_error:
+        try:
+            await observer_connection.disconnect()
+        except BaseException as cleanup_error:
+            raise BaseExceptionGroup(
+                "native concurrency scenario and observer cleanup both failed",
+                [operation_error, cleanup_error],
+            ) from None
+        raise
+    await observer_connection.disconnect()
+    return result
+
+
+async def run_native_disconnect_scenario(
+    config: RunnerConfig,
+    isolated: IsolatedApplication,
+    profile: ProcessProfile,
+    *,
+    run_id: str,
+    policy: SupervisorPolicy,
+    sql_auth_settings: SqlAuthObserverSettings,
+    table_name: str,
+    token: str,
+) -> NativeDisconnectScenarioResult:
+    """Close a real TCP peer only after its identifiable SQL wait appears."""
+
+    if (
+        config.database_mode != "sql_auth"
+        or profile not in native_fastapi_profiles(config.platform_system)
+        or profile.server != "uvicorn"
+        or profile.workers != 1
+    ):
+        raise RunnerConfigurationError(
+            "native disconnect requires one SQL-auth Uvicorn worker"
+        )
+    if (
+        not isinstance(token, str)
+        or OBSERVER_CONTEXT_TOKEN_PATTERN.fullmatch(token) is None
+    ):
+        raise RunnerConfigurationError("disconnect context token is invalid")
+    artifact_directory = (
+        config.run_root / "worker-records" / "native-disconnect"
+    ).resolve()
+    environment = build_profile_environment(
+        config,
+        isolated,
+        profile,
+        run_id=run_id,
+        artifact_directory=artifact_directory,
+        sql_auth_settings=sql_auth_settings,
+        table_name=table_name,
+    )
+    worker_prefix = environment["FASTMSSQL_FRAMEWORK_APPLICATION_NAME"]
+    observer_application_name = f"{worker_prefix}-observer"
+    if len(observer_application_name) > MAX_SQL_SERVER_APPLICATION_NAME:
+        raise RunnerConfigurationError(
+            "generated observer application name is too long"
+        )
+    observer_connection = create_observer_connection(
+        sql_auth_settings,
+        application_name=observer_application_name,
+    )
+    await observer_connection.connect(validate=True)
+
+    async def execute() -> NativeDisconnectScenarioResult:
+        observer = SqlServerObserver(
+            source=observer_connection,
+            worker_prefix=worker_prefix,
+            observer_application_name=observer_application_name,
+            poll_interval_seconds=policy.poll_interval_seconds,
+        )
+
+        async def worker_is_ready(port: int) -> bool:
+            try:
+                payload = await http_get_json(
+                    port,
+                    "/ready",
+                    timeout_seconds=0.5,
+                )
+            except HttpProbeError:
+                return False
+            return payload.get("state") == "ready"
+
+        launch = await launch_with_port_retry(
+            command_builder=lambda port: build_server_command(
+                config,
+                profile,
+                port=port,
+            ),
+            cwd=isolated.root,
+            environment=environment,
+            readiness_probe=worker_is_ready,
+            policy=policy,
+        )
+        supervisor = launch.supervisor
+        scenario_timeout = 10.0
+        async with supervisor:
+            ready_records = await supervisor.wait_for_worker_records(
+                directory=artifact_directory,
+                phase="ready",
+                expected_run_id=run_id,
+                expected_count=1,
+            )
+            ready_pids = tuple(
+                sorted(int(record["pid"]) for record in ready_records)
+            )
+            await observer.wait_for_ready_workers(
+                ready_records,
+                timeout_seconds=policy.startup_timeout_seconds,
+            )
+            before_response = await http_request_json(
+                launch.port,
+                "/pool",
+                expected_statuses=(200,),
+                timeout_seconds=scenario_timeout,
+            )
+            if before_response.payload.get("pid") != ready_pids[0]:
+                raise WorkerEvidenceError(
+                    "disconnect pool response PID is inconsistent"
+                )
+            before_pool = before_response.payload.get("pool")
+            if not isinstance(before_pool, Mapping):
+                raise WorkerEvidenceError(
+                    "disconnect pool evidence is malformed"
+                )
+
+            raw_request = await open_raw_http_request(
+                launch.port,
+                f"/cancel/{token}",
+                timeout_seconds=scenario_timeout,
+            )
+            try:
+                observed_sample = await observer.wait_for_context_token(
+                    token,
+                    present=True,
+                    timeout_seconds=scenario_timeout,
+                )
+            finally:
+                await raw_request.close(timeout_seconds=scenario_timeout)
+            settled_sample = await observer.wait_for_context_token(
+                token,
+                present=False,
+                timeout_seconds=scenario_timeout,
+            )
+            await wait_for_pool_settlement(
+                launch.port,
+                expected_pid=ready_pids[0],
+                timeout_seconds=scenario_timeout,
+                poll_interval_seconds=policy.poll_interval_seconds,
+            )
+            recovery = await http_request_json(
+                launch.port,
+                "/value/36",
+                expected_statuses=(200,),
+                timeout_seconds=scenario_timeout,
+            )
+            after_payload = await wait_for_pool_settlement(
+                launch.port,
+                expected_pid=ready_pids[0],
+                timeout_seconds=scenario_timeout,
+                poll_interval_seconds=policy.poll_interval_seconds,
+            )
+            after_pool = after_payload.get("pool")
+            if not isinstance(after_pool, Mapping):
+                raise WorkerEvidenceError(
+                    "disconnect recovery pool evidence is malformed"
+                )
+            evidence = validate_disconnect_evidence(
+                token=token,
+                observed_sample=observed_sample,
+                settled_sample=settled_sample,
+                before_pool=before_pool,
+                after_pool=after_pool,
+                recovery_payload=recovery.payload,
+            )
+            outcome = await supervisor.stop()
+
+        if token in outcome.stdout or token in outcome.stderr:
+            raise WorkerEvidenceError(
+                "disconnect context token appeared in server diagnostics"
+            )
+        shutdown_records = supervisor.read_worker_records(
+            directory=artifact_directory,
+            phase="shutdown",
+            expected_run_id=run_id,
+            expected_count=1,
+        )
+        shutdown_pids = tuple(
+            sorted(int(record["pid"]) for record in shutdown_records)
+        )
+        if ready_pids != shutdown_pids:
+            raise WorkerEvidenceError(
+                "ready and shutdown worker PIDs do not reconcile"
+            )
+        listening_sockets_after = (
+            (launch.port,)
+            if await loopback_port_is_listening(launch.port)
+            else ()
+        )
+        if listening_sockets_after:
+            raise ProcessSupervisorError(
+                "loopback listener survived supervised shutdown"
+            )
+        zero_sample = await observer.wait_for_zero_sessions(
+            timeout_seconds=policy.graceful_timeout_seconds,
+        )
+        verify_isolated_application(isolated)
+        return NativeDisconnectScenarioResult(
+            profile_id=profile.id,
+            evidence=evidence,
+            ready_pids=ready_pids,
+            shutdown_pids=shutdown_pids,
+            manager_pid=outcome.pid,
+            descendant_pids=outcome.descendant_pids,
+            returncode=outcome.returncode,
+            graceful_stop=outcome.graceful_stop,
+            forced_cleanup=outcome.forced_cleanup,
+            listening_sockets_after=listening_sockets_after,
+            sessions_after=zero_sample.current_sessions,
+        )
+
+    try:
+        result = await execute()
+    except BaseException as operation_error:
+        try:
+            await observer_connection.disconnect()
+        except BaseException as cleanup_error:
+            raise BaseExceptionGroup(
+                "native disconnect scenario and observer cleanup both failed",
+                [operation_error, cleanup_error],
+            ) from None
+        raise
+    await observer_connection.disconnect()
+    return result
+
+
+async def run_native_graceful_query_scenario(
+    config: RunnerConfig,
+    isolated: IsolatedApplication,
+    profile: ProcessProfile,
+    *,
+    run_id: str,
+    policy: SupervisorPolicy,
+    sql_auth_settings: SqlAuthObserverSettings,
+    table_name: str,
+    token: str,
+    value: int,
+    sql_delay_ms: int,
+) -> NativeGracefulQueryScenarioResult:
+    """Signal one POSIX Uvicorn process while identified SQL is in flight."""
+
+    expected_profile = next(
+        (
+            candidate
+            for candidate in native_fastapi_profiles(config.platform_system)
+            if candidate.family == "fastapi-uvicorn-asyncio"
+            and candidate.workers == 1
+        ),
+        None,
+    )
+    if (
+        os.name != "posix"
+        or config.database_mode != "sql_auth"
+        or profile != expected_profile
+    ):
+        raise RunnerConfigurationError(
+            "graceful query requires one POSIX SQL-auth Uvicorn asyncio worker"
+        )
+    if (
+        not isinstance(token, str)
+        or OBSERVER_CONTEXT_TOKEN_PATTERN.fullmatch(token) is None
+        or isinstance(value, bool)
+        or not isinstance(value, int)
+        or not MIN_SQL_BIGINT <= value <= MAX_SQL_BIGINT
+        or sql_delay_ms not in SQL_DELAY_MILLISECONDS
+        or sql_delay_ms <= 0
+    ):
+        raise RunnerConfigurationError(
+            "graceful query token, value or SQL delay is invalid"
+        )
+    artifact_directory = (
+        config.run_root / "worker-records" / "native-graceful-query"
+    ).resolve()
+    environment = build_profile_environment(
+        config,
+        isolated,
+        profile,
+        run_id=run_id,
+        artifact_directory=artifact_directory,
+        sql_auth_settings=sql_auth_settings,
+        table_name=table_name,
+        sql_delay_ms=sql_delay_ms,
+    )
+    worker_prefix = environment["FASTMSSQL_FRAMEWORK_APPLICATION_NAME"]
+    observer_application_name = f"{worker_prefix}-observer"
+    if len(observer_application_name) > MAX_SQL_SERVER_APPLICATION_NAME:
+        raise RunnerConfigurationError(
+            "generated observer application name is too long"
+        )
+    observer_connection = create_observer_connection(
+        sql_auth_settings,
+        application_name=observer_application_name,
+    )
+    await observer_connection.connect(validate=True)
+
+    async def execute() -> NativeGracefulQueryScenarioResult:
+        observer = SqlServerObserver(
+            source=observer_connection,
+            worker_prefix=worker_prefix,
+            observer_application_name=observer_application_name,
+            poll_interval_seconds=policy.poll_interval_seconds,
+        )
+
+        async def worker_is_ready(port: int) -> bool:
+            try:
+                payload = await http_get_json(
+                    port,
+                    "/ready",
+                    timeout_seconds=0.5,
+                )
+            except HttpProbeError:
+                return False
+            return payload.get("state") == "ready"
+
+        launch = await launch_with_port_retry(
+            command_builder=lambda port: build_server_command(
+                config,
+                profile,
+                port=port,
+            ),
+            cwd=isolated.root,
+            environment=environment,
+            readiness_probe=worker_is_ready,
+            policy=policy,
+        )
+        supervisor = launch.supervisor
+        scenario_timeout = max(5.0, sql_delay_ms / 1_000 + 3.0)
+        async with supervisor:
+            ready_records = await supervisor.wait_for_worker_records(
+                directory=artifact_directory,
+                phase="ready",
+                expected_run_id=run_id,
+                expected_count=1,
+            )
+            ready_pids = tuple(
+                sorted(int(record["pid"]) for record in ready_records)
+            )
+            await observer.wait_for_ready_workers(
+                ready_records,
+                timeout_seconds=policy.startup_timeout_seconds,
+            )
+
+            response_task = asyncio.create_task(
+                http_request_json(
+                    launch.port,
+                    f"/wait/{value}",
+                    expected_statuses=(200,),
+                    timeout_seconds=scenario_timeout,
+                    context_token=token,
+                )
+            )
+            await asyncio.sleep(0)
+            stop_task: asyncio.Task[ProcessOutcome] | None = None
+            try:
+                observed_sample = await observer.wait_for_context_token(
+                    token,
+                    present=True,
+                    timeout_seconds=scenario_timeout,
+                )
+                stop_task = asyncio.create_task(supervisor.stop())
+                response = await response_task
+                outcome = await stop_task
+            finally:
+                pending_tasks = tuple(
+                    task
+                    for task in (response_task, stop_task)
+                    if task is not None and not task.done()
+                )
+                for task in pending_tasks:
+                    task.cancel()
+                if pending_tasks:
+                    await asyncio.gather(
+                        *pending_tasks,
+                        return_exceptions=True,
+                    )
+
+            evidence = validate_graceful_query_evidence(
+                token=token,
+                observed_sample=observed_sample,
+                response_payload=response.payload,
+                expected_value=value,
+                sql_delay_ms=sql_delay_ms,
+            )
+            if (
+                outcome.returncode not in {0, -signal.SIGTERM}
+                or not outcome.graceful_stop
+                or outcome.forced_cleanup
+            ):
+                raise WorkerEvidenceError(
+                    "graceful query server did not exit normally"
+                )
+
+        if token in outcome.stdout or token in outcome.stderr:
+            raise WorkerEvidenceError(
+                "graceful query token appeared in server diagnostics"
+            )
+        shutdown_records = supervisor.read_worker_records(
+            directory=artifact_directory,
+            phase="shutdown",
+            expected_run_id=run_id,
+            expected_count=1,
+        )
+        shutdown_pids = tuple(
+            sorted(int(record["pid"]) for record in shutdown_records)
+        )
+        if ready_pids != shutdown_pids:
+            raise WorkerEvidenceError(
+                "graceful query ready and shutdown worker PIDs do not reconcile"
+            )
+        listening_sockets_after = (
+            (launch.port,)
+            if await loopback_port_is_listening(launch.port)
+            else ()
+        )
+        if listening_sockets_after:
+            raise ProcessSupervisorError(
+                "loopback listener survived graceful query shutdown"
+            )
+        zero_sample = await observer.wait_for_zero_sessions(
+            timeout_seconds=policy.graceful_timeout_seconds,
+        )
+        verify_isolated_application(isolated)
+        return NativeGracefulQueryScenarioResult(
+            profile_id=profile.id,
+            evidence=evidence,
+            ready_pids=ready_pids,
+            shutdown_pids=shutdown_pids,
+            manager_pid=outcome.pid,
+            descendant_pids=outcome.descendant_pids,
+            returncode=outcome.returncode,
+            graceful_stop=outcome.graceful_stop,
+            forced_cleanup=outcome.forced_cleanup,
+            listening_sockets_after=listening_sockets_after,
+            sessions_after=zero_sample.current_sessions,
+        )
+
+    try:
+        result = await execute()
+    except BaseException as operation_error:
+        try:
+            await observer_connection.disconnect()
+        except BaseException as cleanup_error:
+            raise BaseExceptionGroup(
+                "graceful query scenario and observer cleanup both failed",
+                [operation_error, cleanup_error],
+            ) from None
+        raise
+    await observer_connection.disconnect()
+    return result
+
+
+async def run_native_graceful_transaction_scenario(
+    config: RunnerConfig,
+    isolated: IsolatedApplication,
+    profile: ProcessProfile,
+    *,
+    run_id: str,
+    policy: SupervisorPolicy,
+    sql_auth_settings: SqlAuthObserverSettings,
+    table_name: str,
+    item_id: int,
+    outcome: str,
+    sql_delay_ms: int,
+) -> NativeGracefulTransactionScenarioResult:
+    """Signal one POSIX Uvicorn process during a pinned transaction."""
+
+    expected_profile = next(
+        (
+            candidate
+            for candidate in native_fastapi_profiles(config.platform_system)
+            if candidate.family == "fastapi-uvicorn-asyncio"
+            and candidate.workers == 1
+        ),
+        None,
+    )
+    if (
+        os.name != "posix"
+        or config.database_mode != "sql_auth"
+        or profile != expected_profile
+    ):
+        raise RunnerConfigurationError(
+            "graceful transaction requires one POSIX SQL-auth Uvicorn "
+            "asyncio worker"
+        )
+    if (
+        not isinstance(table_name, str)
+        or SQL_IDENTIFIER_PATTERN.fullmatch(table_name) is None
+        or isinstance(item_id, bool)
+        or not isinstance(item_id, int)
+        or not 1 <= item_id <= MAX_SQL_BIGINT
+        or outcome not in {"commit", "rollback"}
+        or sql_delay_ms not in SQL_DELAY_MILLISECONDS
+        or sql_delay_ms <= 0
+    ):
+        raise RunnerConfigurationError(
+            "graceful transaction table, identity, outcome or SQL delay is "
+            "invalid"
+        )
+
+    token = f"transaction:{item_id}:{outcome}"
+    artifact_directory = (
+        config.run_root
+        / "worker-records"
+        / f"native-graceful-transaction-{outcome}"
+    ).resolve()
+    environment = build_profile_environment(
+        config,
+        isolated,
+        profile,
+        run_id=run_id,
+        artifact_directory=artifact_directory,
+        sql_auth_settings=sql_auth_settings,
+        table_name=table_name,
+        sql_delay_ms=sql_delay_ms,
+    )
+    worker_prefix = environment["FASTMSSQL_FRAMEWORK_APPLICATION_NAME"]
+    observer_application_name = f"{worker_prefix}-observer"
+    if len(observer_application_name) > MAX_SQL_SERVER_APPLICATION_NAME:
+        raise RunnerConfigurationError(
+            "generated observer application name is too long"
+        )
+
+    qualified_table = f"dbo.[{table_name}]"
+    drop_sql = f"DROP TABLE IF EXISTS {qualified_table}"
+    create_sql = (
+        f"CREATE TABLE {qualified_table} ("
+        "[id] BIGINT NOT NULL PRIMARY KEY, "
+        "[value] NVARCHAR(64) NOT NULL)"
+    )
+    durable_sql = (
+        f"SELECT [value] AS [value] FROM {qualified_table} "
+        "WHERE [id] = @P1"
+    )
+    observer_connection = create_observer_connection(
+        sql_auth_settings,
+        application_name=observer_application_name,
+    )
+    await observer_connection.connect(validate=True)
+
+    async def execute() -> NativeGracefulTransactionScenarioResult:
+        observer = SqlServerObserver(
+            source=observer_connection,
+            worker_prefix=worker_prefix,
+            observer_application_name=observer_application_name,
+            poll_interval_seconds=policy.poll_interval_seconds,
+        )
+
+        async def worker_is_ready(port: int) -> bool:
+            try:
+                payload = await http_get_json(
+                    port,
+                    "/ready",
+                    timeout_seconds=0.5,
+                )
+            except HttpProbeError:
+                return False
+            return payload.get("state") == "ready"
+
+        launch = await launch_with_port_retry(
+            command_builder=lambda port: build_server_command(
+                config,
+                profile,
+                port=port,
+            ),
+            cwd=isolated.root,
+            environment=environment,
+            readiness_probe=worker_is_ready,
+            policy=policy,
+        )
+        supervisor = launch.supervisor
+        scenario_timeout = max(5.0, sql_delay_ms / 1_000 + 3.0)
+        async with supervisor:
+            ready_records = await supervisor.wait_for_worker_records(
+                directory=artifact_directory,
+                phase="ready",
+                expected_run_id=run_id,
+                expected_count=1,
+            )
+            ready_pids = tuple(
+                sorted(int(record["pid"]) for record in ready_records)
+            )
+            await observer.wait_for_ready_workers(
+                ready_records,
+                timeout_seconds=policy.startup_timeout_seconds,
+            )
+            worker_application_name = ready_records[0].get(
+                "worker_application_name"
+            )
+            if (
+                not isinstance(worker_application_name, str)
+                or APPLICATION_DIRECTORY_PATTERN.fullmatch(
+                    worker_application_name
+                )
+                is None
+            ):
+                raise WorkerEvidenceError(
+                    "graceful transaction worker application name is invalid"
+                )
+
+            response_task = asyncio.create_task(
+                http_request_json(
+                    launch.port,
+                    f"/transaction/{item_id}?outcome={outcome}",
+                    method="POST",
+                    expected_statuses=(200,),
+                    timeout_seconds=scenario_timeout,
+                )
+            )
+            await asyncio.sleep(0)
+            stop_task: asyncio.Task[ProcessOutcome] | None = None
+            try:
+                holding_record = await wait_for_transaction_phase_record(
+                    supervisor,
+                    directory=artifact_directory,
+                    expected_run_id=run_id,
+                    expected_pid=ready_pids[0],
+                    expected_worker_application_name=(
+                        worker_application_name
+                    ),
+                    item_id=item_id,
+                    outcome=outcome,
+                    transaction_phase="holding",
+                    timeout_seconds=scenario_timeout,
+                )
+                observed_sample = await observer.wait_for_context_token(
+                    token,
+                    present=True,
+                    timeout_seconds=scenario_timeout,
+                )
+                stop_task = asyncio.create_task(supervisor.stop())
+                response = await response_task
+                outcome_record = await stop_task
+            finally:
+                pending_tasks = tuple(
+                    task
+                    for task in (response_task, stop_task)
+                    if task is not None and not task.done()
+                )
+                for task in pending_tasks:
+                    task.cancel()
+                if pending_tasks:
+                    await asyncio.gather(
+                        *pending_tasks,
+                        return_exceptions=True,
+                    )
+
+            if (
+                outcome_record.returncode not in {0, -signal.SIGTERM}
+                or not outcome_record.graceful_stop
+                or outcome_record.forced_cleanup
+            ):
+                raise WorkerEvidenceError(
+                    "graceful transaction server did not exit normally"
+                )
+
+        if token in outcome_record.stdout or token in outcome_record.stderr:
+            raise WorkerEvidenceError(
+                "graceful transaction token appeared in server diagnostics"
+            )
+        shutdown_records = supervisor.read_worker_records(
+            directory=artifact_directory,
+            phase="shutdown",
+            expected_run_id=run_id,
+            expected_count=1,
+        )
+        shutdown_pids = tuple(
+            sorted(int(record["pid"]) for record in shutdown_records)
+        )
+        if ready_pids != shutdown_pids:
+            raise WorkerEvidenceError(
+                "graceful transaction ready and shutdown worker PIDs do not "
+                "reconcile"
+            )
+        settled_record = await wait_for_transaction_phase_record(
+            supervisor,
+            directory=artifact_directory,
+            expected_run_id=run_id,
+            expected_pid=ready_pids[0],
+            expected_worker_application_name=worker_application_name,
+            item_id=item_id,
+            outcome=outcome,
+            transaction_phase="settled",
+            timeout_seconds=scenario_timeout,
+        )
+        listening_sockets_after = (
+            (launch.port,)
+            if await loopback_port_is_listening(launch.port)
+            else ()
+        )
+        if listening_sockets_after:
+            raise ProcessSupervisorError(
+                "loopback listener survived graceful transaction shutdown"
+            )
+        zero_sample = await observer.wait_for_zero_sessions(
+            timeout_seconds=policy.graceful_timeout_seconds,
+        )
+        durable_result = await observer_connection.query(
+            durable_sql,
+            [item_id],
+        )
+        durable_rows = tuple(durable_result.all())
+        evidence = validate_graceful_transaction_evidence(
+            token=token,
+            item_id=item_id,
+            outcome=outcome,
+            holding_record=holding_record,
+            settled_record=settled_record,
+            observed_sample=observed_sample,
+            response_payload=response.payload,
+            durable_rows=durable_rows,
+        )
+        verify_isolated_application(isolated)
+        return NativeGracefulTransactionScenarioResult(
+            profile_id=profile.id,
+            evidence=evidence,
+            ready_pids=ready_pids,
+            shutdown_pids=shutdown_pids,
+            manager_pid=outcome_record.pid,
+            descendant_pids=outcome_record.descendant_pids,
+            returncode=outcome_record.returncode,
+            graceful_stop=outcome_record.graceful_stop,
+            forced_cleanup=outcome_record.forced_cleanup,
+            listening_sockets_after=listening_sockets_after,
+            sessions_after=zero_sample.current_sessions,
+        )
+
+    async def cleanup() -> tuple[BaseException, ...]:
+        errors: list[BaseException] = []
+        try:
+            await observer_connection.execute(drop_sql)
+        except BaseException as error:
+            errors.append(error)
+        try:
+            await observer_connection.disconnect()
+        except BaseException as error:
+            errors.append(error)
+        return tuple(errors)
+
+    try:
+        await observer_connection.execute(drop_sql)
+        await observer_connection.execute(create_sql)
+        result = await execute()
+    except BaseException as operation_error:
+        cleanup_errors = await cleanup()
+        if cleanup_errors:
+            raise BaseExceptionGroup(
+                "graceful transaction scenario and cleanup failed",
+                [operation_error, *cleanup_errors],
+            ) from None
+        raise
+    cleanup_errors = await cleanup()
+    if len(cleanup_errors) == 1:
+        raise cleanup_errors[0]
+    if cleanup_errors:
+        raise BaseExceptionGroup(
+            "graceful transaction cleanup failed",
+            list(cleanup_errors),
+        )
+    return result
+
+
+async def run_native_saturation_scenario(
+    config: RunnerConfig,
+    isolated: IsolatedApplication,
+    profile: ProcessProfile,
+    *,
+    run_id: str,
+    policy: SupervisorPolicy,
+    sql_auth_settings: SqlAuthObserverSettings,
+    table_name: str,
+    holder_values: Sequence[int],
+    waiter_values: Sequence[int],
+    excess_values: Sequence[int],
+    recovery_value: int,
+    sql_delay_ms: int,
+    acquire_timeout_ms: int,
+) -> NativeSaturationScenarioResult:
+    """Saturate one worker's app admission and FastMssql pool exactly."""
+
+    expected_profile = next(
+        (
+            candidate
+            for candidate in native_fastapi_profiles(config.platform_system)
+            if candidate.family == "fastapi-uvicorn-asyncio"
+            and candidate.workers == 1
+        ),
+        None,
+    )
+    pool_max = config.global_connection_budget
+    all_values = (
+        *holder_values,
+        *waiter_values,
+        *excess_values,
+        recovery_value,
+    )
+    if (
+        config.database_mode != "sql_auth"
+        or profile != expected_profile
+        or pool_max <= 0
+        or len(holder_values) != pool_max
+        or len(waiter_values) != pool_max
+        or not excess_values
+        or sql_delay_ms not in SQL_DELAY_MILLISECONDS
+        or sql_delay_ms <= 0
+        or acquire_timeout_ms not in ACQUIRE_TIMEOUT_MILLISECONDS
+        or acquire_timeout_ms >= sql_delay_ms
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not MIN_SQL_BIGINT <= value <= MAX_SQL_BIGINT
+            for value in all_values
+        )
+        or len(set(all_values)) != len(all_values)
+    ):
+        raise RunnerConfigurationError(
+            "native saturation profile, workload or timeout is invalid"
+        )
+
+    artifact_directory = (
+        config.run_root / "worker-records" / "native-saturation"
+    ).resolve()
+    environment = build_profile_environment(
+        config,
+        isolated,
+        profile,
+        run_id=run_id,
+        artifact_directory=artifact_directory,
+        sql_auth_settings=sql_auth_settings,
+        table_name=table_name,
+        sql_delay_ms=sql_delay_ms,
+        acquire_timeout_ms=acquire_timeout_ms,
+    )
+    worker_prefix = environment["FASTMSSQL_FRAMEWORK_APPLICATION_NAME"]
+    observer_application_name = f"{worker_prefix}-observer"
+    if len(observer_application_name) > MAX_SQL_SERVER_APPLICATION_NAME:
+        raise RunnerConfigurationError(
+            "generated observer application name is too long"
+        )
+    observer_connection = create_observer_connection(
+        sql_auth_settings,
+        application_name=observer_application_name,
+    )
+    await observer_connection.connect(validate=True)
+
+    async def execute() -> NativeSaturationScenarioResult:
+        observer = SqlServerObserver(
+            source=observer_connection,
+            worker_prefix=worker_prefix,
+            observer_application_name=observer_application_name,
+            poll_interval_seconds=policy.poll_interval_seconds,
+        )
+
+        async def worker_is_ready(port: int) -> bool:
+            try:
+                payload = await http_get_json(
+                    port,
+                    "/ready",
+                    timeout_seconds=0.5,
+                )
+            except HttpProbeError:
+                return False
+            return payload.get("state") == "ready"
+
+        launch = await launch_with_port_retry(
+            command_builder=lambda port: build_server_command(
+                config,
+                profile,
+                port=port,
+            ),
+            cwd=isolated.root,
+            environment=environment,
+            readiness_probe=worker_is_ready,
+            policy=policy,
+        )
+        supervisor = launch.supervisor
+        scenario_timeout = max(
+            5.0,
+            sql_delay_ms / 1_000 + 3.0,
+            acquire_timeout_ms / 1_000 + 3.0,
+        )
+        request_tasks: list[asyncio.Task[LoopbackJsonResponse]] = []
+        async with supervisor:
+            ready_records = await supervisor.wait_for_worker_records(
+                directory=artifact_directory,
+                phase="ready",
+                expected_run_id=run_id,
+                expected_count=1,
+            )
+            ready_pids = tuple(
+                sorted(int(record["pid"]) for record in ready_records)
+            )
+            await observer.wait_for_ready_workers(
+                ready_records,
+                timeout_seconds=policy.startup_timeout_seconds,
+            )
+            worker_application_name = ready_records[0].get(
+                "worker_application_name"
+            )
+            if (
+                not isinstance(worker_application_name, str)
+                or APPLICATION_DIRECTORY_PATTERN.fullmatch(
+                    worker_application_name
+                )
+                is None
+            ):
+                raise WorkerEvidenceError(
+                    "native saturation worker application name is invalid"
+                )
+            baseline_response = await http_request_json(
+                launch.port,
+                "/pool",
+                expected_statuses=(200,),
+                timeout_seconds=scenario_timeout,
+            )
+
+            try:
+                holder_tasks = tuple(
+                    asyncio.create_task(
+                        http_request_json(
+                            launch.port,
+                            f"/saturated/{value}",
+                            expected_statuses=(200,),
+                            timeout_seconds=scenario_timeout,
+                        )
+                    )
+                    for value in holder_values
+                )
+                request_tasks.extend(holder_tasks)
+                await asyncio.sleep(0)
+                busy_sample = await observer.wait_for_minimum_requests(
+                    pool_max,
+                    timeout_seconds=scenario_timeout,
+                )
+
+                waiter_tasks = tuple(
+                    asyncio.create_task(
+                        http_request_json(
+                            launch.port,
+                            f"/saturated/{value}",
+                            expected_statuses=(504,),
+                            timeout_seconds=scenario_timeout,
+                        )
+                    )
+                    for value in waiter_values
+                )
+                request_tasks.extend(waiter_tasks)
+                await asyncio.sleep(0)
+                saturation_timeout = max(
+                    policy.poll_interval_seconds * 2,
+                    acquire_timeout_ms / 1_000 * 0.8,
+                )
+                saturated_pool_record = await wait_for_saturation_state(
+                    launch.port,
+                    expected_pid=ready_pids[0],
+                    pool_max=pool_max,
+                    expected_waiters=pool_max,
+                    timeout_seconds=saturation_timeout,
+                    poll_interval_seconds=policy.poll_interval_seconds,
+                )
+
+                rejection_tasks = tuple(
+                    asyncio.create_task(
+                        http_request_json(
+                            launch.port,
+                            f"/saturated/{value}",
+                            expected_statuses=(503,),
+                            timeout_seconds=scenario_timeout,
+                        )
+                    )
+                    for value in excess_values
+                )
+                request_tasks.extend(rejection_tasks)
+                rejection_responses = tuple(
+                    await asyncio.gather(*rejection_tasks)
+                )
+                waiter_responses = tuple(
+                    await asyncio.gather(*waiter_tasks)
+                )
+                holder_responses = tuple(
+                    await asyncio.gather(*holder_tasks)
+                )
+                await wait_for_pool_settlement(
+                    launch.port,
+                    expected_pid=ready_pids[0],
+                    timeout_seconds=scenario_timeout,
+                    poll_interval_seconds=policy.poll_interval_seconds,
+                )
+                recovery_response = await http_request_json(
+                    launch.port,
+                    f"/saturated/{recovery_value}",
+                    expected_statuses=(200,),
+                    timeout_seconds=scenario_timeout,
+                )
+                settled_pool_record = await wait_for_pool_settlement(
+                    launch.port,
+                    expected_pid=ready_pids[0],
+                    timeout_seconds=scenario_timeout,
+                    poll_interval_seconds=policy.poll_interval_seconds,
+                )
+                evidence = validate_native_saturation_evidence(
+                    expected_pid=ready_pids[0],
+                    expected_application_name=worker_application_name,
+                    holder_values=holder_values,
+                    waiter_values=waiter_values,
+                    excess_values=excess_values,
+                    recovery_value=recovery_value,
+                    acquire_timeout_ms=acquire_timeout_ms,
+                    busy_sample=busy_sample,
+                    baseline_pool_record=baseline_response.payload,
+                    saturated_pool_record=saturated_pool_record,
+                    settled_pool_record=settled_pool_record,
+                    holder_responses=holder_responses,
+                    waiter_responses=waiter_responses,
+                    rejection_responses=rejection_responses,
+                    recovery_response=recovery_response,
+                )
+                outcome_record = await supervisor.stop()
+            finally:
+                pending_tasks = tuple(
+                    task for task in request_tasks if not task.done()
+                )
+                for task in pending_tasks:
+                    task.cancel()
+                if pending_tasks:
+                    await asyncio.gather(
+                        *pending_tasks,
+                        return_exceptions=True,
+                    )
+
+        if (
+            outcome_record.returncode not in {0, -signal.SIGTERM}
+            or not outcome_record.graceful_stop
+            or outcome_record.forced_cleanup
+        ):
+            raise WorkerEvidenceError(
+                "native saturation server did not stop cleanly"
+            )
+        shutdown_records = supervisor.read_worker_records(
+            directory=artifact_directory,
+            phase="shutdown",
+            expected_run_id=run_id,
+            expected_count=1,
+        )
+        shutdown_pids = tuple(
+            sorted(int(record["pid"]) for record in shutdown_records)
+        )
+        if ready_pids != shutdown_pids:
+            raise WorkerEvidenceError(
+                "native saturation ready and shutdown worker PIDs do not "
+                "reconcile"
+            )
+        listening_sockets_after = (
+            (launch.port,)
+            if await loopback_port_is_listening(launch.port)
+            else ()
+        )
+        if listening_sockets_after:
+            raise ProcessSupervisorError(
+                "loopback listener survived native saturation shutdown"
+            )
+        zero_sample = await observer.wait_for_zero_sessions(
+            timeout_seconds=policy.graceful_timeout_seconds,
+        )
+        verify_isolated_application(isolated)
+        return NativeSaturationScenarioResult(
+            profile_id=profile.id,
+            evidence=evidence,
+            ready_pids=ready_pids,
+            shutdown_pids=shutdown_pids,
+            manager_pid=outcome_record.pid,
+            descendant_pids=outcome_record.descendant_pids,
+            returncode=outcome_record.returncode,
+            graceful_stop=outcome_record.graceful_stop,
+            forced_cleanup=outcome_record.forced_cleanup,
+            listening_sockets_after=listening_sockets_after,
+            sessions_after=zero_sample.current_sessions,
+        )
+
+    try:
+        result = await execute()
+    except BaseException as operation_error:
+        try:
+            await observer_connection.disconnect()
+        except BaseException as cleanup_error:
+            raise BaseExceptionGroup(
+                "native saturation scenario and observer cleanup both failed",
+                [operation_error, cleanup_error],
+            ) from None
+        raise
+    await observer_connection.disconnect()
+    return result
+
+
+async def run_native_streaming_scenario(
+    config: RunnerConfig,
+    isolated: IsolatedApplication,
+    profile: ProcessProfile,
+    *,
+    run_id: str,
+    policy: SupervisorPolicy,
+    sql_auth_settings: SqlAuthObserverSettings,
+    table_name: str,
+    full_rows: int,
+    early_rows: int,
+    early_prefix_rows: int,
+    recovery_value: int,
+    rss_growth_limit_bytes: int,
+) -> NativeStreamingScenarioResult:
+    """Prove full and early-close ResultStream delivery through real HTTP."""
+
+    expected_profile = next(
+        (
+            candidate
+            for candidate in native_fastapi_profiles(config.platform_system)
+            if candidate.family == "fastapi-uvicorn-asyncio"
+            and candidate.workers == 1
+        ),
+        None,
+    )
+    if (
+        config.database_mode != "sql_auth"
+        or profile != expected_profile
+        or isinstance(full_rows, bool)
+        or not isinstance(full_rows, int)
+        or not 2 <= full_rows <= MAX_HTTP_STREAM_ROWS
+        or isinstance(early_rows, bool)
+        or not isinstance(early_rows, int)
+        or not 2 <= early_rows <= MAX_HTTP_STREAM_ROWS
+        or isinstance(early_prefix_rows, bool)
+        or not isinstance(early_prefix_rows, int)
+        or not 1 <= early_prefix_rows < early_rows
+        or isinstance(recovery_value, bool)
+        or not isinstance(recovery_value, int)
+        or not MIN_SQL_BIGINT <= recovery_value <= MAX_SQL_BIGINT
+        or isinstance(rss_growth_limit_bytes, bool)
+        or not isinstance(rss_growth_limit_bytes, int)
+        or rss_growth_limit_bytes <= 0
+    ):
+        raise RunnerConfigurationError(
+            "native streaming profile, rows, recovery or RSS bound is invalid"
+        )
+
+    artifact_directory = (
+        config.run_root / "worker-records" / "native-streaming"
+    ).resolve()
+    environment = build_profile_environment(
+        config,
+        isolated,
+        profile,
+        run_id=run_id,
+        artifact_directory=artifact_directory,
+        sql_auth_settings=sql_auth_settings,
+        table_name=table_name,
+    )
+    worker_prefix = environment["FASTMSSQL_FRAMEWORK_APPLICATION_NAME"]
+    observer_application_name = f"{worker_prefix}-observer"
+    if len(observer_application_name) > MAX_SQL_SERVER_APPLICATION_NAME:
+        raise RunnerConfigurationError(
+            "generated observer application name is too long"
+        )
+    observer_connection = create_observer_connection(
+        sql_auth_settings,
+        application_name=observer_application_name,
+    )
+    await observer_connection.connect(validate=True)
+
+    async def execute() -> NativeStreamingScenarioResult:
+        observer = SqlServerObserver(
+            source=observer_connection,
+            worker_prefix=worker_prefix,
+            observer_application_name=observer_application_name,
+            poll_interval_seconds=policy.poll_interval_seconds,
+        )
+
+        async def worker_is_ready(port: int) -> bool:
+            try:
+                payload = await http_get_json(
+                    port,
+                    "/ready",
+                    timeout_seconds=0.5,
+                )
+            except HttpProbeError:
+                return False
+            return payload.get("state") == "ready"
+
+        launch = await launch_with_port_retry(
+            command_builder=lambda port: build_server_command(
+                config,
+                profile,
+                port=port,
+            ),
+            cwd=isolated.root,
+            environment=environment,
+            readiness_probe=worker_is_ready,
+            policy=policy,
+        )
+        supervisor = launch.supervisor
+        scenario_timeout = max(15.0, policy.graceful_timeout_seconds)
+        async with supervisor:
+            ready_records = await supervisor.wait_for_worker_records(
+                directory=artifact_directory,
+                phase="ready",
+                expected_run_id=run_id,
+                expected_count=1,
+            )
+            ready_pids = tuple(
+                sorted(int(record["pid"]) for record in ready_records)
+            )
+            await observer.wait_for_ready_workers(
+                ready_records,
+                timeout_seconds=policy.startup_timeout_seconds,
+            )
+            rss_start_bytes = process_rss_bytes(ready_pids)
+            rss_stop = asyncio.Event()
+            rss_monitor = asyncio.create_task(
+                monitor_process_rss(
+                    ready_pids,
+                    stop=rss_stop,
+                    poll_interval_seconds=policy.poll_interval_seconds,
+                )
+            )
+            try:
+                full_observation = await consume_ndjson_stream(
+                    launch.port,
+                    f"/stream?rows={full_rows}",
+                    expected_rows=full_rows,
+                    timeout_seconds=scenario_timeout,
+                )
+                full_settled_pool_record = await wait_for_pool_settlement(
+                    launch.port,
+                    expected_pid=ready_pids[0],
+                    timeout_seconds=scenario_timeout,
+                    poll_interval_seconds=policy.poll_interval_seconds,
+                )
+
+                early_active_sample: SqlObserverSample | None = None
+
+                async def observe_early_sql() -> None:
+                    nonlocal early_active_sample
+                    early_active_sample = await observer.wait_for_minimum_requests(
+                        1,
+                        timeout_seconds=scenario_timeout,
+                    )
+
+                early_observation = await read_ndjson_prefix_and_close(
+                    launch.port,
+                    f"/stream?rows={early_rows}",
+                    requested_rows=early_rows,
+                    prefix_rows=early_prefix_rows,
+                    timeout_seconds=scenario_timeout,
+                    before_read=observe_early_sql,
+                )
+                if early_active_sample is None:
+                    raise WorkerEvidenceError(
+                        "early-close stream was not observed in SQL Server"
+                    )
+                early_settled_sample = await observer.wait_for_zero_requests(
+                    timeout_seconds=scenario_timeout,
+                )
+                early_settled_pool_record = await wait_for_pool_settlement(
+                    launch.port,
+                    expected_pid=ready_pids[0],
+                    timeout_seconds=scenario_timeout,
+                    poll_interval_seconds=policy.poll_interval_seconds,
+                )
+                recovery_response = await http_request_json(
+                    launch.port,
+                    f"/value/{recovery_value}",
+                    expected_statuses=(200,),
+                    timeout_seconds=scenario_timeout,
+                )
+                await wait_for_pool_settlement(
+                    launch.port,
+                    expected_pid=ready_pids[0],
+                    timeout_seconds=scenario_timeout,
+                    poll_interval_seconds=policy.poll_interval_seconds,
+                )
+            except BaseException as operation_error:
+                rss_stop.set()
+                try:
+                    await rss_monitor
+                except BaseException as monitor_error:
+                    raise BaseExceptionGroup(
+                        "native streaming operation and RSS monitor failed",
+                        [operation_error, monitor_error],
+                    ) from None
+                raise
+            rss_stop.set()
+            rss_peak_bytes = await rss_monitor
+            rss_end_bytes = process_rss_bytes(ready_pids)
+            rss_peak_bytes = max(
+                rss_start_bytes,
+                rss_peak_bytes,
+                rss_end_bytes,
+            )
+            evidence = validate_native_streaming_evidence(
+                expected_pid=ready_pids[0],
+                pool_max=config.global_connection_budget,
+                full_observation=full_observation,
+                early_observation=early_observation,
+                driver_buffer_rows=EXPECTED_STREAM_BUFFER_ROWS,
+                rss_start_bytes=rss_start_bytes,
+                rss_peak_bytes=rss_peak_bytes,
+                rss_end_bytes=rss_end_bytes,
+                rss_growth_limit_bytes=rss_growth_limit_bytes,
+                full_settled_pool_record=full_settled_pool_record,
+                early_settled_pool_record=early_settled_pool_record,
+                early_settled_sample=early_settled_sample,
+                recovery_value=recovery_value,
+                recovery_response=recovery_response,
+            )
+            outcome_record = await supervisor.stop()
+
+        if (
+            outcome_record.returncode not in {0, -signal.SIGTERM}
+            or not outcome_record.graceful_stop
+            or outcome_record.forced_cleanup
+        ):
+            raise WorkerEvidenceError(
+                "native streaming server did not stop cleanly"
+            )
+        shutdown_records = supervisor.read_worker_records(
+            directory=artifact_directory,
+            phase="shutdown",
+            expected_run_id=run_id,
+            expected_count=1,
+        )
+        shutdown_pids = tuple(
+            sorted(int(record["pid"]) for record in shutdown_records)
+        )
+        if ready_pids != shutdown_pids:
+            raise WorkerEvidenceError(
+                "native streaming ready and shutdown worker PIDs do not "
+                "reconcile"
+            )
+        listening_sockets_after = (
+            (launch.port,)
+            if await loopback_port_is_listening(launch.port)
+            else ()
+        )
+        if listening_sockets_after:
+            raise ProcessSupervisorError(
+                "loopback listener survived native streaming shutdown"
+            )
+        zero_sample = await observer.wait_for_zero_sessions(
+            timeout_seconds=policy.graceful_timeout_seconds,
+        )
+        verify_isolated_application(isolated)
+        return NativeStreamingScenarioResult(
+            profile_id=profile.id,
+            evidence=evidence,
+            ready_pids=ready_pids,
+            shutdown_pids=shutdown_pids,
+            manager_pid=outcome_record.pid,
+            descendant_pids=outcome_record.descendant_pids,
+            returncode=outcome_record.returncode,
+            graceful_stop=outcome_record.graceful_stop,
+            forced_cleanup=outcome_record.forced_cleanup,
+            listening_sockets_after=listening_sockets_after,
+            sessions_after=zero_sample.current_sessions,
+        )
+
+    try:
+        result = await execute()
+    except BaseException as operation_error:
+        try:
+            await observer_connection.disconnect()
+        except BaseException as cleanup_error:
+            raise BaseExceptionGroup(
+                "native streaming scenario and observer cleanup both failed",
+                [operation_error, cleanup_error],
+            ) from None
+        raise
+    await observer_connection.disconnect()
+    return result
 
 
 async def run_offline_smoke_profile(

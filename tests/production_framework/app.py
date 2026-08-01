@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
+import hashlib
 import importlib.metadata
 import json
 import logging
@@ -49,6 +50,7 @@ COMMON_ENVIRONMENT_KEYS = (
     "FASTMSSQL_FRAMEWORK_ARTIFACT_DIR",
     "FASTMSSQL_FRAMEWORK_TABLE",
     "FASTMSSQL_FRAMEWORK_SQL_DELAY_MS",
+    "FASTMSSQL_FRAMEWORK_ACQUIRE_TIMEOUT_MS",
     "FASTMSSQL_FRAMEWORK_CANDIDATE_SHA",
     "FASTMSSQL_FRAMEWORK_WHEEL_FILENAME",
     "FASTMSSQL_FRAMEWORK_WHEEL_SHA256",
@@ -62,6 +64,7 @@ SQL_AUTH_ENVIRONMENT_KEYS = (
 )
 WORKER_COUNTS = frozenset({1, 2, 4, 8})
 SQL_DELAY_MILLISECONDS = frozenset({0, 50, 100, 200, 250, 500, 1_000, 2_000, 5_000})
+ACQUIRE_TIMEOUT_MILLISECONDS = frozenset({100, 250, 500, 1_000, 5_000})
 SAFE_RUN_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 SAFE_SQL_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 SAFE_SERVER = re.compile(r"[A-Za-z0-9][A-Za-z0-9.:[\]_-]{0,252}")
@@ -96,10 +99,9 @@ PRINCIPAL_SQL = (
     "@@SPID AS session_id"
 )
 VALUE_SQL = "SELECT CAST(@P1 AS BIGINT) AS value, @@SPID AS session_id"
-CANCEL_SQL = (
-    "SET CONTEXT_INFO @P1; "
-    "WAITFOR DELAY '00:00:05.000'; "
-    "SELECT @@SPID AS session_id"
+SET_CONTEXT_INFO_SQL = "SET CONTEXT_INFO @P1"
+CANCEL_WAIT_SQL = (
+    "WAITFOR DELAY '00:00:05.000'; SELECT @@SPID AS session_id"
 )
 STREAM_SQL = """
 WITH generated AS (
@@ -109,6 +111,9 @@ WITH generated AS (
 )
 SELECT value FROM generated ORDER BY value OPTION (MAXRECURSION 0)
 """.strip()
+STREAM_CONTEXT_SQL = (
+    "SET CONTEXT_INFO @P1;\n" + STREAM_SQL.replace("@P1", "@P2")
+)
 ERROR_SQL = "SELECT value FROM dbo.fastmssql_framework_intentional_missing_table"
 
 
@@ -333,6 +338,7 @@ class WorkerConfig:
     artifact_directory: Path
     table_name: str
     sql_delay_ms: int
+    acquire_timeout_ms: int
     candidate: CandidateProvenance
     database: DatabaseSettings | None
 
@@ -391,6 +397,15 @@ class WorkerConfig:
             raise ConfigurationError(
                 "SQL delay must be selected from the closed allowlist"
             )
+        acquire_timeout = _integer(
+            environment,
+            "FASTMSSQL_FRAMEWORK_ACQUIRE_TIMEOUT_MS",
+            minimum=1,
+        )
+        if acquire_timeout not in ACQUIRE_TIMEOUT_MILLISECONDS:
+            raise ConfigurationError(
+                "acquire timeout must be selected from the closed allowlist"
+            )
 
         if database_mode is DatabaseMode.SQL_AUTH:
             database = _database_settings(environment)
@@ -425,6 +440,7 @@ class WorkerConfig:
                 SAFE_SQL_IDENTIFIER,
             ),
             sql_delay_ms=delay,
+            acquire_timeout_ms=acquire_timeout,
             candidate=_candidate_provenance(environment),
             database=database,
         )
@@ -443,6 +459,7 @@ class WorkerConfig:
             "pool_max_per_worker": self.pool_max_per_worker,
             "run_id": self.run_id,
             "sql_delay_ms": self.sql_delay_ms,
+            "acquire_timeout_ms": self.acquire_timeout_ms,
             "table_name": self.table_name,
             "worker_count": self.worker_count,
             "wheel_filename": self.candidate.wheel_filename,
@@ -514,7 +531,7 @@ def _driver_config(config: WorkerConfig) -> WorkerDriverConfig:
             min_idle=0,
             max_lifetime_secs=None,
             idle_timeout_secs=None,
-            connection_timeout_secs=5,
+            connection_timeout_secs=None,
             retry_connection=False,
         ),
         lifecycle=LifecycleConfig(
@@ -523,7 +540,7 @@ def _driver_config(config: WorkerConfig) -> WorkerDriverConfig:
         ),
         timeouts=TimeoutConfig(
             connect_timeout_secs=10,
-            acquire_timeout_secs=5,
+            acquire_timeout_secs=config.acquire_timeout_ms / 1_000,
             operation_timeout_secs=15,
             transaction_timeout_secs=20,
             rollback_timeout_secs=5,
@@ -573,6 +590,10 @@ class WorkerLifecycle:
     config: WorkerConfig
     connection_factory: ConnectionFactory = _default_connection_factory
     pid: int = field(default_factory=_current_pid)
+    process_started_monotonic: float = field(
+        default_factory=time.monotonic,
+        init=False,
+    )
     state: WorkerState = field(default=WorkerState.NEW, init=False)
     connection: DriverConnection | None = field(
         default=None,
@@ -580,28 +601,29 @@ class WorkerLifecycle:
         repr=False,
     )
     pool_identity: str | None = field(default=None, init=False)
+    pool_created_pid: int | None = field(default=None, init=False)
+    pool_created_monotonic: float | None = field(default=None, init=False)
+    pool_connected_monotonic: float | None = field(default=None, init=False)
     worker_application_name: str | None = field(default=None, init=False)
 
-    def _record(self, phase: str) -> None:
-        destination = self.config.artifact_directory / f"{phase}-{self.pid}.json"
+    def _write_atomic_record(
+        self,
+        destination: Path,
+        payload: Mapping[str, object],
+        *,
+        record_name: str,
+    ) -> None:
         if destination.exists():
             raise WorkerLifecycleError(
-                f"{phase} record already exists for worker PID {self.pid}"
+                f"{record_name} record already exists for worker PID {self.pid}"
             )
-        payload = {
-            **self.config.public_record(),
-            "phase": phase,
-            "pid": self.pid,
-            "pool_identity": self.pool_identity,
-            "worker_application_name": self.worker_application_name,
-        }
         temporary_path: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
                 mode="w",
                 encoding="utf-8",
                 dir=self.config.artifact_directory,
-                prefix=f".{phase}-{self.pid}-",
+                prefix=f".{record_name}-{self.pid}-",
                 suffix=".tmp",
                 delete=False,
             ) as temporary:
@@ -614,6 +636,52 @@ class WorkerLifecycle:
         finally:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
+
+    def _record(self, phase: str) -> None:
+        destination = self.config.artifact_directory / f"{phase}-{self.pid}.json"
+        self._write_atomic_record(
+            destination,
+            {
+                **self.config.public_record(),
+                "phase": phase,
+                "pid": self.pid,
+                "pool_connected_monotonic": self.pool_connected_monotonic,
+                "pool_created_monotonic": self.pool_created_monotonic,
+                "pool_created_pid": self.pool_created_pid,
+                "pool_identity": self.pool_identity,
+                "process_started_monotonic": self.process_started_monotonic,
+                "worker_application_name": self.worker_application_name,
+            },
+            record_name=phase,
+        )
+
+    def record_transaction_phase(
+        self,
+        item_id: int,
+        outcome: Literal["commit", "rollback"],
+        transaction_phase: Literal["holding", "settled"],
+    ) -> None:
+        self.ensure_ready()
+        destination = self.config.artifact_directory / (
+            f"transaction-{transaction_phase}-{outcome}-{self.pid}-{item_id}.json"
+        )
+        context_token = f"transaction:{item_id}:{outcome}"
+        self._write_atomic_record(
+            destination,
+            {
+                **self.config.public_record(),
+                "context_token_sha256": hashlib.sha256(
+                    context_token.encode("ascii")
+                ).hexdigest(),
+                "item_id": item_id,
+                "outcome": outcome,
+                "phase": "transaction",
+                "pid": self.pid,
+                "transaction_phase": transaction_phase,
+                "worker_application_name": self.worker_application_name,
+            },
+            record_name=f"transaction-{transaction_phase}",
+        )
 
     def _require_worker_pid(self) -> None:
         current_pid = os.getpid()
@@ -635,10 +703,13 @@ class WorkerLifecycle:
                 self.pid,
             )
             if self.config.database_mode is DatabaseMode.SQL_AUTH:
+                self.pool_created_pid = os.getpid()
+                self.pool_created_monotonic = time.monotonic()
                 connection = self.connection_factory(self.config, self.pid)
                 self.connection = connection
                 self.pool_identity = f"{self.pid}-{id(connection):x}"
                 await connection.connect(validate=True)
+                self.pool_connected_monotonic = time.monotonic()
             else:
                 self.pool_identity = f"{self.pid}-offline"
             self._record("ready")
@@ -727,7 +798,7 @@ def _stream_row_record(row: Any, column_names: tuple[str, ...]) -> dict[str, Any
     return {name: row[index] for index, name in enumerate(column_names)}
 
 
-async def _cancel_and_settle(task: asyncio.Task[Any]) -> None:
+async def _cancel_and_settle(task: asyncio.Future[Any]) -> None:
     if not task.done():
         task.cancel()
     try:
@@ -802,12 +873,26 @@ class WorkerRouteState:
             "value": int(row["value"]),
         }
 
-    async def wait_payload(self, value: int) -> dict[str, int]:
+    async def wait_payload(
+        self,
+        value: int,
+        *,
+        context_token: str | None = None,
+    ) -> dict[str, int]:
         connection = self.lifecycle.require_connection()
         delay_prefix = WAIT_PREFIX_BY_MILLISECONDS[self.config.sql_delay_ms]
-        row = _result_row(
-            await connection.query(f"{delay_prefix}{VALUE_SQL}", [value])
-        )
+        wait_sql = f"{delay_prefix}{VALUE_SQL}"
+        if context_token is None:
+            row = _result_row(await connection.query(wait_sql, [value]))
+        else:
+            if SAFE_CANCEL_TOKEN.fullmatch(context_token) is None:
+                raise HTTPException(status_code=422, detail="invalid context token")
+            async with connection.transaction() as transaction:
+                await transaction.execute(
+                    SET_CONTEXT_INFO_SQL,
+                    [context_token.encode("ascii")],
+                )
+                row = _result_row(await transaction.query(wait_sql, [value]))
         return {
             "delay_ms": self.config.sql_delay_ms,
             "session_id": int(row["session_id"]),
@@ -844,19 +929,29 @@ class WorkerRouteState:
                 [item_id, "transaction"],
             )
             context_token = f"transaction:{item_id}:{outcome}".encode("ascii")
+            await transaction.execute(
+                SET_CONTEXT_INFO_SQL,
+                [context_token],
+            )
+            self.lifecycle.record_transaction_phase(
+                item_id,
+                outcome,
+                "holding",
+            )
             row = _result_row(
                 await transaction.query(
-                    (
-                        f"SET CONTEXT_INFO @P1; {delay_prefix}"
-                        "SELECT @@SPID AS session_id"
-                    ),
-                    [context_token],
+                    f"{delay_prefix}SELECT @@SPID AS session_id",
                 )
             )
             if outcome == "commit":
                 await transaction.commit()
             else:
                 await transaction.rollback()
+            self.lifecycle.record_transaction_phase(
+                item_id,
+                outcome,
+                "settled",
+            )
         return {
             "item_id": item_id,
             "outcome": outcome,
@@ -871,9 +966,16 @@ class WorkerRouteState:
         if SAFE_CANCEL_TOKEN.fullmatch(token) is None:
             raise HTTPException(status_code=422, detail="invalid cancellation token")
         connection = self.lifecycle.require_connection()
-        query_task = asyncio.create_task(
-            connection.query(CANCEL_SQL, [token.encode("ascii")])
-        )
+
+        async def identified_wait():
+            async with connection.transaction() as transaction:
+                await transaction.execute(
+                    SET_CONTEXT_INFO_SQL,
+                    [token.encode("ascii")],
+                )
+                return await transaction.query(CANCEL_WAIT_SQL)
+
+        query_task = asyncio.create_task(identified_wait())
         disconnect_task = asyncio.create_task(_wait_for_disconnect(request))
         try:
             completed, _ = await asyncio.wait(
@@ -915,11 +1017,23 @@ class WorkerRouteState:
             self.admission_active -= 1
             self.admission.release()
 
-    async def stream_records(self, rows: int) -> AsyncIterator[str]:
+    async def stream_records(
+        self,
+        rows: int,
+        token: str | None = None,
+    ) -> AsyncIterator[str]:
         connection = self.lifecycle.require_connection()
+        if token is None:
+            sql = STREAM_SQL
+            parameters: list[object] = [rows]
+        else:
+            if SAFE_CANCEL_TOKEN.fullmatch(token) is None:
+                raise HTTPException(status_code=422, detail="invalid stream token")
+            sql = STREAM_CONTEXT_SQL
+            parameters = [token.encode("ascii"), rows]
         stream = await connection.stream(
-            STREAM_SQL,
-            [rows],
+            sql,
+            parameters,
             buffer_size=STREAM_BUFFER_ROWS,
         )
         async with stream:
@@ -1041,9 +1155,15 @@ def create_fastapi_app(
 
     @application.get("/wait/{value}")
     async def wait_probe(
+        request: Request,
         value: int = PathParameter(ge=MIN_SQL_BIGINT, le=MAX_SQL_BIGINT),
     ) -> dict[str, int]:
-        return await routes.wait_payload(value)
+        return await routes.wait_payload(
+            value,
+            context_token=request.headers.get(
+                "x-fastmssql-context-token"
+            ),
+        )
 
     @application.get("/cancel/{token}")
     async def cancel_probe(
@@ -1063,7 +1183,20 @@ def create_fastapi_app(
     async def saturated_probe(
         value: int = PathParameter(ge=MIN_SQL_BIGINT, le=MAX_SQL_BIGINT),
     ):
-        payload = await routes.admitted_value_payload(value)
+        try:
+            payload = await routes.admitted_value_payload(value)
+        except fastmssql.OperationTimeoutError as error:
+            if getattr(error, "phase", None) != "acquire":
+                raise
+            return JSONResponse(
+                {
+                    "error": "pool_acquire_timeout",
+                    "operation": "query",
+                    "phase": "acquire",
+                    "retryable": bool(getattr(error, "retryable", False)),
+                },
+                status_code=504,
+            )
         if payload is None:
             return JSONResponse(
                 {"error": "saturated"},
@@ -1074,9 +1207,12 @@ def create_fastapi_app(
     @application.get("/stream")
     async def stream_probe(
         rows: int = Query(default=1_000, ge=1, le=MAX_STREAM_ROWS),
+        token: str | None = Query(default=None),
     ) -> StreamingResponse:
+        if token is not None and SAFE_CANCEL_TOKEN.fullmatch(token) is None:
+            raise HTTPException(status_code=422, detail="invalid stream token")
         return StreamingResponse(
-            routes.stream_records(rows),
+            routes.stream_records(rows, token),
             media_type="application/x-ndjson",
         )
 

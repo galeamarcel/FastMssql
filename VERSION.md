@@ -96,6 +96,57 @@ No release, package-version change, or artifact publication has occurred.
   displayed `0.7.7` version, release, published artifact or
   original-repository state.
 
+### Production framework native ASGI real-network matrix
+
+- Added deterministic installed-wheel FastAPI process scenarios for Uvicorn
+  asyncio, Uvicorn uvloop and Gunicorn with `UvicornWorker`, each at exact
+  worker counts `1/2/4/8`. All 12 Docker SQL-auth profiles passed worker
+  reachability, parameter correctness, per-worker pool division, aggregate
+  session/request bounds, ready/shutdown PID reconciliation and teardown;
+  the maximum observed aggregate worker-session count was eight, every
+  profile ended at zero matching sessions and none used forced cleanup.
+- Proved true inter-request async overlap on one persistent Uvicorn asyncio
+  event loop using the same four SQL waits: `1.0635 s` sequential versus
+  `0.2998 s` concurrent, four simultaneously observed SQL requests and a
+  `0.0065 s` health probe during the wave. The pool returned to zero active
+  and pending acquisitions.
+- Added raw-client disconnect evidence that waits for an exact private SQL
+  context token before closing the socket, requires the SQL request to
+  disappear, proves the cancelled physical connection is replaced and then
+  executes a successful recovery request. Only the token SHA-256 is retained.
+- Added POSIX graceful-shutdown evidence for an active pooled query plus
+  separate pooled commit and rollback transactions. `SIGTERM` is sent only
+  after SQL Server and the atomic transaction-phase record agree; the query
+  response completes, commit leaves the selected row present, rollback leaves
+  it absent, and all three servers exit gracefully with zero sessions.
+- Added the exact two-layer saturation case for pool size `P=4`: four holders,
+  four admitted waiters, three immediate structured `503` rejections, four
+  structured pool-acquire `504` timeouts, a maximum of four SQL sessions and
+  requests, zero active/pending work after settlement and successful recovery.
+- Added real incremental NDJSON streaming through the HTTP transport. Full
+  consumption validated the exact order and digest of 10,000 rows with first
+  data at `0.1027 s` and completion at `0.9620 s`; the early-close case asked
+  for 10,000 rows, validated 32 and then closed the peer. SQL requests and
+  pool usage settled to zero, recovery passed, and worker RSS grew
+  `2,228,224` bytes against the explicit `67,108,864`-byte bound while the
+  driver buffer remained eight rows.
+- The cumulative implemented contract passes `151/151`, with exactly eight
+  future Task 9--11 shell/load/report/hosted gates explicitly deselected. The
+  complete contract is intentionally `151 passed, 8 failed`; no Task 7
+  behavior remains hidden behind a skip or swallowed exception. Self-review
+  added one global wall-clock deadline over each streaming response so a
+  drip-fed peer cannot reset a per-read timeout indefinitely, and corrected
+  three direct endpoint tests to pass the query-injected optional stream token
+  explicitly.
+- Real evidence used the healthy dedicated SQL Server 2022 Docker container,
+  SQL authentication and the ABI3 wheel installed into the fresh Python
+  `3.13.14` venv. The wheel runtime is exact commit
+  `9a020924ff78d40cbe6ebe8595a204b0f14d46ea`; Task 7 changes only the
+  repository-owned framework application, runner, tests, implementation plan
+  and `VERSION.md`.
+  It changes no FastMssql/Tiberius runtime, package metadata, displayed
+  `0.7.7` version, release, published artifact or original-repository state.
+
 ### Production framework external-process supervisor
 
 - Added a schema-1, fail-closed process runner with closed operation bounds,

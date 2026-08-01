@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import ast
 import asyncio
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -688,6 +689,60 @@ async def test_process_supervisor_owns_group_logs_records_and_descendants(
     _assert_pids_are_gone(all_pids)
 
 
+@pytest.mark.skipif(
+    os.name != "posix",
+    reason="POSIX signal re-raise semantics are not portable to Windows",
+)
+@pytest.mark.asyncio
+async def test_process_supervisor_accepts_graceful_sigterm_reraise(
+    tmp_path: Path,
+) -> None:
+    runner = _load_production_framework_runner()
+    ready = tmp_path / "ready.txt"
+    shutdown = tmp_path / "shutdown.txt"
+    program = _write_process_program(
+        tmp_path,
+        "graceful_sigterm_reraise.py",
+        """
+        import signal
+        import sys
+        import time
+
+        ready, shutdown = sys.argv[1:]
+        captured = []
+
+        def request_stop(signum, _frame):
+            captured.append(signum)
+
+        signal.signal(signal.SIGTERM, request_stop)
+        with open(ready, "w", encoding="utf-8") as handle:
+            handle.write("ready\\n")
+        while not captured:
+            time.sleep(0.01)
+        with open(shutdown, "w", encoding="utf-8") as handle:
+            handle.write("shutdown-complete\\n")
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.raise_signal(captured[-1])
+        """,
+    )
+    supervisor = await runner.ProcessSupervisor.start(
+        [sys.executable, str(program), str(ready), str(shutdown)],
+        cwd=tmp_path,
+        environment=_process_environment(runner),
+        policy=_supervisor_policy(runner),
+    )
+
+    async with supervisor:
+        await supervisor.wait_for_readiness(ready.is_file)
+        outcome = await supervisor.stop()
+
+    assert shutdown.read_text(encoding="utf-8") == "shutdown-complete\n"
+    assert outcome.returncode == -signal.SIGTERM
+    assert outcome.graceful_stop is True
+    assert outcome.forced_cleanup is False
+    _assert_pids_are_gone((supervisor.pid,))
+
+
 @pytest.mark.asyncio
 async def test_process_supervisor_propagates_exact_child_exit(
     tmp_path: Path,
@@ -1294,6 +1349,7 @@ def _valid_worker_environment(tmp_path: Path) -> dict[str, str]:
         "FASTMSSQL_FRAMEWORK_ARTIFACT_DIR": str(artifact_directory),
         "FASTMSSQL_FRAMEWORK_TABLE": "framework_items_01234567",
         "FASTMSSQL_FRAMEWORK_SQL_DELAY_MS": "100",
+        "FASTMSSQL_FRAMEWORK_ACQUIRE_TIMEOUT_MS": "250",
         "FASTMSSQL_FRAMEWORK_CANDIDATE_SHA": "a" * 40,
         "FASTMSSQL_FRAMEWORK_WHEEL_FILENAME": (
             "fastmssql-0.7.7-cp39-abi3-macosx_10_12_universal2.whl"
@@ -1380,6 +1436,8 @@ def test_worker_config_rejects_out_of_range_database_ports(
         ("FASTMSSQL_FRAMEWORK_RUN_ID", "../escape"),
         ("FASTMSSQL_FRAMEWORK_TABLE", "items; DROP TABLE items"),
         ("FASTMSSQL_FRAMEWORK_SQL_DELAY_MS", "101"),
+        ("FASTMSSQL_FRAMEWORK_ACQUIRE_TIMEOUT_MS", "0"),
+        ("FASTMSSQL_FRAMEWORK_ACQUIRE_TIMEOUT_MS", "251"),
     ],
 )
 def test_worker_config_rejects_unsafe_identifiers_and_unlisted_delays(
@@ -1609,6 +1667,108 @@ def test_offline_profile_environment_is_closed_and_credential_free(
     runner.verify_isolated_application(isolated)
     assert not list(isolated.root.rglob("__pycache__"))
     assert not list(isolated.root.rglob("*.pyc"))
+
+
+@pytest.mark.parametrize(
+    ("platform_name", "expected_families", "expected_count"),
+    [
+        (
+            "darwin",
+            {
+                "fastapi-gunicorn-uvicorn-worker",
+                "fastapi-uvicorn-asyncio",
+                "fastapi-uvicorn-uvloop",
+            },
+            12,
+        ),
+        ("win32", {"fastapi-uvicorn-asyncio"}, 4),
+    ],
+)
+def test_native_fastapi_profile_selection_is_exact(
+    platform_name: str,
+    expected_families: set[str],
+    expected_count: int,
+) -> None:
+    runner = _load_production_framework_runner()
+
+    profiles = runner.native_fastapi_profiles(platform_name)
+
+    assert len(profiles) == expected_count
+    assert {profile.family for profile in profiles} == expected_families
+    assert {profile.workers for profile in profiles} == {1, 2, 4, 8}
+    assert all(profile.database_mode == "sql_auth" for profile in profiles)
+    assert all(profile.applicable for profile in profiles)
+
+
+def test_sql_auth_profile_environment_is_closed_bounded_and_redactable(
+    tmp_path: Path,
+) -> None:
+    runner = _load_production_framework_runner()
+    offline_config = _config_with_actual_wheel_hash(runner, tmp_path)
+    config = replace(offline_config, database_mode="sql_auth")
+    isolated = runner.prepare_isolated_application(
+        config,
+        source_directory=ROOT / "tests/production_framework",
+        directory_name="sql-auth-environment",
+    )
+    profile = next(
+        profile
+        for profile in runner.native_fastapi_profiles("darwin")
+        if profile.family == "fastapi-uvicorn-asyncio" and profile.workers == 2
+    )
+    settings = runner.SqlAuthObserverSettings(
+        host="127.0.0.1",
+        port=14334,
+        database="fastmssql_validation",
+        username="fastmssql_owner",
+        password="private-sql-auth-value",
+    )
+    artifact_directory = config.run_root / "records" / profile.id
+
+    environment = runner.build_profile_environment(
+        config,
+        isolated,
+        profile,
+        run_id="native-run-01",
+        artifact_directory=artifact_directory,
+        sql_auth_settings=settings,
+        table_name="framework_items_native_01",
+        sql_delay_ms=500,
+        acquire_timeout_ms=250,
+    )
+
+    assert artifact_directory.is_dir()
+    assert environment["FASTMSSQL_FRAMEWORK_DATABASE_MODE"] == "sql_auth"
+    assert environment["FASTMSSQL_FRAMEWORK_WORKER_COUNT"] == "2"
+    assert environment["FASTMSSQL_FRAMEWORK_GLOBAL_CONNECTION_BUDGET"] == "16"
+    assert environment["FASTMSSQL_FRAMEWORK_TABLE"] == "framework_items_native_01"
+    assert environment["FASTMSSQL_FRAMEWORK_SQL_DELAY_MS"] == "500"
+    assert environment["FASTMSSQL_FRAMEWORK_ACQUIRE_TIMEOUT_MS"] == "250"
+    assert environment["FASTMSSQL_SQL_AUTH_OWNER_PASSWORD"] == (
+        "private-sql-auth-value"
+    )
+    assert "PYTHONPATH" not in environment
+    persisted = runner.redact(
+        json.dumps(environment, sort_keys=True),
+        runner._credential_values(environment),
+    )
+    assert "private-sql-auth-value" not in persisted
+
+    for invalid_delay in (-1, 101, 5_001):
+        with pytest.raises(runner.RunnerConfigurationError):
+            runner.build_profile_environment(
+                config,
+                isolated,
+                profile,
+                run_id=f"native-invalid-{invalid_delay}",
+                artifact_directory=(
+                    config.run_root / "records" / f"invalid-{invalid_delay}"
+                ),
+                sql_auth_settings=settings,
+                table_name="framework_items_native_01",
+                sql_delay_ms=invalid_delay,
+                acquire_timeout_ms=250,
+            )
 
 
 def test_gunicorn_hooks_leave_asgi_lifespan_ownership_to_uvicorn() -> None:
@@ -1938,6 +2098,31 @@ class _FakeTransaction:
         self.events.append(("transaction_rollback", self.session_id))
 
 
+class _RouteTransaction(_FakeTransaction):
+    def __init__(
+        self,
+        events: list[object],
+        session_id: int,
+        connection: "_RouteConnection",
+    ) -> None:
+        super().__init__(events, session_id)
+        self.connection = connection
+
+    async def query(
+        self,
+        sql: str,
+        params: list[object] | None = None,
+    ) -> _FakeQueryResult:
+        arguments = list(params or ())
+        self.events.append(("transaction_query", sql, arguments))
+        if "WAITFOR DELAY '00:00:05.000'" in sql and not arguments:
+            return await self.connection.query(sql, params)
+        row: dict[str, object] = {"session_id": self.session_id}
+        if arguments and isinstance(arguments[-1], int):
+            row["value"] = arguments[-1]
+        return _FakeQueryResult(row)
+
+
 class _FakeResultSet:
     def __init__(
         self,
@@ -2104,9 +2289,10 @@ class _RouteConnection(_FakeConnection):
         }
 
     def transaction(self) -> _FakeTransaction:
-        transaction = _FakeTransaction(
+        transaction = _RouteTransaction(
             self.events,
             session_id=800 + len(self.transactions),
+            connection=self,
         )
         self.transactions.append(transaction)
         self.events.append("connection_transaction")
@@ -2261,6 +2447,58 @@ async def test_fastapi_sql_auth_identity_value_wait_and_pool_routes_are_bounded(
 
 
 @pytest.mark.asyncio
+async def test_fastapi_wait_header_identifies_the_inflight_pinned_session(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    events: list[object] = []
+    connection = _RouteConnection(events)
+    application = framework_app.create_fastapi_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            response = await client.get(
+                "/wait/73",
+                headers={
+                    "X-FastMssql-Context-Token": "graceful_query_token_42"
+                },
+            )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "delay_ms": 100,
+        "session_id": 800,
+        "value": 73,
+    }
+    execute_event = next(
+        event
+        for event in events
+        if isinstance(event, tuple) and event[0] == "transaction_execute"
+    )
+    query_event = next(
+        event
+        for event in events
+        if isinstance(event, tuple) and event[0] == "transaction_query"
+    )
+    assert events.index(execute_event) < events.index(query_event)
+    assert execute_event[1:] == (
+        "SET CONTEXT_INFO @P1",
+        [b"graceful_query_token_42"],
+    )
+    assert "WAITFOR DELAY '00:00:00.100'" in query_event[1]
+    assert "graceful_query_token_42" not in query_event[1]
+    assert query_event[2] == [73]
+    assert "graceful_query_token_42" not in response.text
+
+
+@pytest.mark.asyncio
 async def test_fastapi_transaction_route_uses_the_worker_pool_and_explicit_outcome(
     tmp_path: Path,
 ) -> None:
@@ -2317,13 +2555,78 @@ async def test_fastapi_transaction_route_uses_the_worker_pool_and_explicit_outco
         for event in events
         if isinstance(event, tuple) and event[0] == "transaction_execute"
     ]
-    assert len(execute_events) == 2
-    for expected_item_id, event in zip((81471, 92583), execute_events):
+    insert_events = [
+        event
+        for event in execute_events
+        if environment["FASTMSSQL_FRAMEWORK_TABLE"] in event[1]
+    ]
+    context_events = [
+        event
+        for event in execute_events
+        if event[1] == "SET CONTEXT_INFO @P1"
+    ]
+    query_events = [
+        event
+        for event in events
+        if isinstance(event, tuple) and event[0] == "transaction_query"
+    ]
+    query_indices = [
+        index
+        for index, event in enumerate(events)
+        if isinstance(event, tuple) and event[0] == "transaction_query"
+    ]
+    assert len(insert_events) == 2
+    assert len(context_events) == 2
+    assert len(query_events) == 2
+    for expected_item_id, event in zip((81471, 92583), insert_events):
         _, sql, params = event
         assert environment["FASTMSSQL_FRAMEWORK_TABLE"] in sql
         assert "@P1" in sql and "@P2" in sql
         assert str(expected_item_id) not in sql
         assert params == [expected_item_id, "transaction"]
+    for expected_item_id, outcome, context_event, query_event, query_index in zip(
+        (81471, 92583),
+        ("commit", "rollback"),
+        context_events,
+        query_events,
+        query_indices,
+    ):
+        assert context_event[2] == [
+            f"transaction:{expected_item_id}:{outcome}".encode("ascii")
+        ]
+        assert "CONTEXT_INFO" not in query_event[1]
+        assert "WAITFOR DELAY '00:00:00.100'" in query_event[1]
+        assert query_event[2] == []
+        assert events.index(context_event) < query_index
+    assert query_indices[0] < events.index(
+        ("transaction_commit", 800)
+    )
+    assert query_indices[1] < events.index(
+        ("transaction_rollback", 801)
+    )
+
+    holding_records = sorted(
+        Path(environment["FASTMSSQL_FRAMEWORK_ARTIFACT_DIR"]).glob(
+            "transaction-holding-*.json"
+        )
+    )
+    settled_records = sorted(
+        Path(environment["FASTMSSQL_FRAMEWORK_ARTIFACT_DIR"]).glob(
+            "transaction-settled-*.json"
+        )
+    )
+    assert len(holding_records) == 2
+    assert len(settled_records) == 2
+    assert {
+        (record["item_id"], record["outcome"], record["transaction_phase"])
+        for path in (*holding_records, *settled_records)
+        for record in [json.loads(path.read_text(encoding="utf-8"))]
+    } == {
+        (81471, "commit", "holding"),
+        (81471, "commit", "settled"),
+        (92583, "rollback", "holding"),
+        (92583, "rollback", "settled"),
+    }
 
 
 class _DisconnectingRequest:
@@ -2370,10 +2673,168 @@ async def test_fastapi_cancel_route_settles_the_sql_task_after_disconnect(
 
     assert payload == {"cancelled": True}
     assert connection.query_cancelled.is_set()
+    execute_event = next(
+        event
+        for event in events
+        if isinstance(event, tuple) and event[0] == "transaction_execute"
+    )
     query_event = _route_query_events(events)[0]
     _, sql, params = query_event
     assert "cancel_token_42" not in sql
-    assert params in ([b"cancel_token_42"], ["cancel_token_42"])
+    assert params == []
+    assert execute_event[1:] == (
+        "SET CONTEXT_INFO @P1",
+        [b"cancel_token_42"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_fastapi_cancel_route_identifies_a_pinned_session_before_waiting(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    events: list[object] = []
+
+    class BlockingTransaction:
+        def __init__(self) -> None:
+            self.query_cancelled = asyncio.Event()
+
+        async def __aenter__(self):
+            events.append("transaction_enter")
+            return self
+
+        async def __aexit__(self, exc_type, exc_value, traceback) -> bool:
+            events.append(
+                (
+                    "transaction_exit",
+                    None if exc_type is None else exc_type.__name__,
+                )
+            )
+            return False
+
+        async def execute(
+            self,
+            sql: str,
+            params: list[object] | None = None,
+        ) -> int:
+            events.append(("transaction_execute", sql, list(params or ())))
+            return 1
+
+        async def query(
+            self,
+            sql: str,
+            params: list[object] | None = None,
+        ) -> _FakeQueryResult:
+            events.append(("transaction_query", sql, list(params or ())))
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.query_cancelled.set()
+                raise
+            raise AssertionError("unreachable")
+
+    class PinnedCancellationConnection(_RouteConnection):
+        def __init__(self) -> None:
+            super().__init__(events)
+            self.pinned_transaction = BlockingTransaction()
+
+        async def query(
+            self,
+            sql: str,
+            params: list[object] | None = None,
+        ) -> _FakeQueryResult:
+            raise AssertionError(
+                "the identified wait must use one pinned transaction session"
+            )
+
+        def transaction(self) -> BlockingTransaction:
+            events.append("connection_transaction")
+            return self.pinned_transaction
+
+    connection = PinnedCancellationConnection()
+    application = framework_app.create_fastapi_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+    )
+    endpoint = next(
+        route.endpoint
+        for route in application.routes
+        if getattr(route, "path", None) == "/cancel/{token}"
+    )
+
+    async with application.router.lifespan_context(application):
+        payload = await asyncio.wait_for(
+            endpoint(
+                request=_DisconnectingRequest(),
+                token="pinned_cancel_token_42",
+            ),
+            timeout=1,
+        )
+
+    assert payload == {"cancelled": True}
+    assert connection.pinned_transaction.query_cancelled.is_set()
+    execute_event = next(
+        event
+        for event in events
+        if isinstance(event, tuple) and event[0] == "transaction_execute"
+    )
+    query_event = next(
+        event
+        for event in events
+        if isinstance(event, tuple) and event[0] == "transaction_query"
+    )
+    assert events.index(execute_event) < events.index(query_event)
+    assert execute_event[1:] == (
+        "SET CONTEXT_INFO @P1",
+        [b"pinned_cancel_token_42"],
+    )
+    assert "WAITFOR" in query_event[1]
+    assert "CONTEXT_INFO" not in query_event[1]
+    assert query_event[2] == []
+    assert ("transaction_exit", "CancelledError") in events
+
+
+@pytest.mark.asyncio
+async def test_fastapi_cancel_route_accepts_the_driver_future_awaitable(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    events: list[object] = []
+
+    class FutureQueryConnection(_RouteConnection):
+        def query(
+            self,
+            sql: str,
+            params: list[object] | None = None,
+        ) -> asyncio.Future[_FakeQueryResult]:
+            self.events.append(("query", sql, list(params or ())))
+            self.query_started.set()
+            future = asyncio.get_running_loop().create_future()
+            self.returned_future = future
+            return future
+
+    connection = FutureQueryConnection(events)
+    application = framework_app.create_fastapi_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+    )
+    endpoint = next(
+        route.endpoint
+        for route in application.routes
+        if getattr(route, "path", None) == "/cancel/{token}"
+    )
+
+    async with application.router.lifespan_context(application):
+        payload = await asyncio.wait_for(
+            endpoint(
+                request=_DisconnectingRequest(),
+                token="future_cancel_token_42",
+            ),
+            timeout=1,
+        )
+
+    assert payload == {"cancelled": True}
+    assert connection.returned_future.cancelled()
 
 
 @pytest.mark.asyncio
@@ -2466,6 +2927,52 @@ async def test_fastapi_saturation_rejects_excess_and_recovers_capacity(
 
 
 @pytest.mark.asyncio
+async def test_fastapi_saturation_reports_private_pool_acquire_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeAcquireTimeout(Exception):
+        phase = "acquire"
+        operation = "query"
+        retryable = True
+
+    monkeypatch.setattr(
+        framework_app.fastmssql,
+        "OperationTimeoutError",
+        FakeAcquireTimeout,
+    )
+    environment = _valid_worker_environment(tmp_path)
+    events: list[object] = []
+    connection = _RouteConnection(
+        events,
+        query_error=FakeAcquireTimeout("private pool timeout detail"),
+    )
+    application = framework_app.create_fastapi_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/saturated/71")
+            pool = await client.get("/pool")
+
+    assert response.status_code == 504
+    assert response.json() == {
+        "error": "pool_acquire_timeout",
+        "operation": "query",
+        "phase": "acquire",
+        "retryable": True,
+    }
+    assert "private pool timeout detail" not in response.text
+    assert pool.json()["admission"]["active"] == 0
+
+
+@pytest.mark.asyncio
 async def test_fastapi_stream_route_closes_bounded_result_stream(
     tmp_path: Path,
 ) -> None:
@@ -2509,6 +3016,43 @@ async def test_fastapi_stream_route_closes_bounded_result_stream(
 
 
 @pytest.mark.asyncio
+async def test_fastapi_stream_context_token_is_parameterized_and_private(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_worker_environment(tmp_path)
+    events: list[object] = []
+    connection = _RouteConnection(events, stream_rows=[{"value": 29}])
+    application = framework_app.create_fastapi_app(
+        environment=environment,
+        connection_factory=_connection_factory(connection, events),
+    )
+
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            response = await client.get(
+                "/stream",
+                params={"rows": 1, "token": "stream_token_29"},
+            )
+            invalid = await client.get(
+                "/stream",
+                params={"rows": 1, "token": "unsafe token"},
+            )
+
+    assert response.status_code == 200
+    assert "stream_token_29" not in response.text
+    stream_event = next(event for event in events if event[0] == "stream")
+    _, sql, params, _ = stream_event
+    assert "SET CONTEXT_INFO @P1" in sql
+    assert "stream_token_29" not in sql
+    assert params == [b"stream_token_29", 1]
+    assert invalid.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_fastapi_stream_closes_driver_stream_when_generator_is_closed(
     tmp_path: Path,
 ) -> None:
@@ -2529,7 +3073,7 @@ async def test_fastapi_stream_closes_driver_stream_when_generator_is_closed(
     )
 
     async with application.router.lifespan_context(application):
-        response = await endpoint(rows=2)
+        response = await endpoint(rows=2, token=None)
         iterator = response.body_iterator
         first = await anext(iterator)
         await iterator.aclose()
@@ -2559,7 +3103,7 @@ async def test_fastapi_stream_closes_driver_stream_on_iteration_error(
     )
 
     async with application.router.lifespan_context(application):
-        response = await endpoint(rows=1)
+        response = await endpoint(rows=1, token=None)
         with pytest.raises(RuntimeError, match="intentional stream failure"):
             await anext(response.body_iterator)
 
@@ -2588,7 +3132,7 @@ async def test_fastapi_stream_closes_driver_stream_on_task_cancellation(
     )
 
     async with application.router.lifespan_context(application):
-        response = await endpoint(rows=1)
+        response = await endpoint(rows=1, token=None)
         pending_row = asyncio.create_task(anext(response.body_iterator))
         await asyncio.wait_for(blocking_result_set.started.wait(), timeout=1)
         pending_row.cancel()
@@ -2959,6 +3503,32 @@ async def test_sql_observer_zero_session_wait_is_bounded() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sql_observer_waits_for_zero_requests_without_zero_sessions() -> None:
+    runner = _load_production_framework_runner()
+    prefix = "fm-run-native"
+    observer_name = f"{prefix}-observer"
+    active_rows = _observer_rows(prefix, observer_name)
+    idle_rows = [
+        {**row, "has_request": 0, "context_info": b""}
+        for row in active_rows
+    ]
+    source = _FakeObserverSource([active_rows, idle_rows])
+    observer = runner.SqlServerObserver(
+        source=source,
+        worker_prefix=prefix,
+        observer_application_name=observer_name,
+        poll_interval_seconds=0.001,
+    )
+
+    idle = await observer.wait_for_zero_requests(timeout_seconds=0.1)
+
+    assert idle.current_requests == 0
+    assert idle.current_sessions == 3
+    assert idle.maximum_requests == 2
+    assert len(source.calls) == 2
+
+
+@pytest.mark.asyncio
 async def test_sql_observer_deadline_cancels_a_hanging_sample() -> None:
     runner = _load_production_framework_runner()
 
@@ -2999,6 +3569,3240 @@ async def test_sql_observer_deadline_cancels_a_hanging_sample() -> None:
 
     assert source.started.is_set()
     assert source.cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_sql_observer_waits_for_context_and_request_bounds() -> None:
+    runner = _load_production_framework_runner()
+    prefix = "fm-native-observer"
+    observer_name = f"{prefix}-observer"
+    rows = _observer_rows(prefix, observer_name)
+    source = _FakeObserverSource([[], rows, rows, []])
+    observer = runner.SqlServerObserver(
+        source=source,
+        worker_prefix=prefix,
+        observer_application_name=observer_name,
+        poll_interval_seconds=0.001,
+    )
+
+    appeared = await observer.wait_for_context_token(
+        "cancel_token_42",
+        present=True,
+        timeout_seconds=0.1,
+    )
+    busy = await observer.wait_for_minimum_requests(
+        2,
+        timeout_seconds=0.1,
+    )
+    disappeared = await observer.wait_for_context_token(
+        "cancel_token_42",
+        present=False,
+        timeout_seconds=0.1,
+    )
+
+    assert "cancel_token_42" in appeared.request_context_tokens
+    assert busy.current_requests >= 2
+    assert "cancel_token_42" not in disappeared.request_context_tokens
+
+    with pytest.raises(runner.RunnerConfigurationError):
+        await observer.wait_for_context_token(
+            "unsafe token",
+            present=True,
+            timeout_seconds=0.1,
+        )
+    with pytest.raises(runner.RunnerConfigurationError):
+        await observer.wait_for_minimum_requests(0, timeout_seconds=0.1)
+
+
+@pytest.mark.asyncio
+async def test_sql_observer_waits_for_every_ready_worker_identity() -> None:
+    runner = _load_production_framework_runner()
+    prefix = "fm-native-workers"
+    observer_name = f"{prefix}-observer"
+    rows = _observer_rows(prefix, observer_name)
+    source = _FakeObserverSource([[], rows])
+    observer = runner.SqlServerObserver(
+        source=source,
+        worker_prefix=prefix,
+        observer_application_name=observer_name,
+        poll_interval_seconds=0.001,
+    )
+    ready_records = (
+        {
+            "phase": "ready",
+            "pid": 101,
+            "worker_application_name": f"{prefix}-101",
+        },
+        {
+            "phase": "ready",
+            "pid": 202,
+            "worker_application_name": f"{prefix}-202",
+        },
+    )
+
+    sample = await observer.wait_for_ready_workers(
+        ready_records,
+        timeout_seconds=0.1,
+    )
+
+    assert runner.reconcile_worker_sessions(sample, ready_records) == (
+        (f"{prefix}-101", 101),
+        (f"{prefix}-202", 202),
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_http_json_is_status_aware_bounded_and_private() -> None:
+    runner = _load_production_framework_runner()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/saturated/19"
+        return httpx.Response(503, json={"error": "saturated"})
+
+    async def private_handler(request: httpx.Request) -> httpx.Response:
+        assert (
+            request.headers["x-fastmssql-context-token"]
+            == "graceful_query_token_42"
+        )
+        return await handler(request)
+
+    response = await runner.http_request_json(
+        8123,
+        "/saturated/19",
+        method="POST",
+        expected_statuses=(503,),
+        context_token="graceful_query_token_42",
+        transport=httpx.MockTransport(private_handler),
+    )
+
+    assert response.status_code == 503
+    assert response.payload == {"error": "saturated"}
+    assert response.elapsed_seconds >= 0
+    assert response.to_record() == {
+        "elapsed_seconds": response.elapsed_seconds,
+        "payload": {"error": "saturated"},
+        "status_code": 503,
+    }
+
+    with pytest.raises(
+        runner.HttpProbeError,
+        match="loopback HTTP probe returned status 503",
+    ):
+        await runner.http_request_json(
+            8123,
+            "/saturated/19",
+            method="POST",
+            transport=httpx.MockTransport(handler),
+        )
+
+    async def oversized_handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            content=b"{" + b"x" * (runner.MAX_HTTP_PROBE_BYTES + 1) + b"}",
+        )
+
+    with pytest.raises(
+        runner.HttpProbeError,
+        match="loopback HTTP response exceeded its byte limit",
+    ):
+        await runner.http_request_json(
+            8123,
+            "/oversized",
+            transport=httpx.MockTransport(oversized_handler),
+        )
+
+
+@pytest.mark.asyncio
+async def test_raw_http_request_stays_open_until_explicit_private_close() -> None:
+    runner = _load_production_framework_runner()
+    received: asyncio.Queue[bytes] = asyncio.Queue()
+    peer_closed = asyncio.Event()
+
+    async def handler(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        try:
+            request = await reader.readuntil(b"\r\n\r\n")
+            await received.put(request)
+            assert await reader.read() == b""
+            peer_closed.set()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    port = int(server.sockets[0].getsockname()[1])
+    try:
+        request = await runner.open_raw_http_request(
+            port,
+            "/cancel/cancel_token_42",
+            timeout_seconds=0.2,
+        )
+        raw = await asyncio.wait_for(received.get(), timeout=0.2)
+        assert raw.startswith(b"GET /cancel/cancel_token_42 HTTP/1.1\r\n")
+        assert b"Connection: close\r\n" in raw
+        assert not peer_closed.is_set()
+        assert "cancel_token_42" not in repr(request)
+
+        await request.close(timeout_seconds=0.2)
+        await asyncio.wait_for(peer_closed.wait(), timeout=0.2)
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_http_ndjson_client_validates_incremental_order_and_digest() -> None:
+    runner = _load_production_framework_runner()
+    first = b'{"result_set":0,"row":{"value":1}}\n'
+    second = b'{"result_set":0,"row":{"value":2}}\n'
+
+    async def handler(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        try:
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/x-ndjson\r\n"
+                + f"Content-Length: {len(first) + len(second)}\r\n".encode(
+                    "ascii"
+                )
+                + b"Connection: close\r\n\r\n"
+            )
+            writer.write(first)
+            await writer.drain()
+            await asyncio.sleep(0.02)
+            writer.write(second)
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    port = int(server.sockets[0].getsockname()[1])
+    try:
+        observation = await runner.consume_ndjson_stream(
+            port,
+            "/stream?rows=2",
+            expected_rows=2,
+            timeout_seconds=1,
+        )
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert observation.status_code == 200
+    assert observation.row_count == 2
+    assert observation.value_digest == hashlib.sha256(b"1\n2\n").hexdigest()
+    assert observation.bytes_received == len(first) + len(second)
+    assert 0 <= observation.first_data_seconds < observation.elapsed_seconds
+
+
+@pytest.mark.asyncio
+async def test_http_ndjson_prefix_close_closes_the_real_peer() -> None:
+    runner = _load_production_framework_runner()
+    peer_closed = asyncio.Event()
+    body = b"".join(
+        f'{{"result_set":0,"row":{{"value":{value}}}}}\n'.encode("ascii")
+        for value in range(1, 101)
+    )
+
+    async def handler(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        try:
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/x-ndjson\r\n"
+                + f"Content-Length: {len(body)}\r\n".encode("ascii")
+                + b"Connection: close\r\n\r\n"
+            )
+            for value in range(1, 4):
+                writer.write(
+                    f'{{"result_set":0,"row":{{"value":{value}}}}}\n'.encode(
+                        "ascii"
+                    )
+                )
+                await writer.drain()
+                await asyncio.sleep(0.005)
+            assert await reader.read() == b""
+            peer_closed.set()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    callbacks: list[str] = []
+
+    async def before_read() -> None:
+        callbacks.append("response-open")
+
+    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    port = int(server.sockets[0].getsockname()[1])
+    try:
+        observation = await runner.read_ndjson_prefix_and_close(
+            port,
+            "/stream?rows=100",
+            requested_rows=100,
+            prefix_rows=3,
+            timeout_seconds=1,
+            before_read=before_read,
+        )
+        await asyncio.wait_for(peer_closed.wait(), timeout=1)
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert callbacks == ["response-open"]
+    assert observation.status_code == 200
+    assert observation.prefix_rows == 3
+    assert observation.prefix_digest == hashlib.sha256(b"1\n2\n3\n").hexdigest()
+    assert 0 <= observation.first_data_seconds < observation.close_seconds
+
+
+@pytest.mark.asyncio
+async def test_http_ndjson_clients_enforce_one_global_deadline() -> None:
+    runner = _load_production_framework_runner()
+    rows = tuple(
+        f'{{"result_set":0,"row":{{"value":{value}}}}}\n'.encode("ascii")
+        for value in range(1, 4)
+    )
+
+    async def assert_global_deadline(client_call) -> None:
+        handler_done = asyncio.Event()
+
+        async def handler(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            try:
+                await reader.readuntil(b"\r\n\r\n")
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: application/x-ndjson\r\n"
+                    + f"Content-Length: {sum(map(len, rows))}\r\n".encode(
+                        "ascii"
+                    )
+                    + b"Connection: close\r\n\r\n"
+                )
+                for index, row in enumerate(rows):
+                    if index:
+                        await asyncio.sleep(0.04)
+                    writer.write(row)
+                    await writer.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                handler_done.set()
+
+        server = await asyncio.start_server(handler, "127.0.0.1", 0)
+        port = int(server.sockets[0].getsockname()[1])
+        started = time.monotonic()
+        try:
+            with pytest.raises(
+                runner.HttpProbeError,
+                match="global deadline",
+            ):
+                await client_call(port)
+            assert time.monotonic() - started < 0.2
+        finally:
+            server.close()
+            await server.wait_closed()
+            await asyncio.wait_for(handler_done.wait(), timeout=0.5)
+
+    await assert_global_deadline(
+        lambda port: runner.consume_ndjson_stream(
+            port,
+            "/stream?rows=3",
+            expected_rows=3,
+            timeout_seconds=0.06,
+        )
+    )
+    await assert_global_deadline(
+        lambda port: runner.read_ndjson_prefix_and_close(
+            port,
+            "/stream?rows=100",
+            requested_rows=100,
+            prefix_rows=3,
+            timeout_seconds=0.06,
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_process_rss_monitor_records_the_peak_until_stopped() -> None:
+    runner = _load_production_framework_runner()
+    values = iter((100, 300, 200))
+    stop = asyncio.Event()
+    calls: list[tuple[int, ...]] = []
+
+    def sample(pids: tuple[int, ...]) -> int:
+        calls.append(pids)
+        value = next(values)
+        if len(calls) == 3:
+            stop.set()
+        return value
+
+    peak = await runner.monitor_process_rss(
+        (101,),
+        stop=stop,
+        poll_interval_seconds=0.001,
+        rss_sampler=sample,
+    )
+
+    assert peak == 300
+    assert calls == [(101,), (101,), (101,)]
+
+
+@pytest.mark.asyncio
+async def test_pool_settlement_wait_is_bounded_and_requires_zero_usage() -> None:
+    runner = _load_production_framework_runner()
+    responses = iter(
+        (
+            {
+                "admission": {"active": 1},
+                "pid": 101,
+                "pool": {"active_connections": 1, "pending_gets": 1},
+            },
+            {
+                "admission": {"active": 0},
+                "pid": 101,
+                "pool": {"active_connections": 0, "pending_gets": 0},
+            },
+        )
+    )
+
+    async def request_json(port: int, path: str, **kwargs):
+        assert port == 8123
+        assert path == "/pool"
+        assert kwargs["timeout_seconds"] > 0
+        return runner.LoopbackJsonResponse(
+            status_code=200,
+            payload=next(responses),
+            elapsed_seconds=0.001,
+        )
+
+    settled = await runner.wait_for_pool_settlement(
+        8123,
+        expected_pid=101,
+        timeout_seconds=0.1,
+        poll_interval_seconds=0.001,
+        request_json=request_json,
+    )
+
+    assert settled["pool"] == {
+        "active_connections": 0,
+        "pending_gets": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_saturation_wait_requires_exact_pool_and_admission_bounds() -> None:
+    runner = _load_production_framework_runner()
+    responses = iter(
+        (
+            {
+                "admission": {"active": 2, "capacity": 4, "rejected": 0},
+                "pid": 101,
+                "pool": {
+                    "active_connections": 2,
+                    "connections": 2,
+                    "idle_connections": 0,
+                    "max_size": 2,
+                    "pending_gets": 0,
+                },
+            },
+            {
+                "admission": {"active": 4, "capacity": 4, "rejected": 0},
+                "pid": 101,
+                "pool": {
+                    "active_connections": 2,
+                    "connections": 2,
+                    "idle_connections": 0,
+                    "max_size": 2,
+                    "pending_gets": 2,
+                },
+            },
+        )
+    )
+
+    async def request_json(port: int, path: str, **kwargs):
+        assert port == 8123
+        assert path == "/pool"
+        assert kwargs["expected_statuses"] == (200,)
+        assert kwargs["timeout_seconds"] > 0
+        return runner.LoopbackJsonResponse(
+            status_code=200,
+            payload=next(responses),
+            elapsed_seconds=0.001,
+        )
+
+    saturated = await runner.wait_for_saturation_state(
+        8123,
+        expected_pid=101,
+        pool_max=2,
+        expected_waiters=2,
+        timeout_seconds=0.1,
+        poll_interval_seconds=0.001,
+        request_json=request_json,
+    )
+
+    assert saturated["admission"] == {
+        "active": 4,
+        "capacity": 4,
+        "rejected": 0,
+    }
+    assert saturated["pool"]["pending_gets"] == 2
+
+
+@pytest.mark.asyncio
+async def test_transaction_phase_wait_is_bounded_and_identity_strict(
+    tmp_path: Path,
+) -> None:
+    runner = _load_production_framework_runner()
+    item_id = 84_271
+    outcome = "commit"
+    token = f"transaction:{item_id}:{outcome}"
+    record = {
+        "context_token_sha256": hashlib.sha256(token.encode("ascii")).hexdigest(),
+        "item_id": item_id,
+        "outcome": outcome,
+        "phase": "transaction",
+        "pid": 101,
+        "run_id": "native-graceful-transaction-commit",
+        "transaction_phase": "holding",
+        "worker_application_name": "fm-native-transaction-commit-101",
+    }
+    path = tmp_path / "transaction-holding-commit-101-84271.json"
+    path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    class FakeSupervisor:
+        started_wall_time_ns = 0
+
+        async def wait_for_readiness(self, probe, *, timeout_seconds):
+            assert timeout_seconds == 0.1
+            assert probe() is True
+
+    selected = await runner.wait_for_transaction_phase_record(
+        FakeSupervisor(),
+        directory=tmp_path,
+        expected_run_id="native-graceful-transaction-commit",
+        expected_pid=101,
+        expected_worker_application_name="fm-native-transaction-commit-101",
+        item_id=item_id,
+        outcome=outcome,
+        transaction_phase="holding",
+        timeout_seconds=0.1,
+    )
+
+    assert selected == record
+    assert token not in json.dumps(selected, sort_keys=True)
+
+    path.write_text(
+        json.dumps({**record, "run_id": "stale-run"}) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        runner.WorkerEvidenceError,
+        match="transaction phase record is inconsistent",
+    ):
+        await runner.wait_for_transaction_phase_record(
+            FakeSupervisor(),
+            directory=tmp_path,
+            expected_run_id="native-graceful-transaction-commit",
+            expected_pid=101,
+            expected_worker_application_name="fm-native-transaction-commit-101",
+            item_id=item_id,
+            outcome=outcome,
+            transaction_phase="holding",
+            timeout_seconds=0.1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_transaction_phase_wait_reconciles_a_fresh_post_exit_record(
+    tmp_path: Path,
+) -> None:
+    runner = _load_production_framework_runner()
+    item_id = 95_381
+    outcome = "rollback"
+    token = f"transaction:{item_id}:{outcome}"
+    record = {
+        "context_token_sha256": hashlib.sha256(
+            token.encode("ascii")
+        ).hexdigest(),
+        "item_id": item_id,
+        "outcome": outcome,
+        "phase": "transaction",
+        "pid": 101,
+        "run_id": "native-graceful-transaction-rollback",
+        "transaction_phase": "settled",
+        "worker_application_name": "fm-native-transaction-rollback-101",
+    }
+    path = tmp_path / "transaction-settled-rollback-101-95381.json"
+    path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    class ExitedSupervisor:
+        started_wall_time_ns = 0
+
+        async def wait_for_readiness(self, probe, *, timeout_seconds):
+            del probe, timeout_seconds
+            raise AssertionError(
+                "an already-written post-exit record must be read directly"
+            )
+
+    selected = await runner.wait_for_transaction_phase_record(
+        ExitedSupervisor(),
+        directory=tmp_path,
+        expected_run_id="native-graceful-transaction-rollback",
+        expected_pid=101,
+        expected_worker_application_name="fm-native-transaction-rollback-101",
+        item_id=item_id,
+        outcome=outcome,
+        transaction_phase="settled",
+        timeout_seconds=0.1,
+    )
+
+    assert selected == record
+    assert token not in json.dumps(selected, sort_keys=True)
+
+
+def test_disconnect_evidence_requires_retirement_recovery_and_hashes_token() -> None:
+    runner = _load_production_framework_runner()
+    token = "cancel_token_42"
+    observed = runner.SqlObserverSample(
+        applications=(
+            runner.ObserverApplicationSample(
+                application_name="fm-native-cancel-101",
+                host_process_ids=(101,),
+                sessions=1,
+                requests=1,
+            ),
+        ),
+        current_sessions=1,
+        current_requests=1,
+        maximum_sessions=1,
+        maximum_requests=1,
+        request_context_tokens=(token,),
+    )
+    settled = replace(
+        observed,
+        current_requests=0,
+        request_context_tokens=(),
+    )
+    before_pool = {
+        "active_connections": 0,
+        "connections": 1,
+        "connections_closed_broken": 0,
+        "connections_created": 1,
+        "idle_connections": 1,
+        "max_size": 1,
+        "pending_gets": 0,
+    }
+    after_pool = {
+        **before_pool,
+        "connections_closed_broken": 1,
+        "connections_created": 2,
+    }
+
+    evidence = runner.validate_disconnect_evidence(
+        token=token,
+        observed_sample=observed,
+        settled_sample=settled,
+        before_pool=before_pool,
+        after_pool=after_pool,
+        recovery_payload={"session_id": 52, "value": 36},
+    )
+
+    record = evidence.to_record()
+    assert record == {
+        "connection_replaced": True,
+        "context_token_sha256": hashlib.sha256(token.encode("ascii")).hexdigest(),
+        "pool_active_after": 0,
+        "pool_pending_after": 0,
+        "recovery_value": 36,
+        "sql_observed_before_close": True,
+        "sql_requests_after": 0,
+        "status": "PASS",
+        "transport": "raw-tcp-client-close",
+    }
+    assert token not in json.dumps(record, sort_keys=True)
+
+    with pytest.raises(
+        runner.WorkerEvidenceError,
+        match="replacement counters",
+    ):
+        runner.validate_disconnect_evidence(
+            token=token,
+            observed_sample=observed,
+            settled_sample=settled,
+            before_pool=before_pool,
+            after_pool=before_pool,
+            recovery_payload={"session_id": 52, "value": 36},
+        )
+
+
+def test_graceful_query_evidence_binds_active_sql_to_the_completed_response() -> None:
+    runner = _load_production_framework_runner()
+    token = "graceful_query_token_42"
+    observed = runner.SqlObserverSample(
+        applications=(
+            runner.ObserverApplicationSample(
+                application_name="fm-native-graceful-query-101",
+                host_process_ids=(101,),
+                sessions=1,
+                requests=1,
+            ),
+        ),
+        current_sessions=1,
+        current_requests=1,
+        maximum_sessions=1,
+        maximum_requests=1,
+        request_context_tokens=(token,),
+    )
+
+    evidence = runner.validate_graceful_query_evidence(
+        token=token,
+        observed_sample=observed,
+        response_payload={
+            "delay_ms": 250,
+            "session_id": 52,
+            "value": 73,
+        },
+        expected_value=73,
+        sql_delay_ms=250,
+    )
+
+    record = evidence.to_record()
+    assert record == {
+        "context_token_sha256": hashlib.sha256(token.encode("ascii")).hexdigest(),
+        "response_completed_after_signal": True,
+        "response_session_id": 52,
+        "response_value": 73,
+        "sql_delay_seconds": 0.25,
+        "sql_observed_before_signal": True,
+        "status": "PASS",
+    }
+    assert token not in json.dumps(record, sort_keys=True)
+
+    with pytest.raises(
+        runner.WorkerEvidenceError,
+        match="graceful query token",
+    ):
+        runner.validate_graceful_query_evidence(
+            token=token,
+            observed_sample=replace(observed, request_context_tokens=()),
+            response_payload={
+                "delay_ms": 250,
+                "session_id": 52,
+                "value": 73,
+            },
+            expected_value=73,
+            sql_delay_ms=250,
+        )
+
+
+@pytest.mark.parametrize(
+    ("outcome", "durable_rows", "durable_result"),
+    (
+        ("commit", ({"value": "transaction"},), "row-present"),
+        ("rollback", (), "row-absent"),
+    ),
+)
+def test_graceful_transaction_evidence_requires_the_selected_durable_outcome(
+    outcome: str,
+    durable_rows: tuple[dict[str, object], ...],
+    durable_result: str,
+) -> None:
+    runner = _load_production_framework_runner()
+    item_id = 84_271 if outcome == "commit" else 95_381
+    token = f"transaction:{item_id}:{outcome}"
+    token_sha256 = hashlib.sha256(token.encode("ascii")).hexdigest()
+    base_record = {
+        "context_token_sha256": token_sha256,
+        "item_id": item_id,
+        "outcome": outcome,
+        "phase": "transaction",
+        "pid": 101,
+        "run_id": f"native-graceful-transaction-{outcome}",
+        "worker_application_name": f"fm-native-transaction-{outcome}-101",
+    }
+    holding_record = {**base_record, "transaction_phase": "holding"}
+    settled_record = {**base_record, "transaction_phase": "settled"}
+    observed = runner.SqlObserverSample(
+        applications=(
+            runner.ObserverApplicationSample(
+                application_name=base_record["worker_application_name"],
+                host_process_ids=(101,),
+                sessions=1,
+                requests=1,
+            ),
+        ),
+        current_sessions=1,
+        current_requests=1,
+        maximum_sessions=1,
+        maximum_requests=1,
+        request_context_tokens=(token,),
+    )
+
+    evidence = runner.validate_graceful_transaction_evidence(
+        token=token,
+        item_id=item_id,
+        outcome=outcome,
+        holding_record=holding_record,
+        settled_record=settled_record,
+        observed_sample=observed,
+        response_payload={
+            "item_id": item_id,
+            "outcome": outcome,
+            "session_id": 52,
+        },
+        durable_rows=durable_rows,
+    )
+
+    record = evidence.to_record()
+    assert record == {
+        "context_token_sha256": token_sha256,
+        "durable_result": durable_result,
+        "item_id": item_id,
+        "outcome": outcome,
+        "response_completed_after_signal": True,
+        "response_session_id": 52,
+        "sql_observed_before_signal": True,
+        "status": "PASS",
+        "transaction_holding_before_signal": True,
+        "transaction_settled": True,
+    }
+    assert token not in json.dumps(record, sort_keys=True)
+
+    wrong_rows = () if outcome == "commit" else ({"value": "transaction"},)
+    with pytest.raises(
+        runner.WorkerEvidenceError,
+        match="durable outcome",
+    ):
+        runner.validate_graceful_transaction_evidence(
+            token=token,
+            item_id=item_id,
+            outcome=outcome,
+            holding_record=holding_record,
+            settled_record=settled_record,
+            observed_sample=observed,
+            response_payload={
+                "item_id": item_id,
+                "outcome": outcome,
+                "session_id": 52,
+            },
+            durable_rows=wrong_rows,
+        )
+
+
+def test_native_saturation_evidence_requires_exact_two_layer_bounds() -> None:
+    runner = _load_production_framework_runner()
+    application_name = "fm-native-saturation-101"
+    busy = runner.SqlObserverSample(
+        applications=(
+            runner.ObserverApplicationSample(
+                application_name=application_name,
+                host_process_ids=(0,),
+                sessions=2,
+                requests=2,
+            ),
+        ),
+        current_sessions=2,
+        current_requests=2,
+        maximum_sessions=2,
+        maximum_requests=2,
+        request_context_tokens=(),
+    )
+    baseline = {
+        "admission": {"active": 0, "capacity": 4, "rejected": 0},
+        "pid": 101,
+        "pool": {
+            "active_connections": 0,
+            "connections": 1,
+            "get_timed_out": 0,
+            "idle_connections": 1,
+            "max_size": 2,
+            "pending_gets": 0,
+        },
+    }
+    saturated = {
+        "admission": {"active": 4, "capacity": 4, "rejected": 0},
+        "pid": 101,
+        "pool": {
+            "active_connections": 2,
+            "connections": 2,
+            "get_timed_out": 0,
+            "idle_connections": 0,
+            "max_size": 2,
+            "pending_gets": 2,
+        },
+    }
+    settled = {
+        "admission": {"active": 0, "capacity": 4, "rejected": 2},
+        "pid": 101,
+        "pool": {
+            "active_connections": 0,
+            "connections": 2,
+            "get_timed_out": 2,
+            "idle_connections": 2,
+            "max_size": 2,
+            "pending_gets": 0,
+        },
+    }
+    holders = tuple(
+        runner.LoopbackJsonResponse(
+            200,
+            {"session_id": session_id, "value": value},
+            2.0,
+        )
+        for session_id, value in ((51, 31), (52, 37))
+    )
+    waiters = tuple(
+        runner.LoopbackJsonResponse(
+            504,
+            {
+                "error": "pool_acquire_timeout",
+                "operation": "query",
+                "phase": "acquire",
+                "retryable": True,
+            },
+            0.5,
+        )
+        for _ in range(2)
+    )
+    rejected = tuple(
+        runner.LoopbackJsonResponse(503, {"error": "saturated"}, 0.01)
+        for _ in range(2)
+    )
+    recovery = runner.LoopbackJsonResponse(
+        200,
+        {"session_id": 53, "value": 59},
+        2.0,
+    )
+
+    evidence = runner.validate_native_saturation_evidence(
+        expected_pid=101,
+        expected_application_name=application_name,
+        holder_values=(31, 37),
+        waiter_values=(41, 43),
+        excess_values=(47, 49),
+        recovery_value=59,
+        acquire_timeout_ms=500,
+        busy_sample=busy,
+        baseline_pool_record=baseline,
+        saturated_pool_record=saturated,
+        settled_pool_record=settled,
+        holder_responses=holders,
+        waiter_responses=waiters,
+        rejection_responses=rejected,
+        recovery_response=recovery,
+    )
+
+    assert evidence.to_record() == {
+        "acquire_timeouts": 2,
+        "admission_active_after": 0,
+        "admission_capacity": 4,
+        "admitted_holders": 2,
+        "admitted_waiters": 2,
+        "maximum_sql_requests": 2,
+        "maximum_sql_sessions": 2,
+        "observed_active_connections": 2,
+        "observed_pending_gets": 2,
+        "pool_active_after": 0,
+        "pool_get_timed_out_delta": 2,
+        "pool_max_per_worker": 2,
+        "pool_pending_after": 0,
+        "recovery_value": 59,
+        "rejected_requests": 2,
+        "status": "PASS",
+    }
+
+    malformed = {
+        **saturated,
+        "pool": {**saturated["pool"], "pending_gets": 1},
+    }
+    with pytest.raises(
+        runner.WorkerEvidenceError,
+        match="saturation bounds",
+    ):
+        runner.validate_native_saturation_evidence(
+            expected_pid=101,
+            expected_application_name=application_name,
+            holder_values=(31, 37),
+            waiter_values=(41, 43),
+            excess_values=(47, 49),
+            recovery_value=59,
+            acquire_timeout_ms=500,
+            busy_sample=busy,
+            baseline_pool_record=baseline,
+            saturated_pool_record=malformed,
+            settled_pool_record=settled,
+            holder_responses=holders,
+            waiter_responses=waiters,
+            rejection_responses=rejected,
+            recovery_response=recovery,
+        )
+
+
+def test_native_streaming_evidence_requires_incremental_bounded_recovery() -> None:
+    runner = _load_production_framework_runner()
+    full = runner.FullNdjsonObservation(
+        status_code=200,
+        content_type="application/x-ndjson; charset=utf-8",
+        row_count=3,
+        value_digest=hashlib.sha256(b"1\n2\n3\n").hexdigest(),
+        bytes_received=108,
+        first_data_seconds=0.01,
+        elapsed_seconds=0.10,
+    )
+    early = runner.EarlyCloseNdjsonObservation(
+        status_code=200,
+        content_type="application/x-ndjson; charset=utf-8",
+        requested_rows=100,
+        prefix_rows=3,
+        prefix_digest=hashlib.sha256(b"1\n2\n3\n").hexdigest(),
+        bytes_received=108,
+        first_data_seconds=0.01,
+        close_seconds=0.05,
+    )
+    settled_pool = {
+        "admission": {"active": 0, "capacity": 8, "rejected": 0},
+        "pid": 101,
+        "pool": {
+            "active_connections": 0,
+            "connections": 4,
+            "idle_connections": 4,
+            "max_size": 4,
+            "pending_gets": 0,
+        },
+    }
+    idle = runner.SqlObserverSample(
+        applications=(
+            runner.ObserverApplicationSample(
+                application_name="fm-native-streaming-101",
+                host_process_ids=(0,),
+                sessions=4,
+                requests=0,
+            ),
+        ),
+        current_sessions=4,
+        current_requests=0,
+        maximum_sessions=4,
+        maximum_requests=1,
+        request_context_tokens=(),
+    )
+    recovery = runner.LoopbackJsonResponse(
+        200,
+        {"session_id": 53, "value": 73},
+        0.01,
+    )
+
+    evidence = runner.validate_native_streaming_evidence(
+        expected_pid=101,
+        pool_max=4,
+        full_observation=full,
+        early_observation=early,
+        driver_buffer_rows=8,
+        rss_start_bytes=1_000,
+        rss_peak_bytes=1_200,
+        rss_end_bytes=1_100,
+        rss_growth_limit_bytes=500,
+        full_settled_pool_record=settled_pool,
+        early_settled_pool_record=settled_pool,
+        early_settled_sample=idle,
+        recovery_value=73,
+        recovery_response=recovery,
+    )
+
+    assert evidence.to_record() == {
+        "driver_buffer_rows": 8,
+        "early_bytes_received": 108,
+        "early_client_closed": True,
+        "early_close_seconds": 0.05,
+        "early_first_data_seconds": 0.01,
+        "early_pool_active_after": 0,
+        "early_pool_pending_after": 0,
+        "early_prefix_digest": early.prefix_digest,
+        "early_prefix_rows": 3,
+        "early_requested_rows": 100,
+        "early_sql_requests_after": 0,
+        "full_bytes_received": 108,
+        "full_elapsed_seconds": 0.10,
+        "full_first_data_seconds": 0.01,
+        "full_pool_active_after": 0,
+        "full_pool_pending_after": 0,
+        "full_rows": 3,
+        "full_value_digest": full.value_digest,
+        "incremental_first_data": True,
+        "recovery_value": 73,
+        "rss_end_bytes": 1_100,
+        "rss_growth_bytes": 200,
+        "rss_growth_limit_bytes": 500,
+        "rss_peak_bytes": 1_200,
+        "rss_start_bytes": 1_000,
+        "status": "PASS",
+    }
+
+    with pytest.raises(
+        runner.WorkerEvidenceError,
+        match="RSS",
+    ):
+        runner.validate_native_streaming_evidence(
+            expected_pid=101,
+            pool_max=4,
+            full_observation=full,
+            early_observation=early,
+            driver_buffer_rows=8,
+            rss_start_bytes=1_000,
+            rss_peak_bytes=1_600,
+            rss_end_bytes=1_100,
+            rss_growth_limit_bytes=500,
+            full_settled_pool_record=settled_pool,
+            early_settled_pool_record=settled_pool,
+            early_settled_sample=idle,
+            recovery_value=73,
+            recovery_response=recovery,
+        )
+
+
+@pytest.mark.asyncio
+async def test_disconnect_scenario_closes_peer_only_after_sql_is_observed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _load_production_framework_runner()
+    config = replace(
+        _config_with_actual_wheel_hash(runner, tmp_path),
+        database_mode="sql_auth",
+        global_connection_budget=8,
+    )
+    profile = replace(
+        _profile_by_family(
+            runner,
+            "fastapi-uvicorn-asyncio",
+            workers=1,
+        ),
+        database_mode="sql_auth",
+        platform_system=config.platform_system,
+    )
+    isolated = runner.prepare_isolated_application(
+        config,
+        source_directory=ROOT / "tests/production_framework",
+        directory_name="native-disconnect-test",
+    )
+    settings = runner.SqlAuthObserverSettings(
+        host="127.0.0.1",
+        port=14334,
+        database="fastmssql_validation",
+        username="fastmssql_owner",
+        password="private-owner-password",
+    )
+    token = "cancel_token_42"
+    ready = {
+        "phase": "ready",
+        "pid": 101,
+        "run_id": "native-disconnect",
+        "worker_application_name": "fm-native-disconnect-101",
+    }
+    observed = runner.SqlObserverSample(
+        applications=(
+            runner.ObserverApplicationSample(
+                application_name="fm-native-disconnect-101",
+                host_process_ids=(101,),
+                sessions=1,
+                requests=1,
+            ),
+        ),
+        current_sessions=1,
+        current_requests=1,
+        maximum_sessions=1,
+        maximum_requests=1,
+        request_context_tokens=(token,),
+    )
+    settled = replace(
+        observed,
+        current_requests=0,
+        request_context_tokens=(),
+    )
+    zero = replace(settled, applications=(), current_sessions=0)
+    before_pool = {
+        "active_connections": 0,
+        "connections": 1,
+        "connections_closed_broken": 0,
+        "connections_created": 1,
+        "idle_connections": 1,
+        "max_size": 8,
+        "pending_gets": 0,
+    }
+    after_pool = {
+        **before_pool,
+        "connections_closed_broken": 1,
+        "connections_created": 2,
+    }
+    events: list[str] = []
+
+    class FakeConnection:
+        async def connect(self, *, validate: bool) -> None:
+            assert validate is True
+            events.append("observer-connect")
+
+        async def disconnect(self) -> None:
+            events.append("observer-disconnect")
+
+    class FakeObserver:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        async def wait_for_ready_workers(self, records, *, timeout_seconds):
+            assert tuple(records) == (ready,)
+            assert timeout_seconds > 0
+            return settled
+
+        async def wait_for_context_token(self, selected, *, present, timeout_seconds):
+            assert selected == token
+            assert timeout_seconds > 0
+            events.append("sql-observed" if present else "sql-settled")
+            return observed if present else settled
+
+        async def wait_for_zero_sessions(self, *, timeout_seconds):
+            assert timeout_seconds > 0
+            return zero
+
+    class FakeRawRequest:
+        async def close(self, *, timeout_seconds):
+            assert timeout_seconds > 0
+            events.append("peer-close")
+
+    outcome = runner.ProcessOutcome(
+        pid=90,
+        returncode=0,
+        stdout="",
+        stderr="",
+        output_truncated=False,
+        descendant_pids=(101,),
+        graceful_stop=True,
+        forced_cleanup=False,
+    )
+
+    class FakeSupervisor:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            del args
+
+        async def wait_for_worker_records(self, **kwargs):
+            assert kwargs["expected_count"] == 1
+            return (ready,)
+
+        def read_worker_records(self, **kwargs):
+            assert kwargs["phase"] == "shutdown"
+            return ({**ready, "phase": "shutdown"},)
+
+        async def stop(self):
+            events.append("server-stop")
+            return outcome
+
+    async def fake_launch(**kwargs):
+        assert await kwargs["readiness_probe"](8125)
+        return runner.ServerLaunch(
+            supervisor=FakeSupervisor(),
+            port=8125,
+            attempts=1,
+            sanitized_command=(sys.executable, "-m", "uvicorn"),
+        )
+
+    async def fake_get(port: int, path: str, **kwargs):
+        assert port == 8125
+        assert path == "/ready"
+        assert kwargs["timeout_seconds"] > 0
+        return {"pid": 101, "state": "ready"}
+
+    request_count = 0
+
+    async def fake_request(port: int, path: str, **kwargs):
+        nonlocal request_count
+        assert port == 8125
+        assert kwargs["expected_statuses"] == (200,)
+        request_count += 1
+        if path == "/pool":
+            payload = {"admission": {"active": 0}, "pid": 101, "pool": before_pool}
+        else:
+            assert path == "/value/36"
+            events.append("recovery")
+            payload = {"session_id": 52, "value": 36}
+        return runner.LoopbackJsonResponse(200, payload, 0.001)
+
+    settlements = iter(
+        (
+            {"admission": {"active": 0}, "pid": 101, "pool": {**after_pool, "connections": 0}},
+            {"admission": {"active": 0}, "pid": 101, "pool": after_pool},
+        )
+    )
+
+    async def fake_settlement(port: int, **kwargs):
+        assert port == 8125
+        assert kwargs["expected_pid"] == 101
+        return next(settlements)
+
+    async def fake_raw(port: int, path: str, **kwargs):
+        assert port == 8125
+        assert path == f"/cancel/{token}"
+        assert kwargs["timeout_seconds"] > 0
+        events.append("peer-open")
+        return FakeRawRequest()
+
+    async def fake_port_not_listening(port: int) -> bool:
+        assert port == 8125
+        return False
+
+    monkeypatch.setattr(runner, "create_observer_connection", lambda *a, **k: FakeConnection())
+    monkeypatch.setattr(runner, "SqlServerObserver", FakeObserver)
+    monkeypatch.setattr(runner, "launch_with_port_retry", fake_launch)
+    monkeypatch.setattr(runner, "http_get_json", fake_get)
+    monkeypatch.setattr(runner, "http_request_json", fake_request)
+    monkeypatch.setattr(runner, "open_raw_http_request", fake_raw)
+    monkeypatch.setattr(runner, "wait_for_pool_settlement", fake_settlement)
+    monkeypatch.setattr(runner, "loopback_port_is_listening", fake_port_not_listening)
+
+    result = await runner.run_native_disconnect_scenario(
+        config,
+        isolated,
+        profile,
+        run_id="native-disconnect",
+        policy=runner.SupervisorPolicy(),
+        sql_auth_settings=settings,
+        table_name="framework_items_native",
+        token=token,
+    )
+
+    record = result.to_record()
+    assert record["status"] == "PASS"
+    assert record["recovery_value"] == 36
+    assert record["sessions_after"] == 0
+    assert request_count == 2
+    assert events.index("sql-observed") < events.index("peer-close")
+    assert events.index("peer-close") < events.index("recovery")
+    assert events[-1] == "observer-disconnect"
+
+
+@pytest.mark.asyncio
+async def test_graceful_query_scenario_signals_only_after_sql_is_observed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _load_production_framework_runner()
+    config = replace(
+        _config_with_actual_wheel_hash(runner, tmp_path),
+        database_mode="sql_auth",
+        global_connection_budget=8,
+    )
+    profile = replace(
+        _profile_by_family(
+            runner,
+            "fastapi-uvicorn-asyncio",
+            workers=1,
+        ),
+        database_mode="sql_auth",
+        platform_system=config.platform_system,
+    )
+    isolated = runner.prepare_isolated_application(
+        config,
+        source_directory=ROOT / "tests/production_framework",
+        directory_name="native-graceful-query-test",
+    )
+    settings = runner.SqlAuthObserverSettings(
+        host="127.0.0.1",
+        port=14334,
+        database="fastmssql_validation",
+        username="fastmssql_owner",
+        password="private-owner-password",
+    )
+    token = "graceful_query_token_42"
+    ready = {
+        "phase": "ready",
+        "pid": 101,
+        "run_id": "native-graceful-query",
+        "worker_application_name": "fm-native-graceful-query-101",
+    }
+    observed = runner.SqlObserverSample(
+        applications=(
+            runner.ObserverApplicationSample(
+                application_name="fm-native-graceful-query-101",
+                host_process_ids=(101,),
+                sessions=1,
+                requests=1,
+            ),
+        ),
+        current_sessions=1,
+        current_requests=1,
+        maximum_sessions=1,
+        maximum_requests=1,
+        request_context_tokens=(token,),
+    )
+    zero = replace(
+        observed,
+        applications=(),
+        current_sessions=0,
+        current_requests=0,
+        request_context_tokens=(),
+    )
+    events: list[str] = []
+    signal_sent = asyncio.Event()
+    response_completed = asyncio.Event()
+
+    class FakeConnection:
+        async def connect(self, *, validate: bool) -> None:
+            assert validate is True
+            events.append("observer-connect")
+
+        async def disconnect(self) -> None:
+            events.append("observer-disconnect")
+
+    class FakeObserver:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        async def wait_for_ready_workers(self, records, *, timeout_seconds):
+            assert tuple(records) == (ready,)
+            assert timeout_seconds > 0
+            return observed
+
+        async def wait_for_context_token(self, selected, *, present, timeout_seconds):
+            assert selected == token
+            assert present is True
+            assert timeout_seconds > 0
+            events.append("sql-observed")
+            return observed
+
+        async def wait_for_zero_sessions(self, *, timeout_seconds):
+            assert timeout_seconds > 0
+            return zero
+
+    outcome = runner.ProcessOutcome(
+        pid=90,
+        returncode=-signal.SIGTERM,
+        stdout="",
+        stderr="",
+        output_truncated=False,
+        descendant_pids=(101,),
+        graceful_stop=True,
+        forced_cleanup=False,
+    )
+
+    class FakeSupervisor:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            del args
+
+        async def wait_for_worker_records(self, **kwargs):
+            assert kwargs["expected_count"] == 1
+            return (ready,)
+
+        def read_worker_records(self, **kwargs):
+            assert kwargs["phase"] == "shutdown"
+            return ({**ready, "phase": "shutdown"},)
+
+        async def stop(self):
+            events.append("signal-sent")
+            signal_sent.set()
+            await response_completed.wait()
+            events.append("server-exit")
+            return outcome
+
+    async def fake_launch(**kwargs):
+        assert await kwargs["readiness_probe"](8126)
+        return runner.ServerLaunch(
+            supervisor=FakeSupervisor(),
+            port=8126,
+            attempts=1,
+            sanitized_command=(sys.executable, "-m", "uvicorn"),
+        )
+
+    async def fake_get(port: int, path: str, **kwargs):
+        assert port == 8126
+        assert path == "/ready"
+        assert kwargs["timeout_seconds"] > 0
+        return {"pid": 101, "state": "ready"}
+
+    async def fake_request(port: int, path: str, **kwargs):
+        assert port == 8126
+        assert path == "/wait/73"
+        assert kwargs["expected_statuses"] == (200,)
+        assert kwargs["context_token"] == token
+        assert kwargs["timeout_seconds"] > 0
+        events.append("request-start")
+        await signal_sent.wait()
+        events.append("response-complete")
+        response_completed.set()
+        return runner.LoopbackJsonResponse(
+            200,
+            {"delay_ms": 250, "session_id": 52, "value": 73},
+            0.25,
+        )
+
+    async def fake_port_not_listening(port: int) -> bool:
+        assert port == 8126
+        return False
+
+    monkeypatch.setattr(
+        runner,
+        "create_observer_connection",
+        lambda *args, **kwargs: FakeConnection(),
+    )
+    monkeypatch.setattr(runner, "SqlServerObserver", FakeObserver)
+    monkeypatch.setattr(runner, "launch_with_port_retry", fake_launch)
+    monkeypatch.setattr(runner, "http_get_json", fake_get)
+    monkeypatch.setattr(runner, "http_request_json", fake_request)
+    monkeypatch.setattr(
+        runner,
+        "loopback_port_is_listening",
+        fake_port_not_listening,
+    )
+
+    result = await runner.run_native_graceful_query_scenario(
+        config,
+        isolated,
+        profile,
+        run_id="native-graceful-query",
+        policy=runner.SupervisorPolicy(),
+        sql_auth_settings=settings,
+        table_name="framework_items_native",
+        token=token,
+        value=73,
+        sql_delay_ms=250,
+    )
+
+    record = result.to_record()
+    assert record["status"] == "PASS"
+    assert record["graceful_stop"] is True
+    assert record["returncode"] == -signal.SIGTERM
+    assert record["response_value"] == 73
+    assert record["sessions_after"] == 0
+    assert events.index("request-start") < events.index("sql-observed")
+    assert events.index("sql-observed") < events.index("signal-sent")
+    assert events.index("signal-sent") < events.index("response-complete")
+    assert events.index("response-complete") < events.index("server-exit")
+    assert events[-1] == "observer-disconnect"
+
+
+@pytest.mark.parametrize(
+    ("outcome", "item_id", "durable_rows"),
+    (
+        ("commit", 84_271, ({"value": "transaction"},)),
+        ("rollback", 95_381, ()),
+    ),
+)
+@pytest.mark.asyncio
+async def test_graceful_transaction_scenario_proves_the_durable_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+    item_id: int,
+    durable_rows: tuple[dict[str, object], ...],
+) -> None:
+    runner = _load_production_framework_runner()
+    config = replace(
+        _config_with_actual_wheel_hash(runner, tmp_path),
+        database_mode="sql_auth",
+        global_connection_budget=8,
+    )
+    profile = replace(
+        _profile_by_family(
+            runner,
+            "fastapi-uvicorn-asyncio",
+            workers=1,
+        ),
+        database_mode="sql_auth",
+        platform_system=config.platform_system,
+    )
+    isolated = runner.prepare_isolated_application(
+        config,
+        source_directory=ROOT / "tests/production_framework",
+        directory_name=f"native-graceful-transaction-{outcome}-test",
+    )
+    settings = runner.SqlAuthObserverSettings(
+        host="127.0.0.1",
+        port=14334,
+        database="fastmssql_validation",
+        username="fastmssql_owner",
+        password="private-owner-password",
+    )
+    run_id = f"native-graceful-transaction-{outcome}"
+    token = f"transaction:{item_id}:{outcome}"
+    worker_application_name = f"fm-native-transaction-{outcome}-101"
+    ready = {
+        "phase": "ready",
+        "pid": 101,
+        "run_id": run_id,
+        "worker_application_name": worker_application_name,
+    }
+    observed = runner.SqlObserverSample(
+        applications=(
+            runner.ObserverApplicationSample(
+                application_name=worker_application_name,
+                host_process_ids=(101,),
+                sessions=1,
+                requests=1,
+            ),
+        ),
+        current_sessions=1,
+        current_requests=1,
+        maximum_sessions=1,
+        maximum_requests=1,
+        request_context_tokens=(token,),
+    )
+    zero = replace(
+        observed,
+        applications=(),
+        current_sessions=0,
+        current_requests=0,
+        request_context_tokens=(),
+    )
+    base_phase_record = {
+        "context_token_sha256": hashlib.sha256(token.encode("ascii")).hexdigest(),
+        "item_id": item_id,
+        "outcome": outcome,
+        "phase": "transaction",
+        "pid": 101,
+        "run_id": run_id,
+        "worker_application_name": worker_application_name,
+    }
+    events: list[str] = []
+    signal_sent = asyncio.Event()
+    response_completed = asyncio.Event()
+
+    class FakeQueryResult:
+        def all(self):
+            return list(durable_rows)
+
+    class FakeConnection:
+        async def connect(self, *, validate: bool) -> None:
+            assert validate is True
+            events.append("observer-connect")
+
+        async def execute(self, sql: str) -> None:
+            if sql.startswith("DROP TABLE"):
+                events.append("fixture-drop")
+            else:
+                assert sql.startswith("CREATE TABLE")
+                events.append("fixture-create")
+
+        async def query(self, sql: str, params: list[object]):
+            assert "WHERE [id] = @P1" in sql
+            assert params == [item_id]
+            events.append("durable-read")
+            return FakeQueryResult()
+
+        async def disconnect(self) -> None:
+            events.append("observer-disconnect")
+
+    class FakeObserver:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        async def wait_for_ready_workers(self, records, *, timeout_seconds):
+            assert tuple(records) == (ready,)
+            assert timeout_seconds > 0
+            return observed
+
+        async def wait_for_context_token(self, selected, *, present, timeout_seconds):
+            assert selected == token
+            assert present is True
+            assert timeout_seconds > 0
+            events.append("sql-observed")
+            return observed
+
+        async def wait_for_zero_sessions(self, *, timeout_seconds):
+            assert timeout_seconds > 0
+            return zero
+
+    process_outcome = runner.ProcessOutcome(
+        pid=90,
+        returncode=-signal.SIGTERM,
+        stdout="",
+        stderr="",
+        output_truncated=False,
+        descendant_pids=(101,),
+        graceful_stop=True,
+        forced_cleanup=False,
+    )
+
+    class FakeSupervisor:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            del args
+
+        async def wait_for_worker_records(self, **kwargs):
+            assert kwargs["expected_count"] == 1
+            return (ready,)
+
+        def read_worker_records(self, **kwargs):
+            assert kwargs["phase"] == "shutdown"
+            return ({**ready, "phase": "shutdown"},)
+
+        async def stop(self):
+            events.append("signal-sent")
+            signal_sent.set()
+            await response_completed.wait()
+            events.append("server-exit")
+            return process_outcome
+
+    async def fake_launch(**kwargs):
+        assert await kwargs["readiness_probe"](8127)
+        return runner.ServerLaunch(
+            supervisor=FakeSupervisor(),
+            port=8127,
+            attempts=1,
+            sanitized_command=(sys.executable, "-m", "uvicorn"),
+        )
+
+    async def fake_get(port: int, path: str, **kwargs):
+        assert port == 8127
+        assert path == "/ready"
+        assert kwargs["timeout_seconds"] > 0
+        return {"pid": 101, "state": "ready"}
+
+    async def fake_request(port: int, path: str, **kwargs):
+        assert port == 8127
+        assert path == f"/transaction/{item_id}?outcome={outcome}"
+        assert kwargs["method"] == "POST"
+        assert kwargs["expected_statuses"] == (200,)
+        events.append("request-start")
+        await signal_sent.wait()
+        events.append("response-complete")
+        response_completed.set()
+        return runner.LoopbackJsonResponse(
+            200,
+            {"item_id": item_id, "outcome": outcome, "session_id": 52},
+            0.25,
+        )
+
+    async def fake_phase_record(supervisor, **kwargs):
+        del supervisor
+        assert kwargs["expected_run_id"] == run_id
+        assert kwargs["expected_pid"] == 101
+        assert kwargs["expected_worker_application_name"] == worker_application_name
+        assert kwargs["item_id"] == item_id
+        assert kwargs["outcome"] == outcome
+        phase = kwargs["transaction_phase"]
+        events.append(f"phase-{phase}")
+        return {**base_phase_record, "transaction_phase": phase}
+
+    async def fake_port_not_listening(port: int) -> bool:
+        assert port == 8127
+        return False
+
+    connection = FakeConnection()
+    monkeypatch.setattr(
+        runner,
+        "create_observer_connection",
+        lambda *args, **kwargs: connection,
+    )
+    monkeypatch.setattr(runner, "SqlServerObserver", FakeObserver)
+    monkeypatch.setattr(runner, "launch_with_port_retry", fake_launch)
+    monkeypatch.setattr(runner, "http_get_json", fake_get)
+    monkeypatch.setattr(runner, "http_request_json", fake_request)
+    monkeypatch.setattr(
+        runner,
+        "wait_for_transaction_phase_record",
+        fake_phase_record,
+    )
+    monkeypatch.setattr(
+        runner,
+        "loopback_port_is_listening",
+        fake_port_not_listening,
+    )
+
+    result = await runner.run_native_graceful_transaction_scenario(
+        config,
+        isolated,
+        profile,
+        run_id=run_id,
+        policy=runner.SupervisorPolicy(),
+        sql_auth_settings=settings,
+        table_name=f"framework_tx_{outcome}_test",
+        item_id=item_id,
+        outcome=outcome,
+        sql_delay_ms=250,
+    )
+
+    record = result.to_record()
+    assert record["status"] == "PASS"
+    assert record["outcome"] == outcome
+    assert record["durable_result"] == (
+        "row-present" if outcome == "commit" else "row-absent"
+    )
+    assert record["graceful_stop"] is True
+    assert record["sessions_after"] == 0
+    assert events.index("request-start") < events.index("phase-holding")
+    assert events.index("phase-holding") < events.index("sql-observed")
+    assert events.index("sql-observed") < events.index("signal-sent")
+    assert events.index("signal-sent") < events.index("response-complete")
+    assert events.index("response-complete") < events.index("server-exit")
+    assert events.index("server-exit") < events.index("phase-settled")
+    assert events.index("phase-settled") < events.index("durable-read")
+    assert events[-2:] == ["fixture-drop", "observer-disconnect"]
+
+
+@pytest.mark.asyncio
+async def test_native_saturation_scenario_bounds_waiters_and_recovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _load_production_framework_runner()
+    config = replace(
+        _config_with_actual_wheel_hash(runner, tmp_path),
+        database_mode="sql_auth",
+        global_connection_budget=2,
+    )
+    profile = replace(
+        _profile_by_family(
+            runner,
+            "fastapi-uvicorn-asyncio",
+            workers=1,
+        ),
+        database_mode="sql_auth",
+        platform_system=config.platform_system,
+    )
+    isolated = runner.prepare_isolated_application(
+        config,
+        source_directory=ROOT / "tests/production_framework",
+        directory_name="native-saturation-test",
+    )
+    settings = runner.SqlAuthObserverSettings(
+        host="127.0.0.1",
+        port=14334,
+        database="fastmssql_validation",
+        username="fastmssql_owner",
+        password="private-owner-password",
+    )
+    run_id = "native-saturation"
+    application_name = "fm-native-saturation-101"
+    ready = {
+        "phase": "ready",
+        "pid": 101,
+        "run_id": run_id,
+        "worker_application_name": application_name,
+    }
+    busy = runner.SqlObserverSample(
+        applications=(
+            runner.ObserverApplicationSample(
+                application_name=application_name,
+                host_process_ids=(101,),
+                sessions=2,
+                requests=2,
+            ),
+        ),
+        current_sessions=2,
+        current_requests=2,
+        maximum_sessions=2,
+        maximum_requests=2,
+        request_context_tokens=(),
+    )
+    zero = replace(
+        busy,
+        applications=(),
+        current_sessions=0,
+        current_requests=0,
+    )
+    baseline = {
+        "admission": {"active": 0, "capacity": 4, "rejected": 0},
+        "pid": 101,
+        "pool": {
+            "active_connections": 0,
+            "connections": 1,
+            "get_timed_out": 0,
+            "idle_connections": 1,
+            "max_size": 2,
+            "pending_gets": 0,
+        },
+    }
+    saturated = {
+        "admission": {"active": 4, "capacity": 4, "rejected": 0},
+        "pid": 101,
+        "pool": {
+            "active_connections": 2,
+            "connections": 2,
+            "get_timed_out": 0,
+            "idle_connections": 0,
+            "max_size": 2,
+            "pending_gets": 2,
+        },
+    }
+    settled = {
+        "admission": {"active": 0, "capacity": 4, "rejected": 2},
+        "pid": 101,
+        "pool": {
+            "active_connections": 0,
+            "connections": 2,
+            "get_timed_out": 2,
+            "idle_connections": 2,
+            "max_size": 2,
+            "pending_gets": 0,
+        },
+    }
+    events: list[str] = []
+    release_waiters = asyncio.Event()
+    release_holders = asyncio.Event()
+    waiter_completions = 0
+    excess_starts = 0
+    settlement_calls = 0
+
+    class FakeConnection:
+        async def connect(self, *, validate: bool) -> None:
+            assert validate is True
+            events.append("observer-connect")
+
+        async def disconnect(self) -> None:
+            events.append("observer-disconnect")
+
+    class FakeObserver:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        async def wait_for_ready_workers(self, records, *, timeout_seconds):
+            assert tuple(records) == (ready,)
+            assert timeout_seconds > 0
+            return busy
+
+        async def wait_for_minimum_requests(
+            self,
+            minimum_requests,
+            *,
+            timeout_seconds,
+        ):
+            assert minimum_requests == 2
+            assert timeout_seconds > 0
+            events.append("sql-holders-observed")
+            return busy
+
+        async def wait_for_zero_sessions(self, *, timeout_seconds):
+            assert timeout_seconds > 0
+            events.append("sql-zero")
+            return zero
+
+    process_outcome = runner.ProcessOutcome(
+        pid=90,
+        returncode=0,
+        stdout="",
+        stderr="",
+        output_truncated=False,
+        descendant_pids=(101,),
+        graceful_stop=True,
+        forced_cleanup=False,
+    )
+
+    class FakeSupervisor:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            del args
+
+        async def wait_for_worker_records(self, **kwargs):
+            assert kwargs["expected_count"] == 1
+            return (ready,)
+
+        def read_worker_records(self, **kwargs):
+            assert kwargs["phase"] == "shutdown"
+            return ({**ready, "phase": "shutdown"},)
+
+        async def stop(self):
+            events.append("server-stop")
+            return process_outcome
+
+    async def fake_launch(**kwargs):
+        assert await kwargs["readiness_probe"](8128)
+        return runner.ServerLaunch(
+            supervisor=FakeSupervisor(),
+            port=8128,
+            attempts=1,
+            sanitized_command=(sys.executable, "-m", "uvicorn"),
+        )
+
+    async def fake_get(port: int, path: str, **kwargs):
+        assert port == 8128
+        assert path == "/ready"
+        assert kwargs["timeout_seconds"] > 0
+        return {"pid": 101, "state": "ready"}
+
+    async def fake_request(port: int, path: str, **kwargs):
+        nonlocal waiter_completions, excess_starts
+        assert port == 8128
+        assert kwargs["timeout_seconds"] > 0
+        if path == "/pool":
+            assert kwargs["expected_statuses"] == (200,)
+            return runner.LoopbackJsonResponse(200, baseline, 0.001)
+        value = int(path.rsplit("/", maxsplit=1)[1])
+        if value in {31, 37}:
+            assert kwargs["expected_statuses"] == (200,)
+            events.append(f"holder-start-{value}")
+            await release_holders.wait()
+            events.append(f"holder-complete-{value}")
+            return runner.LoopbackJsonResponse(
+                200,
+                {"session_id": 50 + (value == 37), "value": value},
+                2.0,
+            )
+        if value in {41, 43}:
+            assert kwargs["expected_statuses"] == (504,)
+            events.append(f"waiter-start-{value}")
+            await release_waiters.wait()
+            waiter_completions += 1
+            events.append(f"waiter-timeout-{value}")
+            if waiter_completions == 2:
+                release_holders.set()
+            return runner.LoopbackJsonResponse(
+                504,
+                {
+                    "error": "pool_acquire_timeout",
+                    "operation": "query",
+                    "phase": "acquire",
+                    "retryable": True,
+                },
+                0.5,
+            )
+        if value in {47, 49}:
+            assert kwargs["expected_statuses"] == (503,)
+            excess_starts += 1
+            events.append(f"rejected-{value}")
+            if excess_starts == 2:
+                release_waiters.set()
+            return runner.LoopbackJsonResponse(
+                503,
+                {"error": "saturated"},
+                0.01,
+            )
+        assert value == 59
+        assert kwargs["expected_statuses"] == (200,)
+        assert release_holders.is_set()
+        events.append("recovery")
+        return runner.LoopbackJsonResponse(
+            200,
+            {"session_id": 53, "value": 59},
+            2.0,
+        )
+
+    async def fake_saturation_wait(port: int, **kwargs):
+        assert port == 8128
+        assert kwargs["expected_pid"] == 101
+        assert kwargs["pool_max"] == 2
+        assert kwargs["expected_waiters"] == 2
+        assert kwargs["timeout_seconds"] > 0
+        assert "holder-start-31" in events
+        assert "holder-start-37" in events
+        assert "waiter-start-41" in events
+        assert "waiter-start-43" in events
+        events.append("saturation-observed")
+        return saturated
+
+    async def fake_pool_settlement(port: int, **kwargs):
+        nonlocal settlement_calls
+        assert port == 8128
+        assert kwargs["expected_pid"] == 101
+        assert kwargs["timeout_seconds"] > 0
+        settlement_calls += 1
+        events.append(f"settled-{settlement_calls}")
+        return settled
+
+    async def fake_port_not_listening(port: int) -> bool:
+        assert port == 8128
+        return False
+
+    monkeypatch.setattr(
+        runner,
+        "create_observer_connection",
+        lambda *args, **kwargs: FakeConnection(),
+    )
+    monkeypatch.setattr(runner, "SqlServerObserver", FakeObserver)
+    monkeypatch.setattr(runner, "launch_with_port_retry", fake_launch)
+    monkeypatch.setattr(runner, "http_get_json", fake_get)
+    monkeypatch.setattr(runner, "http_request_json", fake_request)
+    monkeypatch.setattr(
+        runner,
+        "wait_for_saturation_state",
+        fake_saturation_wait,
+    )
+    monkeypatch.setattr(
+        runner,
+        "wait_for_pool_settlement",
+        fake_pool_settlement,
+    )
+    monkeypatch.setattr(
+        runner,
+        "loopback_port_is_listening",
+        fake_port_not_listening,
+    )
+
+    result = await runner.run_native_saturation_scenario(
+        config,
+        isolated,
+        profile,
+        run_id=run_id,
+        policy=runner.SupervisorPolicy(),
+        sql_auth_settings=settings,
+        table_name="framework_items_native",
+        holder_values=(31, 37),
+        waiter_values=(41, 43),
+        excess_values=(47, 49),
+        recovery_value=59,
+        sql_delay_ms=2_000,
+        acquire_timeout_ms=500,
+    )
+
+    record = result.to_record()
+    assert record["status"] == "PASS"
+    assert record["pool_max_per_worker"] == 2
+    assert record["admitted_waiters"] == 2
+    assert record["rejected_requests"] == 2
+    assert record["acquire_timeouts"] == 2
+    assert record["sessions_after"] == 0
+    assert events.index("sql-holders-observed") < events.index(
+        "saturation-observed"
+    )
+    assert events.index("saturation-observed") < events.index("rejected-47")
+    assert events.index("rejected-49") < events.index("waiter-timeout-41")
+    assert events.index("waiter-timeout-43") < events.index(
+        "holder-complete-31"
+    )
+    assert events.index("holder-complete-37") < events.index("settled-1")
+    assert events.index("settled-1") < events.index("recovery")
+    assert events.index("recovery") < events.index("settled-2")
+    assert events.index("settled-2") < events.index("server-stop")
+    assert events[-1] == "observer-disconnect"
+
+
+@pytest.mark.asyncio
+async def test_native_streaming_scenario_consumes_closes_and_recovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _load_production_framework_runner()
+    config = replace(
+        _config_with_actual_wheel_hash(runner, tmp_path),
+        database_mode="sql_auth",
+        global_connection_budget=2,
+    )
+    profile = replace(
+        _profile_by_family(
+            runner,
+            "fastapi-uvicorn-asyncio",
+            workers=1,
+        ),
+        database_mode="sql_auth",
+        platform_system=config.platform_system,
+    )
+    isolated = runner.prepare_isolated_application(
+        config,
+        source_directory=ROOT / "tests/production_framework",
+        directory_name="native-streaming-test",
+    )
+    settings = runner.SqlAuthObserverSettings(
+        host="127.0.0.1",
+        port=14334,
+        database="fastmssql_validation",
+        username="fastmssql_owner",
+        password="private-owner-password",
+    )
+    run_id = "native-streaming"
+    application_name = "fm-native-streaming-101"
+    ready = {
+        "phase": "ready",
+        "pid": 101,
+        "run_id": run_id,
+        "worker_application_name": application_name,
+    }
+    active = runner.SqlObserverSample(
+        applications=(
+            runner.ObserverApplicationSample(
+                application_name=application_name,
+                host_process_ids=(0,),
+                sessions=1,
+                requests=1,
+            ),
+        ),
+        current_sessions=1,
+        current_requests=1,
+        maximum_sessions=1,
+        maximum_requests=1,
+        request_context_tokens=(),
+    )
+    idle = replace(active, current_requests=0)
+    zero = replace(
+        active,
+        applications=(),
+        current_sessions=0,
+        current_requests=0,
+    )
+    settled_pool = {
+        "admission": {"active": 0, "capacity": 4, "rejected": 0},
+        "pid": 101,
+        "pool": {
+            "active_connections": 0,
+            "connections": 1,
+            "idle_connections": 1,
+            "max_size": 2,
+            "pending_gets": 0,
+        },
+    }
+    full_observation = runner.FullNdjsonObservation(
+        status_code=200,
+        content_type="application/x-ndjson; charset=utf-8",
+        row_count=100,
+        value_digest=hashlib.sha256(
+            b"".join(f"{value}\n".encode("ascii") for value in range(1, 101))
+        ).hexdigest(),
+        bytes_received=3_692,
+        first_data_seconds=0.01,
+        elapsed_seconds=0.2,
+    )
+    early_observation = runner.EarlyCloseNdjsonObservation(
+        status_code=200,
+        content_type="application/x-ndjson; charset=utf-8",
+        requested_rows=1_000,
+        prefix_rows=32,
+        prefix_digest=hashlib.sha256(
+            b"".join(f"{value}\n".encode("ascii") for value in range(1, 33))
+        ).hexdigest(),
+        bytes_received=1_174,
+        first_data_seconds=0.01,
+        close_seconds=0.05,
+    )
+    events: list[str] = []
+    settlement_calls = 0
+    rss_samples = iter((1_000, 1_100))
+
+    class FakeConnection:
+        async def connect(self, *, validate: bool) -> None:
+            assert validate is True
+            events.append("observer-connect")
+
+        async def disconnect(self) -> None:
+            events.append("observer-disconnect")
+
+    class FakeObserver:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        async def wait_for_ready_workers(self, records, *, timeout_seconds):
+            assert tuple(records) == (ready,)
+            assert timeout_seconds > 0
+            return active
+
+        async def wait_for_minimum_requests(
+            self,
+            minimum_requests,
+            *,
+            timeout_seconds,
+        ):
+            assert minimum_requests == 1
+            assert timeout_seconds > 0
+            events.append("early-sql-active")
+            return active
+
+        async def wait_for_zero_requests(self, *, timeout_seconds):
+            assert timeout_seconds > 0
+            events.append("early-sql-idle")
+            return idle
+
+        async def wait_for_zero_sessions(self, *, timeout_seconds):
+            assert timeout_seconds > 0
+            events.append("sql-zero")
+            return zero
+
+    process_outcome = runner.ProcessOutcome(
+        pid=90,
+        returncode=0,
+        stdout="",
+        stderr="",
+        output_truncated=False,
+        descendant_pids=(101,),
+        graceful_stop=True,
+        forced_cleanup=False,
+    )
+
+    class FakeSupervisor:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            del args
+
+        async def wait_for_worker_records(self, **kwargs):
+            assert kwargs["expected_count"] == 1
+            return (ready,)
+
+        def read_worker_records(self, **kwargs):
+            assert kwargs["phase"] == "shutdown"
+            return ({**ready, "phase": "shutdown"},)
+
+        async def stop(self):
+            events.append("server-stop")
+            return process_outcome
+
+    async def fake_launch(**kwargs):
+        assert await kwargs["readiness_probe"](8129)
+        return runner.ServerLaunch(
+            supervisor=FakeSupervisor(),
+            port=8129,
+            attempts=1,
+            sanitized_command=(sys.executable, "-m", "uvicorn"),
+        )
+
+    async def fake_get(port: int, path: str, **kwargs):
+        assert port == 8129
+        assert path == "/ready"
+        assert kwargs["timeout_seconds"] > 0
+        return {"pid": 101, "state": "ready"}
+
+    async def fake_full_stream(port: int, path: str, **kwargs):
+        assert port == 8129
+        assert path == "/stream?rows=100"
+        assert kwargs["expected_rows"] == 100
+        assert kwargs["timeout_seconds"] > 0
+        events.append("full-stream")
+        return full_observation
+
+    async def fake_early_stream(port: int, path: str, **kwargs):
+        assert port == 8129
+        assert path == "/stream?rows=1000"
+        assert kwargs["requested_rows"] == 1_000
+        assert kwargs["prefix_rows"] == 32
+        assert kwargs["timeout_seconds"] > 0
+        events.append("early-open")
+        await kwargs["before_read"]()
+        events.append("early-close")
+        return early_observation
+
+    async def fake_pool_settlement(port: int, **kwargs):
+        nonlocal settlement_calls
+        assert port == 8129
+        assert kwargs["expected_pid"] == 101
+        assert kwargs["timeout_seconds"] > 0
+        settlement_calls += 1
+        events.append(f"settled-{settlement_calls}")
+        return settled_pool
+
+    async def fake_request(port: int, path: str, **kwargs):
+        assert port == 8129
+        assert path == "/value/73"
+        assert kwargs["expected_statuses"] == (200,)
+        events.append("recovery")
+        return runner.LoopbackJsonResponse(
+            200,
+            {"session_id": 53, "value": 73},
+            0.01,
+        )
+
+    def fake_rss(pids: tuple[int, ...]) -> int:
+        assert pids == (101,)
+        value = next(rss_samples)
+        events.append(f"rss-{value}")
+        return value
+
+    async def fake_rss_monitor(pids, *, stop, **kwargs):
+        assert pids == (101,)
+        del kwargs
+        await stop.wait()
+        events.append("rss-peak")
+        return 1_200
+
+    async def fake_port_not_listening(port: int) -> bool:
+        assert port == 8129
+        return False
+
+    monkeypatch.setattr(
+        runner,
+        "create_observer_connection",
+        lambda *args, **kwargs: FakeConnection(),
+    )
+    monkeypatch.setattr(runner, "SqlServerObserver", FakeObserver)
+    monkeypatch.setattr(runner, "launch_with_port_retry", fake_launch)
+    monkeypatch.setattr(runner, "http_get_json", fake_get)
+    monkeypatch.setattr(runner, "consume_ndjson_stream", fake_full_stream)
+    monkeypatch.setattr(
+        runner,
+        "read_ndjson_prefix_and_close",
+        fake_early_stream,
+    )
+    monkeypatch.setattr(
+        runner,
+        "wait_for_pool_settlement",
+        fake_pool_settlement,
+    )
+    monkeypatch.setattr(runner, "http_request_json", fake_request)
+    monkeypatch.setattr(runner, "process_rss_bytes", fake_rss)
+    monkeypatch.setattr(runner, "monitor_process_rss", fake_rss_monitor)
+    monkeypatch.setattr(
+        runner,
+        "loopback_port_is_listening",
+        fake_port_not_listening,
+    )
+
+    result = await runner.run_native_streaming_scenario(
+        config,
+        isolated,
+        profile,
+        run_id=run_id,
+        policy=runner.SupervisorPolicy(),
+        sql_auth_settings=settings,
+        table_name="framework_items_native",
+        full_rows=100,
+        early_rows=1_000,
+        early_prefix_rows=32,
+        recovery_value=73,
+        rss_growth_limit_bytes=500,
+    )
+
+    record = result.to_record()
+    assert record["status"] == "PASS"
+    assert record["full_rows"] == 100
+    assert record["early_prefix_rows"] == 32
+    assert record["early_sql_requests_after"] == 0
+    assert record["rss_growth_bytes"] == 200
+    assert record["sessions_after"] == 0
+    assert events.index("full-stream") < events.index("settled-1")
+    assert events.index("early-open") < events.index("early-sql-active")
+    assert events.index("early-sql-active") < events.index("early-close")
+    assert events.index("early-close") < events.index("early-sql-idle")
+    assert events.index("early-sql-idle") < events.index("settled-2")
+    assert events.index("settled-2") < events.index("recovery")
+    assert events.index("recovery") < events.index("settled-3")
+    assert events.index("rss-peak") < events.index("server-stop")
+    assert events[-1] == "observer-disconnect"
+
+
+@pytest.mark.asyncio
+async def test_collect_worker_payloads_reaches_every_expected_pid() -> None:
+    runner = _load_production_framework_runner()
+    observed = iter(
+        [
+            {"pid": 202, "principal": "fastmssql_owner"},
+            {"pid": 202, "principal": "fastmssql_owner"},
+            {"pid": 101, "principal": "fastmssql_owner"},
+            {"pid": 101, "principal": "fastmssql_owner"},
+        ]
+    )
+
+    async def request_json(port: int, path: str, **kwargs):
+        assert port == 8123
+        assert path == "/principal"
+        assert kwargs["timeout_seconds"] > 0
+        return next(observed)
+
+    payloads = await runner.collect_worker_payloads(
+        8123,
+        "/principal",
+        expected_pids=(101, 202),
+        timeout_seconds=0.1,
+        request_json=request_json,
+    )
+
+    assert tuple(payload["pid"] for payload in payloads) == (101, 202)
+
+    async def unexpected_worker(port: int, path: str, **kwargs):
+        del port, path, kwargs
+        return {"pid": 303}
+
+    with pytest.raises(
+        runner.WorkerEvidenceError,
+        match="unexpected worker PID",
+    ):
+        await runner.collect_worker_payloads(
+            8123,
+            "/principal",
+            expected_pids=(101, 202),
+            timeout_seconds=0.1,
+            request_json=unexpected_worker,
+        )
+
+
+@pytest.mark.asyncio
+async def test_collect_worker_payloads_uses_bounded_parallel_probe_waves() -> None:
+    runner = _load_production_framework_runner()
+    released = asyncio.Event()
+    active = 0
+    maximum_active = 0
+    call_index = 0
+
+    async def concurrency_sensitive_request(port: int, path: str, **kwargs):
+        nonlocal active, maximum_active, call_index
+        assert port == 8123
+        assert path == "/principal"
+        assert kwargs["timeout_seconds"] > 0
+        selected_index = call_index
+        call_index += 1
+        active += 1
+        maximum_active = max(maximum_active, active)
+        if active >= 2:
+            released.set()
+        try:
+            await released.wait()
+            return {
+                "pid": 101 if selected_index % 2 == 0 else 202,
+                "principal": "fastmssql_owner",
+            }
+        finally:
+            active -= 1
+
+    payloads = await runner.collect_worker_payloads(
+        8123,
+        "/principal",
+        expected_pids=(101, 202),
+        timeout_seconds=0.1,
+        request_json=concurrency_sensitive_request,
+    )
+
+    assert tuple(payload["pid"] for payload in payloads) == (101, 202)
+    assert maximum_active == 2
+
+
+def test_native_scaling_evidence_reconciles_workers_pool_and_sql_budget(
+    tmp_path: Path,
+) -> None:
+    runner = _load_production_framework_runner()
+    config = replace(
+        _config_with_actual_wheel_hash(runner, tmp_path),
+        database_mode="sql_auth",
+        global_connection_budget=8,
+    )
+    profile = replace(
+        _profile_by_family(
+            runner,
+            "fastapi-uvicorn-asyncio",
+            workers=2,
+        ),
+        database_mode="sql_auth",
+        platform_system=config.platform_system,
+    )
+    ready_records = tuple(
+        {
+            "candidate_sha": config.candidate_sha,
+            "phase": "ready",
+            "pid": pid,
+            "pool_connected_monotonic": 12.0 + offset,
+            "pool_created_monotonic": 11.0 + offset,
+            "pool_created_pid": pid,
+            "pool_identity": f"pool-{pid}",
+            "pool_max_per_worker": 4,
+            "process_started_monotonic": 10.0 + offset,
+            "worker_application_name": f"fm-native-scale-{pid}",
+            "wheel_filename": config.wheel.name,
+            "wheel_sha256": config.wheel_sha256,
+        }
+        for offset, pid in enumerate((101, 202))
+    )
+    package_records = tuple(
+        {
+            "candidate_sha": config.candidate_sha,
+            "fastmssql_import_path": (
+                f"/isolated/site-packages/fastmssql-{pid}.so"
+            ),
+            "pid": pid,
+            "wheel_filename": config.wheel.name,
+            "wheel_sha256": config.wheel_sha256,
+        }
+        for pid in (101, 202)
+    )
+    principal_records = tuple(
+        {
+            "application_name": f"fm-native-scale-{pid}",
+            "pid": pid,
+            "principal": "fastmssql_owner",
+            "session_id": session_id,
+        }
+        for pid, session_id in ((101, 51), (202, 52))
+    )
+    pool_records = tuple(
+        {
+            "application_name": f"fm-native-scale-{pid}",
+            "pid": pid,
+            "admission": {"active": 0, "capacity": 8, "rejected": 0},
+            "operations": {"pending_operations": 0},
+            "pool": {
+                "active_connections": 0,
+                "connections": 2,
+                "idle_connections": 2,
+                "max_size": 4,
+                "pending_gets": 0,
+            },
+        }
+        for pid in (101, 202)
+    )
+    observer_sample = runner.SqlObserverSample(
+        applications=tuple(
+            runner.ObserverApplicationSample(
+                application_name=f"fm-native-scale-{pid}",
+                host_process_ids=(pid,),
+                sessions=2,
+                requests=1,
+            )
+            for pid in (101, 202)
+        ),
+        current_sessions=4,
+        current_requests=2,
+        maximum_sessions=4,
+        maximum_requests=2,
+        request_context_tokens=(),
+    )
+
+    evidence = runner.validate_native_scaling_evidence(
+        config=config,
+        profile=profile,
+        ready_records=ready_records,
+        package_records=package_records,
+        principal_records=principal_records,
+        pool_records=pool_records,
+        parameter_payloads=(
+            {"session_id": 51, "value": 731_901},
+            {"session_id": 52, "value": 731_902},
+        ),
+        expected_values=(731_901, 731_902),
+        expected_principal="fastmssql_owner",
+        observer_sample=observer_sample,
+    )
+
+    record = evidence.to_record()
+    assert record["profile_id"] == profile.id
+    assert record["ready_pids"] == [101, 202]
+    assert record["parameter_values"] == [731_901, 731_902]
+    assert record["pool_max_per_worker"] == 4
+    assert record["maximum_aggregate_sql_sessions"] == 4
+    assert record["maximum_simultaneous_sql_requests"] == 2
+    assert [worker["pid"] for worker in record["worker_records"]] == [101, 202]
+    assert all(worker["pool_created_pid"] == worker["pid"] for worker in record["worker_records"])
+
+    excessive_sessions = replace(observer_sample, maximum_sessions=9)
+    with pytest.raises(
+        runner.WorkerEvidenceError,
+        match="global connection budget",
+    ):
+        runner.validate_native_scaling_evidence(
+            config=config,
+            profile=profile,
+            ready_records=ready_records,
+            package_records=package_records,
+            principal_records=principal_records,
+            pool_records=pool_records,
+            parameter_payloads=(
+                {"session_id": 51, "value": 731_901},
+                {"session_id": 52, "value": 731_902},
+            ),
+            expected_values=(731_901, 731_902),
+            expected_principal="fastmssql_owner",
+            observer_sample=excessive_sessions,
+        )
+
+
+@pytest.mark.asyncio
+async def test_native_scaling_profile_runs_every_layer_and_tears_down(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _load_production_framework_runner()
+    config = replace(
+        _config_with_actual_wheel_hash(runner, tmp_path),
+        database_mode="sql_auth",
+        global_connection_budget=8,
+    )
+    profile = replace(
+        _profile_by_family(
+            runner,
+            "fastapi-uvicorn-asyncio",
+            workers=2,
+        ),
+        database_mode="sql_auth",
+        platform_system=config.platform_system,
+    )
+    isolated = runner.prepare_isolated_application(
+        config,
+        source_directory=ROOT / "tests/production_framework",
+        directory_name="native-scaling-test",
+    )
+    settings = runner.SqlAuthObserverSettings(
+        host="127.0.0.1",
+        port=14334,
+        database="fastmssql_validation",
+        username="fastmssql_owner",
+        password="private-owner-password",
+    )
+    events: list[object] = []
+    ready_records = tuple(
+        {
+            "candidate_sha": config.candidate_sha,
+            "phase": "ready",
+            "pid": pid,
+            "pool_connected_monotonic": 12.0 + offset,
+            "pool_created_monotonic": 11.0 + offset,
+            "pool_created_pid": pid,
+            "pool_identity": f"pool-{pid}",
+            "pool_max_per_worker": 4,
+            "process_started_monotonic": 10.0 + offset,
+            "run_id": "native-scale",
+            "worker_application_name": f"fm-native-scale-{pid}",
+            "wheel_filename": config.wheel.name,
+            "wheel_sha256": config.wheel_sha256,
+        }
+        for offset, pid in enumerate((101, 202))
+    )
+    shutdown_records = tuple(
+        {**record, "phase": "shutdown"} for record in ready_records
+    )
+    busy_sample = runner.SqlObserverSample(
+        applications=tuple(
+            runner.ObserverApplicationSample(
+                application_name=f"fm-native-scale-{pid}",
+                host_process_ids=(pid,),
+                sessions=2,
+                requests=1,
+            )
+            for pid in (101, 202)
+        ),
+        current_sessions=4,
+        current_requests=2,
+        maximum_sessions=4,
+        maximum_requests=2,
+        request_context_tokens=(),
+    )
+    zero_sample = runner.SqlObserverSample(
+        applications=(),
+        current_sessions=0,
+        current_requests=0,
+        maximum_sessions=4,
+        maximum_requests=2,
+        request_context_tokens=(),
+    )
+
+    class FakeObserverConnection:
+        async def connect(self, *, validate: bool) -> None:
+            events.append(("observer-connect", validate))
+
+        async def disconnect(self) -> None:
+            events.append("observer-disconnect")
+
+    class FakeObserver:
+        def __init__(self, **kwargs) -> None:
+            events.append(("observer", kwargs["worker_prefix"]))
+
+        async def wait_for_ready_workers(self, records, *, timeout_seconds):
+            assert tuple(records) == ready_records
+            assert timeout_seconds > 0
+            events.append("workers-observed")
+            return busy_sample
+
+        async def wait_for_minimum_requests(self, minimum, *, timeout_seconds):
+            assert minimum == 2
+            assert timeout_seconds > 0
+            events.append("wave-observed")
+            return busy_sample
+
+        async def sample(self):
+            return busy_sample
+
+        async def wait_for_zero_sessions(self, *, timeout_seconds):
+            assert timeout_seconds > 0
+            events.append("zero-sessions")
+            return zero_sample
+
+    outcome = runner.ProcessOutcome(
+        pid=90,
+        returncode=0,
+        stdout="",
+        stderr="",
+        output_truncated=False,
+        descendant_pids=(101, 202),
+        graceful_stop=True,
+        forced_cleanup=False,
+    )
+
+    class FakeSupervisor:
+        pid = 90
+        selected_outcome = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            del exc_type, exc, traceback
+            if self.selected_outcome is None:
+                await self.stop()
+
+        async def wait_for_worker_records(self, **kwargs):
+            assert kwargs["expected_count"] == 2
+            assert kwargs["expected_run_id"] == "native-scale"
+            return ready_records
+
+        def read_worker_records(self, **kwargs):
+            assert kwargs["phase"] == "shutdown"
+            return shutdown_records
+
+        def descendant_pids(self):
+            return (101, 202)
+
+        async def stop(self):
+            events.append("server-stop")
+            self.selected_outcome = outcome
+            return outcome
+
+    supervisor = FakeSupervisor()
+
+    async def fake_launch(**kwargs):
+        assert await kwargs["readiness_probe"](8123)
+        events.append("server-launch")
+        return runner.ServerLaunch(
+            supervisor=supervisor,
+            port=8123,
+            attempts=1,
+            sanitized_command=(sys.executable, "-m", "uvicorn"),
+        )
+
+    async def fake_get(port: int, path: str, **kwargs):
+        assert port == 8123
+        assert kwargs["timeout_seconds"] > 0
+        assert path == "/ready"
+        return {"pid": 101, "state": "ready"}
+
+    async def fake_collect(port: int, path: str, **kwargs):
+        assert port == 8123
+        assert kwargs["expected_pids"] == (101, 202)
+        if path == "/package":
+            return tuple(
+                {
+                    "candidate_sha": config.candidate_sha,
+                    "fastmssql_import_path": f"/site-packages/fastmssql-{pid}.so",
+                    "pid": pid,
+                    "wheel_filename": config.wheel.name,
+                    "wheel_sha256": config.wheel_sha256,
+                }
+                for pid in (101, 202)
+            )
+        if path == "/principal":
+            return tuple(
+                {
+                    "application_name": f"fm-native-scale-{pid}",
+                    "pid": pid,
+                    "principal": "fastmssql_owner",
+                    "session_id": session_id,
+                }
+                for pid, session_id in ((101, 51), (202, 52))
+            )
+        assert path == "/pool"
+        return tuple(
+            {
+                "application_name": f"fm-native-scale-{pid}",
+                "pid": pid,
+                "admission": {"active": 0, "capacity": 8, "rejected": 0},
+                "operations": {},
+                "pool": {
+                    "active_connections": 0,
+                    "connections": 2,
+                    "idle_connections": 2,
+                    "max_size": 4,
+                    "pending_gets": 0,
+                },
+            }
+            for pid in (101, 202)
+        )
+
+    async def fake_request(port: int, path: str, **kwargs):
+        assert port == 8123
+        assert kwargs["expected_statuses"] == (200,)
+        value = int(path.removeprefix("/wait/"))
+        return runner.LoopbackJsonResponse(
+            status_code=200,
+            payload={"session_id": 51, "value": value},
+            elapsed_seconds=0.01,
+        )
+
+    async def fake_port_not_listening(port: int) -> bool:
+        assert port == 8123
+        return False
+
+    monkeypatch.setattr(runner, "create_observer_connection", lambda *a, **k: FakeObserverConnection())
+    monkeypatch.setattr(runner, "SqlServerObserver", FakeObserver)
+    monkeypatch.setattr(runner, "launch_with_port_retry", fake_launch)
+    monkeypatch.setattr(runner, "http_get_json", fake_get)
+    monkeypatch.setattr(runner, "collect_worker_payloads", fake_collect)
+    monkeypatch.setattr(runner, "http_request_json", fake_request)
+    monkeypatch.setattr(runner, "validate_package_record", lambda *a, **k: dict(a[2]))
+    monkeypatch.setattr(
+        runner,
+        "loopback_port_is_listening",
+        fake_port_not_listening,
+    )
+
+    result = await runner.run_native_scaling_profile(
+        config,
+        isolated,
+        profile,
+        repository_root=ROOT,
+        run_id="native-scale",
+        policy=runner.SupervisorPolicy(),
+        sql_auth_settings=settings,
+        table_name="framework_items_native",
+        wave_values=(731_901, 731_902),
+    )
+
+    record = result.to_record()
+    assert record["status"] == "PASS"
+    assert record["ready_pids"] == [101, 202]
+    assert record["shutdown_pids"] == [101, 202]
+    assert record["sessions_after"] == 0
+    assert record["forced_cleanup"] is False
+    assert events[0] == ("observer-connect", True)
+    assert events[-1] == "observer-disconnect"
+    assert events.index("wave-observed") < events.index("server-stop")
+
+
+@pytest.mark.asyncio
+async def test_native_scaling_matrix_runs_every_selected_profile_deterministically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _load_production_framework_runner()
+    config = replace(
+        _config_with_actual_wheel_hash(runner, tmp_path),
+        database_mode="sql_auth",
+        global_connection_budget=8,
+    )
+    profiles = tuple(
+        replace(
+            _profile_by_family(
+                runner,
+                "fastapi-uvicorn-asyncio",
+                workers=workers,
+            ),
+            database_mode="sql_auth",
+            platform_system=config.platform_system,
+        )
+        for workers in (1, 4)
+    )
+    settings = runner.SqlAuthObserverSettings(
+        host="127.0.0.1",
+        port=14334,
+        database="fastmssql_validation",
+        username="fastmssql_owner",
+        password="private-owner-password",
+    )
+    calls: list[dict[str, object]] = []
+
+    async def fake_profile(config_arg, isolated, profile, **kwargs):
+        assert config_arg is config
+        assert isolated.root.is_relative_to(config.run_root)
+        calls.append({"profile": profile, **kwargs})
+        return profile.id
+
+    monkeypatch.setattr(runner, "native_fastapi_profiles", lambda platform: profiles)
+    monkeypatch.setattr(runner, "run_native_scaling_profile", fake_profile)
+
+    results = await runner.run_native_scaling_matrix(
+        config,
+        repository_root=ROOT,
+        source_directory=ROOT / "tests/production_framework",
+        sql_auth_settings=settings,
+        table_name="framework_items_native",
+        policy=runner.SupervisorPolicy(),
+    )
+
+    assert results == tuple(profile.id for profile in profiles)
+    assert [call["profile"] for call in calls] == list(profiles)
+    assert [call["run_id"] for call in calls] == [
+        "nscale-aaaaaaaa-1",
+        "nscale-aaaaaaaa-2",
+    ]
+    assert [call["wave_values"] for call in calls] == [
+        (731_101, 731_102),
+        (731_201, 731_202, 731_203, 731_204),
+    ]
+
+
+def test_native_concurrency_evidence_requires_true_overlap_and_responsiveness() -> None:
+    runner = _load_production_framework_runner()
+    busy_sample = runner.SqlObserverSample(
+        applications=(
+            runner.ObserverApplicationSample(
+                application_name="fm-native-concurrency-101",
+                host_process_ids=(101,),
+                sessions=4,
+                requests=4,
+            ),
+        ),
+        current_sessions=4,
+        current_requests=4,
+        maximum_sessions=4,
+        maximum_requests=4,
+        request_context_tokens=(),
+    )
+    payloads = tuple(
+        {"delay_ms": 250, "session_id": 50 + offset, "value": value}
+        for offset, value in enumerate((741_001, 741_002, 741_003, 741_004), start=1)
+    )
+    pool_record = {
+        "admission": {"active": 0, "capacity": 16, "rejected": 0},
+        "operations": {},
+        "pid": 101,
+        "pool": {
+            "active_connections": 0,
+            "connections": 4,
+            "idle_connections": 4,
+            "max_size": 8,
+            "pending_gets": 0,
+        },
+    }
+
+    evidence = runner.validate_native_concurrency_evidence(
+        sequential_payloads=payloads,
+        concurrent_payloads=payloads,
+        expected_values=(741_001, 741_002, 741_003, 741_004),
+        sequential_seconds=1.05,
+        concurrent_seconds=0.28,
+        health_seconds=0.01,
+        sql_delay_ms=250,
+        observer_sample=busy_sample,
+        pool_record=pool_record,
+    )
+
+    assert evidence.to_record() == {
+        "concurrent_seconds": 0.28,
+        "health_seconds": 0.01,
+        "maximum_simultaneous_sql_requests": 4,
+        "pool_active_after": 0,
+        "pool_pending_after": 0,
+        "sequential_seconds": 1.05,
+        "sql_delay_seconds": 0.25,
+        "status": "PASS",
+        "values_exact": True,
+    }
+
+    with pytest.raises(
+        runner.WorkerEvidenceError,
+        match="concurrent SQL wave did not beat",
+    ):
+        runner.validate_native_concurrency_evidence(
+            sequential_payloads=payloads,
+            concurrent_payloads=payloads,
+            expected_values=(741_001, 741_002, 741_003, 741_004),
+            sequential_seconds=1.0,
+            concurrent_seconds=0.75,
+            health_seconds=0.01,
+            sql_delay_ms=250,
+            observer_sample=busy_sample,
+            pool_record=pool_record,
+        )
+
+
+@pytest.mark.asyncio
+async def test_native_concurrency_scenario_measures_same_server_and_cleans_up(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _load_production_framework_runner()
+    config = replace(
+        _config_with_actual_wheel_hash(runner, tmp_path),
+        database_mode="sql_auth",
+        global_connection_budget=8,
+    )
+    profile = replace(
+        _profile_by_family(
+            runner,
+            "fastapi-uvicorn-asyncio",
+            workers=1,
+        ),
+        database_mode="sql_auth",
+        platform_system=config.platform_system,
+    )
+    isolated = runner.prepare_isolated_application(
+        config,
+        source_directory=ROOT / "tests/production_framework",
+        directory_name="native-concurrency-test",
+    )
+    settings = runner.SqlAuthObserverSettings(
+        host="127.0.0.1",
+        port=14334,
+        database="fastmssql_validation",
+        username="fastmssql_owner",
+        password="private-owner-password",
+    )
+    ready_record = {
+        "phase": "ready",
+        "pid": 101,
+        "run_id": "native-concurrency",
+        "worker_application_name": "fm-native-concurrency-101",
+    }
+    shutdown_record = {**ready_record, "phase": "shutdown"}
+    busy_sample = runner.SqlObserverSample(
+        applications=(
+            runner.ObserverApplicationSample(
+                application_name="fm-native-concurrency-101",
+                host_process_ids=(101,),
+                sessions=4,
+                requests=4,
+            ),
+        ),
+        current_sessions=4,
+        current_requests=4,
+        maximum_sessions=4,
+        maximum_requests=4,
+        request_context_tokens=(),
+    )
+    zero_sample = replace(
+        busy_sample,
+        applications=(),
+        current_sessions=0,
+        current_requests=0,
+    )
+    events: list[str] = []
+
+    class FakeConnection:
+        async def connect(self, *, validate: bool) -> None:
+            assert validate is True
+            events.append("observer-connect")
+
+        async def disconnect(self) -> None:
+            events.append("observer-disconnect")
+
+    class FakeObserver:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        async def wait_for_ready_workers(self, records, *, timeout_seconds):
+            assert tuple(records) == (ready_record,)
+            assert timeout_seconds > 0
+            return busy_sample
+
+        async def wait_for_minimum_requests(self, minimum, *, timeout_seconds):
+            assert minimum == 2
+            assert timeout_seconds > 0
+            return busy_sample
+
+        async def sample(self):
+            return busy_sample
+
+        async def wait_for_zero_sessions(self, *, timeout_seconds):
+            assert timeout_seconds > 0
+            return zero_sample
+
+    outcome = runner.ProcessOutcome(
+        pid=90,
+        returncode=0,
+        stdout="",
+        stderr="",
+        output_truncated=False,
+        descendant_pids=(101,),
+        graceful_stop=True,
+        forced_cleanup=False,
+    )
+
+    class FakeSupervisor:
+        pid = 90
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            del args
+
+        async def wait_for_worker_records(self, **kwargs):
+            assert kwargs["expected_count"] == 1
+            return (ready_record,)
+
+        def read_worker_records(self, **kwargs):
+            assert kwargs["phase"] == "shutdown"
+            return (shutdown_record,)
+
+        async def stop(self):
+            events.append("server-stop")
+            return outcome
+
+    async def fake_launch(**kwargs):
+        assert await kwargs["readiness_probe"](8124)
+        return runner.ServerLaunch(
+            supervisor=FakeSupervisor(),
+            port=8124,
+            attempts=1,
+            sanitized_command=(sys.executable, "-m", "uvicorn"),
+        )
+
+    async def fake_get(port: int, path: str, **kwargs):
+        assert port == 8124
+        assert path == "/ready"
+        assert kwargs["timeout_seconds"] > 0
+        return {"pid": 101, "state": "ready"}
+
+    async def fake_request(port: int, path: str, **kwargs):
+        assert port == 8124
+        assert kwargs["expected_statuses"] == (200,)
+        if path.startswith("/wait/"):
+            await asyncio.sleep(0.02)
+            value = int(path.removeprefix("/wait/"))
+            payload = {"delay_ms": 250, "session_id": 51, "value": value}
+        elif path == "/ready":
+            payload = {"pid": 101, "state": "ready"}
+        else:
+            assert path == "/pool"
+            payload = {
+                "pid": 101,
+                "pool": {
+                    "active_connections": 0,
+                    "connections": 4,
+                    "idle_connections": 4,
+                    "max_size": 8,
+                    "pending_gets": 0,
+                },
+            }
+        return runner.LoopbackJsonResponse(
+            status_code=200,
+            payload=payload,
+            elapsed_seconds=0.001,
+        )
+
+    async def fake_port_not_listening(port: int) -> bool:
+        assert port == 8124
+        return False
+
+    monkeypatch.setattr(runner, "create_observer_connection", lambda *a, **k: FakeConnection())
+    monkeypatch.setattr(runner, "SqlServerObserver", FakeObserver)
+    monkeypatch.setattr(runner, "launch_with_port_retry", fake_launch)
+    monkeypatch.setattr(runner, "http_get_json", fake_get)
+    monkeypatch.setattr(runner, "http_request_json", fake_request)
+    monkeypatch.setattr(runner, "loopback_port_is_listening", fake_port_not_listening)
+
+    result = await runner.run_native_concurrency_scenario(
+        config,
+        isolated,
+        profile,
+        run_id="native-concurrency",
+        policy=runner.SupervisorPolicy(),
+        sql_auth_settings=settings,
+        table_name="framework_items_native",
+        values=(741_001, 741_002, 741_003, 741_004),
+        sql_delay_ms=250,
+    )
+
+    record = result.to_record()
+    assert record["status"] == "PASS"
+    assert record["maximum_simultaneous_sql_requests"] == 4
+    assert record["ready_pids"] == [101]
+    assert record["shutdown_pids"] == [101]
+    assert record["sessions_after"] == 0
+    assert events == ["observer-connect", "server-stop", "observer-disconnect"]
 
 
 def test_observer_connection_factory_lazily_uses_one_installed_wheel_pool(
@@ -3204,6 +7008,12 @@ async def test_native_fastapi_lifespan_owns_one_pool_in_the_worker_pid(
         ready_payload = json.loads(ready_record.read_text(encoding="utf-8"))
         assert ready_payload["phase"] == "ready"
         assert ready_payload["pid"] == os.getpid()
+        assert ready_payload["pool_created_pid"] == os.getpid()
+        assert (
+            ready_payload["process_started_monotonic"]
+            <= ready_payload["pool_created_monotonic"]
+            <= ready_payload["pool_connected_monotonic"]
+        )
         assert environment[
             "FASTMSSQL_SQL_AUTH_OWNER_PASSWORD"
         ] not in ready_record.read_text(encoding="utf-8")
@@ -3242,7 +7052,8 @@ async def test_default_connection_factory_applies_the_per_worker_budget(
         assert pool.max_size == 4
         assert pool.min_idle == 0
         assert constructor_arguments["operation_metrics_config"].enabled is True
-        assert constructor_arguments["timeout_config"].acquire_timeout_secs == 5
+        assert constructor_arguments["pool_config"].connection_timeout_secs is None
+        assert constructor_arguments["timeout_config"].acquire_timeout_secs == 0.25
         assert constructor_arguments["lifecycle_config"].shutdown_timeout_secs == 15
 
 

@@ -713,7 +713,7 @@ required.
 - modify: `tests/test_production_framework_contract.py`
 - modify: `VERSION.md`
 
-- [ ] **Step 7.1: process scaling matrix**
+- [x] **Step 7.1: process scaling matrix**
 
 Implement Uvicorn asyncio/uvloop and Gunicorn Uvicorn-worker profiles at
 `1/2/4/8`.
@@ -728,19 +728,19 @@ For each:
 - enforce aggregate budget;
 - stop and reconcile shutdown PIDs/sessions.
 
-- [ ] **Step 7.2: native concurrency**
+- [x] **Step 7.2: native concurrency**
 
 Measure sequential and concurrent SQL waits on one Uvicorn worker and a
 lightweight health request during the wave. Use same-run ratios and exact
 results, not an absolute throughput threshold.
 
-- [ ] **Step 7.3: real disconnect cancellation**
+- [x] **Step 7.3: real disconnect cancellation**
 
 Use raw/HTTP streaming client behavior to close the socket only after the SQL
 observer sees the unique token. Require SQL disappearance, settled
 cancellation, pool recovery and a successful next request.
 
-- [ ] **Step 7.4: graceful query shutdown**
+- [x] **Step 7.4: graceful query shutdown**
 
 On POSIX:
 
@@ -750,12 +750,12 @@ On POSIX:
 - require the response and normal server exit;
 - require every shutdown record and zero sessions.
 
-- [ ] **Step 7.5: graceful pooled transaction shutdown**
+- [x] **Step 7.5: graceful pooled transaction shutdown**
 
 Run separate commit and rollback profiles. The app signals its transaction
 phase structurally; SQL Server proves the selected durable/absent row outcome.
 
-- [ ] **Step 7.6: saturation and recovery**
+- [x] **Step 7.6: saturation and recovery**
 
 For one worker:
 
@@ -767,7 +767,7 @@ For one worker:
 - settle holders/waiters;
 - run recovery.
 
-- [ ] **Step 7.7: real HTTP streaming**
+- [x] **Step 7.7: real HTTP streaming**
 
 Full-consumption profile:
 
@@ -784,7 +784,7 @@ Early-close profile:
 - settle generator/ResultStream;
 - observe SQL disappearance and pool recovery.
 
-- [ ] **Step 7.8: verify specialized native evidence and commit**
+- [x] **Step 7.8: verify specialized native evidence and commit**
 
 Commit:
 
