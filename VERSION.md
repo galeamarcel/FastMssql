@@ -52,6 +52,17 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Production framework case-validator review RED
+
+- Added behavioral review reproductions for platform-native absolute wheel
+  import paths, exact execution-model ownership, nonempty positive worker PID
+  lifecycles, exact integer counters and graceful-transaction provenance.
+- Required the fixed-worker validator to recompute the deterministic
+  worker-stride digest instead of accepting two mutually forged digest fields,
+  while preserving valid finite histogram evidence across floating-point
+  accumulation noise. These are harness-only RED contracts; no
+  FastMssql/Tiberius runtime or displayed `0.7.7` package version changed.
+
 ### Production framework case-validator evidence alignment
 
 - Aligned the canonical FRAME-028 and FRAME-036--FRAME-045 validators with

@@ -870,7 +870,10 @@ def _runtime_shaped_case_evidence() -> dict[str, object]:
             (1, 2, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000)
         )
     ]
-    value_digest = "c" * 64
+    value_digest = (
+        "9f8d50c88a799974d40cb5af35f1f2cf"
+        "cf1339551ca2c9c008ae6da400bdc5ff"
+    )
     return {
         "candidate": {
             "git_sha": candidate_sha,
@@ -1283,3 +1286,710 @@ def test_case_validator_accepts_runtime_shape_and_rejects_primary_mutation(
     assert forged["violations"] == [], case_id
     with pytest.raises(AssertionError):
         validator(forged)
+
+
+_CASE_VALIDATOR_REVIEW_DEFECTS = (
+    (
+        "FRAME-028-windows-path-on-posix",
+        test_every_worker_imports_the_exact_isolated_wheel,
+        (
+            (
+                ("candidate", "wheel", "import_path"),
+                r"C:\wheel-venv\Lib\site-packages\fastmssql\__init__.py",
+            ),
+            (
+                (
+                    "profiles",
+                    0,
+                    "worker_records",
+                    0,
+                    "fastmssql_import_path",
+                ),
+                r"C:\wheel-venv\Lib\site-packages\fastmssql\__init__.py",
+            ),
+        ),
+    ),
+    (
+        "FRAME-028-relative-posix-path",
+        test_every_worker_imports_the_exact_isolated_wheel,
+        (
+            (
+                ("candidate", "wheel", "import_path"),
+                "opt/wheel-venv/lib/site-packages/fastmssql/__init__.py",
+            ),
+            (
+                (
+                    "profiles",
+                    0,
+                    "worker_records",
+                    0,
+                    "fastmssql_import_path",
+                ),
+                "opt/wheel-venv/lib/site-packages/fastmssql/__init__.py",
+            ),
+        ),
+    ),
+    (
+        "FRAME-028-wrong-terminal-package",
+        test_every_worker_imports_the_exact_isolated_wheel,
+        (
+            (
+                ("candidate", "wheel", "import_path"),
+                "/opt/wheel-venv/lib/site-packages/not-fastmssql/__init__.py",
+            ),
+            (
+                (
+                    "profiles",
+                    0,
+                    "worker_records",
+                    0,
+                    "fastmssql_import_path",
+                ),
+                "/opt/wheel-venv/lib/site-packages/not-fastmssql/__init__.py",
+            ),
+        ),
+    ),
+    (
+        "FRAME-028-posix-path-on-windows",
+        test_every_worker_imports_the_exact_isolated_wheel,
+        (
+            (("platform", "system"), "Windows"),
+            (
+                ("candidate", "wheel", "import_path"),
+                "/opt/wheel-venv/lib/site-packages/fastmssql/__init__.py",
+            ),
+            (
+                (
+                    "profiles",
+                    0,
+                    "worker_records",
+                    0,
+                    "fastmssql_import_path",
+                ),
+                "/opt/wheel-venv/lib/site-packages/fastmssql/__init__.py",
+            ),
+        ),
+    ),
+    (
+        "FRAME-028-parent-segment",
+        test_every_worker_imports_the_exact_isolated_wheel,
+        (
+            (
+                ("candidate", "wheel", "import_path"),
+                (
+                    "/opt/wheel-venv/lib/site-packages/other/../"
+                    "fastmssql/__init__.py"
+                ),
+            ),
+            (
+                (
+                    "profiles",
+                    0,
+                    "worker_records",
+                    0,
+                    "fastmssql_import_path",
+                ),
+                (
+                    "/opt/wheel-venv/lib/site-packages/other/../"
+                    "fastmssql/__init__.py"
+                ),
+            ),
+        ),
+    ),
+    (
+        "FRAME-028-control-character",
+        test_every_worker_imports_the_exact_isolated_wheel,
+        (
+            (
+                ("candidate", "wheel", "import_path"),
+                "/opt/wheel-venv/lib/site-packages/fastmssql/\n__init__.py",
+            ),
+            (
+                (
+                    "profiles",
+                    0,
+                    "worker_records",
+                    0,
+                    "fastmssql_import_path",
+                ),
+                "/opt/wheel-venv/lib/site-packages/fastmssql/\n__init__.py",
+            ),
+        ),
+    ),
+    (
+        "FRAME-028-posix-terminal-case",
+        test_every_worker_imports_the_exact_isolated_wheel,
+        (
+            (
+                ("candidate", "wheel", "import_path"),
+                "/opt/wheel-venv/lib/site-packages/FastMssql/__INIT__.PY",
+            ),
+            (
+                (
+                    "profiles",
+                    0,
+                    "worker_records",
+                    0,
+                    "fastmssql_import_path",
+                ),
+                "/opt/wheel-venv/lib/site-packages/FastMssql/__INIT__.PY",
+            ),
+        ),
+    ),
+    (
+        "FRAME-036-empty-worker-lifecycle",
+        test_real_client_disconnect_settles_sql_and_recovers,
+        (
+            (("scenarios", "client_disconnect_cancellation", "ready_pids"), []),
+            (
+                ("scenarios", "client_disconnect_cancellation", "shutdown_pids"),
+                [],
+            ),
+        ),
+    ),
+    (
+        "FRAME-036-boolean-worker-pid",
+        test_real_client_disconnect_settles_sql_and_recovers,
+        (
+            (
+                ("scenarios", "client_disconnect_cancellation", "ready_pids"),
+                [True],
+            ),
+            (
+                ("scenarios", "client_disconnect_cancellation", "shutdown_pids"),
+                [True],
+            ),
+        ),
+    ),
+    (
+        "FRAME-036-duplicate-worker-pids",
+        test_real_client_disconnect_settles_sql_and_recovers,
+        (
+            (
+                ("scenarios", "client_disconnect_cancellation", "ready_pids"),
+                [101, 101],
+            ),
+            (
+                ("scenarios", "client_disconnect_cancellation", "shutdown_pids"),
+                [101, 101],
+            ),
+        ),
+    ),
+    (
+        "FRAME-036-zero-worker-pid",
+        test_real_client_disconnect_settles_sql_and_recovers,
+        (
+            (
+                ("scenarios", "client_disconnect_cancellation", "ready_pids"),
+                [0],
+            ),
+            (
+                ("scenarios", "client_disconnect_cancellation", "shutdown_pids"),
+                [0],
+            ),
+        ),
+    ),
+    (
+        "FRAME-036-negative-worker-pid",
+        test_real_client_disconnect_settles_sql_and_recovers,
+        (
+            (
+                ("scenarios", "client_disconnect_cancellation", "ready_pids"),
+                [-1],
+            ),
+            (
+                ("scenarios", "client_disconnect_cancellation", "shutdown_pids"),
+                [-1],
+            ),
+        ),
+    ),
+    (
+        "FRAME-036-boolean-manager-pid",
+        test_real_client_disconnect_settles_sql_and_recovers,
+        (
+            (("scenarios", "client_disconnect_cancellation", "manager_pid"), True),
+        ),
+    ),
+    (
+        "FRAME-036-zero-manager-pid",
+        test_real_client_disconnect_settles_sql_and_recovers,
+        (
+            (("scenarios", "client_disconnect_cancellation", "manager_pid"), 0),
+        ),
+    ),
+    (
+        "FRAME-036-negative-manager-pid",
+        test_real_client_disconnect_settles_sql_and_recovers,
+        (
+            (("scenarios", "client_disconnect_cancellation", "manager_pid"), -1),
+        ),
+    ),
+    (
+        "FRAME-036-boolean-returncode",
+        test_real_client_disconnect_settles_sql_and_recovers,
+        (
+            (("scenarios", "client_disconnect_cancellation", "returncode"), False),
+        ),
+    ),
+    (
+        "FRAME-036-boolean-session-count",
+        test_real_client_disconnect_settles_sql_and_recovers,
+        (
+            (("scenarios", "client_disconnect_cancellation", "sessions_after"), False),
+        ),
+    ),
+    (
+        "FRAME-036-boolean-descendant-pid",
+        test_real_client_disconnect_settles_sql_and_recovers,
+        (
+            (
+                ("scenarios", "client_disconnect_cancellation", "descendant_pids"),
+                [True],
+            ),
+        ),
+    ),
+    (
+        "FRAME-036-negative-descendant-pid",
+        test_real_client_disconnect_settles_sql_and_recovers,
+        (
+            (
+                ("scenarios", "client_disconnect_cancellation", "descendant_pids"),
+                [-1],
+            ),
+        ),
+    ),
+    (
+        "FRAME-036-zero-descendant-pid",
+        test_real_client_disconnect_settles_sql_and_recovers,
+        (
+            (
+                ("scenarios", "client_disconnect_cancellation", "descendant_pids"),
+                [0],
+            ),
+        ),
+    ),
+    (
+        "FRAME-041-wrong-execution-model",
+        test_flask_sync_worker_remains_occupied,
+        (
+            (
+                ("scenarios", "flask_sync_occupancy", "execution_model"),
+                (
+                    "Flask via WsgiToAsgi: persistent ASGI loop, "
+                    "thread-sensitive WSGI serialization per process"
+                ),
+            ),
+        ),
+    ),
+    (
+        "FRAME-041-boolean-thread-limit",
+        test_flask_sync_worker_remains_occupied,
+        (
+            (("scenarios", "flask_sync_occupancy", "thread_limit_per_worker"), True),
+        ),
+    ),
+    (
+        "FRAME-041-boolean-active-requests",
+        test_flask_sync_worker_remains_occupied,
+        (
+            (("scenarios", "flask_sync_occupancy", "maximum_active_requests"), True),
+        ),
+    ),
+    (
+        "FRAME-041-boolean-sql-requests",
+        test_flask_sync_worker_remains_occupied,
+        (
+            (
+                (
+                    "scenarios",
+                    "flask_sync_occupancy",
+                    "maximum_simultaneous_sql_requests",
+                ),
+                True,
+            ),
+        ),
+    ),
+    (
+        "FRAME-041-boolean-sql-sessions",
+        test_flask_sync_worker_remains_occupied,
+        (
+            (
+                (
+                    "scenarios",
+                    "flask_sync_occupancy",
+                    "maximum_aggregate_sql_sessions",
+                ),
+                True,
+            ),
+        ),
+    ),
+    (
+        "FRAME-041-boolean-worker-active-requests",
+        test_flask_sync_worker_remains_occupied,
+        (
+            (
+                (
+                    "scenarios",
+                    "flask_sync_occupancy",
+                    "worker_execution",
+                    0,
+                    "maximum_active_requests",
+                ),
+                True,
+            ),
+        ),
+    ),
+    (
+        "FRAME-041-boolean-worker-thread-count",
+        test_flask_sync_worker_remains_occupied,
+        (
+            (
+                (
+                    "scenarios",
+                    "flask_sync_occupancy",
+                    "worker_execution",
+                    0,
+                    "wsgi_thread_count",
+                ),
+                True,
+            ),
+        ),
+    ),
+    (
+        "FRAME-042-wrong-execution-model",
+        test_flask_gthread_has_explicit_thread_occupancy,
+        (
+            (
+                ("scenarios", "flask_gthread_occupancy", "execution_model"),
+                "native ASGI: concurrent requests on persistent event loop",
+            ),
+        ),
+    ),
+    (
+        "FRAME-043-wrong-execution-model",
+        test_flask_one_request_can_gather_concurrent_sql,
+        (
+            (
+                ("scenarios", "flask_internal_concurrency", "execution_model"),
+                (
+                    "Flask via WsgiToAsgi: persistent ASGI loop, "
+                    "thread-sensitive WSGI serialization per process"
+                ),
+            ),
+        ),
+    ),
+    (
+        "FRAME-043-boolean-wsgi-slot",
+        test_flask_one_request_can_gather_concurrent_sql,
+        (
+            (("scenarios", "flask_internal_concurrency", "wsgi_request_slots"), True),
+        ),
+    ),
+    (
+        "FRAME-044-wrong-execution-model",
+        test_adapted_flask_uses_persistent_worker_event_loop,
+        (
+            (
+                ("scenarios", "adapted_flask_persistent_loop", "execution_model"),
+                "Flask WSGI: async view, occupied WSGI worker/thread",
+            ),
+        ),
+    ),
+    (
+        "FRAME-044-boolean-worker-count",
+        test_adapted_flask_uses_persistent_worker_event_loop,
+        (
+            (("scenarios", "adapted_flask_persistent_loop", "workers"), True),
+        ),
+    ),
+    (
+        "FRAME-044-boolean-serialized-call-count",
+        test_adapted_flask_uses_persistent_worker_event_loop,
+        (
+            (
+                (
+                    "scenarios",
+                    "adapted_flask_persistent_loop",
+                    "maximum_serialized_wsgi_calls_per_process",
+                ),
+                True,
+            ),
+        ),
+    ),
+    (
+        "FRAME-044-boolean-sql-request-count",
+        test_adapted_flask_uses_persistent_worker_event_loop,
+        (
+            (
+                (
+                    "scenarios",
+                    "adapted_flask_persistent_loop",
+                    "maximum_simultaneous_sql_requests",
+                ),
+                True,
+            ),
+        ),
+    ),
+    (
+        "FRAME-044-boolean-sql-session-count",
+        test_adapted_flask_uses_persistent_worker_event_loop,
+        (
+            (
+                (
+                    "scenarios",
+                    "adapted_flask_persistent_loop",
+                    "maximum_aggregate_sql_sessions",
+                ),
+                True,
+            ),
+        ),
+    ),
+    (
+        "FRAME-045-wrong-execution-model",
+        test_adapted_flask_is_thread_sensitive_serialized_per_process,
+        (
+            (
+                ("scenarios", "adapted_flask_serialization", "execution_model"),
+                "native ASGI: concurrent requests on persistent event loop",
+            ),
+        ),
+    ),
+    (
+        "FRAME-045-boolean-wsgi-call-count",
+        test_adapted_flask_is_thread_sensitive_serialized_per_process,
+        (
+            (
+                ("scenarios", "adapted_flask_serialization", "wsgi_calls_per_process"),
+                True,
+            ),
+        ),
+    ),
+    (
+        "FRAME-045-boolean-sql-request-count",
+        test_adapted_flask_is_thread_sensitive_serialized_per_process,
+        (
+            (
+                (
+                    "scenarios",
+                    "adapted_flask_serialization",
+                    "maximum_simultaneous_sql_requests",
+                ),
+                True,
+            ),
+        ),
+    ),
+    (
+        "FRAME-048-self-consistent-forged-digest",
+        test_fixed_worker_load_reaches_required_and_extended_profiles,
+        (
+            (("load_profiles", 0, "value_digest"), "f" * 64),
+            (("load_profiles", 0, "expected_value_digest"), "f" * 64),
+        ),
+    ),
+    (
+        "FRAME-048-boolean-active-request-count",
+        test_fixed_worker_load_reaches_required_and_extended_profiles,
+        ((("load_profiles", 0, "maximum_active_requests"), True),),
+    ),
+    (
+        "FRAME-048-boolean-sql-session-count",
+        test_fixed_worker_load_reaches_required_and_extended_profiles,
+        ((("load_profiles", 0, "maximum_sql_sessions"), True),),
+    ),
+    (
+        "FRAME-048-boolean-sql-request-count",
+        test_fixed_worker_load_reaches_required_and_extended_profiles,
+        ((("load_profiles", 0, "maximum_sql_requests"), True),),
+    ),
+    (
+        "FRAME-048-boolean-pool-active-count",
+        test_fixed_worker_load_reaches_required_and_extended_profiles,
+        ((("load_profiles", 0, "maximum_pool_active"), True),),
+    ),
+    (
+        "FRAME-048-boolean-pool-pending-count",
+        test_fixed_worker_load_reaches_required_and_extended_profiles,
+        ((("load_profiles", 0, "maximum_pool_pending"), True),),
+    ),
+    (
+        "FRAME-048-boolean-duration",
+        test_fixed_worker_load_reaches_required_and_extended_profiles,
+        ((("load_profiles", 0, "duration_seconds"), True),),
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("case_id", "validator", "mutations"),
+    _CASE_VALIDATOR_REVIEW_DEFECTS,
+    ids=[contract[0] for contract in _CASE_VALIDATOR_REVIEW_DEFECTS],
+)
+def test_case_validator_rejects_review_forgery(
+    case_id: str,
+    validator,
+    mutations: tuple[tuple[tuple[object, ...], object], ...],
+) -> None:
+    """Reject self-consistent evidence forgeries hidden by Python equality."""
+
+    evidence = _runtime_shaped_case_evidence()
+    validator(deepcopy(evidence))
+
+    forged = deepcopy(evidence)
+    for mutation_path, invalid_value in mutations:
+        _replace_case_value(forged, mutation_path, invalid_value)
+    assert forged["overall"] == "PASS", case_id
+    assert forged["violations"] == [], case_id
+    with pytest.raises(AssertionError):
+        validator(forged)
+
+
+@pytest.mark.parametrize("outcome", ("commit", "rollback"))
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    (
+        ("context_token_sha256", "not-a-sha256"),
+        ("item_id", True),
+        ("item_id", 0),
+        ("item_id", -1),
+        ("response_session_id", True),
+        ("response_session_id", 0),
+        ("response_session_id", -1),
+    ),
+)
+def test_frame_038_rejects_invalid_transaction_provenance(
+    outcome: str,
+    field_name: str,
+    invalid_value: object,
+) -> None:
+    """Require valid SHA provenance and positive exact IDs for both outcomes."""
+
+    evidence = _runtime_shaped_case_evidence()
+    test_graceful_transaction_shutdown_has_deterministic_outcomes(
+        deepcopy(evidence)
+    )
+
+    forged = deepcopy(evidence)
+    forged["scenarios"]["graceful_transaction_shutdown"][outcome][field_name] = (
+        invalid_value
+    )
+    assert forged["overall"] == "PASS"
+    assert forged["violations"] == []
+    with pytest.raises(AssertionError):
+        test_graceful_transaction_shutdown_has_deterministic_outcomes(forged)
+
+
+_SATURATION_EQUAL_COUNTER_FIELDS = (
+    "pool_max_per_worker",
+    "admitted_holders",
+    "admitted_waiters",
+    "maximum_sql_sessions",
+    "maximum_sql_requests",
+    "observed_active_connections",
+    "observed_pending_gets",
+    "acquire_timeouts",
+    "pool_get_timed_out_delta",
+)
+
+
+@pytest.mark.parametrize(
+    "boolean_field",
+    _SATURATION_EQUAL_COUNTER_FIELDS,
+)
+def test_frame_039_rejects_boolean_equality_counter(
+    boolean_field: str,
+) -> None:
+    """Reject each boolean independently even when all relationships agree."""
+
+    evidence = _runtime_shaped_case_evidence()
+    test_saturated_pool_has_bounded_admission_and_recovers(deepcopy(evidence))
+
+    forged = deepcopy(evidence)
+    scenario = forged["scenarios"]["saturation"]
+    for field_name in _SATURATION_EQUAL_COUNTER_FIELDS:
+        scenario[field_name] = 1
+    scenario["admission_capacity"] = 2
+    scenario[boolean_field] = True
+    assert forged["overall"] == "PASS"
+    assert forged["violations"] == []
+    with pytest.raises(AssertionError):
+        test_saturated_pool_has_bounded_admission_and_recovers(forged)
+
+
+@pytest.mark.parametrize(
+    ("boolean_field", "invalid_value"),
+    (
+        ("rejected_requests", True),
+        ("pool_active_after", False),
+        ("pool_pending_after", False),
+        ("admission_active_after", False),
+    ),
+)
+def test_frame_039_rejects_boolean_boundary_counter(
+    boolean_field: str,
+    invalid_value: bool,
+) -> None:
+    """Reject booleans accepted by positive and zero integer comparisons."""
+
+    evidence = _runtime_shaped_case_evidence()
+    test_saturated_pool_has_bounded_admission_and_recovers(deepcopy(evidence))
+
+    forged = deepcopy(evidence)
+    forged["scenarios"]["saturation"][boolean_field] = invalid_value
+    assert forged["overall"] == "PASS"
+    assert forged["violations"] == []
+    with pytest.raises(AssertionError):
+        test_saturated_pool_has_bounded_admission_and_recovers(forged)
+
+
+@pytest.mark.parametrize(
+    ("platform_system", "candidate_path", "worker_path"),
+    (
+        (
+            "Linux",
+            "/opt/wheel-venv/lib/site-packages/fastmssql/__init__.py",
+            "/opt/wheel-venv/lib/site-packages/fastmssql/__init__.py",
+        ),
+        (
+            "Darwin",
+            "/private/var/wheel-venv/lib/site-packages/fastmssql/__init__.py",
+            "/private/var/wheel-venv/lib/site-packages/fastmssql/__init__.py",
+        ),
+        (
+            "Windows",
+            r"C:\Wheel-Venv\Lib\site-packages\fastmssql\__init__.py",
+            r"c:\wheel-venv\lib\SITE-PACKAGES\FastMssql\__INIT__.PY",
+        ),
+    ),
+    ids=("linux", "darwin", "windows-case-insensitive"),
+)
+def test_frame_028_accepts_platform_native_isolated_wheel_paths(
+    platform_system: str,
+    candidate_path: str,
+    worker_path: str,
+) -> None:
+    """Keep native POSIX and case-insensitive Windows wheel paths portable."""
+
+    evidence = _runtime_shaped_case_evidence()
+    _replace_case_value(evidence, ("platform", "system"), platform_system)
+    _replace_case_value(
+        evidence,
+        ("candidate", "wheel", "import_path"),
+        candidate_path,
+    )
+    _replace_case_value(
+        evidence,
+        ("profiles", 0, "worker_records", 0, "fastmssql_import_path"),
+        worker_path,
+    )
+    test_every_worker_imports_the_exact_isolated_wheel(evidence)
+
+
+def test_frame_048_accepts_finite_histogram_rounding_noise() -> None:
+    """Do not reject a valid accumulated histogram for one floating-point ULP."""
+
+    evidence = _runtime_shaped_case_evidence()
+    histogram = evidence["load_profiles"][0]["latency_histogram"]
+    histogram["minimum_ms"] = 0.1
+    histogram["maximum_ms"] = 0.1
+    histogram["sum_ms"] = 100.00000000000001
+    test_fixed_worker_load_reaches_required_and_extended_profiles(evidence)
