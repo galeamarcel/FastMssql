@@ -52,6 +52,15 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Production framework case-validator runtime-shape RED correction
+
+- Corrected the behavioral case-validator fixture to use the exact bounded
+  latency buckets, saturation cardinalities, worker provenance fields and
+  lifecycle fields emitted by the current runtime evidence records.
+- This keeps the RED boundary honest: each valid representative record must
+  be accepted before its case-owned field is forged. No FastMssql/Tiberius
+  runtime or displayed `0.7.7` package version changed.
+
 ### Production framework case-validator RED
 
 - Added database-independent behavioral contracts that feed the canonical

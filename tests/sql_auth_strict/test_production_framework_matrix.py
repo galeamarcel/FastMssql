@@ -621,28 +621,38 @@ def test_cumulative_exact_sha_gates_are_mandatory(
 
 
 def _runtime_shaped_case_evidence() -> dict[str, object]:
-    """Return valid records using the exact names emitted by runtime evidence."""
+    """Return valid records using runtime-emitted names and invariants."""
 
     candidate_sha = "a" * 40
     wheel_sha256 = "b" * 64
     wheel_filename = "fastmssql-0.7.7-cp311-abi3.whl"
     import_path = "/opt/wheel/lib/site-packages/fastmssql/__init__.py"
     worker = {
-        "candidate_sha": candidate_sha,
+        "application_name": "framework-worker-101",
         "fastmssql_import_path": import_path,
         "pid": 101,
         "pool_connected_monotonic": 2.0,
+        "pool_created_monotonic": 1.5,
         "pool_created_pid": 101,
         "pool_identity": "pool-101",
+        "principal": "framework_user",
         "process_started_monotonic": 1.0,
-        "wheel_filename": wheel_filename,
-        "wheel_sha256": wheel_sha256,
     }
-    transaction_common = {
+    lifecycle_common = {
+        "descendant_pids": [],
         "forced_cleanup": False,
         "graceful_stop": True,
-        "response_completed_after_signal": True,
+        "listening_sockets_after": [],
+        "manager_pid": 100,
+        "profile_id": "representative-profile",
+        "ready_pids": [101],
+        "returncode": 0,
         "sessions_after": 0,
+        "shutdown_pids": [101],
+    }
+    transaction_common = {
+        **lifecycle_common,
+        "response_completed_after_signal": True,
         "sql_observed_before_signal": True,
         "status": "PASS",
         "transaction_holding_before_signal": True,
@@ -654,7 +664,7 @@ def _runtime_shaped_case_evidence() -> dict[str, object]:
             "upper_bound_ms": upper_bound,
         }
         for index, upper_bound in enumerate(
-            (1, 2, 5, 10, 20, 50, 100, 200, 500, 1_000, 2_000, 5_000, 10_000)
+            (1, 2, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000)
         )
     ]
     value_digest = "c" * 64
@@ -737,9 +747,14 @@ def _runtime_shaped_case_evidence() -> dict[str, object]:
         ],
         "scenarios": {
             "adapted_flask_persistent_loop": {
-                "forced_cleanup": False,
-                "graceful_stop": True,
+                **lifecycle_common,
+                "execution_model": (
+                    "Flask via WsgiToAsgi: persistent ASGI loop, "
+                    "thread-sensitive WSGI serialization per process"
+                ),
+                "maximum_aggregate_sql_sessions": 1,
                 "maximum_serialized_wsgi_calls_per_process": 1,
+                "maximum_simultaneous_sql_requests": 1,
                 "persistent_worker_loops": [
                     {
                         "async_thread_token": 11,
@@ -749,50 +764,58 @@ def _runtime_shaped_case_evidence() -> dict[str, object]:
                     }
                 ],
                 "server": "uvicorn",
-                "sessions_after": 0,
                 "status": "PASS",
                 "worker_records": [worker],
                 "workers": 1,
             },
             "adapted_flask_serialization": {
+                **lifecycle_common,
                 "concurrent_seconds": 1.07,
                 "execution_model": (
                     "Flask via WsgiToAsgi: persistent ASGI loop, "
                     "thread-sensitive WSGI serialization per process"
                 ),
+                "loop_token": 7,
                 "maximum_simultaneous_sql_requests": 1,
                 "multi_process_scaling": "additional worker processes only",
                 "pool_active_after": 0,
                 "pool_pending_after": 0,
                 "sequential_seconds": 1.04,
                 "serialization_ratio": 1.07 / 1.04,
+                "sql_delay_seconds": 0.25,
                 "status": "PASS",
                 "values": [1, 2, 3, 4],
                 "wsgi_calls_per_process": 1,
             },
             "client_disconnect_cancellation": {
+                **lifecycle_common,
                 "connection_replaced": True,
-                "forced_cleanup": False,
-                "graceful_stop": True,
+                "context_token_sha256": "1" * 64,
                 "pool_active_after": 0,
                 "pool_pending_after": 0,
                 "recovery_value": 36,
-                "sessions_after": 0,
                 "sql_observed_before_close": True,
                 "sql_requests_after": 0,
                 "status": "PASS",
                 "transport": "raw-tcp-client-close",
             },
             "flask_gthread_occupancy": {
-                "forced_cleanup": False,
-                "graceful_stop": True,
+                **lifecycle_common,
+                "execution_model": (
+                    "Flask WSGI: async view, occupied WSGI worker/thread"
+                ),
                 "loop_tokens_distinct_per_worker": True,
+                "maximum_active_requests": 4,
+                "maximum_aggregate_sql_sessions": 4,
                 "maximum_simultaneous_sql_requests": 4,
+                "profile_id": "flask-gunicorn-gthread-w1",
                 "queued_request_proven": True,
-                "sessions_after": 0,
+                "request_count": 5,
+                "sql_delay_seconds": 0.25,
                 "status": "PASS",
                 "thread_limit_per_worker": 4,
                 "values": [1, 2, 3, 4, 5],
+                "wave_seconds": 0.5,
                 "worker_class": "gthread",
                 "worker_execution": [
                     {
@@ -801,30 +824,42 @@ def _runtime_shaped_case_evidence() -> dict[str, object]:
                         "wsgi_thread_count": 4,
                     }
                 ],
+                "workers": 1,
             },
             "flask_internal_concurrency": {
+                **lifecycle_common,
                 "concurrent_seconds": 0.26,
                 "execution_model": (
                     "Flask WSGI: async view, occupied WSGI worker/thread"
                 ),
+                "loop_token": 7,
                 "maximum_simultaneous_sql_requests": 4,
+                "outer_response_seconds": 1.3,
                 "pool_active_after": 0,
                 "pool_pending_after": 0,
                 "sequential_seconds": 1.02,
+                "sql_delay_seconds": 0.25,
                 "status": "PASS",
                 "values_exact": True,
                 "wsgi_request_slots": 1,
             },
             "flask_sync_occupancy": {
-                "forced_cleanup": False,
-                "graceful_stop": True,
+                **lifecycle_common,
+                "execution_model": (
+                    "Flask WSGI: async view, occupied WSGI worker/thread"
+                ),
                 "loop_tokens_distinct_per_worker": True,
+                "maximum_active_requests": 1,
+                "maximum_aggregate_sql_sessions": 1,
                 "maximum_simultaneous_sql_requests": 1,
+                "profile_id": "flask-gunicorn-sync-w1",
                 "queued_request_proven": True,
-                "sessions_after": 0,
+                "request_count": 2,
+                "sql_delay_seconds": 0.25,
                 "status": "PASS",
                 "thread_limit_per_worker": 1,
                 "values": [1, 2],
+                "wave_seconds": 0.5,
                 "worker_class": "sync",
                 "worker_execution": [
                     {
@@ -833,13 +868,15 @@ def _runtime_shaped_case_evidence() -> dict[str, object]:
                         "wsgi_thread_count": 1,
                     }
                 ],
+                "workers": 1,
             },
             "graceful_query_shutdown": {
-                "forced_cleanup": False,
-                "graceful_stop": True,
-                "listening_sockets_after": [],
+                **lifecycle_common,
+                "context_token_sha256": "2" * 64,
                 "response_completed_after_signal": True,
-                "sessions_after": 0,
+                "response_session_id": 52,
+                "response_value": 37,
+                "sql_delay_seconds": 1.0,
                 "sql_observed_before_signal": True,
                 "status": "PASS",
             },
@@ -857,36 +894,47 @@ def _runtime_shaped_case_evidence() -> dict[str, object]:
                 "status": "PASS",
             },
             "large_streaming": {
+                **lifecycle_common,
                 "driver_buffer_rows": 8,
+                "early_bytes_received": 256,
                 "early_client_closed": True,
+                "early_close_seconds": 0.2,
+                "early_first_data_seconds": 0.05,
                 "early_pool_active_after": 0,
                 "early_pool_pending_after": 0,
                 "early_prefix_digest": "d" * 64,
                 "early_prefix_rows": 16,
                 "early_requested_rows": 1_000,
                 "early_sql_requests_after": 0,
+                "full_bytes_received": 16_384,
+                "full_elapsed_seconds": 0.5,
+                "full_first_data_seconds": 0.05,
                 "full_pool_active_after": 0,
                 "full_pool_pending_after": 0,
                 "full_rows": 1_000,
                 "full_value_digest": "e" * 64,
                 "incremental_first_data": True,
                 "recovery_value": 40,
+                "rss_end_bytes": 4_608,
                 "rss_growth_bytes": 1_024,
                 "rss_growth_limit_bytes": 2_048,
+                "rss_peak_bytes": 5_120,
+                "rss_start_bytes": 4_096,
                 "status": "PASS",
             },
             "saturation": {
-                "acquire_timeouts": 1,
+                **lifecycle_common,
+                "acquire_timeouts": 4,
                 "admission_active_after": 0,
                 "admission_capacity": 8,
                 "admitted_holders": 4,
                 "admitted_waiters": 4,
-                "maximum_sql_requests": 8,
+                "maximum_sql_requests": 4,
                 "maximum_sql_sessions": 4,
                 "observed_active_connections": 4,
                 "observed_pending_gets": 4,
                 "pool_active_after": 0,
-                "pool_get_timed_out_delta": 1,
+                "pool_get_timed_out_delta": 4,
                 "pool_max_per_worker": 4,
                 "pool_pending_after": 0,
                 "recovery_value": 39,
