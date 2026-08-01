@@ -69,6 +69,32 @@ EXPECTED_SCHEMA_PROFILE_IDENTITIES = {
     for family in EXPECTED_PROFILE_FAMILIES
     for workers in EXPECTED_WORKER_COUNTS
 }
+EXPECTED_SCHEMA_SCENARIOS = {
+    "adapted_flask_persistent_loop",
+    "adapted_flask_serialization",
+    "client_disconnect_cancellation",
+    "flask_gthread_occupancy",
+    "flask_internal_concurrency",
+    "flask_sync_occupancy",
+    "graceful_query_shutdown",
+    "graceful_transaction_shutdown",
+    "large_streaming",
+    "native_concurrency",
+    "saturation",
+}
+MINIMUM_SCHEMA_LOAD_FIELDS = {
+    "completed",
+    "errors",
+    "fixed_client_workers",
+    "global_connection_budget",
+    "maximum_sql_sessions",
+    "operations",
+    "pending_after",
+    "process_count_end",
+    "process_count_start",
+    "status",
+    "values_exact",
+}
 EXPECTED_CASES = {f"FRAME-{number:03d}" for number in range(27, 55)}
 
 
@@ -11241,6 +11267,11 @@ def _schema_one_inputs(
     *,
     platform_system: str = "Windows",
 ) -> dict[str, Any]:
+    candidate_import_path = (
+        "C:/wheel-venv/Lib/site-packages/fastmssql/__init__.py"
+        if platform_system == "Windows"
+        else "/opt/wheel-venv/lib/site-packages/fastmssql/__init__.py"
+    )
     profiles: list[dict[str, object]] = []
     for profile in runner.expand_profiles(
         platform_system,
@@ -11249,42 +11280,114 @@ def _schema_one_inputs(
         record = profile.to_record()
         if record["applicable"]:
             record["status"] = "PASS"
+            record["worker_records"] = [
+                {"fastmssql_import_path": candidate_import_path}
+                for _ in range(record["workers"])
+            ]
         profiles.append(record)
+    locked_versions = {
+        "asgiref": "3.12.1",
+        "fastapi": "0.139.2",
+        "flask": "3.1.3",
+        "gunicorn": "26.0.0",
+        "httpx": "0.28.1",
+        "uvicorn": "0.51.0",
+        "uvicorn-worker": "0.4.0",
+        "uvloop": "0.22.1",
+    }
+    posix_only = ["gunicorn", "uvicorn-worker", "uvloop"]
+    installed_versions = {
+        name: version
+        for name, version in locked_versions.items()
+        if platform_system != "Windows" or name not in posix_only
+    }
+    scenarios = {
+        name: {"status": "PASS"}
+        for name in EXPECTED_SCHEMA_SCENARIOS
+    }
+    if platform_system == "Windows":
+        for name in (
+            "graceful_query_shutdown",
+            "graceful_transaction_shutdown",
+        ):
+            scenarios[name] = {
+                "not_applicable_reason": (
+                    "POSIX SIGTERM graceful shutdown is not supported on Windows"
+                ),
+                "status": "N/A",
+            }
+        for name in (
+            "flask_gthread_occupancy",
+            "flask_internal_concurrency",
+            "flask_sync_occupancy",
+        ):
+            scenarios[name] = {
+                "not_applicable_reason": "Gunicorn is not supported on Windows",
+                "status": "N/A",
+            }
     return {
-        "candidate_import_path": (
-            "C:/wheel-venv/Lib/site-packages/fastmssql/__init__.py"
-            if platform_system == "Windows"
-            else "/opt/wheel-venv/lib/site-packages/fastmssql/__init__.py"
-        ),
+        "candidate_import_path": candidate_import_path,
         "comparison": {
-            "labels": [
-                "native ASGI: concurrent requests on persistent event loop"
-            ],
+            "labels": list(runner.EXECUTION_MODEL_LABELS),
             "rendered": "measured execution models",
         },
         "cumulative_gate_contracts": {
+            "code_review_graph": True,
             "dependency_security": True,
             "exact_sha": True,
+            "generated_reports": True,
+            "installed_wheel": True,
+            "original_local_regression": True,
+            "root_rust": True,
+            "sql_auth_runner": True,
+            "vendored_tiberius": True,
         },
         "dependencies": {
-            "installed_versions": {
-                "fastapi": "0.139.2",
-                "uvicorn": "0.51.0",
-            },
+            "installed_versions": installed_versions,
+            "locked_versions": locked_versions,
+            "posix_only": posix_only,
             "runtime": [],
         },
         "harness_git_sha": "c" * 40,
         "hosted_gate_contracts": {
-            "Windows": {
+            "Linux": {
+                "database": "Microsoft SQL Server 2022 Docker",
                 "installed_wheel": True,
                 "real_sql_auth": True,
-            }
+                "required_profiles": "complete-posix",
+                "workflow_owned": True,
+            },
+            "Windows": {
+                "database": "Microsoft SQL Server 2022 Express",
+                "gunicorn": "N/A",
+                "installed_wheel": True,
+                "real_sql_auth": True,
+                "uvicorn_worker_counts": [1, 2, 4, 8],
+                "uvloop": "N/A",
+                "workflow_owned": True,
+            },
+            "macOS": {
+                "claim_boundary_explicit": True,
+                "hosted_sql_auth": False,
+                "installed_wheel": True,
+                "local_docker_sql_auth": True,
+                "real_server_processes": True,
+                "workflow_owned": True,
+            },
         },
         "load_profiles": [
             {
                 "completed": 1_000,
+                "errors": 0,
+                "fixed_client_workers": True,
+                "global_connection_budget": 16,
+                "maximum_sql_sessions": 8,
                 "operations": 1_000,
+                "pending_after": 0,
+                "process_count_end": 4,
+                "process_count_start": 4,
                 "status": "PASS",
+                "values_exact": True,
             }
         ],
         "platform_record": {
@@ -11298,17 +11401,23 @@ def _schema_one_inputs(
         },
         "privacy": {
             "artifact_matches": [],
+            "command_matches": [],
+            "connection_string_patterns_checked": 1,
+            "credential_values_checked": 2,
+            "credential_values_expected": 2,
+            "http_matches": [],
+            "log_matches": [],
             "tracked_matches": [],
         },
         "profiles": profiles,
-        "scenarios": {
-            "native_concurrency": {
-                "status": "PASS",
-                "values_exact": True,
-            }
-        },
+        "scenarios": scenarios,
         "teardown": {
+            "active_pool_leases_after": 0,
             "child_processes_after": 0,
+            "forced_cleanup_count": 0,
+            "listening_sockets_after": 0,
+            "pending_pool_waiters_after": 0,
+            "sql_requests_after": 0,
             "sql_sessions_after": 0,
         },
         "tool_versions": {
@@ -11421,53 +11530,19 @@ def test_schema_one_evidence_derives_exact_provenance_inventory_and_pass(
         "python_implementation": "CPython",
         "system": platform_system,
     }
-    assert evidence["tools"] == {
-        "python": "3.13.5",
-        "rust": "1.94.0",
-        "sql_server": "16.0",
-    }
-    assert evidence["dependencies"] == {
-        "installed_versions": {
-            "fastapi": "0.139.2",
-            "uvicorn": "0.51.0",
-        },
-        "runtime": [],
-    }
-    assert evidence["comparison"] == {
-        "labels": ["native ASGI: concurrent requests on persistent event loop"],
-        "rendered": "measured execution models",
-    }
-    assert evidence["load_profiles"] == [
-        {
-            "completed": 1_000,
-            "operations": 1_000,
-            "status": "PASS",
-        }
+    assert evidence["tools"] == inputs["tool_versions"]
+    assert evidence["dependencies"] == inputs["dependencies"]
+    assert evidence["comparison"] == inputs["comparison"]
+    assert evidence["load_profiles"] == inputs["load_profiles"]
+    assert evidence["scenarios"] == inputs["scenarios"]
+    assert evidence["privacy"] == inputs["privacy"]
+    assert evidence["teardown"] == inputs["teardown"]
+    assert evidence["hosted_gate_contracts"] == inputs[
+        "hosted_gate_contracts"
     ]
-    assert evidence["scenarios"] == {
-        "native_concurrency": {
-            "status": "PASS",
-            "values_exact": True,
-        }
-    }
-    assert evidence["privacy"] == {
-        "artifact_matches": [],
-        "tracked_matches": [],
-    }
-    assert evidence["teardown"] == {
-        "child_processes_after": 0,
-        "sql_sessions_after": 0,
-    }
-    assert evidence["hosted_gate_contracts"] == {
-        "Windows": {
-            "installed_wheel": True,
-            "real_sql_auth": True,
-        }
-    }
-    assert evidence["cumulative_gate_contracts"] == {
-        "dependency_security": True,
-        "exact_sha": True,
-    }
+    assert evidence["cumulative_gate_contracts"] == inputs[
+        "cumulative_gate_contracts"
+    ]
     assert evidence["profiles"] == inputs["profiles"]
     assert {
         profile["id"]: {
@@ -11551,26 +11626,18 @@ def test_schema_one_evidence_is_deeply_detached_and_derives_profile_failures(
 
     assert evidence["platform"]["machine"] == "AMD64"
     assert evidence["tools"]["python"] == "3.13.5"
-    assert evidence["dependencies"] == {
-        "installed_versions": {
-            "fastapi": "0.139.2",
-            "uvicorn": "0.51.0",
-        },
-        "runtime": [],
-    }
+    assert evidence["dependencies"]["installed_versions"]["fastapi"] == (
+        "0.139.2"
+    )
+    assert evidence["dependencies"]["runtime"] == []
     assert len(evidence["profiles"]) == 28
     assert evidence["scenarios"]["native_concurrency"]["status"] == "PASS"
-    assert evidence["comparison"]["labels"] == [
-        "native ASGI: concurrent requests on persistent event loop"
-    ]
+    assert evidence["comparison"]["labels"] == list(
+        runner.EXECUTION_MODEL_LABELS
+    )
     assert evidence["comparison"]["rendered"] == "measured execution models"
-    assert evidence["load_profiles"] == [
-        {
-            "completed": 1_000,
-            "operations": 1_000,
-            "status": "PASS",
-        }
-    ]
+    assert evidence["load_profiles"][0]["completed"] == 1_000
+    assert evidence["load_profiles"][0]["status"] == "PASS"
     assert evidence["privacy"]["artifact_matches"] == []
     assert evidence["teardown"]["child_processes_after"] == 0
     assert evidence["hosted_gate_contracts"]["Windows"][
@@ -11817,6 +11884,346 @@ def test_schema_one_validator_rejects_stale_or_self_contradictory_evidence(
         runner.validate_production_framework_evidence(false_fail)
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "float-schema-version",
+        "boolean-worker-count",
+        "float-required-operations",
+        "float-extended-operations",
+        "float-profile-workers",
+        "array-database-mode",
+        "array-profile-status",
+    ],
+)
+def test_schema_one_validator_requires_exact_json_scalar_types(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    """Catch Python equality or hashing accepting a forged JSON scalar type."""
+
+    runner = _load_production_framework_runner()
+    config = _schema_one_config(runner, tmp_path)
+    evidence = runner.build_production_framework_evidence(
+        config,
+        **_schema_one_inputs(runner),
+    )
+    forged = json.loads(json.dumps(evidence))
+
+    if mutation == "float-schema-version":
+        forged["schema_version"] = 1.0
+    elif mutation == "boolean-worker-count":
+        forged["configuration"]["worker_counts"] = [True, 2, 4, 8]
+    elif mutation == "float-required-operations":
+        forged["configuration"]["required_operations"] = 1_000.0
+    elif mutation == "float-extended-operations":
+        forged["configuration"]["extended_operations"] = [10_000.0, 99_999.0]
+    elif mutation == "float-profile-workers":
+        forged["profiles"][0]["workers"] = float(
+            forged["profiles"][0]["workers"]
+        )
+    elif mutation == "array-database-mode":
+        forged["configuration"]["database_mode"] = []
+    else:
+        passing = next(
+            profile
+            for profile in forged["profiles"]
+            if profile["status"] == "PASS"
+        )
+        passing["status"] = []
+
+    with pytest.raises(runner.EvidenceSchemaError):
+        runner.validate_production_framework_evidence(forged)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "empty-scenarios",
+        "missing-scenario",
+        "replaced-scenario",
+        "extra-scenario",
+        "empty-load-profiles",
+        "missing-load-field",
+        "wrong-load-operation",
+        "extra-load-operation",
+        "partial-privacy",
+        "partial-teardown",
+        "partial-hosted-gates",
+        "extra-cumulative-gate",
+    ],
+)
+def test_schema_one_rejects_partial_auxiliary_sections(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    """Catch an overall PASS artifact whose auxiliary schema is incomplete."""
+
+    runner = _load_production_framework_runner()
+    config = _schema_one_config(runner, tmp_path)
+    inputs = _schema_one_inputs(runner)
+    assert set(inputs["scenarios"]) == EXPECTED_SCHEMA_SCENARIOS
+    assert set(inputs["load_profiles"][0]) >= MINIMUM_SCHEMA_LOAD_FIELDS
+
+    if mutation == "empty-scenarios":
+        inputs["scenarios"] = {}
+    elif mutation == "missing-scenario":
+        inputs["scenarios"].pop("native_concurrency")
+    elif mutation == "replaced-scenario":
+        inputs["scenarios"].pop("native_concurrency")
+        inputs["scenarios"]["unexpected"] = {"status": "PASS"}
+    elif mutation == "extra-scenario":
+        inputs["scenarios"]["unexpected"] = {"status": "PASS"}
+    elif mutation == "empty-load-profiles":
+        inputs["load_profiles"] = []
+    elif mutation == "missing-load-field":
+        inputs["load_profiles"][0].pop("errors")
+    elif mutation == "wrong-load-operation":
+        inputs["load_profiles"][0]["operations"] = 10_000
+        inputs["load_profiles"][0]["completed"] = 10_000
+    elif mutation == "extra-load-operation":
+        extra = dict(inputs["load_profiles"][0])
+        extra["operations"] = 10_000
+        extra["completed"] = 10_000
+        inputs["load_profiles"].append(extra)
+    elif mutation == "partial-privacy":
+        inputs["privacy"].pop("command_matches")
+    elif mutation == "partial-teardown":
+        inputs["teardown"].pop("listening_sockets_after")
+    elif mutation == "partial-hosted-gates":
+        inputs["hosted_gate_contracts"].pop("Linux")
+    else:
+        inputs["cumulative_gate_contracts"]["unexpected"] = True
+
+    with pytest.raises(runner.EvidenceSchemaError):
+        runner.build_production_framework_evidence(config, **inputs)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_violation"),
+    [
+        ("privacy-match", "privacy.artifact_matches.detected"),
+        ("teardown-residue", "teardown.sql_sessions_after.nonzero"),
+        ("cumulative-gate", "gate.cumulative.exact_sha.failed"),
+        (
+            "hosted-gate",
+            "gate.hosted.windows.installed_wheel.mismatch",
+        ),
+        ("scenario-failure", "scenario.native_concurrency.failed"),
+        ("load-failure", "load.1000.failed"),
+        (
+            "dependency-mismatch",
+            "dependencies.installed_versions.mismatch",
+        ),
+        ("runtime-dependency", "dependencies.runtime.unlocked"),
+    ],
+)
+def test_schema_one_derives_auxiliary_failures_before_overall_status(
+    tmp_path: Path,
+    mutation: str,
+    expected_violation: str,
+) -> None:
+    """Catch privacy, teardown, gate, scenario or load failures yielding PASS."""
+
+    runner = _load_production_framework_runner()
+    config = _schema_one_config(runner, tmp_path)
+    inputs = _schema_one_inputs(runner)
+
+    if mutation == "privacy-match":
+        inputs["privacy"]["artifact_matches"] = ["credential-pattern"]
+    elif mutation == "teardown-residue":
+        inputs["teardown"]["sql_sessions_after"] = 1
+    elif mutation == "cumulative-gate":
+        inputs["cumulative_gate_contracts"]["exact_sha"] = False
+    elif mutation == "hosted-gate":
+        inputs["hosted_gate_contracts"]["Windows"][
+            "installed_wheel"
+        ] = False
+    elif mutation == "scenario-failure":
+        inputs["scenarios"]["native_concurrency"]["status"] = "FAIL"
+    elif mutation == "load-failure":
+        inputs["load_profiles"][0]["status"] = "FAIL"
+    elif mutation == "runtime-dependency":
+        inputs["dependencies"]["runtime"] = ["unlocked-runtime-package"]
+    else:
+        inputs["dependencies"]["installed_versions"]["fastapi"] = "0.0.0"
+
+    evidence = runner.build_production_framework_evidence(config, **inputs)
+
+    assert evidence["overall"] == "FAIL"
+    assert expected_violation in evidence["violations"]
+
+
+@pytest.mark.parametrize(
+    ("platform_system", "candidate_import_path"),
+    [
+        (
+            "Windows",
+            r"C:\wheel-venv\Lib\site-packages\fastmssql\__init__.py",
+        ),
+        (
+            "Linux",
+            "/opt/wheel-venv/lib/site-packages/fastmssql/__init__.py",
+        ),
+        (
+            "Darwin",
+            "/opt/wheel-venv/lib/site-packages/fastmssql/__init__.py",
+        ),
+    ],
+)
+def test_schema_one_accepts_native_platform_import_path_forms(
+    tmp_path: Path,
+    platform_system: str,
+    candidate_import_path: str,
+) -> None:
+    """Keep resolved Windows and POSIX wheel import paths portable."""
+
+    runner = _load_production_framework_runner()
+    config = _schema_one_config(
+        runner,
+        tmp_path,
+        platform_system=platform_system,
+    )
+    inputs = _schema_one_inputs(runner, platform_system=platform_system)
+    inputs["candidate_import_path"] = candidate_import_path
+    for profile in inputs["profiles"]:
+        for worker in profile.get("worker_records", []):
+            worker["fastmssql_import_path"] = candidate_import_path
+
+    evidence = runner.build_production_framework_evidence(config, **inputs)
+
+    assert evidence["candidate"]["wheel"]["import_path"] == (
+        candidate_import_path
+    )
+
+
+@pytest.mark.parametrize(
+    ("platform_system", "candidate_import_path"),
+    [
+        ("Windows", "FastMssql/python/fastmssql/__init__.py"),
+        ("Windows", "C:/repo/FastMssql/python/fastmssql/__init__.py"),
+        (
+            "Windows",
+            "C:/wheel-venv/Lib/site-packages/fastmssql/__init__.py\nsecret",
+        ),
+        (
+            "Windows",
+            "C:/wheel-venv/Lib/site-packages/not-fastmssql/__init__.py",
+        ),
+        (
+            "Windows",
+            "/opt/wheel-venv/lib/site-packages/fastmssql/__init__.py",
+        ),
+        ("Linux", "opt/wheel-venv/site-packages/fastmssql/__init__.py"),
+        ("Linux", "/workspace/FastMssql/python/fastmssql/__init__.py"),
+        (
+            "Linux",
+            "/opt/wheel-venv/lib/site-packages/fastmssql/__init__.py\nsecret",
+        ),
+        (
+            "Darwin",
+            r"C:\wheel-venv\Lib\site-packages\fastmssql\__init__.py",
+        ),
+        ("Darwin", "/workspace/FastMssql/python/fastmssql/__init__.py"),
+    ],
+)
+def test_schema_one_rejects_unsafe_or_nonisolated_import_paths(
+    tmp_path: Path,
+    platform_system: str,
+    candidate_import_path: str,
+) -> None:
+    """Catch relative, source-tree, control-character or wrong-platform paths."""
+
+    runner = _load_production_framework_runner()
+    config = _schema_one_config(
+        runner,
+        tmp_path,
+        platform_system=platform_system,
+    )
+    inputs = _schema_one_inputs(runner, platform_system=platform_system)
+    inputs["candidate_import_path"] = candidate_import_path
+    for profile in inputs["profiles"]:
+        for worker in profile.get("worker_records", []):
+            worker["fastmssql_import_path"] = candidate_import_path
+
+    with pytest.raises(runner.EvidenceSchemaError, match="import path"):
+        runner.build_production_framework_evidence(config, **inputs)
+
+
+@pytest.mark.parametrize("platform_system", ["Windows", "Linux", "Darwin"])
+def test_schema_one_binds_candidate_import_to_every_passing_worker(
+    tmp_path: Path,
+    platform_system: str,
+) -> None:
+    """Catch any worker importing a different, even structurally safe, wheel."""
+
+    runner = _load_production_framework_runner()
+    config = _schema_one_config(
+        runner,
+        tmp_path,
+        platform_system=platform_system,
+    )
+    evidence = runner.build_production_framework_evidence(
+        config,
+        **_schema_one_inputs(runner, platform_system=platform_system),
+    )
+    coordinates = [
+        (profile_index, worker_index)
+        for profile_index, profile in enumerate(evidence["profiles"])
+        if profile["status"] == "PASS"
+        for worker_index in range(len(profile["worker_records"]))
+    ]
+    assert coordinates
+    different_safe_path = (
+        r"D:\other-venv\Lib\site-packages\fastmssql\__init__.py"
+        if platform_system == "Windows"
+        else "/srv/other-venv/lib/site-packages/fastmssql/__init__.py"
+    )
+
+    for profile_index, worker_index in coordinates:
+        forged = json.loads(json.dumps(evidence))
+        forged["profiles"][profile_index]["worker_records"][worker_index][
+            "fastmssql_import_path"
+        ] = different_safe_path
+
+        with pytest.raises(runner.EvidenceSchemaError, match="import path"):
+            runner.validate_production_framework_evidence(forged)
+
+
+@pytest.mark.parametrize("platform_system", ["Windows", "Linux", "Darwin"])
+@pytest.mark.parametrize("mutation", ["missing", "short"])
+def test_schema_one_requires_complete_worker_import_records(
+    tmp_path: Path,
+    platform_system: str,
+    mutation: str,
+) -> None:
+    """Catch absent evidence or a validator checking fewer than all workers."""
+
+    runner = _load_production_framework_runner()
+    config = _schema_one_config(
+        runner,
+        tmp_path,
+        platform_system=platform_system,
+    )
+    evidence = runner.build_production_framework_evidence(
+        config,
+        **_schema_one_inputs(runner, platform_system=platform_system),
+    )
+    forged = json.loads(json.dumps(evidence))
+    passing = next(
+        profile
+        for profile in forged["profiles"]
+        if profile["status"] == "PASS" and profile["workers"] >= 2
+    )
+    if mutation == "missing":
+        passing.pop("worker_records")
+    else:
+        passing["worker_records"].pop()
+
+    with pytest.raises(runner.EvidenceSchemaError, match="import path"):
+        runner.validate_production_framework_evidence(forged)
+
+
 def test_schema_one_writer_is_atomic_exclusive_and_partial_safe(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -12017,6 +12424,101 @@ def test_schema_one_writer_is_atomic_exclusive_and_partial_safe(
     assert sorted(path.name for path in race_directory.iterdir()) == [
         race_output.name
     ]
+
+
+def test_schema_one_writer_preserves_primary_error_when_cleanup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch staging cleanup masking an exclusive-publication conflict."""
+
+    runner = _load_production_framework_runner()
+    config = _schema_one_config(runner, tmp_path)
+    evidence = runner.build_production_framework_evidence(
+        config,
+        **_schema_one_inputs(runner),
+    )
+    output = tmp_path / "conflict" / "schema-one-evidence.json"
+    output.parent.mkdir()
+    original_link = runner.os.link
+    original_unlink = Path.unlink
+    competing = json.loads(json.dumps(evidence))
+    competing["overall"] = "FAIL"
+    competing["violations"] = ["race.winner"]
+    competing_bytes = json.dumps(
+        competing,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    competing_staged = output.parent / "competing-winner.json"
+    competing_staged.write_bytes(competing_bytes)
+
+    def conflicting_link(staged_path: Path, final_path: Path) -> None:
+        original_link(competing_staged, final_path)
+        original_link(staged_path, final_path)
+
+    def failing_staging_cleanup(staged_path: Path) -> None:
+        assert staged_path.parent == output.parent
+        assert staged_path != output
+        raise OSError("private cleanup detail")
+
+    monkeypatch.setattr(runner.os, "link", conflicting_link)
+    monkeypatch.setattr(
+        runner,
+        "_cleanup_evidence_staging",
+        failing_staging_cleanup,
+        raising=False,
+    )
+
+    with pytest.raises(
+        runner.EvidenceArtifactError,
+        match="already exists",
+    ) as captured:
+        runner.write_production_framework_evidence(output, evidence)
+
+    assert output.read_bytes() == competing_bytes
+    assert "private cleanup detail" not in str(captured.value)
+    assert getattr(captured.value, "__notes__", []) == [
+        "evidence staging cleanup also failed"
+    ]
+    original_unlink(competing_staged)
+
+
+def test_schema_one_writer_reports_successful_publication_with_residue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch a cleanup failure falsely reporting that publication never happened."""
+
+    runner = _load_production_framework_runner()
+    config = _schema_one_config(runner, tmp_path)
+    evidence = runner.build_production_framework_evidence(
+        config,
+        **_schema_one_inputs(runner),
+    )
+    output = tmp_path / "published" / "schema-one-evidence.json"
+    output.parent.mkdir()
+
+    def failing_staging_cleanup(staged_path: Path) -> None:
+        assert staged_path.parent == output.parent
+        assert staged_path != output
+        raise OSError("private cleanup detail")
+
+    monkeypatch.setattr(
+        runner,
+        "_cleanup_evidence_staging",
+        failing_staging_cleanup,
+        raising=False,
+    )
+
+    with pytest.raises(
+        runner.EvidenceArtifactError,
+        match="published but staging cleanup failed",
+    ) as captured:
+        runner.write_production_framework_evidence(output, evidence)
+
+    assert json.loads(output.read_text(encoding="utf-8")) == evidence
+    assert "private cleanup detail" not in str(captured.value)
 
 
 def test_shell_runner_builds_one_isolated_wheel_and_never_logs_secrets() -> None:

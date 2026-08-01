@@ -52,6 +52,16 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Production framework schema-1 review RED
+
+- Added focused review reproductions for exact JSON scalar typing, complete
+  auxiliary schemas, derived privacy/teardown/gate/scenario/load failures and
+  isolated-wheel import-path binding across every passing worker.
+- Added publication cleanup contracts that preserve an exclusive-link primary
+  error and distinguish a successfully published artifact with staging
+  residue. These are harness-only RED contracts; no FastMssql/Tiberius runtime
+  or displayed `0.7.7` package version changed.
+
 ### Production framework schema-1 evidence
 
 - Implemented the detached schema-1 evidence builder with independent
