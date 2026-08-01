@@ -52,6 +52,15 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Production framework case-validator RED
+
+- Added database-independent behavioral contracts that feed the canonical
+  `FRAME-028`, `FRAME-036`--`FRAME-045` and `FRAME-048` validators records
+  using the exact field vocabulary emitted by the runtime evidence classes.
+- Each contract keeps the aggregate verdict at PASS, mutates one case-owned
+  primary field and requires that case's validator to reject the forgery.
+  No FastMssql/Tiberius runtime or displayed `0.7.7` package version changed.
+
 ### Production framework schema-1 review fixes
 
 - Enforced exact JSON scalar types, canonical dependency/tool/gate schemas,
