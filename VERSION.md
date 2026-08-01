@@ -52,6 +52,17 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Production framework case-validator evidence alignment
+
+- Aligned the canonical FRAME-028 and FRAME-036--FRAME-045 validators with
+  the exact evidence fields emitted by the process harness, including wheel
+  import binding, lifecycle settlement, saturation, streaming and the
+  distinct Flask WSGI/adapted-ASGI execution models.
+- Strengthened FRAME-048 to validate exact fixed-worker counts, sums,
+  digests, bounded latency/resource evidence and final settlement rather than
+  trusting the aggregate PASS marker. No FastMssql/Tiberius runtime or
+  displayed `0.7.7` package version changed.
+
 ### Production framework case-validator runtime-shape RED correction
 
 - Corrected the behavioral case-validator fixture to use the exact bounded

@@ -129,6 +129,51 @@ def _assert_not_applicable(
     assert scenario["not_applicable_reason"] == reason
 
 
+def _assert_clean_scenario_lifecycle(
+    scenario: dict[str, object],
+) -> None:
+    assert scenario["graceful_stop"] is True
+    assert scenario["forced_cleanup"] is False
+    assert scenario["listening_sockets_after"] == []
+    assert scenario["sessions_after"] == 0
+    assert scenario["ready_pids"] == scenario["shutdown_pids"]
+
+
+def _assert_wsgi_occupancy(
+    evidence: dict[str, object],
+    scenario: dict[str, object],
+    *,
+    worker_class: str,
+    thread_limit: int,
+) -> None:
+    assert scenario["status"] == "PASS"
+    assert scenario["worker_class"] == worker_class
+    assert scenario["workers"] == 1
+    assert scenario["execution_model"] in APPROVED_LABELS
+    assert scenario["thread_limit_per_worker"] == thread_limit
+    assert scenario["queued_request_proven"] is True
+    assert scenario["loop_tokens_distinct_per_worker"] is True
+    assert scenario["maximum_active_requests"] == thread_limit
+    assert scenario["maximum_simultaneous_sql_requests"] == thread_limit
+    assert scenario["maximum_aggregate_sql_sessions"] <= (
+        evidence["configuration"]["global_connection_budget"]
+    )
+    values = scenario["values"]
+    assert scenario["request_count"] == len(values) == thread_limit + 1
+    assert all(type(value) is int for value in values)
+    assert len(set(values)) == len(values)
+    assert scenario["sql_delay_seconds"] > 0
+    assert scenario["wave_seconds"] >= scenario["sql_delay_seconds"] * 1.5
+    worker_execution = scenario["worker_execution"]
+    assert len(worker_execution) == 1
+    assert worker_execution[0] == {
+        "maximum_active_requests": thread_limit,
+        "pid": scenario["ready_pids"][0],
+        "wsgi_thread_count": thread_limit,
+    }
+    _assert_clean_scenario_lifecycle(scenario)
+
+
 @case("FRAME-027")
 def test_production_dependencies_are_locked_and_platform_scoped(
     production_framework_evidence,
@@ -158,16 +203,23 @@ def test_every_worker_imports_the_exact_isolated_wheel(
     wheel = candidate["wheel"]
     assert re.fullmatch(r"[0-9a-f]{64}", wheel["sha256"])
     assert wheel["filename"].startswith("fastmssql-0.7.7-")
-    assert "site-packages" in wheel["import_path"]
-    assert "FastMssql/python" not in wheel["import_path"]
+    platform = production_framework_evidence["platform"]["system"]
+    candidate_path = wheel["import_path"].replace("\\", "/")
+    if platform == "Windows":
+        candidate_path = candidate_path.casefold()
+    assert "site-packages" in candidate_path.casefold()
+    assert "fastmssql/python" not in candidate_path.casefold()
     worker_paths = {
-        worker["fastmssql_import_path"]
+        (
+            worker["fastmssql_import_path"].replace("\\", "/").casefold()
+            if platform == "Windows"
+            else worker["fastmssql_import_path"].replace("\\", "/")
+        )
         for profile in _applicable(production_framework_evidence)
         for worker in profile["worker_records"]
     }
     assert worker_paths
-    assert all("site-packages" in path for path in worker_paths)
-    assert all("FastMssql/python" not in path for path in worker_paths)
+    assert worker_paths == {candidate_path}
 
 
 @case("FRAME-029")
@@ -313,10 +365,13 @@ def test_real_client_disconnect_settles_sql_and_recovers(
     )
     assert scenario["transport"] == "raw-tcp-client-close"
     assert scenario["sql_observed_before_close"]
+    assert scenario["connection_replaced"] is True
+    assert re.fullmatch(r"[0-9a-f]{64}", scenario["context_token_sha256"])
     assert scenario["sql_requests_after"] == 0
     assert scenario["pool_active_after"] == 0
     assert scenario["pool_pending_after"] == 0
     assert scenario["recovery_value"] == 36
+    _assert_clean_scenario_lifecycle(scenario)
 
 
 @case("FRAME-037")
@@ -328,11 +383,15 @@ def test_graceful_query_shutdown_finishes_without_forced_cleanup(
         _assert_not_applicable(scenario, POSIX_SHUTDOWN_NA)
         return
     assert scenario["status"] == "PASS"
-    assert scenario["signal"] == "SIGTERM"
-    assert scenario["query_observed"]
-    assert scenario["response_completed"]
+    assert scenario["sql_observed_before_signal"] is True
+    assert scenario["response_completed_after_signal"] is True
+    assert re.fullmatch(r"[0-9a-f]{64}", scenario["context_token_sha256"])
+    assert type(scenario["response_session_id"]) is int
+    assert scenario["response_session_id"] > 0
+    assert type(scenario["response_value"]) is int
+    assert scenario["sql_delay_seconds"] > 0
     assert scenario["forced_cleanup"] is False
-    assert scenario["sessions_after"] == 0
+    _assert_clean_scenario_lifecycle(scenario)
 
 
 @case("FRAME-038")
@@ -346,12 +405,19 @@ def test_graceful_transaction_shutdown_has_deterministic_outcomes(
         _assert_not_applicable(scenario, POSIX_SHUTDOWN_NA)
         return
     assert scenario["status"] == "PASS"
-    assert scenario["commit"]["durable_rows"] == 1
-    assert scenario["rollback"]["durable_rows"] == 0
-    assert scenario["commit"]["forced_cleanup"] is False
-    assert scenario["rollback"]["forced_cleanup"] is False
-    assert scenario["transactions_after"] == 0
-    assert scenario["sessions_after"] == 0
+    for outcome, durable_result in {
+        "commit": "row-present",
+        "rollback": "row-absent",
+    }.items():
+        record = scenario[outcome]
+        assert record["status"] == "PASS"
+        assert record["outcome"] == outcome
+        assert record["durable_result"] == durable_result
+        assert record["sql_observed_before_signal"] is True
+        assert record["transaction_holding_before_signal"] is True
+        assert record["response_completed_after_signal"] is True
+        assert record["transaction_settled"] is True
+        _assert_clean_scenario_lifecycle(record)
 
 
 @case("FRAME-039")
@@ -362,13 +428,23 @@ def test_saturated_pool_has_bounded_admission_and_recovers(
         production_framework_evidence,
         "saturation",
     )
-    assert scenario["maximum_pool_connections"] == scenario["pool_max"]
-    assert scenario["maximum_admitted_waiters"] <= scenario["queue_max"]
-    assert scenario["rejected_503"] > 0
-    assert scenario["typed_acquire_timeouts"] > 0
+    pool_max = scenario["pool_max_per_worker"]
+    assert pool_max > 0
+    assert scenario["admitted_holders"] == pool_max
+    assert scenario["admitted_waiters"] == pool_max
+    assert scenario["admission_capacity"] == pool_max * 2
+    assert scenario["maximum_sql_sessions"] == pool_max
+    assert scenario["maximum_sql_requests"] == pool_max
+    assert scenario["observed_active_connections"] == pool_max
+    assert scenario["observed_pending_gets"] == pool_max
+    assert scenario["rejected_requests"] > 0
+    assert scenario["acquire_timeouts"] == pool_max
+    assert scenario["pool_get_timed_out_delta"] == pool_max
     assert scenario["pool_active_after"] == 0
     assert scenario["pool_pending_after"] == 0
+    assert scenario["admission_active_after"] == 0
     assert scenario["recovery_value"] == 39
+    _assert_clean_scenario_lifecycle(scenario)
 
 
 @case("FRAME-040")
@@ -379,17 +455,33 @@ def test_result_stream_reaches_real_http_incrementally_and_cleans_up(
         production_framework_evidence,
         "large_streaming",
     )
-    full = scenario["full_consumption"]
-    early = scenario["early_close"]
-    assert full["transport"] == "chunked-http-1.1"
-    assert full["first_data_before_completion"]
-    assert full["row_count"] == full["expected_row_count"]
-    assert full["digest"] == full["expected_digest"]
-    assert full["maximum_buffered_rows"] <= full["buffer_size"]
-    assert early["validated_prefix_rows"] > 0
-    assert early["sql_requests_after"] == 0
-    assert early["pool_pending_after"] == 0
-    assert early["recovery_value"] == 40
+    assert scenario["driver_buffer_rows"] == 8
+    assert scenario["incremental_first_data"] is True
+    assert 2 <= scenario["full_rows"] <= 10_000
+    assert re.fullmatch(r"[0-9a-f]{64}", scenario["full_value_digest"])
+    assert scenario["full_bytes_received"] > 0
+    assert 0 <= scenario["full_first_data_seconds"] < scenario["full_elapsed_seconds"]
+    assert scenario["full_pool_active_after"] == 0
+    assert scenario["full_pool_pending_after"] == 0
+    assert scenario["early_client_closed"] is True
+    assert 2 <= scenario["early_requested_rows"] <= 10_000
+    assert 1 <= scenario["early_prefix_rows"] < scenario["early_requested_rows"]
+    assert re.fullmatch(r"[0-9a-f]{64}", scenario["early_prefix_digest"])
+    assert scenario["early_bytes_received"] > 0
+    assert 0 <= scenario["early_first_data_seconds"] < scenario["early_close_seconds"]
+    assert scenario["early_sql_requests_after"] == 0
+    assert scenario["early_pool_active_after"] == 0
+    assert scenario["early_pool_pending_after"] == 0
+    assert scenario["rss_peak_bytes"] >= max(
+        scenario["rss_start_bytes"],
+        scenario["rss_end_bytes"],
+    )
+    assert scenario["rss_growth_bytes"] == (
+        scenario["rss_peak_bytes"] - scenario["rss_start_bytes"]
+    )
+    assert scenario["rss_growth_bytes"] <= scenario["rss_growth_limit_bytes"]
+    assert scenario["recovery_value"] == 40
+    _assert_clean_scenario_lifecycle(scenario)
 
 
 @case("FRAME-041")
@@ -400,12 +492,12 @@ def test_flask_sync_worker_remains_occupied(
     if production_framework_evidence["platform"]["system"] == "Windows":
         _assert_not_applicable(scenario, GUNICORN_NA)
         return
-    assert scenario["status"] == "PASS"
-    assert scenario["worker_class"] == "sync"
-    assert scenario["request_slots_per_worker"] == 1
-    assert scenario["second_request_waited"]
-    assert scenario["request_loop_ids_distinct"]
-    assert scenario["values_exact"]
+    _assert_wsgi_occupancy(
+        production_framework_evidence,
+        scenario,
+        worker_class="sync",
+        thread_limit=1,
+    )
 
 
 @case("FRAME-042")
@@ -416,12 +508,12 @@ def test_flask_gthread_has_explicit_thread_occupancy(
     if production_framework_evidence["platform"]["system"] == "Windows":
         _assert_not_applicable(scenario, GUNICORN_NA)
         return
-    assert scenario["status"] == "PASS"
-    assert scenario["worker_class"] == "gthread"
-    assert scenario["threads_per_worker"] == 4
-    assert scenario["maximum_active_requests_per_process"] <= 4
-    assert scenario["fifth_request_waited"]
-    assert scenario["values_exact"]
+    _assert_wsgi_occupancy(
+        production_framework_evidence,
+        scenario,
+        worker_class="gthread",
+        thread_limit=4,
+    )
 
 
 @case("FRAME-043")
@@ -433,10 +525,19 @@ def test_flask_one_request_can_gather_concurrent_sql(
         _assert_not_applicable(scenario, GUNICORN_NA)
         return
     assert scenario["status"] == "PASS"
-    assert scenario["wsgi_request_slots_consumed"] == 1
-    assert scenario["sequential_values"] == scenario["concurrent_values"]
+    assert scenario["execution_model"] in APPROVED_LABELS
+    assert scenario["wsgi_request_slots"] == 1
+    assert scenario["values_exact"] is True
+    assert scenario["maximum_simultaneous_sql_requests"] == 4
     assert scenario["concurrent_seconds"] < scenario["sequential_seconds"] * 0.70
-    assert scenario["inter_request_asgi_claim"] is False
+    assert scenario["sequential_seconds"] >= scenario["sql_delay_seconds"] * 3
+    assert scenario["concurrent_seconds"] >= scenario["sql_delay_seconds"] * 0.75
+    assert scenario["outer_response_seconds"] >= (
+        scenario["sequential_seconds"] + scenario["concurrent_seconds"]
+    ) * 0.90
+    assert scenario["pool_active_after"] == 0
+    assert scenario["pool_pending_after"] == 0
+    _assert_clean_scenario_lifecycle(scenario)
 
 
 @case("FRAME-044")
@@ -448,9 +549,38 @@ def test_adapted_flask_uses_persistent_worker_event_loop(
         "adapted_flask_persistent_loop",
     )
     assert scenario["server"] == "uvicorn"
-    assert scenario["sequential_loop_ids_equal"]
-    assert scenario["pool_created_in_lifespan"]
-    assert scenario["sessions_after"] == 0
+    assert scenario["execution_model"] in APPROVED_LABELS
+    assert scenario["maximum_serialized_wsgi_calls_per_process"] == 1
+    workers = scenario["workers"]
+    loops = scenario["persistent_worker_loops"]
+    worker_records = scenario["worker_records"]
+    assert workers > 0
+    assert len(loops) == len(worker_records) == workers
+    assert {record["pid"] for record in loops} == {
+        worker["pid"] for worker in worker_records
+    }
+    for record in loops:
+        assert all(
+            type(record[name]) is int and record[name] > 0
+            for name in (
+                "async_thread_token",
+                "loop_token",
+                "pid",
+                "wsgi_thread_token",
+            )
+        )
+    for worker in worker_records:
+        assert worker["pool_created_pid"] == worker["pid"]
+        assert worker["pool_connected_monotonic"] >= (
+            worker["process_started_monotonic"]
+        )
+    assert 1 <= scenario["maximum_simultaneous_sql_requests"] <= workers
+    assert scenario["maximum_aggregate_sql_sessions"] <= (
+        production_framework_evidence["configuration"][
+            "global_connection_budget"
+        ]
+    )
+    _assert_clean_scenario_lifecycle(scenario)
 
 
 @case("FRAME-045")
@@ -461,10 +591,21 @@ def test_adapted_flask_is_thread_sensitive_serialized_per_process(
         production_framework_evidence,
         "adapted_flask_serialization",
     )
-    assert scenario["thread_sensitive"] is True
-    assert scenario["maximum_wsgi_calls_per_process"] == 1
-    assert scenario["concurrent_seconds"] >= scenario["sequential_seconds"] * 0.85
-    assert scenario["scaling_unit"] == "process"
+    assert scenario["execution_model"] in APPROVED_LABELS
+    assert scenario["wsgi_calls_per_process"] == 1
+    assert scenario["maximum_simultaneous_sql_requests"] == 1
+    assert scenario["multi_process_scaling"] == "additional worker processes only"
+    assert len(scenario["values"]) == 4
+    assert all(type(value) is int for value in scenario["values"])
+    assert scenario["sequential_seconds"] > 0
+    assert scenario["concurrent_seconds"] > 0
+    assert 0.75 <= scenario["serialization_ratio"] <= 1.35
+    assert scenario["serialization_ratio"] == pytest.approx(
+        scenario["concurrent_seconds"] / scenario["sequential_seconds"]
+    )
+    assert scenario["pool_active_after"] == 0
+    assert scenario["pool_pending_after"] == 0
+    _assert_clean_scenario_lifecycle(scenario)
 
 
 @case("FRAME-046")
@@ -513,10 +654,12 @@ def test_fixed_worker_load_reaches_required_and_extended_profiles(
     assert configuration["required_operations"] == 1_000
     assert configuration["extended_operations"] == [10_000, 99_999]
     assert configuration["extended_requires_opt_in"] is True
+    load_profiles = production_framework_evidence["load_profiles"]
     profiles = {
         profile["operations"]: profile
-        for profile in production_framework_evidence["load_profiles"]
+        for profile in load_profiles
     }
+    assert len(profiles) == len(load_profiles)
     expected_operations = {1_000}
     if configuration["allow_extended"]:
         expected_operations |= {10_000, 99_999}
@@ -525,11 +668,71 @@ def test_fixed_worker_load_reaches_required_and_extended_profiles(
         assert profile["status"] == "PASS"
         assert profile["completed"] == operations
         assert profile["errors"] == 0
-        assert profile["fixed_client_workers"]
-        assert profile["values_exact"]
-        assert profile["maximum_sql_sessions"] <= profile["global_connection_budget"]
-        assert profile["process_count_end"] == profile["process_count_start"]
+        assert profile["fixed_client_workers"] is True
+        assert profile["values_exact"] is True
+        assert profile["value_count"] == profile["expected_value_count"] == operations
+        assert profile["value_sum"] == profile["expected_value_sum"] == (
+            operations * (operations + 1) // 2
+        )
+        assert profile["value_digest"] == profile["expected_value_digest"]
+        assert re.fullmatch(r"[0-9a-f]{64}", profile["value_digest"])
+        assert profile["value_digest_algorithm"] == "sha256-worker-stride-v1"
+        client_workers = profile["client_worker_count"]
+        assert 1 <= profile["maximum_active_requests"] <= client_workers <= 256
+        budget = profile["global_connection_budget"]
+        assert budget == configuration["global_connection_budget"]
+        assert profile["maximum_sql_sessions"] <= budget
+        assert profile["maximum_sql_requests"] <= budget
+        assert profile["maximum_pool_active"] <= budget
+        assert profile["maximum_pool_pending"] <= client_workers
+        server_workers = profile["server_worker_count"]
+        assert server_workers == 4
+        assert profile["server_child_count_start"] == server_workers
+        assert profile["maximum_server_child_count"] == server_workers
+        assert profile["server_child_count_end"] == server_workers
+        assert profile["process_count_start"] == server_workers
+        assert profile["process_count_end"] == server_workers
+        assert profile["resource_samples"] >= 2
+        assert profile["rss_peak_bytes"] >= max(
+            profile["rss_start_bytes"],
+            profile["rss_end_bytes"],
+        )
+        assert profile["rss_growth_bytes"] == (
+            profile["rss_peak_bytes"] - profile["rss_start_bytes"]
+        )
+        assert profile["sql_requests_start"] == 0
+        assert profile["sql_requests_end"] == 0
+        assert profile["sql_sessions_start"] <= budget
+        assert profile["sql_sessions_end"] <= budget
+        assert profile["pool_active_start"] == 0
+        assert profile["pool_active_after"] == 0
+        assert profile["pool_pending_start"] == 0
+        assert profile["pool_pending_after"] == 0
         assert profile["pending_after"] == 0
+        histogram = profile["latency_histogram"]
+        assert [bucket["upper_bound_ms"] for bucket in histogram["buckets"]] == [
+            1,
+            2,
+            5,
+            10,
+            25,
+            50,
+            100,
+            250,
+            500,
+            1_000,
+            2_500,
+            5_000,
+            10_000,
+        ]
+        assert histogram["count"] == operations
+        assert sum(bucket["count"] for bucket in histogram["buckets"]) + (
+            histogram["overflow_count"]
+        ) == operations
+        assert 0 <= histogram["minimum_ms"] <= histogram["maximum_ms"]
+        assert histogram["minimum_ms"] * operations <= histogram["sum_ms"]
+        assert histogram["sum_ms"] <= histogram["maximum_ms"] * operations
+        assert profile["duration_seconds"] >= 0
 
 
 @case("FRAME-049")
@@ -883,13 +1086,19 @@ def _runtime_shaped_case_evidence() -> dict[str, object]:
             "graceful_transaction_shutdown": {
                 "commit": {
                     **transaction_common,
+                    "context_token_sha256": "3" * 64,
                     "durable_result": "row-present",
+                    "item_id": 37,
                     "outcome": "commit",
+                    "response_session_id": 53,
                 },
                 "rollback": {
                     **transaction_common,
+                    "context_token_sha256": "4" * 64,
                     "durable_result": "row-absent",
+                    "item_id": 38,
                     "outcome": "rollback",
+                    "response_session_id": 54,
                 },
                 "status": "PASS",
             },
