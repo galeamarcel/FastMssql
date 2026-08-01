@@ -188,6 +188,21 @@ No release, package-version change, or artifact publication has occurred.
   changes no FastMssql/Tiberius runtime, package metadata, displayed `0.7.7`
   version, release, published artifact or original-repository state.
 
+### Specialized framework-wave and lifecycle false-PASS reproductions
+
+- Added focused RED coverage for the two Task 8 scenarios that still waited
+  for SQL observation before inspecting their HTTP tasks. A `/gather` failure
+  before its four internal SQL requests and an adapted-serialization failure
+  before its first SQL request must remain the primary exception while every
+  observer/request task settles.
+- Added a closed lifecycle-evidence contract for all four Task 8 result
+  records. A server that exits by itself with code zero before the harness
+  requests shutdown has `graceful_stop=false` and must never serialize
+  `status=PASS`, even when PID, listener and session reconciliation succeeds.
+- These reproductions change only repository-owned tests and documentation.
+  They change no FastMssql/Tiberius runtime, package metadata, displayed
+  `0.7.7` version, release, published artifact or original-repository state.
+
 ### Shared-listener and dynamic Flask evidence fix
 
 - Removed the invalid assumption that a shared Gunicorn/Uvicorn listener

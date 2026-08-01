@@ -7108,6 +7108,76 @@ async def test_observed_request_wave_normalizes_response_timeout() -> None:
     assert request_cancelled.is_set()
 
 
+def test_task8_results_refuse_pass_without_harness_controlled_shutdown(
+) -> None:
+    """Catch PASS evidence produced after a server exits before harness stop."""
+
+    runner = _load_production_framework_runner()
+    evidence = SimpleNamespace(
+        to_record=lambda: {"status": "PASS"},
+        worker_execution=(
+            {"maximum_active_requests": 1, "pid": 101},
+        ),
+    )
+    process_fields = {
+        "descendant_pids": (101,),
+        "forced_cleanup": False,
+        "graceful_stop": False,
+        "listening_sockets_after": (),
+        "manager_pid": 90,
+        "returncode": 0,
+        "sessions_after": 0,
+        "shutdown_pids": (101,),
+    }
+    profile_fields = {
+        **process_fields,
+        "launch_attempts": 1,
+        "port": 8125,
+        "sanitized_command": (sys.executable, "-m", "server"),
+    }
+    results = (
+        runner.FlaskWsgiProfileResult(
+            profile=_profile_by_family(
+                runner,
+                "flask-gunicorn-sync",
+                workers=1,
+            ),
+            scaling_evidence=evidence,
+            wsgi_evidence=evidence,
+            **profile_fields,
+        ),
+        runner.AdaptedFlaskProfileResult(
+            profile=_profile_by_family(
+                runner,
+                "flask-asgi-uvicorn-asyncio",
+                workers=1,
+            ),
+            scaling_evidence=evidence,
+            adapted_evidence=evidence,
+            **profile_fields,
+        ),
+        runner.FlaskGatherScenarioResult(
+            profile_id="flask-gunicorn-sync-w1",
+            evidence=evidence,
+            ready_pids=(101,),
+            **process_fields,
+        ),
+        runner.AdaptedFlaskSerializationScenarioResult(
+            profile_id="flask-asgi-uvicorn-asyncio-w1",
+            evidence=evidence,
+            ready_pids=(101,),
+            **process_fields,
+        ),
+    )
+
+    for result in results:
+        with pytest.raises(
+            runner.WorkerEvidenceError,
+            match="harness-controlled graceful shutdown",
+        ):
+            result.to_record()
+
+
 def test_flask_wsgi_profile_selection_is_posix_only_and_complete() -> None:
     """Catch a missing worker count, WSGI class, or false Windows claim."""
 
@@ -8161,6 +8231,133 @@ async def test_flask_gather_scenario_uses_real_server_lifecycle_and_cleanup(
     ]
 
 
+@pytest.mark.asyncio
+async def test_flask_gather_scenario_preserves_pre_sql_http_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch SQL-observer timeout masking a failed /gather response."""
+
+    runner = _load_production_framework_runner()
+    config = replace(
+        _config_with_actual_wheel_hash(runner, tmp_path),
+        database_mode="sql_auth",
+        global_connection_budget=8,
+    )
+    profile = replace(
+        _profile_by_family(runner, "flask-gunicorn-sync", workers=1),
+        database_mode="sql_auth",
+        platform_system=config.platform_system,
+    )
+    isolated = runner.prepare_isolated_application(
+        config,
+        source_directory=ROOT / "tests/production_framework",
+        directory_name="flask-gather-primary-error-test",
+    )
+    settings = runner.SqlAuthObserverSettings(
+        host="127.0.0.1",
+        port=14334,
+        database="fastmssql_validation",
+        username="fastmssql_owner",
+        password="private-owner-password",
+    )
+    ready_record = {
+        "phase": "ready",
+        "pid": 101,
+        "run_id": "flask-gather-error",
+        "worker_application_name": "fm-flask-gather-error-101",
+    }
+    request_failed = asyncio.Event()
+    events: list[str] = []
+
+    class FakeConnection:
+        async def connect(self, *, validate: bool) -> None:
+            assert validate is True
+            events.append("observer-connect")
+
+        async def disconnect(self) -> None:
+            events.append("observer-disconnect")
+
+    class FakeObserver:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        async def wait_for_ready_workers(self, records, *, timeout_seconds):
+            assert tuple(records) == (ready_record,)
+            assert timeout_seconds > 0
+
+        async def wait_for_minimum_requests(self, minimum, *, timeout_seconds):
+            assert minimum == 4
+            assert timeout_seconds > 0
+            await request_failed.wait()
+            raise runner.ReadinessTimeoutError(
+                "observer would mask the primary HTTP failure"
+            )
+
+    class FakeSupervisor:
+        pid = 90
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            del args
+
+        async def wait_for_worker_records(self, **kwargs):
+            assert kwargs["expected_count"] == 1
+            return (ready_record,)
+
+    async def fake_launch(**kwargs):
+        assert await kwargs["readiness_probe"](8126)
+        return runner.ServerLaunch(
+            supervisor=FakeSupervisor(),
+            port=8126,
+            attempts=1,
+            sanitized_command=(sys.executable, "-m", "gunicorn"),
+        )
+
+    async def fake_get(port: int, path: str, **kwargs):
+        assert port == 8126
+        assert path == "/ready"
+        assert kwargs["timeout_seconds"] > 0
+        return {"pid": 101, "state": "ready"}
+
+    async def fake_request(port: int, path: str, **kwargs):
+        assert port == 8126
+        assert path == "/gather"
+        assert kwargs["expected_statuses"] == (200,)
+        request_failed.set()
+        raise runner.HttpProbeError("primary /gather HTTP failure")
+
+    monkeypatch.setattr(
+        runner,
+        "create_observer_connection",
+        lambda *args, **kwargs: FakeConnection(),
+    )
+    monkeypatch.setattr(runner, "SqlServerObserver", FakeObserver)
+    monkeypatch.setattr(runner, "launch_with_port_retry", fake_launch)
+    monkeypatch.setattr(runner, "http_get_json", fake_get)
+    monkeypatch.setattr(runner, "http_request_json", fake_request)
+
+    with pytest.raises(
+        runner.HttpProbeError,
+        match="primary /gather HTTP failure",
+    ):
+        await runner.run_flask_gather_scenario(
+            config,
+            isolated,
+            profile,
+            run_id="flask-gather-error",
+            policy=runner.SupervisorPolicy(),
+            sql_auth_settings=settings,
+            table_name="framework_items_flask",
+            sql_delay_ms=250,
+        )
+
+    assert request_failed.is_set()
+    assert events == ["observer-connect", "observer-disconnect"]
+
+
 def test_adapted_flask_profile_selection_matches_platform_capabilities() -> None:
     """Catch a missing asyncio/uvloop count or an invalid Windows uvloop gate."""
 
@@ -9030,6 +9227,156 @@ async def test_adapted_flask_serialization_scenario_is_supervised_and_bounded(
         "zero-sessions",
         "observer-disconnect",
     ]
+
+
+@pytest.mark.asyncio
+async def test_adapted_serialization_preserves_pre_sql_http_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch observer failure masking a failed adapted concurrent wave."""
+
+    runner = _load_production_framework_runner()
+    config = replace(
+        _config_with_actual_wheel_hash(runner, tmp_path),
+        database_mode="sql_auth",
+        global_connection_budget=8,
+    )
+    profile = replace(
+        _profile_by_family(
+            runner,
+            "flask-asgi-uvicorn-asyncio",
+            workers=1,
+        ),
+        database_mode="sql_auth",
+        platform_system=config.platform_system,
+    )
+    isolated = runner.prepare_isolated_application(
+        config,
+        source_directory=ROOT / "tests/production_framework",
+        directory_name="adapted-serialization-primary-error-test",
+    )
+    settings = runner.SqlAuthObserverSettings(
+        host="127.0.0.1",
+        port=14334,
+        database="fastmssql_validation",
+        username="fastmssql_owner",
+        password="private-owner-password",
+    )
+    ready_record = {
+        "phase": "ready",
+        "pid": 101,
+        "run_id": "adapted-serialization-error",
+        "worker_application_name": "fm-adapted-serialization-error-101",
+    }
+    request_failed = asyncio.Event()
+    pending_cancellations: list[int] = []
+    request_count = 0
+    events: list[str] = []
+
+    class FakeConnection:
+        async def connect(self, *, validate: bool) -> None:
+            assert validate is True
+            events.append("observer-connect")
+
+        async def disconnect(self) -> None:
+            events.append("observer-disconnect")
+
+    class FakeObserver:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        async def wait_for_ready_workers(self, records, *, timeout_seconds):
+            assert tuple(records) == (ready_record,)
+            assert timeout_seconds > 0
+
+        async def wait_for_minimum_requests(self, minimum, *, timeout_seconds):
+            assert minimum == 1
+            assert timeout_seconds > 0
+            await request_failed.wait()
+            raise runner.ReadinessTimeoutError(
+                "observer would mask the adapted HTTP failure"
+            )
+
+    class FakeSupervisor:
+        pid = 90
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            del args
+
+        async def wait_for_worker_records(self, **kwargs):
+            assert kwargs["expected_count"] == 1
+            return (ready_record,)
+
+    async def fake_launch(**kwargs):
+        assert await kwargs["readiness_probe"](8128)
+        return runner.ServerLaunch(
+            supervisor=FakeSupervisor(),
+            port=8128,
+            attempts=1,
+            sanitized_command=(sys.executable, "-m", "uvicorn"),
+        )
+
+    async def fake_get(port: int, path: str, **kwargs):
+        assert port == 8128
+        assert path == "/ready"
+        assert kwargs["timeout_seconds"] > 0
+        return {"pid": 101, "state": "ready"}
+
+    async def fake_request(port: int, path: str, **kwargs):
+        nonlocal request_count
+        assert port == 8128
+        assert path.startswith("/execution/wait/")
+        assert kwargs["expected_statuses"] == (200,)
+        request_count += 1
+        if request_count <= 4:
+            return runner.LoopbackJsonResponse(
+                status_code=200,
+                payload={"value": request_count},
+                elapsed_seconds=0.001,
+            )
+        if request_count == 5:
+            request_failed.set()
+            raise runner.HttpProbeError(
+                "primary adapted serialization HTTP failure"
+            )
+        try:
+            await asyncio.Event().wait()
+        finally:
+            pending_cancellations.append(request_count)
+
+    monkeypatch.setattr(
+        runner,
+        "create_observer_connection",
+        lambda *args, **kwargs: FakeConnection(),
+    )
+    monkeypatch.setattr(runner, "SqlServerObserver", FakeObserver)
+    monkeypatch.setattr(runner, "launch_with_port_retry", fake_launch)
+    monkeypatch.setattr(runner, "http_get_json", fake_get)
+    monkeypatch.setattr(runner, "http_request_json", fake_request)
+
+    with pytest.raises(
+        runner.HttpProbeError,
+        match="primary adapted serialization HTTP failure",
+    ):
+        await runner.run_adapted_flask_serialization_scenario(
+            config,
+            isolated,
+            profile,
+            run_id="adapted-serialization-error",
+            policy=runner.SupervisorPolicy(),
+            sql_auth_settings=settings,
+            table_name="framework_items_flask",
+            values=(764_001, 764_002, 764_003, 764_004),
+            sql_delay_ms=50,
+        )
+
+    assert request_failed.is_set()
+    assert len(pending_cancellations) == 3
+    assert events == ["observer-connect", "observer-disconnect"]
 
 
 def test_execution_model_language_is_exact_and_rejects_equivalence_claims() -> None:
