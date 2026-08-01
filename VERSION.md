@@ -203,6 +203,35 @@ No release, package-version change, or artifact publication has occurred.
   They change no FastMssql/Tiberius runtime, package metadata, displayed
   `0.7.7` version, release, published artifact or original-repository state.
 
+### Specialized framework-wave and lifecycle evidence fix
+
+- Generalized the bounded HTTP/SQL wave coordinator so one HTTP request may
+  legitimately expose several concurrent SQL requests. The coordinator now
+  returns both the settled responses and the exact observer sample captured
+  during the wave while preserving HTTP-error precedence and settling every
+  child task.
+- Routed Flask `/gather` and adapted-Flask serialization through that common
+  coordinator. A pre-SQL HTTP failure can no longer be replaced by an
+  observer timeout, including the one-request/four-SQL `/gather` model.
+- Added one closed, platform-aware harness-controlled shutdown invariant and
+  enforce it immediately after `stop()` and again before serializing any of
+  the four Task 8 result records. Exit code zero without a harness-requested
+  graceful stop is now fail-closed evidence, not `PASS`.
+- The three focused false-PASS reproductions pass after the correction, and
+  the cumulative implemented contract passes `175/175` with exactly eight
+  future Task 9--11 gates deselected. Fresh installed-wheel Docker SQL-auth
+  evidence at `.artifacts/sql-auth/task8-real-wk9f5sjh/` passed all eight
+  WSGI profiles, `/gather`, all eight adapted-ASGI profiles and adapted
+  serialization with harness-controlled graceful shutdown, no forced cleanup
+  and zero sessions after every profile. The affected native FastAPI matrix
+  also passed all `12/12` asyncio/uvloop/Gunicorn profiles with maximum eight
+  sessions and zero sessions after teardown at
+  `.artifacts/sql-auth/task7-matrix-5xdq5lq7/`.
+- This correction remains within the repository-owned production-framework
+  harness, tests and documentation. It changes no FastMssql/Tiberius runtime,
+  package metadata, displayed `0.7.7` version, release, published artifact or
+  original-repository state.
+
 ### Shared-listener and dynamic Flask evidence fix
 
 - Removed the invalid assumption that a shared Gunicorn/Uvicorn listener
@@ -226,11 +255,11 @@ No release, package-version change, or artifact publication has occurred.
   profiles, the one-request `/gather` scenario, all eight adapted Uvicorn
   asyncio/uvloop profiles and the dedicated serialization scenario. Every
   profile ended with zero SQL sessions, no listener and no forced cleanup.
-  `/gather` measured `1.0131 s` sequential versus `0.2644 s` concurrent with
-  four SQL requests inside one WSGI slot; adapted Flask measured `1.0902 s`
-  sequential versus `1.0911 s` concurrent with exactly one serialized WSGI
+  `/gather` measured `1.0122 s` sequential versus `0.2648 s` concurrent with
+  four SQL requests inside one WSGI slot; adapted Flask measured `1.0851 s`
+  sequential versus `1.0713 s` concurrent with exactly one serialized WSGI
   call and one SQL request per process.
-- The cumulative implemented contract passes `172/172`; exactly eight future
+- The cumulative implemented contract passes `175/175`; exactly eight future
   Task 9--11 shell/load/report/hosted gates are explicitly deselected. The
   verified evidence uses candidate runtime
   `9a020924ff78d40cbe6ebe8595a204b0f14d46ea` and wheel SHA-256

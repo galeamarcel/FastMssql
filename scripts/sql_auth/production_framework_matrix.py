@@ -314,6 +314,32 @@ class ProcessOutcome:
     forced_cleanup: bool
 
 
+def require_harness_controlled_graceful_shutdown(
+    *,
+    returncode: int,
+    graceful_stop: bool,
+    forced_cleanup: bool,
+) -> None:
+    """Reject PASS evidence unless the harness requested a clean shutdown."""
+
+    accepted_returncodes = {0}
+    if os.name == "posix":
+        accepted_returncodes.add(-signal.SIGTERM)
+    if (
+        isinstance(returncode, bool)
+        or not isinstance(returncode, int)
+        or not isinstance(graceful_stop, bool)
+        or not isinstance(forced_cleanup, bool)
+        or returncode not in accepted_returncodes
+        or not graceful_stop
+        or forced_cleanup
+    ):
+        raise WorkerEvidenceError(
+            "production framework evidence requires harness-controlled "
+            "graceful shutdown"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class ServerLaunch:
     supervisor: ProcessSupervisor
@@ -409,6 +435,11 @@ class FlaskWsgiProfileResult:
     sessions_after: int
 
     def to_record(self) -> dict[str, object]:
+        require_harness_controlled_graceful_shutdown(
+            returncode=self.returncode,
+            graceful_stop=self.graceful_stop,
+            forced_cleanup=self.forced_cleanup,
+        )
         record = self.profile.to_record()
         record.update(self.scaling_evidence.to_record())
         record.update(self.wsgi_evidence.to_record())
@@ -455,6 +486,11 @@ class AdaptedFlaskProfileResult:
     sessions_after: int
 
     def to_record(self) -> dict[str, object]:
+        require_harness_controlled_graceful_shutdown(
+            returncode=self.returncode,
+            graceful_stop=self.graceful_stop,
+            forced_cleanup=self.forced_cleanup,
+        )
         record = self.profile.to_record()
         record.update(self.scaling_evidence.to_record())
         record.update(self.adapted_evidence.to_record())
@@ -527,6 +563,11 @@ class FlaskGatherScenarioResult:
     sessions_after: int
 
     def to_record(self) -> dict[str, object]:
+        require_harness_controlled_graceful_shutdown(
+            returncode=self.returncode,
+            graceful_stop=self.graceful_stop,
+            forced_cleanup=self.forced_cleanup,
+        )
         record = self.evidence.to_record()
         record.update(
             {
@@ -562,6 +603,11 @@ class AdaptedFlaskSerializationScenarioResult:
     sessions_after: int
 
     def to_record(self) -> dict[str, object]:
+        require_harness_controlled_graceful_shutdown(
+            returncode=self.returncode,
+            graceful_stop=self.graceful_stop,
+            forced_cleanup=self.forced_cleanup,
+        )
         record = self.evidence.to_record()
         record.update(
             {
@@ -831,6 +877,12 @@ class SqlObserverSample:
                 for token in self.request_context_tokens
             ],
         }
+
+
+@dataclass(frozen=True, slots=True)
+class ObservedRequestWave:
+    responses: tuple[LoopbackJsonResponse, ...]
+    observer_sample: SqlObserverSample
 
 
 @dataclass(frozen=True, slots=True)
@@ -1478,7 +1530,7 @@ async def await_observed_request_wave(
     *,
     minimum_requests: int,
     timeout_seconds: float,
-) -> tuple[LoopbackJsonResponse, ...]:
+) -> ObservedRequestWave:
     """Await SQL observation and HTTP settlement without hiding either error."""
 
     if (
@@ -1492,10 +1544,10 @@ async def await_observed_request_wave(
     if (
         isinstance(minimum_requests, bool)
         or not isinstance(minimum_requests, int)
-        or not 1 <= minimum_requests <= len(request_tasks)
+        or minimum_requests <= 0
     ):
         raise RunnerConfigurationError(
-            "observed request minimum is outside the request wave"
+            "observed request minimum must be a positive integer"
         )
     if (
         isinstance(timeout_seconds, bool)
@@ -1535,7 +1587,7 @@ async def await_observed_request_wave(
                 )
             if not observation_task.done():
                 try:
-                    await asyncio.wait_for(
+                    observer_sample = await asyncio.wait_for(
                         observation_task,
                         timeout=remaining,
                     )
@@ -1544,10 +1596,13 @@ async def await_observed_request_wave(
                         "SQL observation did not settle within the wave bound"
                     ) from None
             else:
-                observation_task.result()
-            return tuple(responses)
+                observer_sample = observation_task.result()
+            return ObservedRequestWave(
+                responses=tuple(responses),
+                observer_sample=observer_sample,
+            )
 
-        observation_task.result()
+        observer_sample = observation_task.result()
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise ReadinessTimeoutError(
@@ -1562,7 +1617,10 @@ async def await_observed_request_wave(
             raise ReadinessTimeoutError(
                 "HTTP responses did not settle within the wave bound"
             ) from None
-        return tuple(responses)
+        return ObservedRequestWave(
+            responses=tuple(responses),
+            observer_sample=observer_sample,
+        )
     finally:
         if not observation_task.done():
             observation_task.cancel()
@@ -6200,12 +6258,13 @@ async def run_native_scaling_profile(
                 )
                 for value in wave_values
             )
-            wave_responses = await await_observed_request_wave(
+            observed_wave = await await_observed_request_wave(
                 observer,
                 wave_tasks,
                 minimum_requests=min(2, len(wave_tasks)),
                 timeout_seconds=wave_timeout,
             )
+            wave_responses = observed_wave.responses
 
             pool_records = await collect_worker_payloads(
                 launch.port,
@@ -6484,12 +6543,13 @@ async def run_flask_wsgi_profile(
                 profile,
                 request_count=len(wave_tasks),
             )
-            wave_responses = await await_observed_request_wave(
+            observed_wave = await await_observed_request_wave(
                 observer,
                 wave_tasks,
                 minimum_requests=minimum_requests,
                 timeout_seconds=wave_timeout,
             )
+            wave_responses = observed_wave.responses
             wave_seconds = time.perf_counter() - wave_started
 
             settled_records = await collect_worker_payloads(
@@ -6532,6 +6592,11 @@ async def run_flask_wsgi_profile(
                 observer_sample=observer_sample,
             )
             outcome = await supervisor.stop()
+            require_harness_controlled_graceful_shutdown(
+                returncode=outcome.returncode,
+                graceful_stop=outcome.graceful_stop,
+                forced_cleanup=outcome.forced_cleanup,
+            )
 
         shutdown_records = supervisor.read_worker_records(
             directory=artifact_directory,
@@ -6810,12 +6875,13 @@ async def run_adapted_flask_profile(
                 profile,
                 request_count=len(wave_tasks),
             )
-            wave_responses = await await_observed_request_wave(
+            observed_wave = await await_observed_request_wave(
                 observer,
                 wave_tasks,
                 minimum_requests=minimum_requests,
                 timeout_seconds=wave_timeout,
             )
+            wave_responses = observed_wave.responses
 
             settled_records = await collect_worker_payloads(
                 launch.port,
@@ -6856,6 +6922,11 @@ async def run_adapted_flask_profile(
                 observer_sample=observer_sample,
             )
             outcome = await supervisor.stop()
+            require_harness_controlled_graceful_shutdown(
+                returncode=outcome.returncode,
+                graceful_stop=outcome.graceful_stop,
+                forced_cleanup=outcome.forced_cleanup,
+            )
 
         shutdown_records = supervisor.read_worker_records(
             directory=artifact_directory,
@@ -7105,21 +7176,15 @@ async def run_adapted_flask_serialization_scenario(
                 )
                 for value in values
             )
-            try:
-                busy_sample = await observer.wait_for_minimum_requests(
-                    1,
-                    timeout_seconds=request_timeout,
-                )
-                concurrent_responses = await asyncio.wait_for(
-                    asyncio.gather(*concurrent_tasks),
-                    timeout=request_timeout,
-                )
-                concurrent_seconds = time.perf_counter() - concurrent_started
-            finally:
-                for task in concurrent_tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*concurrent_tasks, return_exceptions=True)
+            observed_wave = await await_observed_request_wave(
+                observer,
+                concurrent_tasks,
+                minimum_requests=1,
+                timeout_seconds=request_timeout,
+            )
+            concurrent_responses = observed_wave.responses
+            busy_sample = observed_wave.observer_sample
+            concurrent_seconds = time.perf_counter() - concurrent_started
 
             state_response = await http_request_json(
                 launch.port,
@@ -7149,6 +7214,11 @@ async def run_adapted_flask_serialization_scenario(
                 sql_delay_ms=sql_delay_ms,
             )
             outcome = await supervisor.stop()
+            require_harness_controlled_graceful_shutdown(
+                returncode=outcome.returncode,
+                graceful_stop=outcome.graceful_stop,
+                forced_cleanup=outcome.forced_cleanup,
+            )
 
         shutdown_records = supervisor.read_worker_records(
             directory=artifact_directory,
@@ -7315,19 +7385,14 @@ async def run_flask_gather_scenario(
                     timeout_seconds=request_timeout,
                 )
             )
-            try:
-                busy_sample = await observer.wait_for_minimum_requests(
-                    4,
-                    timeout_seconds=request_timeout,
-                )
-                response = await asyncio.wait_for(
-                    gather_task,
-                    timeout=request_timeout,
-                )
-            finally:
-                if not gather_task.done():
-                    gather_task.cancel()
-                await asyncio.gather(gather_task, return_exceptions=True)
+            observed_wave = await await_observed_request_wave(
+                observer,
+                (gather_task,),
+                minimum_requests=4,
+                timeout_seconds=request_timeout,
+            )
+            (response,) = observed_wave.responses
+            busy_sample = observed_wave.observer_sample
 
             state_response = await http_request_json(
                 launch.port,
@@ -7349,6 +7414,11 @@ async def run_flask_gather_scenario(
                 sql_delay_ms=sql_delay_ms,
             )
             outcome = await supervisor.stop()
+            require_harness_controlled_graceful_shutdown(
+                returncode=outcome.returncode,
+                graceful_stop=outcome.graceful_stop,
+                forced_cleanup=outcome.forced_cleanup,
+            )
 
         shutdown_records = supervisor.read_worker_records(
             directory=artifact_directory,
