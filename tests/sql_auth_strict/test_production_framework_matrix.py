@@ -77,6 +77,7 @@ def production_framework_evidence() -> dict[str, object]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["schema_version"] == 1
     assert payload["candidate"]["git_sha"] == _git_head()
+    assert payload["harness"]["git_sha"] == _git_head()
     assert payload["overall"] == "PASS"
     assert payload["violations"] == []
     return payload

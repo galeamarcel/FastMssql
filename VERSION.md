@@ -52,6 +52,29 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Production framework schema-1 evidence RED
+
+- Added behavioral RED contracts for one exact top-level schema with
+  independent candidate/harness SHAs, isolated-wheel provenance, sanitized
+  configuration and independently derived Windows/Linux/Darwin
+  expected/applicable/N/A profile inventories and profile identities.
+- Required final evidence to deep-copy caller inputs, derive FAIL from failed
+  required profiles, reject incomplete/duplicate/pending/contradictory
+  inventories and enforce PASS if and only if aggregate violations are empty.
+- Added validation for stale candidate/harness provenance, self-consistent
+  forged universes, profile identities, partial/extra schema fields, every
+  forged inventory count and inconsistent final status. The synchronized
+  writer contract now gates the actual exclusive hard-link operation after
+  complete staging: readers observe no final path before the atomic operation
+  and the complete payload while it is still in progress; concurrent
+  publishers produce exactly one winner, existing bytes are preserved and
+  failure leaves no residue.
+- Tightened the canonical `FRAME-027`–`FRAME-054` evidence fixture so the
+  harness commit is bound independently to the current exact SHA.
+- These tests intentionally precede the Task 9 schema implementation. They
+  change no FastMssql/Tiberius runtime, package metadata, displayed `0.7.7`
+  version, release, published artifact or original-repository state.
+
 ### Production framework fixed-worker review RED
 
 - Added review-driven behavioral coverage proving that completed PASS

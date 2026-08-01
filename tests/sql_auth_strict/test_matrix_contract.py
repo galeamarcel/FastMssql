@@ -1801,6 +1801,7 @@ def test_production_framework_evidence_requires_exact_current_sha(
     payload = {
         "schema_version": 1,
         "candidate": {"git_sha": _git_head()},
+        "harness": {"git_sha": _git_head()},
         "overall": "PASS",
         "violations": [],
     }
@@ -1815,6 +1816,15 @@ def test_production_framework_evidence_requires_exact_current_sha(
 
     assert _production_framework_evidence.__wrapped__() == payload
 
+    payload["harness"]["git_sha"] = "0" * 40
+    evidence_path.write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError):
+        _production_framework_evidence.__wrapped__()
+
+    payload["harness"]["git_sha"] = _git_head()
     payload["candidate"]["git_sha"] = "0" * 40
     evidence_path.write_text(
         json.dumps(payload),

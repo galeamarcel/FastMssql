@@ -15,6 +15,7 @@ import socket
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import tracemalloc
 import tomllib
@@ -59,6 +60,14 @@ EXPECTED_PROFILE_FAMILIES = {
     "flask-gunicorn-gthread",
     "flask-asgi-uvicorn-asyncio",
     "flask-asgi-uvicorn-uvloop",
+}
+EXPECTED_SCHEMA_PROFILE_IDENTITIES = {
+    f"{family}-w{workers}": {
+        "family": family,
+        "workers": workers,
+    }
+    for family in EXPECTED_PROFILE_FAMILIES
+    for workers in EXPECTED_WORKER_COUNTS
 }
 EXPECTED_CASES = {f"FRAME-{number:03d}" for number in range(27, 55)}
 
@@ -11207,6 +11216,807 @@ def test_fixed_worker_latency_histogram_is_bounded_and_validated() -> None:
     ):
         histogram.observe(float.fromhex("0x1.fffffffffffffp+1023"))
     assert histogram.to_record() == pristine
+
+
+def _schema_one_config(
+    runner: Any,
+    tmp_path: Path,
+    *,
+    platform_system: str = "Windows",
+) -> Any:
+    arguments = _runner_cli_arguments(tmp_path)
+    arguments[arguments.index("--database-mode") + 1] = "sql_auth"
+    wheel = Path(arguments[arguments.index("--wheel") + 1])
+    arguments[arguments.index("--wheel-sha256") + 1] = hashlib.sha256(
+        wheel.read_bytes()
+    ).hexdigest()
+    return replace(
+        runner.parse_cli(arguments),
+        platform_system=platform_system,
+    )
+
+
+def _schema_one_inputs(
+    runner: Any,
+    *,
+    platform_system: str = "Windows",
+) -> dict[str, Any]:
+    profiles: list[dict[str, object]] = []
+    for profile in runner.expand_profiles(
+        platform_system,
+        database_mode="sql_auth",
+    ):
+        record = profile.to_record()
+        if record["applicable"]:
+            record["status"] = "PASS"
+        profiles.append(record)
+    return {
+        "candidate_import_path": (
+            "C:/wheel-venv/Lib/site-packages/fastmssql/__init__.py"
+            if platform_system == "Windows"
+            else "/opt/wheel-venv/lib/site-packages/fastmssql/__init__.py"
+        ),
+        "comparison": {
+            "labels": [
+                "native ASGI: concurrent requests on persistent event loop"
+            ],
+            "rendered": "measured execution models",
+        },
+        "cumulative_gate_contracts": {
+            "dependency_security": True,
+            "exact_sha": True,
+        },
+        "dependencies": {
+            "installed_versions": {
+                "fastapi": "0.139.2",
+                "uvicorn": "0.51.0",
+            },
+            "runtime": [],
+        },
+        "harness_git_sha": "c" * 40,
+        "hosted_gate_contracts": {
+            "Windows": {
+                "installed_wheel": True,
+                "real_sql_auth": True,
+            }
+        },
+        "load_profiles": [
+            {
+                "completed": 1_000,
+                "operations": 1_000,
+                "status": "PASS",
+            }
+        ],
+        "platform_record": {
+            "machine": {
+                "Darwin": "arm64",
+                "Linux": "x86_64",
+                "Windows": "AMD64",
+            }[platform_system],
+            "python_implementation": "CPython",
+            "system": platform_system,
+        },
+        "privacy": {
+            "artifact_matches": [],
+            "tracked_matches": [],
+        },
+        "profiles": profiles,
+        "scenarios": {
+            "native_concurrency": {
+                "status": "PASS",
+                "values_exact": True,
+            }
+        },
+        "teardown": {
+            "child_processes_after": 0,
+            "sql_sessions_after": 0,
+        },
+        "tool_versions": {
+            "python": "3.13.5",
+            "rust": "1.94.0",
+            "sql_server": "16.0",
+        },
+        "violations": [],
+    }
+
+
+@pytest.mark.parametrize(
+    (
+        "platform_system",
+        "expected_applicable",
+        "expected_not_applicable",
+        "expected_import_path",
+        "expected_machine",
+    ),
+    [
+        (
+            "Windows",
+            8,
+            20,
+            "C:/wheel-venv/Lib/site-packages/fastmssql/__init__.py",
+            "AMD64",
+        ),
+        (
+            "Linux",
+            28,
+            0,
+            "/opt/wheel-venv/lib/site-packages/fastmssql/__init__.py",
+            "x86_64",
+        ),
+        (
+            "Darwin",
+            28,
+            0,
+            "/opt/wheel-venv/lib/site-packages/fastmssql/__init__.py",
+            "arm64",
+        ),
+    ],
+)
+def test_schema_one_evidence_derives_exact_provenance_inventory_and_pass(
+    tmp_path: Path,
+    platform_system: str,
+    expected_applicable: int,
+    expected_not_applicable: int,
+    expected_import_path: str,
+    expected_machine: str,
+) -> None:
+    """Catch a hard-coded platform inventory or conflated provenance SHA."""
+
+    runner = _load_production_framework_runner()
+    config = _schema_one_config(
+        runner,
+        tmp_path,
+        platform_system=platform_system,
+    )
+    inputs = _schema_one_inputs(
+        runner,
+        platform_system=platform_system,
+    )
+    expected_ids = sorted(EXPECTED_SCHEMA_PROFILE_IDENTITIES)
+
+    evidence = runner.build_production_framework_evidence(config, **inputs)
+
+    assert set(evidence) == {
+        "candidate",
+        "comparison",
+        "configuration",
+        "cumulative_gate_contracts",
+        "dependencies",
+        "harness",
+        "hosted_gate_contracts",
+        "load_profiles",
+        "overall",
+        "platform",
+        "privacy",
+        "profile_inventory",
+        "profiles",
+        "scenarios",
+        "schema_version",
+        "teardown",
+        "tools",
+        "violations",
+    }
+    assert evidence["schema_version"] == 1
+    assert evidence["candidate"] == {
+        "git_sha": "a" * 40,
+        "wheel": {
+            "filename": "fastmssql-0.7.7-cp311-abi3.whl",
+            "import_path": expected_import_path,
+            "sha256": hashlib.sha256(b"test-wheel").hexdigest(),
+        },
+    }
+    assert evidence["harness"] == {"git_sha": "c" * 40}
+    assert evidence["configuration"] == {
+        "allow_extended": False,
+        "database_mode": "sql_auth",
+        "extended_operations": [10_000, 99_999],
+        "extended_requires_opt_in": True,
+        "global_connection_budget": 16,
+        "operations": [1_000],
+        "required_operations": 1_000,
+        "worker_counts": [1, 2, 4, 8],
+    }
+    assert evidence["platform"] == {
+        "machine": expected_machine,
+        "python_implementation": "CPython",
+        "system": platform_system,
+    }
+    assert evidence["tools"] == {
+        "python": "3.13.5",
+        "rust": "1.94.0",
+        "sql_server": "16.0",
+    }
+    assert evidence["dependencies"] == {
+        "installed_versions": {
+            "fastapi": "0.139.2",
+            "uvicorn": "0.51.0",
+        },
+        "runtime": [],
+    }
+    assert evidence["comparison"] == {
+        "labels": ["native ASGI: concurrent requests on persistent event loop"],
+        "rendered": "measured execution models",
+    }
+    assert evidence["load_profiles"] == [
+        {
+            "completed": 1_000,
+            "operations": 1_000,
+            "status": "PASS",
+        }
+    ]
+    assert evidence["scenarios"] == {
+        "native_concurrency": {
+            "status": "PASS",
+            "values_exact": True,
+        }
+    }
+    assert evidence["privacy"] == {
+        "artifact_matches": [],
+        "tracked_matches": [],
+    }
+    assert evidence["teardown"] == {
+        "child_processes_after": 0,
+        "sql_sessions_after": 0,
+    }
+    assert evidence["hosted_gate_contracts"] == {
+        "Windows": {
+            "installed_wheel": True,
+            "real_sql_auth": True,
+        }
+    }
+    assert evidence["cumulative_gate_contracts"] == {
+        "dependency_security": True,
+        "exact_sha": True,
+    }
+    assert evidence["profiles"] == inputs["profiles"]
+    assert {
+        profile["id"]: {
+            "database_mode": profile["database_mode"],
+            "family": profile["family"],
+            "platform_system": profile["platform_system"],
+            "workers": profile["workers"],
+        }
+        for profile in evidence["profiles"]
+    } == {
+        profile_id: {
+            "database_mode": "sql_auth",
+            "family": identity["family"],
+            "platform_system": platform_system,
+            "workers": identity["workers"],
+        }
+        for profile_id, identity in EXPECTED_SCHEMA_PROFILE_IDENTITIES.items()
+    }
+    assert evidence["profile_inventory"] == {
+        "applicable": expected_applicable,
+        "executed": expected_applicable,
+        "expected": 28,
+        "expected_ids": expected_ids,
+        "failed": 0,
+        "not_applicable": expected_not_applicable,
+        "skipped": 0,
+    }
+    assert evidence["overall"] == "PASS"
+    assert evidence["violations"] == []
+
+
+def test_schema_one_evidence_is_deeply_detached_and_derives_profile_failures(
+    tmp_path: Path,
+) -> None:
+    """Catch caller aliases or required FAIL/SKIPPED profiles yielding PASS."""
+
+    runner = _load_production_framework_runner()
+    config = _schema_one_config(runner, tmp_path)
+    inputs = _schema_one_inputs(runner)
+    failed_profile = next(
+        profile
+        for profile in inputs["profiles"]
+        if profile["id"] == "fastapi-uvicorn-asyncio-w1"
+    )
+    skipped_profile = next(
+        profile
+        for profile in inputs["profiles"]
+        if profile["id"] == "fastapi-uvicorn-asyncio-w2"
+    )
+    failed_profile["status"] = "FAIL"
+    skipped_profile["status"] = "SKIPPED"
+
+    evidence = runner.build_production_framework_evidence(config, **inputs)
+    expected_violations = [
+        "profile.fastapi-uvicorn-asyncio-w1.failed",
+        "profile.fastapi-uvicorn-asyncio-w2.skipped",
+    ]
+
+    assert evidence["overall"] == "FAIL"
+    assert evidence["violations"] == expected_violations
+    assert evidence["profile_inventory"]["failed"] == 1
+    assert evidence["profile_inventory"]["skipped"] == 1
+    assert evidence["profile_inventory"]["executed"] == 7
+
+    inputs["platform_record"]["machine"] = "mutated"
+    inputs["tool_versions"]["python"] = "mutated"
+    inputs["dependencies"]["installed_versions"]["fastapi"] = "mutated"
+    inputs["dependencies"]["runtime"].append("mutated")
+    inputs["profiles"][0]["status"] = "MUTATED"
+    inputs["profiles"].clear()
+    inputs["scenarios"]["native_concurrency"]["status"] = "FAIL"
+    inputs["comparison"]["labels"].append("mutated")
+    inputs["comparison"]["rendered"] = "mutated"
+    inputs["load_profiles"][0]["completed"] = 0
+    inputs["load_profiles"].append({"status": "MUTATED"})
+    inputs["privacy"]["artifact_matches"].append("secret")
+    inputs["teardown"]["child_processes_after"] = 1
+    inputs["hosted_gate_contracts"]["Windows"]["installed_wheel"] = False
+    inputs["cumulative_gate_contracts"]["exact_sha"] = False
+    inputs["violations"].append("caller.mutated")
+
+    assert evidence["platform"]["machine"] == "AMD64"
+    assert evidence["tools"]["python"] == "3.13.5"
+    assert evidence["dependencies"] == {
+        "installed_versions": {
+            "fastapi": "0.139.2",
+            "uvicorn": "0.51.0",
+        },
+        "runtime": [],
+    }
+    assert len(evidence["profiles"]) == 28
+    assert evidence["scenarios"]["native_concurrency"]["status"] == "PASS"
+    assert evidence["comparison"]["labels"] == [
+        "native ASGI: concurrent requests on persistent event loop"
+    ]
+    assert evidence["comparison"]["rendered"] == "measured execution models"
+    assert evidence["load_profiles"] == [
+        {
+            "completed": 1_000,
+            "operations": 1_000,
+            "status": "PASS",
+        }
+    ]
+    assert evidence["privacy"]["artifact_matches"] == []
+    assert evidence["teardown"]["child_processes_after"] == 0
+    assert evidence["hosted_gate_contracts"]["Windows"][
+        "installed_wheel"
+    ] is True
+    assert evidence["cumulative_gate_contracts"]["exact_sha"] is True
+    assert evidence["violations"] == expected_violations
+
+
+def test_schema_one_evidence_aggregates_explicit_caller_violations(
+    tmp_path: Path,
+) -> None:
+    """Catch a builder that drops upstream scenario or teardown failures."""
+
+    runner = _load_production_framework_runner()
+    config = _schema_one_config(runner, tmp_path)
+    inputs = _schema_one_inputs(runner)
+    inputs["violations"] = [
+        "teardown.sessions.remaining",
+        "load.required.timeout",
+    ]
+
+    evidence = runner.build_production_framework_evidence(config, **inputs)
+
+    assert evidence["overall"] == "FAIL"
+    assert evidence["violations"] == [
+        "load.required.timeout",
+        "teardown.sessions.remaining",
+    ]
+    assert evidence["profile_inventory"]["failed"] == 0
+    assert evidence["profile_inventory"]["skipped"] == 0
+
+
+def test_schema_one_evidence_rejects_incomplete_or_contradictory_profiles(
+    tmp_path: Path,
+) -> None:
+    """Catch missing, duplicate, pending, or contradictory final inventory."""
+
+    runner = _load_production_framework_runner()
+    config = _schema_one_config(runner, tmp_path)
+
+    missing = _schema_one_inputs(runner)
+    missing["profiles"].pop()
+    with pytest.raises(runner.EvidenceSchemaError, match="profile inventory"):
+        runner.build_production_framework_evidence(config, **missing)
+
+    duplicate = _schema_one_inputs(runner)
+    duplicate["profiles"].append(dict(duplicate["profiles"][0]))
+    with pytest.raises(runner.EvidenceSchemaError, match="profile IDs"):
+        runner.build_production_framework_evidence(config, **duplicate)
+
+    pending = _schema_one_inputs(runner)
+    applicable = next(
+        profile for profile in pending["profiles"] if profile["applicable"]
+    )
+    applicable["status"] = "PENDING"
+    with pytest.raises(runner.EvidenceSchemaError, match="final status"):
+        runner.build_production_framework_evidence(config, **pending)
+
+    contradictory = _schema_one_inputs(runner)
+    not_applicable = next(
+        profile
+        for profile in contradictory["profiles"]
+        if not profile["applicable"]
+    )
+    not_applicable["applicable"] = True
+    with pytest.raises(runner.EvidenceSchemaError, match="applicability"):
+        runner.build_production_framework_evidence(config, **contradictory)
+
+    reasonless = _schema_one_inputs(runner)
+    not_applicable = next(
+        profile
+        for profile in reasonless["profiles"]
+        if not profile["applicable"]
+    )
+    not_applicable["not_applicable_reason"] = ""
+    with pytest.raises(runner.EvidenceSchemaError, match="applicability"):
+        runner.build_production_framework_evidence(config, **reasonless)
+
+
+def test_schema_one_validator_rejects_stale_or_self_contradictory_evidence(
+    tmp_path: Path,
+) -> None:
+    """Catch stale provenance or forged final evidence with coherent counts."""
+
+    runner = _load_production_framework_runner()
+    config = _schema_one_config(runner, tmp_path)
+    evidence = runner.build_production_framework_evidence(
+        config,
+        **_schema_one_inputs(runner),
+    )
+    runner.validate_production_framework_evidence(
+        evidence,
+        expected_candidate_sha="a" * 40,
+        expected_harness_sha="c" * 40,
+    )
+
+    stale_harness = json.loads(json.dumps(evidence))
+    stale_harness["harness"]["git_sha"] = "d" * 40
+    with pytest.raises(runner.EvidenceSchemaError, match="harness SHA"):
+        runner.validate_production_framework_evidence(
+            stale_harness,
+            expected_candidate_sha="a" * 40,
+            expected_harness_sha="c" * 40,
+        )
+
+    stale_candidate = json.loads(json.dumps(evidence))
+    stale_candidate["candidate"]["git_sha"] = "d" * 40
+    with pytest.raises(runner.EvidenceSchemaError, match="candidate SHA"):
+        runner.validate_production_framework_evidence(
+            stale_candidate,
+            expected_candidate_sha="a" * 40,
+            expected_harness_sha="c" * 40,
+        )
+
+    missing_section = json.loads(json.dumps(evidence))
+    missing_section.pop("privacy")
+    with pytest.raises(runner.EvidenceSchemaError, match="top-level schema"):
+        runner.validate_production_framework_evidence(missing_section)
+
+    extra_section = json.loads(json.dumps(evidence))
+    extra_section["unexpected"] = {}
+    with pytest.raises(runner.EvidenceSchemaError, match="top-level schema"):
+        runner.validate_production_framework_evidence(extra_section)
+
+    missing_nested_field = json.loads(json.dumps(evidence))
+    missing_nested_field["candidate"]["wheel"].pop("sha256")
+    with pytest.raises(runner.EvidenceSchemaError, match="wheel schema"):
+        runner.validate_production_framework_evidence(missing_nested_field)
+
+    extra_nested_field = json.loads(json.dumps(evidence))
+    extra_nested_field["profile_inventory"]["unexpected"] = 0
+    with pytest.raises(runner.EvidenceSchemaError, match="inventory schema"):
+        runner.validate_production_framework_evidence(extra_nested_field)
+
+    for count_name in (
+        "applicable",
+        "executed",
+        "expected",
+        "failed",
+        "not_applicable",
+        "skipped",
+    ):
+        forged_count = json.loads(json.dumps(evidence))
+        forged_count["profile_inventory"][count_name] += 1
+        with pytest.raises(
+            runner.EvidenceSchemaError,
+            match="profile inventory",
+        ):
+            runner.validate_production_framework_evidence(forged_count)
+
+    linux_config = _schema_one_config(
+        runner,
+        tmp_path,
+        platform_system="Linux",
+    )
+    linux_evidence = runner.build_production_framework_evidence(
+        linux_config,
+        **_schema_one_inputs(runner, platform_system="Linux"),
+    )
+
+    forged_universe = json.loads(json.dumps(linux_evidence))
+    removed = forged_universe["profiles"].pop()
+    forged_universe["profile_inventory"]["expected_ids"].remove(removed["id"])
+    forged_universe["profile_inventory"]["expected"] = 27
+    forged_universe["profile_inventory"]["applicable"] = 27
+    forged_universe["profile_inventory"]["executed"] = 27
+    with pytest.raises(
+        runner.EvidenceSchemaError,
+        match="profile IDs|profile inventory",
+    ):
+        runner.validate_production_framework_evidence(forged_universe)
+
+    duplicate = json.loads(json.dumps(linux_evidence))
+    duplicate["profiles"].append(dict(duplicate["profiles"][0]))
+    duplicate["profile_inventory"]["expected_ids"].append(
+        duplicate["profiles"][0]["id"]
+    )
+    duplicate["profile_inventory"]["expected_ids"].sort()
+    duplicate["profile_inventory"]["expected"] = 29
+    duplicate["profile_inventory"]["applicable"] = 29
+    duplicate["profile_inventory"]["executed"] = 29
+    with pytest.raises(
+        runner.EvidenceSchemaError,
+        match="profile IDs|profile inventory",
+    ):
+        runner.validate_production_framework_evidence(duplicate)
+
+    pending = json.loads(json.dumps(linux_evidence))
+    pending["profiles"][0]["status"] = "PENDING"
+    pending["profile_inventory"]["executed"] = 27
+    with pytest.raises(runner.EvidenceSchemaError, match="final status"):
+        runner.validate_production_framework_evidence(pending)
+
+    for field_name, forged_value in (
+        ("database_mode", "offline"),
+        ("family", "flask-gunicorn-sync"),
+        ("platform_system", "Darwin"),
+        ("workers", 8),
+    ):
+        forged_identity = json.loads(json.dumps(linux_evidence))
+        target = next(
+            profile
+            for profile in forged_identity["profiles"]
+            if profile["id"] == "fastapi-uvicorn-asyncio-w1"
+        )
+        target[field_name] = forged_value
+        with pytest.raises(runner.EvidenceSchemaError, match="profile identity"):
+            runner.validate_production_framework_evidence(forged_identity)
+
+    contradictory = json.loads(json.dumps(linux_evidence))
+    contradictory["profiles"][0]["applicable"] = False
+    contradictory["profiles"][0]["status"] = "N/A"
+    contradictory["profiles"][0]["not_applicable_reason"] = "forged"
+    contradictory["profile_inventory"]["applicable"] = 27
+    contradictory["profile_inventory"]["not_applicable"] = 1
+    contradictory["profile_inventory"]["executed"] = 27
+    with pytest.raises(runner.EvidenceSchemaError, match="applicability"):
+        runner.validate_production_framework_evidence(contradictory)
+
+    failed_without_violation = json.loads(json.dumps(linux_evidence))
+    failed_without_violation["profiles"][0]["status"] = "FAIL"
+    failed_without_violation["profile_inventory"]["failed"] = 1
+    failed_without_violation["overall"] = "FAIL"
+    with pytest.raises(runner.EvidenceSchemaError, match="violations"):
+        runner.validate_production_framework_evidence(failed_without_violation)
+
+    skipped_without_violation = json.loads(json.dumps(linux_evidence))
+    skipped_without_violation["profiles"][0]["status"] = "SKIPPED"
+    skipped_without_violation["profile_inventory"]["executed"] = 27
+    skipped_without_violation["profile_inventory"]["skipped"] = 1
+    skipped_without_violation["overall"] = "FAIL"
+    with pytest.raises(runner.EvidenceSchemaError, match="violations"):
+        runner.validate_production_framework_evidence(skipped_without_violation)
+
+    false_pass = json.loads(json.dumps(evidence))
+    false_pass["violations"] = ["load.required.timeout"]
+    with pytest.raises(runner.EvidenceSchemaError, match="overall status"):
+        runner.validate_production_framework_evidence(false_pass)
+
+    false_fail = json.loads(json.dumps(evidence))
+    false_fail["overall"] = "FAIL"
+    with pytest.raises(runner.EvidenceSchemaError, match="overall status"):
+        runner.validate_production_framework_evidence(false_fail)
+
+
+def test_schema_one_writer_is_atomic_exclusive_and_partial_safe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch visible partial JSON, overwrite, or concurrent double publication."""
+
+    runner = _load_production_framework_runner()
+    config = _schema_one_config(runner, tmp_path)
+    evidence = runner.build_production_framework_evidence(
+        config,
+        **_schema_one_inputs(runner),
+    )
+
+    success_directory = tmp_path / "success"
+    success_directory.mkdir()
+    output = success_directory / "schema-one-evidence.json"
+    runner.write_production_framework_evidence(output, evidence)
+    original_bytes = output.read_bytes()
+    assert json.loads(original_bytes) == evidence
+    assert sorted(path.name for path in success_directory.iterdir()) == [
+        output.name
+    ]
+
+    with pytest.raises(runner.EvidenceArtifactError, match="already exists"):
+        runner.write_production_framework_evidence(output, evidence)
+    assert output.read_bytes() == original_bytes
+    assert sorted(path.name for path in success_directory.iterdir()) == [
+        output.name
+    ]
+
+    malformed_directory = tmp_path / "malformed"
+    malformed_directory.mkdir()
+    malformed_output = malformed_directory / "schema-one-evidence.json"
+    malformed = json.loads(json.dumps(evidence))
+    malformed["comparison"]["rendered"] = object()
+    with pytest.raises(
+        (runner.EvidenceSchemaError, runner.EvidenceArtifactError)
+    ) as captured:
+        runner.write_production_framework_evidence(
+            malformed_output,
+            malformed,
+        )
+    assert "Object of type object" not in str(captured.value)
+    assert list(malformed_directory.iterdir()) == []
+
+    atomic_directory = tmp_path / "atomic"
+    atomic_directory.mkdir()
+    atomic_output = atomic_directory / "schema-one-evidence.json"
+    writer_errors: list[Exception] = []
+    link_entered = threading.Event()
+    link_release = threading.Event()
+    link_created = threading.Event()
+    link_return = threading.Event()
+    original_link = runner.os.link
+
+    def controlled_link(
+        staged_path: Path,
+        final_path: Path,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        assert Path(final_path) == atomic_output
+        assert Path(staged_path) != Path(final_path)
+        assert json.loads(Path(staged_path).read_text(encoding="utf-8")) == evidence
+        link_entered.set()
+        if not link_release.wait(timeout=5):
+            raise AssertionError("link operation was not released")
+        original_link(staged_path, final_path, *args, **kwargs)
+        link_created.set()
+        if not link_return.wait(timeout=5):
+            raise AssertionError("link operation was not allowed to return")
+
+    monkeypatch.setattr(
+        runner.os,
+        "link",
+        controlled_link,
+    )
+
+    def publish_evidence() -> None:
+        try:
+            runner.write_production_framework_evidence(
+                atomic_output,
+                evidence,
+            )
+        except Exception as error:
+            writer_errors.append(error)
+
+    def observe_with_four_readers(*, expect_absent: bool) -> None:
+        reader_count = 4
+        readers_ready = threading.Barrier(reader_count + 1)
+        observations: list[str] = []
+        observation_lock = threading.Lock()
+
+        def observe_publication() -> None:
+            try:
+                readers_ready.wait(timeout=5)
+            except threading.BrokenBarrierError:
+                observation = "reader barrier failed"
+            else:
+                try:
+                    visible_payload = json.loads(
+                        atomic_output.read_text(encoding="utf-8")
+                    )
+                except FileNotFoundError:
+                    observation = "absent"
+                except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                    observation = type(error).__name__
+                else:
+                    observation = (
+                        "valid"
+                        if visible_payload == evidence
+                        else "incomplete payload"
+                    )
+            with observation_lock:
+                observations.append(observation)
+
+        readers = [
+            threading.Thread(target=observe_publication)
+            for _ in range(reader_count)
+        ]
+        for reader in readers:
+            reader.start()
+        readers_ready.wait(timeout=5)
+        for reader in readers:
+            reader.join(timeout=5)
+        assert all(not reader.is_alive() for reader in readers)
+        expected = "absent" if expect_absent else "valid"
+        assert sorted(observations) == [expected] * reader_count
+
+    writer = threading.Thread(target=publish_evidence)
+    writer.start()
+    assert link_entered.wait(timeout=5)
+    observe_with_four_readers(expect_absent=True)
+
+    link_release.set()
+    assert link_created.wait(timeout=5)
+    observe_with_four_readers(expect_absent=False)
+    link_return.set()
+    writer.join(timeout=20)
+
+    assert not writer.is_alive()
+    assert writer_errors == []
+    assert json.loads(atomic_output.read_text(encoding="utf-8")) == evidence
+    assert sorted(path.name for path in atomic_directory.iterdir()) == [
+        atomic_output.name
+    ]
+
+    monkeypatch.setattr(
+        runner.os,
+        "link",
+        original_link,
+    )
+    large_inputs = _schema_one_inputs(runner)
+    large_inputs["comparison"]["rendered"] = "x" * 8_388_608
+    large_evidence = runner.build_production_framework_evidence(
+        config,
+        **large_inputs,
+    )
+
+    race_directory = tmp_path / "race"
+    race_directory.mkdir()
+    race_output = race_directory / "schema-one-evidence.json"
+    start = threading.Barrier(3)
+    race_results: list[str] = []
+    race_errors: list[Exception] = []
+    result_lock = threading.Lock()
+
+    def competing_writer() -> None:
+        try:
+            start.wait(timeout=5)
+            runner.write_production_framework_evidence(
+                race_output,
+                large_evidence,
+            )
+        except Exception as error:
+            with result_lock:
+                race_errors.append(error)
+        else:
+            with result_lock:
+                race_results.append("published")
+
+    competitors = [
+        threading.Thread(target=competing_writer),
+        threading.Thread(target=competing_writer),
+    ]
+    for competitor in competitors:
+        competitor.start()
+    start.wait(timeout=5)
+    for competitor in competitors:
+        competitor.join(timeout=20)
+
+    assert all(not competitor.is_alive() for competitor in competitors)
+    assert race_results == ["published"]
+    assert len(race_errors) == 1
+    assert isinstance(race_errors[0], runner.EvidenceArtifactError)
+    assert "already exists" in str(race_errors[0])
+    assert json.loads(race_output.read_text(encoding="utf-8")) == large_evidence
+    assert sorted(path.name for path in race_directory.iterdir()) == [
+        race_output.name
+    ]
 
 
 def test_shell_runner_builds_one_isolated_wheel_and_never_logs_secrets() -> None:
