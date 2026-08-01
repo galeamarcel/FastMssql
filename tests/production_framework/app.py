@@ -21,8 +21,10 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+import threading
 import time
 from typing import Any, Literal, Protocol
+import weakref
 
 from asgiref.wsgi import WsgiToAsgi
 import fastmssql
@@ -36,7 +38,7 @@ from fastmssql import (
 )
 from fastapi import FastAPI, HTTPException, Path as PathParameter, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from flask import Flask, request as flask_request
+from flask import Flask, g as flask_g, request as flask_request
 from werkzeug.exceptions import HTTPException as WerkzeugHttpException
 
 
@@ -80,6 +82,13 @@ MIN_SQL_BIGINT = -(2**63)
 MAX_SQL_BIGINT = 2**63 - 1
 SIGNED_DECIMAL_INTEGER = re.compile(r"-?[0-9]+")
 LOGGER = logging.getLogger("fastmssql.production_framework")
+FLASK_WSGI_EXECUTION_MODEL = (
+    "Flask WSGI: async view, occupied WSGI worker/thread"
+)
+ADAPTED_FLASK_EXECUTION_MODEL = (
+    "Flask via WsgiToAsgi: persistent ASGI loop, thread-sensitive WSGI "
+    "serialization per process"
+)
 
 WAIT_PREFIX_BY_MILLISECONDS = {
     0: "",
@@ -815,6 +824,137 @@ async def _wait_for_disconnect(request: Request) -> None:
 
 
 @dataclass(slots=True)
+class WsgiRequestLease:
+    """One request slot owned until Flask tears down its WSGI request."""
+
+    request_sequence: int
+    wsgi_thread_token: int
+    closed: bool = False
+
+
+@dataclass(slots=True)
+class WsgiRequestActivity:
+    """Thread-safe, process-local evidence for the selected Flask model."""
+
+    execution_model: str
+    pid: int = field(default_factory=_current_pid)
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
+    _active_requests: int = field(default=0, init=False)
+    _completed_requests: int = field(default=0, init=False)
+    _maximum_active_requests: int = field(default=0, init=False)
+    _request_sequence: int = field(default=0, init=False)
+    _next_loop_token: int = field(default=0, init=False)
+    _next_async_thread_token: int = field(default=0, init=False)
+    _next_wsgi_thread_token: int = field(default=0, init=False)
+    _loop_tokens: weakref.WeakKeyDictionary[Any, int] = field(
+        default_factory=weakref.WeakKeyDictionary,
+        init=False,
+        repr=False,
+    )
+    _async_thread_tokens: weakref.WeakKeyDictionary[threading.Thread, int] = (
+        field(
+            default_factory=weakref.WeakKeyDictionary,
+            init=False,
+            repr=False,
+        )
+    )
+    _wsgi_thread_tokens: weakref.WeakKeyDictionary[threading.Thread, int] = field(
+        default_factory=weakref.WeakKeyDictionary,
+        init=False,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        if self.execution_model not in {
+            FLASK_WSGI_EXECUTION_MODEL,
+            ADAPTED_FLASK_EXECUTION_MODEL,
+        }:
+            raise ConfigurationError("invalid Flask execution model")
+
+    def _async_thread_token_locked(self, thread: threading.Thread) -> int:
+        token = self._async_thread_tokens.get(thread)
+        if token is None:
+            self._next_async_thread_token += 1
+            token = self._next_async_thread_token
+            self._async_thread_tokens[thread] = token
+        return token
+
+    def _wsgi_thread_token_locked(self, thread: threading.Thread) -> int:
+        token = self._wsgi_thread_tokens.get(thread)
+        if token is None:
+            self._next_wsgi_thread_token += 1
+            token = self._next_wsgi_thread_token
+            self._wsgi_thread_tokens[thread] = token
+        return token
+
+    def _loop_token_locked(self, loop: asyncio.AbstractEventLoop) -> int:
+        token = self._loop_tokens.get(loop)
+        if token is None:
+            self._next_loop_token += 1
+            token = self._next_loop_token
+            self._loop_tokens[loop] = token
+        return token
+
+    def begin(self) -> WsgiRequestLease:
+        with self._lock:
+            self._request_sequence += 1
+            self._active_requests += 1
+            self._maximum_active_requests = max(
+                self._maximum_active_requests,
+                self._active_requests,
+            )
+            return WsgiRequestLease(
+                request_sequence=self._request_sequence,
+                wsgi_thread_token=self._wsgi_thread_token_locked(
+                    threading.current_thread()
+                ),
+            )
+
+    def finish(self, lease: WsgiRequestLease) -> None:
+        with self._lock:
+            if lease.closed or self._active_requests <= 0:
+                raise WorkerLifecycleError("WSGI request lease is not active")
+            lease.closed = True
+            self._active_requests -= 1
+            self._completed_requests += 1
+
+    def async_payload(self, lease: WsgiRequestLease) -> dict[str, object]:
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            if lease.closed:
+                raise WorkerLifecycleError("WSGI request lease is already closed")
+            return {
+                "async_thread_token": self._async_thread_token_locked(
+                    threading.current_thread()
+                ),
+                "execution_model": self.execution_model,
+                "loop_token": self._loop_token_locked(loop),
+                "pid": self.pid,
+                "request_sequence": lease.request_sequence,
+                "wsgi_active_requests": self._active_requests,
+                "wsgi_maximum_active_requests": (
+                    self._maximum_active_requests
+                ),
+                "wsgi_thread_token": lease.wsgi_thread_token,
+            }
+
+    def settled_payload(self) -> dict[str, object]:
+        with self._lock:
+            return {
+                "active_other_requests": self._active_requests,
+                "completed_requests": self._completed_requests,
+                "execution_model": self.execution_model,
+                "maximum_active_requests": self._maximum_active_requests,
+                "pid": self.pid,
+                "wsgi_thread_count": len(self._wsgi_thread_tokens),
+            }
+
+
+@dataclass(slots=True)
 class WorkerRouteState:
     """Common SQL behavior backed by exactly one worker-local pool."""
 
@@ -1227,6 +1367,7 @@ def create_flask_app(
     *,
     environment: Mapping[str, str] | None = None,
     connection_factory: ConnectionFactory = _default_connection_factory,
+    execution_model: str = FLASK_WSGI_EXECUTION_MODEL,
 ) -> Flask:
     """Create the Flask WSGI application inside a forked worker."""
 
@@ -1237,7 +1378,34 @@ def create_flask_app(
         connection_factory=connection_factory,
     )
     routes = WorkerRouteState(config=config, lifecycle=lifecycle)
+    activity = WsgiRequestActivity(execution_model=execution_model)
+    tracked_execution_endpoints = frozenset(
+        {
+            "execution_wait_probe",
+            "gather_probe",
+            "loop_probe",
+        }
+    )
     application.extensions["fastmssql_worker"] = lifecycle
+    application.extensions["fastmssql_wsgi_activity"] = activity
+
+    def current_request_lease() -> WsgiRequestLease:
+        lease = getattr(flask_g, "fastmssql_wsgi_request_lease", None)
+        if not isinstance(lease, WsgiRequestLease):
+            raise WorkerLifecycleError("Flask request has no WSGI lease")
+        return lease
+
+    @application.before_request
+    def begin_wsgi_request() -> None:
+        if flask_request.endpoint in tracked_execution_endpoints:
+            flask_g.fastmssql_wsgi_request_lease = activity.begin()
+
+    @application.teardown_request
+    def finish_wsgi_request(error: BaseException | None) -> None:
+        del error
+        lease = flask_g.pop("fastmssql_wsgi_request_lease", None)
+        if lease is not None:
+            activity.finish(lease)
 
     @application.errorhandler(Exception)
     def safe_internal_error(error: Exception):
@@ -1280,6 +1448,19 @@ def create_flask_app(
             return {"error": "invalid_bigint"}, 422
         return await routes.wait_payload(parsed)
 
+    @application.get("/execution/wait/<value>")
+    async def execution_wait_probe(value: str):
+        parsed = _bounded_sql_bigint(value)
+        if parsed is None:
+            return {"error": "invalid_bigint"}, 422
+        payload: dict[str, object] = await routes.wait_payload(parsed)
+        payload.update(activity.async_payload(current_request_lease()))
+        return payload
+
+    @application.get("/execution/state")
+    def execution_state_probe() -> dict[str, object]:
+        return activity.settled_payload()
+
     @application.post("/transaction/<item_id>")
     async def transaction_probe(item_id: str):
         parsed = _bounded_sql_bigint(item_id, minimum=1)
@@ -1291,12 +1472,16 @@ def create_flask_app(
         return await routes.transaction_payload(parsed, outcome)
 
     @application.get("/loop")
-    async def loop_probe() -> dict[str, int]:
-        return await routes.loop_payload()
+    async def loop_probe() -> dict[str, object]:
+        payload: dict[str, object] = await routes.loop_payload()
+        payload.update(activity.async_payload(current_request_lease()))
+        return payload
 
     @application.get("/gather")
     async def gather_probe() -> dict[str, object]:
-        return await routes.gather_payload()
+        payload = await routes.gather_payload()
+        payload.update(activity.async_payload(current_request_lease()))
+        return payload
 
     @application.get("/error")
     async def error_probe() -> None:
@@ -1381,6 +1566,7 @@ def create_adapted_flask_app(
     wsgi_application = create_flask_app(
         environment=environment,
         connection_factory=connection_factory,
+        execution_model=ADAPTED_FLASK_EXECUTION_MODEL,
     )
     lifecycle = flask_worker_lifecycle(wsgi_application)
     return LifespanWsgiToAsgi(

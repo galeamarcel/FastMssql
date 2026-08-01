@@ -188,6 +188,43 @@ No release, package-version change, or artifact publication has occurred.
   changes no FastMssql/Tiberius runtime, package metadata, displayed `0.7.7`
   version, release, published artifact or original-repository state.
 
+### Shared-listener and dynamic Flask evidence fix
+
+- Removed the invalid assumption that a shared Gunicorn/Uvicorn listener
+  dispatches one concurrent request to every configured worker. Exact
+  one-worker behavior remains mandatory (`sync=1`, `gthread=4` plus the
+  queued fifth request); multi-worker waves record the concurrency actually
+  observed while ready/pool and repeated SQL probes still reach every PID.
+- Added one bounded request-wave coordinator that races SQL observation with
+  HTTP settlement, propagates the primary HTTP failure, cancels and awaits all
+  remaining work, and maps both observation and response deadline expiry to
+  the runner's typed readiness error instead of leaking raw asyncio timeouts.
+- Restricted WSGI workload accounting to `/loop`, `/gather` and
+  `/execution/wait`. Control and state probes no longer alter request
+  sequences or concurrency maxima. Workers not selected by a wave retain
+  explicit truthful zero execution counters.
+- Worker fan-out collection now accepts only one explicitly named positive
+  monotonic counter; all other fields must remain identical. Adapted-Flask
+  `/loop` uses this narrow mode for per-request sequence changes, while
+  stable identity drift remains a hard failure.
+- The installed-wheel Docker SQL-auth matrix passed all eight Gunicorn WSGI
+  profiles, the one-request `/gather` scenario, all eight adapted Uvicorn
+  asyncio/uvloop profiles and the dedicated serialization scenario. Every
+  profile ended with zero SQL sessions, no listener and no forced cleanup.
+  `/gather` measured `1.0131 s` sequential versus `0.2644 s` concurrent with
+  four SQL requests inside one WSGI slot; adapted Flask measured `1.0902 s`
+  sequential versus `1.0911 s` concurrent with exactly one serialized WSGI
+  call and one SQL request per process.
+- The cumulative implemented contract passes `172/172`; exactly eight future
+  Task 9--11 shell/load/report/hosted gates are explicitly deselected. The
+  verified evidence uses candidate runtime
+  `9a020924ff78d40cbe6ebe8595a204b0f14d46ea` and wheel SHA-256
+  `27ff22db629966623b1432264faee4c4f04295de80c19fb97984a127a8acfd05`.
+- This fix changes only the repository-owned production-framework
+  application, runner, tests and documentation. It changes no
+  FastMssql/Tiberius runtime, package metadata, displayed `0.7.7` version,
+  release, published artifact or original-repository state.
+
 ### Production framework external-process supervisor
 
 - Added a schema-1, fail-closed process runner with closed operation bounds,

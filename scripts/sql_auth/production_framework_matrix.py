@@ -40,6 +40,29 @@ MAX_SQL_BIGINT = 2**63 - 1
 MAX_HTTP_STREAM_ROWS = 10_000
 MAX_NDJSON_LINE_BYTES = 256
 EXPECTED_STREAM_BUFFER_ROWS = 8
+NATIVE_ASGI_EXECUTION_MODEL = (
+    "native ASGI: concurrent requests on persistent event loop"
+)
+FLASK_WSGI_EXECUTION_MODEL = (
+    "Flask WSGI: async view, occupied WSGI worker/thread"
+)
+ADAPTED_FLASK_EXECUTION_MODEL = (
+    "Flask via WsgiToAsgi: persistent ASGI loop, thread-sensitive WSGI "
+    "serialization per process"
+)
+EXECUTION_MODEL_LABELS = (
+    NATIVE_ASGI_EXECUTION_MODEL,
+    FLASK_WSGI_EXECUTION_MODEL,
+    ADAPTED_FLASK_EXECUTION_MODEL,
+)
+FORBIDDEN_EXECUTION_MODEL_CLAIMS = (
+    "equivalent",
+    "fully async flask",
+    "fully asynchronous flask",
+    "native asgi flask",
+    "same throughput",
+    "true-async flask",
+)
 GUNICORN_WINDOWS_REASON = "Gunicorn is not supported on Windows"
 UVLOOP_WINDOWS_REASON = "uvloop is not supported on Windows"
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
@@ -126,6 +149,39 @@ class IsolatedApplicationError(ProcessSupervisorError):
 
 class HttpProbeError(ProcessSupervisorError):
     """A bounded loopback HTTP probe failed or returned invalid data."""
+
+
+def execution_model_labels() -> tuple[str, str, str]:
+    """Return only the three approved measured execution-model labels."""
+
+    return EXECUTION_MODEL_LABELS
+
+
+def validate_execution_model_language(
+    statements: Sequence[str],
+) -> tuple[str, ...]:
+    """Reject language that claims unmeasured framework equivalence."""
+
+    if isinstance(statements, (str, bytes)) or not statements:
+        raise RunnerConfigurationError(
+            "execution-model language must be a non-empty string sequence"
+        )
+    validated: list[str] = []
+    for statement in statements:
+        if not isinstance(statement, str) or not statement.strip():
+            raise RunnerConfigurationError(
+                "execution-model language contains an invalid statement"
+            )
+        normalized = " ".join(statement.casefold().split())
+        if any(
+            forbidden in normalized
+            for forbidden in FORBIDDEN_EXECUTION_MODEL_CLAIMS
+        ):
+            raise WorkerEvidenceError(
+                "forbidden execution-model claim was generated"
+            )
+        validated.append(statement)
+    return tuple(validated)
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,6 +392,94 @@ class NativeScalingProfileResult:
 
 
 @dataclass(frozen=True, slots=True)
+class FlaskWsgiProfileResult:
+    profile: ProcessProfile
+    scaling_evidence: NativeScalingEvidence
+    wsgi_evidence: FlaskWsgiWaveEvidence
+    port: int
+    launch_attempts: int
+    sanitized_command: tuple[str, ...]
+    shutdown_pids: tuple[int, ...]
+    manager_pid: int
+    descendant_pids: tuple[int, ...]
+    returncode: int
+    graceful_stop: bool
+    forced_cleanup: bool
+    listening_sockets_after: tuple[int, ...]
+    sessions_after: int
+
+    def to_record(self) -> dict[str, object]:
+        record = self.profile.to_record()
+        record.update(self.scaling_evidence.to_record())
+        record.update(self.wsgi_evidence.to_record())
+        record.update(
+            {
+                "descendant_pids": list(self.descendant_pids),
+                "forced_cleanup": self.forced_cleanup,
+                "graceful_stop": self.graceful_stop,
+                "launch_attempts": self.launch_attempts,
+                "listening_sockets_after": list(
+                    self.listening_sockets_after
+                ),
+                "manager_pid": self.manager_pid,
+                "maximum_active_requests": max(
+                    worker["maximum_active_requests"]
+                    for worker in self.wsgi_evidence.worker_execution
+                ),
+                "port": self.port,
+                "returncode": self.returncode,
+                "sanitized_command": list(self.sanitized_command),
+                "sessions_after": self.sessions_after,
+                "shutdown_pids": list(self.shutdown_pids),
+                "status": "PASS",
+            }
+        )
+        return record
+
+
+@dataclass(frozen=True, slots=True)
+class AdaptedFlaskProfileResult:
+    profile: ProcessProfile
+    scaling_evidence: NativeScalingEvidence
+    adapted_evidence: AdaptedFlaskScalingEvidence
+    port: int
+    launch_attempts: int
+    sanitized_command: tuple[str, ...]
+    shutdown_pids: tuple[int, ...]
+    manager_pid: int
+    descendant_pids: tuple[int, ...]
+    returncode: int
+    graceful_stop: bool
+    forced_cleanup: bool
+    listening_sockets_after: tuple[int, ...]
+    sessions_after: int
+
+    def to_record(self) -> dict[str, object]:
+        record = self.profile.to_record()
+        record.update(self.scaling_evidence.to_record())
+        record.update(self.adapted_evidence.to_record())
+        record.update(
+            {
+                "descendant_pids": list(self.descendant_pids),
+                "forced_cleanup": self.forced_cleanup,
+                "graceful_stop": self.graceful_stop,
+                "launch_attempts": self.launch_attempts,
+                "listening_sockets_after": list(
+                    self.listening_sockets_after
+                ),
+                "manager_pid": self.manager_pid,
+                "port": self.port,
+                "returncode": self.returncode,
+                "sanitized_command": list(self.sanitized_command),
+                "sessions_after": self.sessions_after,
+                "shutdown_pids": list(self.shutdown_pids),
+                "status": "PASS",
+            }
+        )
+        return record
+
+
+@dataclass(frozen=True, slots=True)
 class NativeConcurrencyScenarioResult:
     profile_id: str
     evidence: NativeConcurrencyEvidence
@@ -357,6 +501,76 @@ class NativeConcurrencyScenarioResult:
                 "forced_cleanup": self.forced_cleanup,
                 "graceful_stop": self.graceful_stop,
                 "listening_sockets_after": list(self.listening_sockets_after),
+                "manager_pid": self.manager_pid,
+                "profile_id": self.profile_id,
+                "ready_pids": list(self.ready_pids),
+                "returncode": self.returncode,
+                "sessions_after": self.sessions_after,
+                "shutdown_pids": list(self.shutdown_pids),
+            }
+        )
+        return record
+
+
+@dataclass(frozen=True, slots=True)
+class FlaskGatherScenarioResult:
+    profile_id: str
+    evidence: FlaskGatherEvidence
+    ready_pids: tuple[int, ...]
+    shutdown_pids: tuple[int, ...]
+    manager_pid: int
+    descendant_pids: tuple[int, ...]
+    returncode: int
+    graceful_stop: bool
+    forced_cleanup: bool
+    listening_sockets_after: tuple[int, ...]
+    sessions_after: int
+
+    def to_record(self) -> dict[str, object]:
+        record = self.evidence.to_record()
+        record.update(
+            {
+                "descendant_pids": list(self.descendant_pids),
+                "forced_cleanup": self.forced_cleanup,
+                "graceful_stop": self.graceful_stop,
+                "listening_sockets_after": list(
+                    self.listening_sockets_after
+                ),
+                "manager_pid": self.manager_pid,
+                "profile_id": self.profile_id,
+                "ready_pids": list(self.ready_pids),
+                "returncode": self.returncode,
+                "sessions_after": self.sessions_after,
+                "shutdown_pids": list(self.shutdown_pids),
+            }
+        )
+        return record
+
+
+@dataclass(frozen=True, slots=True)
+class AdaptedFlaskSerializationScenarioResult:
+    profile_id: str
+    evidence: AdaptedFlaskSerializationEvidence
+    ready_pids: tuple[int, ...]
+    shutdown_pids: tuple[int, ...]
+    manager_pid: int
+    descendant_pids: tuple[int, ...]
+    returncode: int
+    graceful_stop: bool
+    forced_cleanup: bool
+    listening_sockets_after: tuple[int, ...]
+    sessions_after: int
+
+    def to_record(self) -> dict[str, object]:
+        record = self.evidence.to_record()
+        record.update(
+            {
+                "descendant_pids": list(self.descendant_pids),
+                "forced_cleanup": self.forced_cleanup,
+                "graceful_stop": self.graceful_stop,
+                "listening_sockets_after": list(
+                    self.listening_sockets_after
+                ),
                 "manager_pid": self.manager_pid,
                 "profile_id": self.profile_id,
                 "ready_pids": list(self.ready_pids),
@@ -672,6 +886,131 @@ class NativeConcurrencyEvidence:
             "sql_delay_seconds": self.sql_delay_seconds,
             "status": "PASS",
             "values_exact": True,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class FlaskWsgiWaveEvidence:
+    profile_id: str
+    execution_model: str
+    values: tuple[int, ...]
+    thread_limit_per_worker: int
+    worker_execution: tuple[dict[str, int], ...]
+    wave_seconds: float
+    sql_delay_seconds: float
+    maximum_aggregate_sql_sessions: int
+    maximum_simultaneous_sql_requests: int
+    queued_request_proven: bool
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "execution_model": self.execution_model,
+            "loop_tokens_distinct_per_worker": True,
+            "maximum_aggregate_sql_sessions": (
+                self.maximum_aggregate_sql_sessions
+            ),
+            "maximum_simultaneous_sql_requests": (
+                self.maximum_simultaneous_sql_requests
+            ),
+            "profile_id": self.profile_id,
+            "queued_request_proven": self.queued_request_proven,
+            "request_count": len(self.values),
+            "sql_delay_seconds": self.sql_delay_seconds,
+            "status": "PASS",
+            "thread_limit_per_worker": self.thread_limit_per_worker,
+            "values": list(self.values),
+            "wave_seconds": self.wave_seconds,
+            "worker_execution": [
+                dict(record) for record in self.worker_execution
+            ],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class FlaskGatherEvidence:
+    sequential_seconds: float
+    concurrent_seconds: float
+    outer_response_seconds: float
+    sql_delay_seconds: float
+    loop_token: int
+    maximum_simultaneous_sql_requests: int
+    pool_active_after: int
+    pool_pending_after: int
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "concurrent_seconds": self.concurrent_seconds,
+            "execution_model": FLASK_WSGI_EXECUTION_MODEL,
+            "loop_token": self.loop_token,
+            "maximum_simultaneous_sql_requests": (
+                self.maximum_simultaneous_sql_requests
+            ),
+            "outer_response_seconds": self.outer_response_seconds,
+            "pool_active_after": self.pool_active_after,
+            "pool_pending_after": self.pool_pending_after,
+            "sequential_seconds": self.sequential_seconds,
+            "sql_delay_seconds": self.sql_delay_seconds,
+            "status": "PASS",
+            "values_exact": True,
+            "wsgi_request_slots": 1,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AdaptedFlaskScalingEvidence:
+    profile_id: str
+    persistent_worker_loops: tuple[dict[str, int], ...]
+    maximum_aggregate_sql_sessions: int
+    maximum_simultaneous_sql_requests: int
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "execution_model": ADAPTED_FLASK_EXECUTION_MODEL,
+            "maximum_aggregate_sql_sessions": (
+                self.maximum_aggregate_sql_sessions
+            ),
+            "maximum_serialized_wsgi_calls_per_process": 1,
+            "maximum_simultaneous_sql_requests": (
+                self.maximum_simultaneous_sql_requests
+            ),
+            "persistent_worker_loops": [
+                dict(record) for record in self.persistent_worker_loops
+            ],
+            "profile_id": self.profile_id,
+            "status": "PASS",
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AdaptedFlaskSerializationEvidence:
+    values: tuple[int, ...]
+    sequential_seconds: float
+    concurrent_seconds: float
+    sql_delay_seconds: float
+    loop_token: int
+    maximum_simultaneous_sql_requests: int
+    pool_active_after: int
+    pool_pending_after: int
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "concurrent_seconds": self.concurrent_seconds,
+            "execution_model": ADAPTED_FLASK_EXECUTION_MODEL,
+            "loop_token": self.loop_token,
+            "maximum_simultaneous_sql_requests": (
+                self.maximum_simultaneous_sql_requests
+            ),
+            "multi_process_scaling": "additional worker processes only",
+            "pool_active_after": self.pool_active_after,
+            "pool_pending_after": self.pool_pending_after,
+            "sequential_seconds": self.sequential_seconds,
+            "serialization_ratio": (
+                self.concurrent_seconds / self.sequential_seconds
+            ),
+            "sql_delay_seconds": self.sql_delay_seconds,
+            "status": "PASS",
+            "values": list(self.values),
+            "wsgi_calls_per_process": 1,
         }
 
 
@@ -1098,6 +1437,148 @@ class SqlServerObserver:
             await self.sleep(min(self.poll_interval_seconds, remaining))
 
 
+def shared_listener_sql_request_minimum(
+    profile: ProcessProfile,
+    *,
+    request_count: int,
+) -> int:
+    """Select a meaningful minimum without assuming perfect worker dispatch."""
+
+    allowed_families = {
+        "flask-asgi-uvicorn-asyncio",
+        "flask-asgi-uvicorn-uvloop",
+        "flask-gunicorn-gthread",
+        "flask-gunicorn-sync",
+    }
+    if (
+        profile.family not in allowed_families
+        or not profile.applicable
+        or profile.workers <= 0
+        or profile.threads_per_worker <= 0
+    ):
+        raise RunnerConfigurationError(
+            "shared-listener SQL observation requires a Flask profile"
+        )
+    if (
+        isinstance(request_count, bool)
+        or not isinstance(request_count, int)
+        or request_count <= 0
+    ):
+        raise RunnerConfigurationError(
+            "shared-listener request count must be a positive integer"
+        )
+    if profile.workers == 1:
+        return min(request_count, profile.threads_per_worker)
+    return 1
+
+
+async def await_observed_request_wave(
+    observer: SqlServerObserver,
+    request_tasks: Sequence[asyncio.Task[LoopbackJsonResponse]],
+    *,
+    minimum_requests: int,
+    timeout_seconds: float,
+) -> tuple[LoopbackJsonResponse, ...]:
+    """Await SQL observation and HTTP settlement without hiding either error."""
+
+    if (
+        not request_tasks
+        or any(not isinstance(task, asyncio.Task) for task in request_tasks)
+        or len({id(task) for task in request_tasks}) != len(request_tasks)
+    ):
+        raise RunnerConfigurationError(
+            "observed request wave requires distinct asyncio tasks"
+        )
+    if (
+        isinstance(minimum_requests, bool)
+        or not isinstance(minimum_requests, int)
+        or not 1 <= minimum_requests <= len(request_tasks)
+    ):
+        raise RunnerConfigurationError(
+            "observed request minimum is outside the request wave"
+        )
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(timeout_seconds)
+        or timeout_seconds <= 0
+    ):
+        raise RunnerConfigurationError(
+            "observed request timeout must be a finite positive number"
+        )
+
+    deadline = time.monotonic() + timeout_seconds
+    observation_task = asyncio.create_task(
+        observer.wait_for_minimum_requests(
+            minimum_requests,
+            timeout_seconds=timeout_seconds,
+        )
+    )
+    response_future = asyncio.gather(*request_tasks)
+    try:
+        done, _ = await asyncio.wait(
+            (observation_task, response_future),
+            timeout=timeout_seconds,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            raise ReadinessTimeoutError(
+                "observed HTTP request wave did not settle within the bound"
+            )
+
+        if response_future.done():
+            responses = response_future.result()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ReadinessTimeoutError(
+                    "SQL observation did not settle within the wave bound"
+                )
+            if not observation_task.done():
+                try:
+                    await asyncio.wait_for(
+                        observation_task,
+                        timeout=remaining,
+                    )
+                except TimeoutError:
+                    raise ReadinessTimeoutError(
+                        "SQL observation did not settle within the wave bound"
+                    ) from None
+            else:
+                observation_task.result()
+            return tuple(responses)
+
+        observation_task.result()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ReadinessTimeoutError(
+                "HTTP responses did not settle within the wave bound"
+            )
+        try:
+            responses = await asyncio.wait_for(
+                asyncio.shield(response_future),
+                timeout=remaining,
+            )
+        except TimeoutError:
+            raise ReadinessTimeoutError(
+                "HTTP responses did not settle within the wave bound"
+            ) from None
+        return tuple(responses)
+    finally:
+        if not observation_task.done():
+            observation_task.cancel()
+        if not response_future.done():
+            response_future.cancel()
+        for task in request_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(
+            observation_task,
+            response_future,
+            *request_tasks,
+            return_exceptions=True,
+        )
+
+
 def _ready_worker_map(
     ready_records: Sequence[Mapping[str, object]],
 ) -> dict[str, int]:
@@ -1192,7 +1673,7 @@ def _nonnegative_metric(record: Mapping[str, object], name: str) -> int:
     return value
 
 
-def validate_native_scaling_evidence(
+def _validate_process_scaling_evidence(
     *,
     config: RunnerConfig,
     profile: ProcessProfile,
@@ -1204,6 +1685,7 @@ def validate_native_scaling_evidence(
     expected_values: Sequence[int],
     expected_principal: str,
     observer_sample: SqlObserverSample,
+    allowed_families: frozenset[str],
 ) -> NativeScalingEvidence:
     """Fail closed unless every worker/process/pool/SQL layer reconciles."""
 
@@ -1211,12 +1693,12 @@ def validate_native_scaling_evidence(
         config.database_mode != "sql_auth"
         or profile.database_mode != "sql_auth"
         or not profile.applicable
-        or not profile.family.startswith("fastapi-")
+        or profile.family not in allowed_families
         or profile.workers not in WORKER_COUNTS
         or config.global_connection_budget % profile.workers
     ):
         raise RunnerConfigurationError(
-            "native scaling evidence requires an applicable SQL-auth profile"
+            "process scaling evidence requires an applicable SQL-auth profile"
         )
     if (
         not isinstance(expected_principal, str)
@@ -1391,6 +1873,75 @@ def validate_native_scaling_evidence(
     )
 
 
+def validate_native_scaling_evidence(
+    *,
+    config: RunnerConfig,
+    profile: ProcessProfile,
+    ready_records: Sequence[Mapping[str, object]],
+    package_records: Sequence[Mapping[str, object]],
+    principal_records: Sequence[Mapping[str, object]],
+    pool_records: Sequence[Mapping[str, object]],
+    parameter_payloads: Sequence[Mapping[str, object]],
+    expected_values: Sequence[int],
+    expected_principal: str,
+    observer_sample: SqlObserverSample,
+) -> NativeScalingEvidence:
+    return _validate_process_scaling_evidence(
+        config=config,
+        profile=profile,
+        ready_records=ready_records,
+        package_records=package_records,
+        principal_records=principal_records,
+        pool_records=pool_records,
+        parameter_payloads=parameter_payloads,
+        expected_values=expected_values,
+        expected_principal=expected_principal,
+        observer_sample=observer_sample,
+        allowed_families=frozenset(
+            {
+                "fastapi-gunicorn-uvicorn-worker",
+                "fastapi-uvicorn-asyncio",
+                "fastapi-uvicorn-uvloop",
+            }
+        ),
+    )
+
+
+def validate_flask_scaling_evidence(
+    *,
+    config: RunnerConfig,
+    profile: ProcessProfile,
+    ready_records: Sequence[Mapping[str, object]],
+    package_records: Sequence[Mapping[str, object]],
+    principal_records: Sequence[Mapping[str, object]],
+    pool_records: Sequence[Mapping[str, object]],
+    parameter_payloads: Sequence[Mapping[str, object]],
+    expected_values: Sequence[int],
+    expected_principal: str,
+    observer_sample: SqlObserverSample,
+) -> NativeScalingEvidence:
+    return _validate_process_scaling_evidence(
+        config=config,
+        profile=profile,
+        ready_records=ready_records,
+        package_records=package_records,
+        principal_records=principal_records,
+        pool_records=pool_records,
+        parameter_payloads=parameter_payloads,
+        expected_values=expected_values,
+        expected_principal=expected_principal,
+        observer_sample=observer_sample,
+        allowed_families=frozenset(
+            {
+                "flask-asgi-uvicorn-asyncio",
+                "flask-asgi-uvicorn-uvloop",
+                "flask-gunicorn-gthread",
+                "flask-gunicorn-sync",
+            }
+        ),
+    )
+
+
 def validate_native_concurrency_evidence(
     *,
     sequential_payloads: Sequence[Mapping[str, object]],
@@ -1476,6 +2027,799 @@ def validate_native_concurrency_evidence(
         concurrent_seconds=float(concurrent_seconds),
         health_seconds=float(health_seconds),
         sql_delay_seconds=sql_delay_seconds,
+        maximum_simultaneous_sql_requests=observer_sample.maximum_requests,
+        pool_active_after=active,
+        pool_pending_after=pending,
+    )
+
+
+def validate_flask_wsgi_wave_evidence(
+    *,
+    config: RunnerConfig,
+    profile: ProcessProfile,
+    ready_records: Sequence[Mapping[str, object]],
+    response_payloads: Sequence[Mapping[str, object]],
+    settled_records: Sequence[Mapping[str, object]],
+    expected_values: Sequence[int],
+    wave_seconds: float,
+    sql_delay_ms: int,
+    observer_sample: SqlObserverSample,
+) -> FlaskWsgiWaveEvidence:
+    """Validate real WSGI occupancy without implying ASGI concurrency."""
+
+    expected_worker_class = {
+        "flask-gunicorn-sync": ("sync", 1),
+        "flask-gunicorn-gthread": ("gthread", 4),
+    }.get(profile.family)
+    if (
+        config.database_mode != "sql_auth"
+        or profile.database_mode != "sql_auth"
+        or not profile.applicable
+        or profile.server != "gunicorn"
+        or expected_worker_class is None
+        or (profile.worker_class, profile.threads_per_worker)
+        != expected_worker_class
+        or profile.workers not in WORKER_COUNTS
+        or config.global_connection_budget % profile.workers
+    ):
+        raise RunnerConfigurationError(
+            "Flask WSGI evidence requires an applicable SQL-auth profile"
+        )
+    if sql_delay_ms not in SQL_DELAY_MILLISECONDS or sql_delay_ms <= 0:
+        raise RunnerConfigurationError(
+            "Flask WSGI evidence requires a positive allowlisted SQL delay"
+        )
+    if (
+        isinstance(wave_seconds, bool)
+        or not isinstance(wave_seconds, (int, float))
+        or not math.isfinite(wave_seconds)
+        or wave_seconds <= 0
+    ):
+        raise WorkerEvidenceError("Flask WSGI timing evidence is malformed")
+    if (
+        not expected_values
+        or len(response_payloads) != len(expected_values)
+        or any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in expected_values
+        )
+    ):
+        raise WorkerEvidenceError(
+            "Flask WSGI response count is inconsistent"
+        )
+
+    ready_map = _ready_worker_map(ready_records)
+    expected_pids = tuple(sorted(ready_map.values()))
+    if len(expected_pids) != profile.workers:
+        raise WorkerEvidenceError(
+            "Flask WSGI ready worker count is inconsistent"
+        )
+    settled_by_pid = _evidence_records_by_pid(
+        settled_records,
+        expected_pids=expected_pids,
+        record_name="Flask WSGI settled",
+    )
+    reconcile_worker_sessions(observer_sample, ready_records)
+
+    thread_limit = profile.threads_per_worker
+    required_payload_keys = {
+        "async_thread_token",
+        "delay_ms",
+        "execution_model",
+        "loop_token",
+        "pid",
+        "request_sequence",
+        "session_id",
+        "value",
+        "wsgi_active_requests",
+        "wsgi_maximum_active_requests",
+        "wsgi_thread_token",
+    }
+    loop_tokens: set[tuple[int, int]] = set()
+    request_sequences: set[tuple[int, int]] = set()
+    response_counts = {pid: 0 for pid in expected_pids}
+    maximum_response_active = {pid: 0 for pid in expected_pids}
+    response_thread_tokens = {pid: set() for pid in expected_pids}
+    values: list[int] = []
+
+    for payload, expected_value in zip(
+        response_payloads,
+        expected_values,
+        strict=True,
+    ):
+        if set(payload) != required_payload_keys:
+            raise WorkerEvidenceError(
+                "Flask WSGI response evidence is malformed"
+            )
+        pid = payload.get("pid")
+        if (
+            isinstance(pid, bool)
+            or not isinstance(pid, int)
+            or pid not in response_counts
+        ):
+            raise WorkerEvidenceError(
+                "Flask WSGI response has an unexpected worker PID"
+            )
+        integer_fields = (
+            "async_thread_token",
+            "loop_token",
+            "request_sequence",
+            "session_id",
+            "wsgi_active_requests",
+            "wsgi_maximum_active_requests",
+            "wsgi_thread_token",
+        )
+        if any(
+            isinstance(payload.get(name), bool)
+            or not isinstance(payload.get(name), int)
+            or int(payload[name]) <= 0
+            for name in integer_fields
+        ):
+            raise WorkerEvidenceError(
+                "Flask WSGI response evidence is malformed"
+            )
+        if (
+            payload.get("execution_model") != FLASK_WSGI_EXECUTION_MODEL
+            or payload.get("delay_ms") != sql_delay_ms
+            or payload.get("value") != expected_value
+        ):
+            raise WorkerEvidenceError(
+                "Flask WSGI response returned inconsistent SQL data"
+            )
+        active = int(payload["wsgi_active_requests"])
+        maximum_active = int(payload["wsgi_maximum_active_requests"])
+        if active > thread_limit or not active <= maximum_active <= thread_limit:
+            if profile.worker_class == "gthread":
+                raise WorkerEvidenceError(
+                    "gthread WSGI concurrency exceeded four threads"
+                )
+            raise WorkerEvidenceError(
+                "sync WSGI concurrency exceeded one request slot"
+            )
+        loop_key = (pid, int(payload["loop_token"]))
+        if loop_key in loop_tokens:
+            raise WorkerEvidenceError(
+                "Flask per-request event loops are not distinct"
+            )
+        loop_tokens.add(loop_key)
+        sequence_key = (pid, int(payload["request_sequence"]))
+        if sequence_key in request_sequences:
+            raise WorkerEvidenceError(
+                "Flask WSGI request sequence is not unique"
+            )
+        request_sequences.add(sequence_key)
+        response_counts[pid] += 1
+        maximum_response_active[pid] = max(
+            maximum_response_active[pid],
+            maximum_active,
+        )
+        response_thread_tokens[pid].add(
+            int(payload["wsgi_thread_token"])
+        )
+        if len(response_thread_tokens[pid]) > thread_limit:
+            raise WorkerEvidenceError(
+                "Flask WSGI response used too many worker threads"
+            )
+        values.append(expected_value)
+
+    required_settled_keys = {
+        "active_other_requests",
+        "completed_requests",
+        "execution_model",
+        "maximum_active_requests",
+        "pid",
+        "wsgi_thread_count",
+    }
+    worker_execution: list[dict[str, int]] = []
+    for pid in expected_pids:
+        settled = settled_by_pid[pid]
+        if set(settled) != required_settled_keys:
+            raise WorkerEvidenceError(
+                "Flask WSGI settled evidence is malformed"
+            )
+        maximum_active = settled.get("maximum_active_requests")
+        thread_count = settled.get("wsgi_thread_count")
+        completed = settled.get("completed_requests")
+        malformed = (
+            settled.get("execution_model") != FLASK_WSGI_EXECUTION_MODEL
+            or settled.get("active_other_requests") != 0
+            or isinstance(maximum_active, bool)
+            or not isinstance(maximum_active, int)
+            or isinstance(thread_count, bool)
+            or not isinstance(thread_count, int)
+            or isinstance(completed, bool)
+            or not isinstance(completed, int)
+        )
+        if response_counts[pid] == 0:
+            malformed = malformed or (
+                maximum_active != 0
+                or thread_count != 0
+                or completed != 0
+            )
+        else:
+            malformed = malformed or (
+                not 1 <= maximum_active <= thread_limit
+                or not maximum_active <= thread_count <= thread_limit
+                or completed < response_counts[pid]
+                or maximum_active < maximum_response_active[pid]
+            )
+        if malformed:
+            if (
+                profile.worker_class == "gthread"
+                and isinstance(maximum_active, int)
+                and not isinstance(maximum_active, bool)
+                and maximum_active > 4
+            ):
+                raise WorkerEvidenceError(
+                    "gthread WSGI concurrency exceeded four threads"
+                )
+            raise WorkerEvidenceError(
+                "Flask WSGI worker did not settle within its request limit"
+            )
+        worker_execution.append(
+            {
+                "maximum_active_requests": maximum_active,
+                "pid": pid,
+                "wsgi_thread_count": thread_count,
+            }
+        )
+
+    if (
+        observer_sample.maximum_sessions > config.global_connection_budget
+        or observer_sample.current_sessions > config.global_connection_budget
+    ):
+        raise WorkerEvidenceError(
+            "Flask WSGI SQL sessions exceeded the global connection budget"
+        )
+    maximum_request_slots = profile.workers * thread_limit
+    if not 1 <= observer_sample.maximum_requests <= maximum_request_slots:
+        raise WorkerEvidenceError(
+            "Flask WSGI SQL request concurrency exceeded its worker slots"
+        )
+
+    queued_request_proven = profile.workers == 1
+    if queued_request_proven:
+        expected_request_count = thread_limit + 1
+        if (
+            len(response_payloads) != expected_request_count
+            or observer_sample.maximum_requests != thread_limit
+            or worker_execution[0]["maximum_active_requests"] != thread_limit
+            or float(wave_seconds) < (sql_delay_ms / 1_000) * 1.5
+        ):
+            raise WorkerEvidenceError(
+                "Flask WSGI one-worker queue was not demonstrated"
+            )
+
+    return FlaskWsgiWaveEvidence(
+        profile_id=profile.id,
+        execution_model=FLASK_WSGI_EXECUTION_MODEL,
+        values=tuple(values),
+        thread_limit_per_worker=thread_limit,
+        worker_execution=tuple(worker_execution),
+        wave_seconds=float(wave_seconds),
+        sql_delay_seconds=sql_delay_ms / 1_000,
+        maximum_aggregate_sql_sessions=observer_sample.maximum_sessions,
+        maximum_simultaneous_sql_requests=observer_sample.maximum_requests,
+        queued_request_proven=queued_request_proven,
+    )
+
+
+def validate_flask_gather_evidence(
+    *,
+    response: LoopbackJsonResponse,
+    state_record: Mapping[str, object],
+    observer_sample: SqlObserverSample,
+    pool_record: Mapping[str, object],
+    sql_delay_ms: int,
+) -> FlaskGatherEvidence:
+    """Prove same-view SQL overlap while exactly one WSGI slot is held."""
+
+    if sql_delay_ms not in SQL_DELAY_MILLISECONDS or sql_delay_ms <= 0:
+        raise RunnerConfigurationError(
+            "Flask gather evidence requires a positive allowlisted SQL delay"
+        )
+    required_payload_keys = {
+        "async_thread_token",
+        "concurrent",
+        "concurrent_seconds",
+        "execution_model",
+        "loop_token",
+        "pid",
+        "request_sequence",
+        "sequential",
+        "sequential_seconds",
+        "wsgi_active_requests",
+        "wsgi_maximum_active_requests",
+        "wsgi_thread_token",
+    }
+    payload = response.payload
+    if response.status_code != 200 or set(payload) != required_payload_keys:
+        raise WorkerEvidenceError("Flask gather response evidence is malformed")
+    if (
+        payload.get("execution_model") != FLASK_WSGI_EXECUTION_MODEL
+        or payload.get("sequential") != [0, 1, 2, 3]
+        or payload.get("concurrent") != [0, 1, 2, 3]
+        or payload.get("wsgi_active_requests") != 1
+        or payload.get("wsgi_maximum_active_requests") != 1
+    ):
+        raise WorkerEvidenceError(
+            "Flask gather did not remain inside one WSGI request slot"
+        )
+    for name in (
+        "async_thread_token",
+        "loop_token",
+        "pid",
+        "request_sequence",
+        "wsgi_thread_token",
+    ):
+        value = payload.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise WorkerEvidenceError(
+                "Flask gather execution identity is malformed"
+            )
+    sequential_seconds = payload.get("sequential_seconds")
+    concurrent_seconds = payload.get("concurrent_seconds")
+    for value in (
+        sequential_seconds,
+        concurrent_seconds,
+        response.elapsed_seconds,
+    ):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise WorkerEvidenceError("Flask gather timing evidence is malformed")
+    if float(concurrent_seconds) >= float(sequential_seconds) * 0.70:
+        raise WorkerEvidenceError(
+            "Flask same-view concurrent SQL did not beat its sequential baseline"
+        )
+    sql_delay_seconds = sql_delay_ms / 1_000
+    if (
+        float(sequential_seconds) < sql_delay_seconds * 3.0
+        or float(concurrent_seconds) < sql_delay_seconds * 0.75
+        or response.elapsed_seconds
+        < (float(sequential_seconds) + float(concurrent_seconds)) * 0.90
+    ):
+        raise WorkerEvidenceError(
+            "Flask gather timings do not prove the configured SQL waits"
+        )
+
+    required_state_keys = {
+        "active_other_requests",
+        "completed_requests",
+        "execution_model",
+        "maximum_active_requests",
+        "pid",
+        "wsgi_thread_count",
+    }
+    completed = state_record.get("completed_requests")
+    if (
+        set(state_record) != required_state_keys
+        or state_record.get("execution_model") != FLASK_WSGI_EXECUTION_MODEL
+        or state_record.get("pid") != payload.get("pid")
+        or state_record.get("active_other_requests") != 0
+        or state_record.get("maximum_active_requests") != 1
+        or state_record.get("wsgi_thread_count") != 1
+        or isinstance(completed, bool)
+        or not isinstance(completed, int)
+        or completed < int(payload["request_sequence"])
+    ):
+        raise WorkerEvidenceError(
+            "Flask gather WSGI request slot did not settle"
+        )
+    if observer_sample.maximum_requests != 4:
+        raise WorkerEvidenceError(
+            "SQL Server did not observe four same-view Flask requests"
+        )
+    pool = pool_record.get("pool")
+    if not isinstance(pool, Mapping):
+        raise WorkerEvidenceError("Flask gather pool evidence is malformed")
+    active = _nonnegative_metric(pool, "active_connections")
+    pending = _nonnegative_metric(pool, "pending_gets")
+    connections = _nonnegative_metric(pool, "connections")
+    idle = _nonnegative_metric(pool, "idle_connections")
+    max_size = _nonnegative_metric(pool, "max_size")
+    if (
+        active != 0
+        or pending != 0
+        or connections > max_size
+        or idle != connections
+        or max_size < 4
+    ):
+        raise WorkerEvidenceError(
+            "Flask gather pool did not settle after same-view concurrency"
+        )
+    return FlaskGatherEvidence(
+        sequential_seconds=float(sequential_seconds),
+        concurrent_seconds=float(concurrent_seconds),
+        outer_response_seconds=float(response.elapsed_seconds),
+        sql_delay_seconds=sql_delay_seconds,
+        loop_token=int(payload["loop_token"]),
+        maximum_simultaneous_sql_requests=observer_sample.maximum_requests,
+        pool_active_after=active,
+        pool_pending_after=pending,
+    )
+
+
+def validate_adapted_flask_scaling_evidence(
+    *,
+    config: RunnerConfig,
+    profile: ProcessProfile,
+    ready_records: Sequence[Mapping[str, object]],
+    first_loop_records: Sequence[Mapping[str, object]],
+    second_loop_records: Sequence[Mapping[str, object]],
+    response_payloads: Sequence[Mapping[str, object]],
+    settled_records: Sequence[Mapping[str, object]],
+    observer_sample: SqlObserverSample,
+) -> AdaptedFlaskScalingEvidence:
+    """Validate persistent ASGI loops and one serialized WSGI lane per PID."""
+
+    if (
+        config.database_mode != "sql_auth"
+        or profile.database_mode != "sql_auth"
+        or profile not in adapted_flask_profiles(config.platform_system)
+        or config.global_connection_budget % profile.workers
+    ):
+        raise RunnerConfigurationError(
+            "adapted Flask evidence requires an applicable SQL-auth profile"
+        )
+    ready_map = _ready_worker_map(ready_records)
+    expected_pids = tuple(sorted(ready_map.values()))
+    if len(expected_pids) != profile.workers:
+        raise WorkerEvidenceError(
+            "adapted Flask ready worker count is inconsistent"
+        )
+    first_by_pid = _evidence_records_by_pid(
+        first_loop_records,
+        expected_pids=expected_pids,
+        record_name="adapted Flask first loop",
+    )
+    second_by_pid = _evidence_records_by_pid(
+        second_loop_records,
+        expected_pids=expected_pids,
+        record_name="adapted Flask second loop",
+    )
+    settled_by_pid = _evidence_records_by_pid(
+        settled_records,
+        expected_pids=expected_pids,
+        record_name="adapted Flask settled",
+    )
+    reconcile_worker_sessions(observer_sample, ready_records)
+
+    loop_keys = {
+        "async_thread_token",
+        "execution_model",
+        "loop_id",
+        "loop_token",
+        "pid",
+        "request_sequence",
+        "value",
+        "wsgi_active_requests",
+        "wsgi_maximum_active_requests",
+        "wsgi_thread_token",
+    }
+    persistent_worker_loops: list[dict[str, int]] = []
+    persistent_by_pid: dict[int, dict[str, int]] = {}
+    for pid in expected_pids:
+        first = first_by_pid[pid]
+        second = second_by_pid[pid]
+        for record in (first, second):
+            if (
+                set(record) != loop_keys
+                or record.get("execution_model")
+                != ADAPTED_FLASK_EXECUTION_MODEL
+                or record.get("value") != 17
+                or record.get("wsgi_active_requests") != 1
+                or record.get("wsgi_maximum_active_requests") != 1
+            ):
+                raise WorkerEvidenceError(
+                    "adapted Flask loop evidence is malformed"
+                )
+            for name in (
+                "async_thread_token",
+                "loop_id",
+                "loop_token",
+                "pid",
+                "request_sequence",
+                "wsgi_thread_token",
+            ):
+                value = record.get(name)
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value <= 0
+                ):
+                    raise WorkerEvidenceError(
+                        "adapted Flask loop identity is malformed"
+                    )
+        if (
+            second["request_sequence"] <= first["request_sequence"]
+            or any(
+                first[name] != second[name]
+                for name in (
+                    "async_thread_token",
+                    "loop_id",
+                    "loop_token",
+                    "wsgi_thread_token",
+                )
+            )
+        ):
+            raise WorkerEvidenceError(
+                "adapted Flask persistent ASGI loop changed within one worker"
+            )
+        persistent = {
+            "async_thread_token": int(first["async_thread_token"]),
+            "loop_token": int(first["loop_token"]),
+            "pid": pid,
+            "wsgi_thread_token": int(first["wsgi_thread_token"]),
+        }
+        persistent_by_pid[pid] = persistent
+        persistent_worker_loops.append(persistent)
+
+    response_keys = {
+        "async_thread_token",
+        "delay_ms",
+        "execution_model",
+        "loop_token",
+        "pid",
+        "request_sequence",
+        "session_id",
+        "value",
+        "wsgi_active_requests",
+        "wsgi_maximum_active_requests",
+        "wsgi_thread_token",
+    }
+    for payload in response_payloads:
+        pid = payload.get("pid")
+        if (
+            set(payload) != response_keys
+            or isinstance(pid, bool)
+            or not isinstance(pid, int)
+            or pid not in persistent_by_pid
+            or payload.get("execution_model")
+            != ADAPTED_FLASK_EXECUTION_MODEL
+            or payload.get("wsgi_active_requests") != 1
+            or payload.get("wsgi_maximum_active_requests") != 1
+            or payload.get("loop_token")
+            != persistent_by_pid[pid]["loop_token"]
+            or payload.get("async_thread_token")
+            != persistent_by_pid[pid]["async_thread_token"]
+            or payload.get("wsgi_thread_token")
+            != persistent_by_pid[pid]["wsgi_thread_token"]
+            or payload.get("delay_ms") not in SQL_DELAY_MILLISECONDS
+            or payload.get("delay_ms") == 0
+            or isinstance(payload.get("value"), bool)
+            or not isinstance(payload.get("value"), int)
+            or isinstance(payload.get("session_id"), bool)
+            or not isinstance(payload.get("session_id"), int)
+            or int(payload["session_id"]) <= 0
+        ):
+            raise WorkerEvidenceError(
+                "adapted Flask serialized response evidence is inconsistent"
+            )
+
+    state_keys = {
+        "active_other_requests",
+        "completed_requests",
+        "execution_model",
+        "maximum_active_requests",
+        "pid",
+        "wsgi_thread_count",
+    }
+    for pid in expected_pids:
+        state = settled_by_pid[pid]
+        completed = state.get("completed_requests")
+        if (
+            set(state) != state_keys
+            or state.get("execution_model")
+            != ADAPTED_FLASK_EXECUTION_MODEL
+            or state.get("active_other_requests") != 0
+            or state.get("maximum_active_requests") != 1
+            or state.get("wsgi_thread_count") != 1
+            or isinstance(completed, bool)
+            or not isinstance(completed, int)
+            or completed < int(second_by_pid[pid]["request_sequence"])
+        ):
+            raise WorkerEvidenceError(
+                "adapted Flask WSGI lane did not settle"
+            )
+    if (
+        observer_sample.maximum_sessions > config.global_connection_budget
+        or observer_sample.current_sessions > config.global_connection_budget
+    ):
+        raise WorkerEvidenceError(
+            "adapted Flask SQL sessions exceeded the global budget"
+        )
+    if not 1 <= observer_sample.maximum_requests <= profile.workers:
+        raise WorkerEvidenceError(
+            "adapted Flask exceeded one serialized SQL request per process"
+        )
+    return AdaptedFlaskScalingEvidence(
+        profile_id=profile.id,
+        persistent_worker_loops=tuple(persistent_worker_loops),
+        maximum_aggregate_sql_sessions=observer_sample.maximum_sessions,
+        maximum_simultaneous_sql_requests=observer_sample.maximum_requests,
+    )
+
+
+def validate_adapted_flask_serialization_evidence(
+    *,
+    sequential_payloads: Sequence[Mapping[str, object]],
+    concurrent_payloads: Sequence[Mapping[str, object]],
+    expected_values: Sequence[int],
+    sequential_seconds: float,
+    concurrent_seconds: float,
+    state_record: Mapping[str, object],
+    observer_sample: SqlObserverSample,
+    pool_record: Mapping[str, object],
+    sql_delay_ms: int,
+) -> AdaptedFlaskSerializationEvidence:
+    """Prove thread-sensitive serialization for one adapted Flask worker."""
+
+    if sql_delay_ms not in SQL_DELAY_MILLISECONDS or sql_delay_ms <= 0:
+        raise RunnerConfigurationError(
+            "adapted Flask serialization requires an allowlisted SQL delay"
+        )
+    if (
+        len(expected_values) != 4
+        or len(sequential_payloads) != 4
+        or len(concurrent_payloads) != 4
+        or any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in expected_values
+        )
+    ):
+        raise WorkerEvidenceError(
+            "adapted Flask serialization response count is inconsistent"
+        )
+    response_keys = {
+        "async_thread_token",
+        "delay_ms",
+        "execution_model",
+        "loop_token",
+        "pid",
+        "request_sequence",
+        "session_id",
+        "value",
+        "wsgi_active_requests",
+        "wsgi_maximum_active_requests",
+        "wsgi_thread_token",
+    }
+    loop_tokens: set[int] = set()
+    async_thread_tokens: set[int] = set()
+    wsgi_thread_tokens: set[int] = set()
+    pids: set[int] = set()
+    request_sequences: set[int] = set()
+    for payloads in (sequential_payloads, concurrent_payloads):
+        for payload, expected_value in zip(
+            payloads,
+            expected_values,
+            strict=True,
+        ):
+            if (
+                set(payload) != response_keys
+                or payload.get("execution_model")
+                != ADAPTED_FLASK_EXECUTION_MODEL
+                or payload.get("delay_ms") != sql_delay_ms
+                or payload.get("value") != expected_value
+                or payload.get("wsgi_active_requests") != 1
+                or payload.get("wsgi_maximum_active_requests") != 1
+            ):
+                raise WorkerEvidenceError(
+                    "adapted Flask serialization response is inconsistent"
+                )
+            for name in (
+                "async_thread_token",
+                "loop_token",
+                "pid",
+                "request_sequence",
+                "session_id",
+                "wsgi_thread_token",
+            ):
+                value = payload.get(name)
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value <= 0
+                ):
+                    raise WorkerEvidenceError(
+                        "adapted Flask serialization identity is malformed"
+                    )
+            loop_tokens.add(int(payload["loop_token"]))
+            async_thread_tokens.add(int(payload["async_thread_token"]))
+            wsgi_thread_tokens.add(int(payload["wsgi_thread_token"]))
+            pids.add(int(payload["pid"]))
+            sequence = int(payload["request_sequence"])
+            if sequence in request_sequences:
+                raise WorkerEvidenceError(
+                    "adapted Flask request sequence is not unique"
+                )
+            request_sequences.add(sequence)
+    if (
+        len(loop_tokens) != 1
+        or len(async_thread_tokens) != 1
+        or len(wsgi_thread_tokens) != 1
+        or len(pids) != 1
+    ):
+        raise WorkerEvidenceError(
+            "adapted Flask did not preserve one serialized worker lane"
+        )
+    for value in (sequential_seconds, concurrent_seconds):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise WorkerEvidenceError(
+                "adapted Flask serialization timing is malformed"
+            )
+    sql_delay_seconds = sql_delay_ms / 1_000
+    ratio = float(concurrent_seconds) / float(sequential_seconds)
+    if (
+        float(sequential_seconds) < sql_delay_seconds * 4 * 0.75
+        or float(concurrent_seconds) < sql_delay_seconds * 4 * 0.75
+        or not 0.75 <= ratio <= 1.35
+    ):
+        raise WorkerEvidenceError(
+            "adapted Flask thread-sensitive serialization timing is inconsistent"
+        )
+    state_keys = {
+        "active_other_requests",
+        "completed_requests",
+        "execution_model",
+        "maximum_active_requests",
+        "pid",
+        "wsgi_thread_count",
+    }
+    completed = state_record.get("completed_requests")
+    if (
+        set(state_record) != state_keys
+        or state_record.get("execution_model")
+        != ADAPTED_FLASK_EXECUTION_MODEL
+        or state_record.get("pid") != next(iter(pids))
+        or state_record.get("active_other_requests") != 0
+        or state_record.get("maximum_active_requests") != 1
+        or state_record.get("wsgi_thread_count") != 1
+        or isinstance(completed, bool)
+        or not isinstance(completed, int)
+        or completed < max(request_sequences)
+    ):
+        raise WorkerEvidenceError(
+            "adapted Flask serialized WSGI lane did not settle"
+        )
+    if observer_sample.maximum_requests != 1:
+        raise WorkerEvidenceError(
+            "adapted Flask exposed parallel SQL requests in one process"
+        )
+    pool = pool_record.get("pool")
+    if not isinstance(pool, Mapping):
+        raise WorkerEvidenceError(
+            "adapted Flask serialization pool evidence is malformed"
+        )
+    active = _nonnegative_metric(pool, "active_connections")
+    pending = _nonnegative_metric(pool, "pending_gets")
+    connections = _nonnegative_metric(pool, "connections")
+    idle = _nonnegative_metric(pool, "idle_connections")
+    max_size = _nonnegative_metric(pool, "max_size")
+    if (
+        active != 0
+        or pending != 0
+        or connections > max_size
+        or idle != connections
+        or max_size <= 0
+    ):
+        raise WorkerEvidenceError(
+            "adapted Flask serialization pool did not settle"
+        )
+    return AdaptedFlaskSerializationEvidence(
+        values=tuple(expected_values),
+        sequential_seconds=float(sequential_seconds),
+        concurrent_seconds=float(concurrent_seconds),
+        sql_delay_seconds=sql_delay_seconds,
+        loop_token=next(iter(loop_tokens)),
         maximum_simultaneous_sql_requests=observer_sample.maximum_requests,
         pool_active_after=active,
         pool_pending_after=pending,
@@ -2470,6 +3814,64 @@ def native_fastapi_profiles(
     ):
         raise RunnerConfigurationError(
             "native FastAPI profile selection is incomplete"
+        )
+    return profiles
+
+
+def flask_wsgi_profiles(
+    platform_name: str,
+) -> tuple[ProcessProfile, ...]:
+    """Select every real Gunicorn Flask WSGI SQL-auth profile on POSIX."""
+
+    if normalize_platform(platform_name) == "Windows":
+        return ()
+    profiles = tuple(
+        profile
+        for profile in expand_profiles(
+            platform_name,
+            database_mode="sql_auth",
+        )
+        if profile.family
+        in {"flask-gunicorn-gthread", "flask-gunicorn-sync"}
+        and profile.applicable
+    )
+    if (
+        {profile.family for profile in profiles}
+        != {"flask-gunicorn-gthread", "flask-gunicorn-sync"}
+        or {profile.workers for profile in profiles} != set(WORKER_COUNTS)
+        or len(profiles) != 2 * len(WORKER_COUNTS)
+    ):
+        raise RunnerConfigurationError(
+            "Flask WSGI profile selection is incomplete"
+        )
+    return profiles
+
+
+def adapted_flask_profiles(
+    platform_name: str,
+) -> tuple[ProcessProfile, ...]:
+    """Select every applicable standalone-Uvicorn adapted Flask profile."""
+
+    platform_system = normalize_platform(platform_name)
+    profiles = tuple(
+        profile
+        for profile in expand_profiles(
+            platform_name,
+            database_mode="sql_auth",
+        )
+        if profile.family.startswith("flask-asgi-uvicorn-")
+        and profile.applicable
+    )
+    expected_families = {"flask-asgi-uvicorn-asyncio"}
+    if platform_system != "Windows":
+        expected_families.add("flask-asgi-uvicorn-uvloop")
+    if (
+        {profile.family for profile in profiles} != expected_families
+        or {profile.workers for profile in profiles} != set(WORKER_COUNTS)
+        or len(profiles) != len(expected_families) * len(WORKER_COUNTS)
+    ):
+        raise RunnerConfigurationError(
+            "adapted Flask profile selection is incomplete"
         )
     return profiles
 
@@ -4556,6 +5958,7 @@ async def collect_worker_payloads(
     expected_pids: Sequence[int],
     timeout_seconds: float,
     request_json: Callable[..., Awaitable[dict[str, object]]] | None = None,
+    monotonic_counter: str | None = None,
 ) -> tuple[dict[str, object], ...]:
     """Reach every expected worker through bounded load-balancer dispatch."""
 
@@ -4569,6 +5972,14 @@ async def collect_worker_payloads(
         or len(set(expected_pids)) != len(expected_pids)
     ):
         raise RunnerConfigurationError("expected worker PIDs are invalid")
+    if monotonic_counter is not None and (
+        not isinstance(monotonic_counter, str)
+        or not monotonic_counter.isidentifier()
+        or monotonic_counter.startswith("_")
+    ):
+        raise RunnerConfigurationError(
+            "worker evidence monotonic counter is invalid"
+        )
     requester = http_get_json if request_json is None else request_json
     expected = frozenset(expected_pids)
     observed: dict[int, dict[str, object]] = {}
@@ -4613,12 +6024,42 @@ async def collect_worker_payloads(
                 raise WorkerEvidenceError(
                     "worker HTTP evidence has an unexpected worker PID"
                 )
+            counter = None
+            if monotonic_counter is not None:
+                counter = payload.get(monotonic_counter)
+                if (
+                    isinstance(counter, bool)
+                    or not isinstance(counter, int)
+                    or counter <= 0
+                ):
+                    raise WorkerEvidenceError(
+                        "worker HTTP monotonic counter is malformed"
+                    )
             prior = observed.get(pid)
             if prior is not None and prior != payload:
-                raise WorkerEvidenceError(
-                    "worker HTTP evidence changed for one PID"
-                )
-            observed[pid] = dict(payload)
+                if monotonic_counter is None:
+                    raise WorkerEvidenceError(
+                        "worker HTTP evidence changed for one PID"
+                    )
+                prior_counter = prior[monotonic_counter]
+                prior_stable = {
+                    key: value
+                    for key, value in prior.items()
+                    if key != monotonic_counter
+                }
+                payload_stable = {
+                    key: value
+                    for key, value in payload.items()
+                    if key != monotonic_counter
+                }
+                if prior_stable != payload_stable:
+                    raise WorkerEvidenceError(
+                        "worker HTTP stable evidence changed for one PID"
+                    )
+                if counter > prior_counter:
+                    observed[pid] = dict(payload)
+            elif prior is None:
+                observed[pid] = dict(payload)
     return tuple(observed[pid] for pid in sorted(observed))
 
 
@@ -4759,20 +6200,12 @@ async def run_native_scaling_profile(
                 )
                 for value in wave_values
             )
-            try:
-                await observer.wait_for_minimum_requests(
-                    min(2, len(wave_tasks)),
-                    timeout_seconds=wave_timeout,
-                )
-                wave_responses = await asyncio.wait_for(
-                    asyncio.gather(*wave_tasks),
-                    timeout=wave_timeout,
-                )
-            finally:
-                for task in wave_tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*wave_tasks, return_exceptions=True)
+            wave_responses = await await_observed_request_wave(
+                observer,
+                wave_tasks,
+                minimum_requests=min(2, len(wave_tasks)),
+                timeout_seconds=wave_timeout,
+            )
 
             pool_records = await collect_worker_payloads(
                 launch.port,
@@ -4904,6 +6337,1072 @@ async def run_native_scaling_matrix(
         )
     verify_isolated_application(isolated)
     return tuple(results)
+
+
+async def run_flask_wsgi_profile(
+    config: RunnerConfig,
+    isolated: IsolatedApplication,
+    profile: ProcessProfile,
+    *,
+    repository_root: Path,
+    run_id: str,
+    policy: SupervisorPolicy,
+    sql_auth_settings: SqlAuthObserverSettings,
+    table_name: str,
+    wave_values: Sequence[int],
+    sql_delay_ms: int = 250,
+) -> FlaskWsgiProfileResult:
+    """Run one real Gunicorn Flask profile and prove its WSGI limits."""
+
+    if (
+        config.database_mode != "sql_auth"
+        or profile.database_mode != "sql_auth"
+        or profile not in flask_wsgi_profiles(config.platform_system)
+    ):
+        raise RunnerConfigurationError(
+            "Flask WSGI profile requires selected POSIX SQL-auth Gunicorn"
+        )
+    if (
+        not wave_values
+        or len(wave_values) > config.global_connection_budget
+        or any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in wave_values
+        )
+    ):
+        raise RunnerConfigurationError("Flask WSGI wave values are invalid")
+
+    artifact_directory = (
+        config.run_root / "worker-records" / profile.id
+    ).resolve()
+    environment = build_profile_environment(
+        config,
+        isolated,
+        profile,
+        run_id=run_id,
+        artifact_directory=artifact_directory,
+        sql_auth_settings=sql_auth_settings,
+        table_name=table_name,
+        sql_delay_ms=sql_delay_ms,
+    )
+    worker_prefix = environment["FASTMSSQL_FRAMEWORK_APPLICATION_NAME"]
+    observer_application_name = f"{worker_prefix}-observer"
+    if len(observer_application_name) > MAX_SQL_SERVER_APPLICATION_NAME:
+        raise RunnerConfigurationError(
+            "generated observer application name is too long"
+        )
+    observer_connection = create_observer_connection(
+        sql_auth_settings,
+        application_name=observer_application_name,
+    )
+    await observer_connection.connect(validate=True)
+
+    async def execute() -> FlaskWsgiProfileResult:
+        observer = SqlServerObserver(
+            source=observer_connection,
+            worker_prefix=worker_prefix,
+            observer_application_name=observer_application_name,
+            poll_interval_seconds=policy.poll_interval_seconds,
+        )
+
+        async def worker_is_ready(port: int) -> bool:
+            try:
+                payload = await http_get_json(
+                    port,
+                    "/ready",
+                    timeout_seconds=0.5,
+                )
+            except HttpProbeError:
+                return False
+            return payload.get("state") == "ready"
+
+        launch = await launch_with_port_retry(
+            command_builder=lambda port: build_server_command(
+                config,
+                profile,
+                port=port,
+            ),
+            cwd=isolated.root,
+            environment=environment,
+            readiness_probe=worker_is_ready,
+            policy=policy,
+        )
+        supervisor = launch.supervisor
+        async with supervisor:
+            ready_records = await supervisor.wait_for_worker_records(
+                directory=artifact_directory,
+                phase="ready",
+                expected_run_id=run_id,
+                expected_count=profile.workers,
+            )
+            ready_pids = tuple(
+                sorted(int(record["pid"]) for record in ready_records)
+            )
+            package_records = await collect_worker_payloads(
+                launch.port,
+                "/package",
+                expected_pids=ready_pids,
+                timeout_seconds=policy.startup_timeout_seconds,
+            )
+            validated_packages = tuple(
+                validate_package_record(
+                    config,
+                    isolated,
+                    package,
+                    repository_root=repository_root,
+                )
+                for package in package_records
+            )
+            principal_records = await collect_worker_payloads(
+                launch.port,
+                "/principal",
+                expected_pids=ready_pids,
+                timeout_seconds=policy.startup_timeout_seconds,
+            )
+            await observer.wait_for_ready_workers(
+                ready_records,
+                timeout_seconds=policy.startup_timeout_seconds,
+            )
+
+            wave_timeout = max(
+                5.0,
+                (len(wave_values) * sql_delay_ms) / 1_000 + 2.0,
+            )
+            wave_started = time.perf_counter()
+            wave_tasks = tuple(
+                asyncio.create_task(
+                    http_request_json(
+                        launch.port,
+                        f"/execution/wait/{value}",
+                        expected_statuses=(200,),
+                        timeout_seconds=wave_timeout,
+                    )
+                )
+                for value in wave_values
+            )
+            minimum_requests = shared_listener_sql_request_minimum(
+                profile,
+                request_count=len(wave_tasks),
+            )
+            wave_responses = await await_observed_request_wave(
+                observer,
+                wave_tasks,
+                minimum_requests=minimum_requests,
+                timeout_seconds=wave_timeout,
+            )
+            wave_seconds = time.perf_counter() - wave_started
+
+            settled_records = await collect_worker_payloads(
+                launch.port,
+                "/execution/state",
+                expected_pids=ready_pids,
+                timeout_seconds=policy.startup_timeout_seconds,
+            )
+            pool_records = await collect_worker_payloads(
+                launch.port,
+                "/pool",
+                expected_pids=ready_pids,
+                timeout_seconds=policy.startup_timeout_seconds,
+            )
+            observer_sample = await observer.sample()
+            response_payloads = tuple(
+                response.payload for response in wave_responses
+            )
+            scaling_evidence = validate_flask_scaling_evidence(
+                config=config,
+                profile=profile,
+                ready_records=ready_records,
+                package_records=validated_packages,
+                principal_records=principal_records,
+                pool_records=pool_records,
+                parameter_payloads=response_payloads,
+                expected_values=wave_values,
+                expected_principal=sql_auth_settings.username,
+                observer_sample=observer_sample,
+            )
+            wsgi_evidence = validate_flask_wsgi_wave_evidence(
+                config=config,
+                profile=profile,
+                ready_records=ready_records,
+                response_payloads=response_payloads,
+                settled_records=settled_records,
+                expected_values=wave_values,
+                wave_seconds=wave_seconds,
+                sql_delay_ms=sql_delay_ms,
+                observer_sample=observer_sample,
+            )
+            outcome = await supervisor.stop()
+
+        shutdown_records = supervisor.read_worker_records(
+            directory=artifact_directory,
+            phase="shutdown",
+            expected_run_id=run_id,
+            expected_count=profile.workers,
+        )
+        shutdown_pids = tuple(
+            sorted(int(record["pid"]) for record in shutdown_records)
+        )
+        if scaling_evidence.ready_pids != shutdown_pids:
+            raise WorkerEvidenceError(
+                "Flask WSGI ready and shutdown worker PIDs do not reconcile"
+            )
+        listening_sockets_after = (
+            (launch.port,)
+            if await loopback_port_is_listening(launch.port)
+            else ()
+        )
+        if listening_sockets_after:
+            raise ProcessSupervisorError(
+                "Flask WSGI loopback listener survived shutdown"
+            )
+        zero_sample = await observer.wait_for_zero_sessions(
+            timeout_seconds=policy.graceful_timeout_seconds,
+        )
+        verify_isolated_application(isolated)
+        return FlaskWsgiProfileResult(
+            profile=profile,
+            scaling_evidence=scaling_evidence,
+            wsgi_evidence=wsgi_evidence,
+            port=launch.port,
+            launch_attempts=launch.attempts,
+            sanitized_command=launch.sanitized_command,
+            shutdown_pids=shutdown_pids,
+            manager_pid=outcome.pid,
+            descendant_pids=outcome.descendant_pids,
+            returncode=outcome.returncode,
+            graceful_stop=outcome.graceful_stop,
+            forced_cleanup=outcome.forced_cleanup,
+            listening_sockets_after=listening_sockets_after,
+            sessions_after=zero_sample.current_sessions,
+        )
+
+    try:
+        result = await execute()
+    except BaseException as operation_error:
+        try:
+            await observer_connection.disconnect()
+        except BaseException as cleanup_error:
+            raise BaseExceptionGroup(
+                "Flask WSGI profile and observer cleanup both failed",
+                [operation_error, cleanup_error],
+            ) from None
+        raise
+    await observer_connection.disconnect()
+    return result
+
+
+async def run_flask_wsgi_matrix(
+    config: RunnerConfig,
+    *,
+    repository_root: Path,
+    source_directory: Path,
+    sql_auth_settings: SqlAuthObserverSettings,
+    table_name: str,
+    policy: SupervisorPolicy | None = None,
+) -> tuple[FlaskWsgiProfileResult, ...]:
+    """Run every POSIX Gunicorn sync/gthread worker-count profile."""
+
+    if config.database_mode != "sql_auth":
+        raise RunnerConfigurationError(
+            "Flask WSGI matrix requires SQL-auth database mode"
+        )
+    selected_policy = policy or SupervisorPolicy()
+    isolated = prepare_isolated_application(
+        config,
+        source_directory=source_directory,
+        directory_name="flask-wsgi-application",
+    )
+    results: list[FlaskWsgiProfileResult] = []
+    for index, profile in enumerate(
+        flask_wsgi_profiles(config.platform_system),
+        start=1,
+    ):
+        if profile.workers == 1:
+            wave_size = profile.threads_per_worker + 1
+        elif profile.worker_class == "sync":
+            wave_size = max(2, profile.workers)
+        else:
+            wave_size = min(
+                config.global_connection_budget,
+                profile.workers * profile.threads_per_worker,
+            )
+        if wave_size > config.global_connection_budget:
+            raise RunnerConfigurationError(
+                "Flask WSGI wave exceeds the global connection budget"
+            )
+        wave_values = tuple(
+            753_000 + index * 100 + offset
+            for offset in range(1, wave_size + 1)
+        )
+        results.append(
+            await run_flask_wsgi_profile(
+                config,
+                isolated,
+                profile,
+                repository_root=repository_root,
+                run_id=f"fwsgi-{config.candidate_sha[:8]}-{index}",
+                policy=selected_policy,
+                sql_auth_settings=sql_auth_settings,
+                table_name=table_name,
+                wave_values=wave_values,
+            )
+        )
+    verify_isolated_application(isolated)
+    return tuple(results)
+
+
+async def run_adapted_flask_profile(
+    config: RunnerConfig,
+    isolated: IsolatedApplication,
+    profile: ProcessProfile,
+    *,
+    repository_root: Path,
+    run_id: str,
+    policy: SupervisorPolicy,
+    sql_auth_settings: SqlAuthObserverSettings,
+    table_name: str,
+    wave_values: Sequence[int],
+    sql_delay_ms: int = 250,
+) -> AdaptedFlaskProfileResult:
+    """Run one Uvicorn-adapted Flask profile with persistent-loop proof."""
+
+    if (
+        config.database_mode != "sql_auth"
+        or profile.database_mode != "sql_auth"
+        or profile not in adapted_flask_profiles(config.platform_system)
+    ):
+        raise RunnerConfigurationError(
+            "adapted Flask profile requires selected SQL-auth Uvicorn"
+        )
+    if (
+        not wave_values
+        or len(wave_values) > config.global_connection_budget
+        or any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in wave_values
+        )
+    ):
+        raise RunnerConfigurationError(
+            "adapted Flask wave values are invalid"
+        )
+    artifact_directory = (
+        config.run_root / "worker-records" / profile.id
+    ).resolve()
+    environment = build_profile_environment(
+        config,
+        isolated,
+        profile,
+        run_id=run_id,
+        artifact_directory=artifact_directory,
+        sql_auth_settings=sql_auth_settings,
+        table_name=table_name,
+        sql_delay_ms=sql_delay_ms,
+    )
+    worker_prefix = environment["FASTMSSQL_FRAMEWORK_APPLICATION_NAME"]
+    observer_application_name = f"{worker_prefix}-observer"
+    if len(observer_application_name) > MAX_SQL_SERVER_APPLICATION_NAME:
+        raise RunnerConfigurationError(
+            "generated observer application name is too long"
+        )
+    observer_connection = create_observer_connection(
+        sql_auth_settings,
+        application_name=observer_application_name,
+    )
+    await observer_connection.connect(validate=True)
+
+    async def execute() -> AdaptedFlaskProfileResult:
+        observer = SqlServerObserver(
+            source=observer_connection,
+            worker_prefix=worker_prefix,
+            observer_application_name=observer_application_name,
+            poll_interval_seconds=policy.poll_interval_seconds,
+        )
+
+        async def worker_is_ready(port: int) -> bool:
+            try:
+                payload = await http_get_json(
+                    port,
+                    "/ready",
+                    timeout_seconds=0.5,
+                )
+            except HttpProbeError:
+                return False
+            return payload.get("state") == "ready"
+
+        launch = await launch_with_port_retry(
+            command_builder=lambda port: build_server_command(
+                config,
+                profile,
+                port=port,
+            ),
+            cwd=isolated.root,
+            environment=environment,
+            readiness_probe=worker_is_ready,
+            policy=policy,
+        )
+        supervisor = launch.supervisor
+        async with supervisor:
+            ready_records = await supervisor.wait_for_worker_records(
+                directory=artifact_directory,
+                phase="ready",
+                expected_run_id=run_id,
+                expected_count=profile.workers,
+            )
+            ready_pids = tuple(
+                sorted(int(record["pid"]) for record in ready_records)
+            )
+            package_records = await collect_worker_payloads(
+                launch.port,
+                "/package",
+                expected_pids=ready_pids,
+                timeout_seconds=policy.startup_timeout_seconds,
+            )
+            validated_packages = tuple(
+                validate_package_record(
+                    config,
+                    isolated,
+                    package,
+                    repository_root=repository_root,
+                )
+                for package in package_records
+            )
+            principal_records = await collect_worker_payloads(
+                launch.port,
+                "/principal",
+                expected_pids=ready_pids,
+                timeout_seconds=policy.startup_timeout_seconds,
+            )
+            await observer.wait_for_ready_workers(
+                ready_records,
+                timeout_seconds=policy.startup_timeout_seconds,
+            )
+            first_loop_records = await collect_worker_payloads(
+                launch.port,
+                "/loop",
+                expected_pids=ready_pids,
+                timeout_seconds=policy.startup_timeout_seconds,
+                monotonic_counter="request_sequence",
+            )
+            second_loop_records = await collect_worker_payloads(
+                launch.port,
+                "/loop",
+                expected_pids=ready_pids,
+                timeout_seconds=policy.startup_timeout_seconds,
+                monotonic_counter="request_sequence",
+            )
+
+            wave_timeout = max(
+                5.0,
+                (len(wave_values) * sql_delay_ms) / 1_000 + 2.0,
+            )
+            wave_tasks = tuple(
+                asyncio.create_task(
+                    http_request_json(
+                        launch.port,
+                        f"/execution/wait/{value}",
+                        expected_statuses=(200,),
+                        timeout_seconds=wave_timeout,
+                    )
+                )
+                for value in wave_values
+            )
+            minimum_requests = shared_listener_sql_request_minimum(
+                profile,
+                request_count=len(wave_tasks),
+            )
+            wave_responses = await await_observed_request_wave(
+                observer,
+                wave_tasks,
+                minimum_requests=minimum_requests,
+                timeout_seconds=wave_timeout,
+            )
+
+            settled_records = await collect_worker_payloads(
+                launch.port,
+                "/execution/state",
+                expected_pids=ready_pids,
+                timeout_seconds=policy.startup_timeout_seconds,
+            )
+            pool_records = await collect_worker_payloads(
+                launch.port,
+                "/pool",
+                expected_pids=ready_pids,
+                timeout_seconds=policy.startup_timeout_seconds,
+            )
+            observer_sample = await observer.sample()
+            response_payloads = tuple(
+                response.payload for response in wave_responses
+            )
+            scaling_evidence = validate_flask_scaling_evidence(
+                config=config,
+                profile=profile,
+                ready_records=ready_records,
+                package_records=validated_packages,
+                principal_records=principal_records,
+                pool_records=pool_records,
+                parameter_payloads=response_payloads,
+                expected_values=wave_values,
+                expected_principal=sql_auth_settings.username,
+                observer_sample=observer_sample,
+            )
+            adapted_evidence = validate_adapted_flask_scaling_evidence(
+                config=config,
+                profile=profile,
+                ready_records=ready_records,
+                first_loop_records=first_loop_records,
+                second_loop_records=second_loop_records,
+                response_payloads=response_payloads,
+                settled_records=settled_records,
+                observer_sample=observer_sample,
+            )
+            outcome = await supervisor.stop()
+
+        shutdown_records = supervisor.read_worker_records(
+            directory=artifact_directory,
+            phase="shutdown",
+            expected_run_id=run_id,
+            expected_count=profile.workers,
+        )
+        shutdown_pids = tuple(
+            sorted(int(record["pid"]) for record in shutdown_records)
+        )
+        if scaling_evidence.ready_pids != shutdown_pids:
+            raise WorkerEvidenceError(
+                "adapted Flask ready and shutdown PIDs do not reconcile"
+            )
+        listening_sockets_after = (
+            (launch.port,)
+            if await loopback_port_is_listening(launch.port)
+            else ()
+        )
+        if listening_sockets_after:
+            raise ProcessSupervisorError(
+                "adapted Flask loopback listener survived shutdown"
+            )
+        zero_sample = await observer.wait_for_zero_sessions(
+            timeout_seconds=policy.graceful_timeout_seconds,
+        )
+        verify_isolated_application(isolated)
+        return AdaptedFlaskProfileResult(
+            profile=profile,
+            scaling_evidence=scaling_evidence,
+            adapted_evidence=adapted_evidence,
+            port=launch.port,
+            launch_attempts=launch.attempts,
+            sanitized_command=launch.sanitized_command,
+            shutdown_pids=shutdown_pids,
+            manager_pid=outcome.pid,
+            descendant_pids=outcome.descendant_pids,
+            returncode=outcome.returncode,
+            graceful_stop=outcome.graceful_stop,
+            forced_cleanup=outcome.forced_cleanup,
+            listening_sockets_after=listening_sockets_after,
+            sessions_after=zero_sample.current_sessions,
+        )
+
+    try:
+        result = await execute()
+    except BaseException as operation_error:
+        try:
+            await observer_connection.disconnect()
+        except BaseException as cleanup_error:
+            raise BaseExceptionGroup(
+                "adapted Flask profile and observer cleanup both failed",
+                [operation_error, cleanup_error],
+            ) from None
+        raise
+    await observer_connection.disconnect()
+    return result
+
+
+async def run_adapted_flask_matrix(
+    config: RunnerConfig,
+    *,
+    repository_root: Path,
+    source_directory: Path,
+    sql_auth_settings: SqlAuthObserverSettings,
+    table_name: str,
+    policy: SupervisorPolicy | None = None,
+) -> tuple[AdaptedFlaskProfileResult, ...]:
+    """Run every applicable adapted-Flask loop/worker-count profile."""
+
+    if config.database_mode != "sql_auth":
+        raise RunnerConfigurationError(
+            "adapted Flask matrix requires SQL-auth database mode"
+        )
+    selected_policy = policy or SupervisorPolicy()
+    isolated = prepare_isolated_application(
+        config,
+        source_directory=source_directory,
+        directory_name="adapted-flask-application",
+    )
+    results: list[AdaptedFlaskProfileResult] = []
+    for index, profile in enumerate(
+        adapted_flask_profiles(config.platform_system),
+        start=1,
+    ):
+        wave_size = max(2, profile.workers)
+        if wave_size > config.global_connection_budget:
+            raise RunnerConfigurationError(
+                "adapted Flask wave exceeds the global connection budget"
+            )
+        wave_values = tuple(
+            762_000 + index * 100 + offset
+            for offset in range(1, wave_size + 1)
+        )
+        results.append(
+            await run_adapted_flask_profile(
+                config,
+                isolated,
+                profile,
+                repository_root=repository_root,
+                run_id=f"fasgi-{config.candidate_sha[:8]}-{index}",
+                policy=selected_policy,
+                sql_auth_settings=sql_auth_settings,
+                table_name=table_name,
+                wave_values=wave_values,
+            )
+        )
+    verify_isolated_application(isolated)
+    return tuple(results)
+
+
+async def run_adapted_flask_serialization_scenario(
+    config: RunnerConfig,
+    isolated: IsolatedApplication,
+    profile: ProcessProfile,
+    *,
+    run_id: str,
+    policy: SupervisorPolicy,
+    sql_auth_settings: SqlAuthObserverSettings,
+    table_name: str,
+    values: Sequence[int],
+    sql_delay_ms: int = 250,
+) -> AdaptedFlaskSerializationScenarioResult:
+    """Measure one WsgiToAsgi thread-sensitive lane under concurrent clients."""
+
+    expected_profile = next(
+        (
+            candidate
+            for candidate in adapted_flask_profiles(config.platform_system)
+            if candidate.family == "flask-asgi-uvicorn-asyncio"
+            and candidate.workers == 1
+        ),
+        None,
+    )
+    if (
+        config.database_mode != "sql_auth"
+        or profile != expected_profile
+        or len(values) != 4
+        or any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in values
+        )
+        or sql_delay_ms not in SQL_DELAY_MILLISECONDS
+        or sql_delay_ms <= 0
+    ):
+        raise RunnerConfigurationError(
+            "adapted Flask serialization requires one asyncio worker and four values"
+        )
+    artifact_directory = (
+        config.run_root / "worker-records" / "adapted-serialization"
+    ).resolve()
+    environment = build_profile_environment(
+        config,
+        isolated,
+        profile,
+        run_id=run_id,
+        artifact_directory=artifact_directory,
+        sql_auth_settings=sql_auth_settings,
+        table_name=table_name,
+        sql_delay_ms=sql_delay_ms,
+    )
+    worker_prefix = environment["FASTMSSQL_FRAMEWORK_APPLICATION_NAME"]
+    observer_application_name = f"{worker_prefix}-observer"
+    if len(observer_application_name) > MAX_SQL_SERVER_APPLICATION_NAME:
+        raise RunnerConfigurationError(
+            "generated observer application name is too long"
+        )
+    observer_connection = create_observer_connection(
+        sql_auth_settings,
+        application_name=observer_application_name,
+    )
+    await observer_connection.connect(validate=True)
+
+    async def execute() -> AdaptedFlaskSerializationScenarioResult:
+        observer = SqlServerObserver(
+            source=observer_connection,
+            worker_prefix=worker_prefix,
+            observer_application_name=observer_application_name,
+            poll_interval_seconds=policy.poll_interval_seconds,
+        )
+
+        async def worker_is_ready(port: int) -> bool:
+            try:
+                payload = await http_get_json(
+                    port,
+                    "/ready",
+                    timeout_seconds=0.5,
+                )
+            except HttpProbeError:
+                return False
+            return payload.get("state") == "ready"
+
+        launch = await launch_with_port_retry(
+            command_builder=lambda port: build_server_command(
+                config,
+                profile,
+                port=port,
+            ),
+            cwd=isolated.root,
+            environment=environment,
+            readiness_probe=worker_is_ready,
+            policy=policy,
+        )
+        supervisor = launch.supervisor
+        request_timeout = max(
+            8.0,
+            len(values) * sql_delay_ms / 1_000 + 3.0,
+        )
+        async with supervisor:
+            ready_records = await supervisor.wait_for_worker_records(
+                directory=artifact_directory,
+                phase="ready",
+                expected_run_id=run_id,
+                expected_count=1,
+            )
+            ready_pids = tuple(
+                sorted(int(record["pid"]) for record in ready_records)
+            )
+            await observer.wait_for_ready_workers(
+                ready_records,
+                timeout_seconds=policy.startup_timeout_seconds,
+            )
+
+            sequential_started = time.perf_counter()
+            sequential_responses = tuple(
+                [
+                    await http_request_json(
+                        launch.port,
+                        f"/execution/wait/{value}",
+                        expected_statuses=(200,),
+                        timeout_seconds=request_timeout,
+                    )
+                    for value in values
+                ]
+            )
+            sequential_seconds = time.perf_counter() - sequential_started
+
+            concurrent_started = time.perf_counter()
+            concurrent_tasks = tuple(
+                asyncio.create_task(
+                    http_request_json(
+                        launch.port,
+                        f"/execution/wait/{value}",
+                        expected_statuses=(200,),
+                        timeout_seconds=request_timeout,
+                    )
+                )
+                for value in values
+            )
+            try:
+                busy_sample = await observer.wait_for_minimum_requests(
+                    1,
+                    timeout_seconds=request_timeout,
+                )
+                concurrent_responses = await asyncio.wait_for(
+                    asyncio.gather(*concurrent_tasks),
+                    timeout=request_timeout,
+                )
+                concurrent_seconds = time.perf_counter() - concurrent_started
+            finally:
+                for task in concurrent_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*concurrent_tasks, return_exceptions=True)
+
+            state_response = await http_request_json(
+                launch.port,
+                "/execution/state",
+                expected_statuses=(200,),
+                timeout_seconds=request_timeout,
+            )
+            pool_response = await http_request_json(
+                launch.port,
+                "/pool",
+                expected_statuses=(200,),
+                timeout_seconds=request_timeout,
+            )
+            evidence = validate_adapted_flask_serialization_evidence(
+                sequential_payloads=tuple(
+                    response.payload for response in sequential_responses
+                ),
+                concurrent_payloads=tuple(
+                    response.payload for response in concurrent_responses
+                ),
+                expected_values=values,
+                sequential_seconds=sequential_seconds,
+                concurrent_seconds=concurrent_seconds,
+                state_record=state_response.payload,
+                observer_sample=busy_sample,
+                pool_record=pool_response.payload,
+                sql_delay_ms=sql_delay_ms,
+            )
+            outcome = await supervisor.stop()
+
+        shutdown_records = supervisor.read_worker_records(
+            directory=artifact_directory,
+            phase="shutdown",
+            expected_run_id=run_id,
+            expected_count=1,
+        )
+        shutdown_pids = tuple(
+            sorted(int(record["pid"]) for record in shutdown_records)
+        )
+        if ready_pids != shutdown_pids:
+            raise WorkerEvidenceError(
+                "adapted serialization ready and shutdown PIDs do not reconcile"
+            )
+        listening_sockets_after = (
+            (launch.port,)
+            if await loopback_port_is_listening(launch.port)
+            else ()
+        )
+        if listening_sockets_after:
+            raise ProcessSupervisorError(
+                "adapted serialization listener survived shutdown"
+            )
+        zero_sample = await observer.wait_for_zero_sessions(
+            timeout_seconds=policy.graceful_timeout_seconds,
+        )
+        verify_isolated_application(isolated)
+        return AdaptedFlaskSerializationScenarioResult(
+            profile_id=profile.id,
+            evidence=evidence,
+            ready_pids=ready_pids,
+            shutdown_pids=shutdown_pids,
+            manager_pid=outcome.pid,
+            descendant_pids=outcome.descendant_pids,
+            returncode=outcome.returncode,
+            graceful_stop=outcome.graceful_stop,
+            forced_cleanup=outcome.forced_cleanup,
+            listening_sockets_after=listening_sockets_after,
+            sessions_after=zero_sample.current_sessions,
+        )
+
+    try:
+        result = await execute()
+    except BaseException as operation_error:
+        try:
+            await observer_connection.disconnect()
+        except BaseException as cleanup_error:
+            raise BaseExceptionGroup(
+                "adapted serialization and observer cleanup both failed",
+                [operation_error, cleanup_error],
+            ) from None
+        raise
+    await observer_connection.disconnect()
+    return result
+
+
+async def run_flask_gather_scenario(
+    config: RunnerConfig,
+    isolated: IsolatedApplication,
+    profile: ProcessProfile,
+    *,
+    run_id: str,
+    policy: SupervisorPolicy,
+    sql_auth_settings: SqlAuthObserverSettings,
+    table_name: str,
+    sql_delay_ms: int = 250,
+) -> FlaskGatherScenarioResult:
+    """Prove four concurrent SQL waits inside one real Flask WSGI request."""
+
+    expected_profile = next(
+        (
+            candidate
+            for candidate in flask_wsgi_profiles(config.platform_system)
+            if candidate.family == "flask-gunicorn-sync"
+            and candidate.workers == 1
+        ),
+        None,
+    )
+    if (
+        config.database_mode != "sql_auth"
+        or profile != expected_profile
+        or sql_delay_ms not in SQL_DELAY_MILLISECONDS
+        or sql_delay_ms <= 0
+    ):
+        raise RunnerConfigurationError(
+            "Flask gather requires one SQL-auth Gunicorn sync worker"
+        )
+    artifact_directory = (
+        config.run_root / "worker-records" / "flask-gather"
+    ).resolve()
+    environment = build_profile_environment(
+        config,
+        isolated,
+        profile,
+        run_id=run_id,
+        artifact_directory=artifact_directory,
+        sql_auth_settings=sql_auth_settings,
+        table_name=table_name,
+        sql_delay_ms=sql_delay_ms,
+    )
+    worker_prefix = environment["FASTMSSQL_FRAMEWORK_APPLICATION_NAME"]
+    observer_application_name = f"{worker_prefix}-observer"
+    if len(observer_application_name) > MAX_SQL_SERVER_APPLICATION_NAME:
+        raise RunnerConfigurationError(
+            "generated observer application name is too long"
+        )
+    observer_connection = create_observer_connection(
+        sql_auth_settings,
+        application_name=observer_application_name,
+    )
+    await observer_connection.connect(validate=True)
+
+    async def execute() -> FlaskGatherScenarioResult:
+        observer = SqlServerObserver(
+            source=observer_connection,
+            worker_prefix=worker_prefix,
+            observer_application_name=observer_application_name,
+            poll_interval_seconds=policy.poll_interval_seconds,
+        )
+
+        async def worker_is_ready(port: int) -> bool:
+            try:
+                payload = await http_get_json(
+                    port,
+                    "/ready",
+                    timeout_seconds=0.5,
+                )
+            except HttpProbeError:
+                return False
+            return payload.get("state") == "ready"
+
+        launch = await launch_with_port_retry(
+            command_builder=lambda port: build_server_command(
+                config,
+                profile,
+                port=port,
+            ),
+            cwd=isolated.root,
+            environment=environment,
+            readiness_probe=worker_is_ready,
+            policy=policy,
+        )
+        supervisor = launch.supervisor
+        request_timeout = max(8.0, sql_delay_ms / 1_000 * 6 + 2.0)
+        async with supervisor:
+            ready_records = await supervisor.wait_for_worker_records(
+                directory=artifact_directory,
+                phase="ready",
+                expected_run_id=run_id,
+                expected_count=1,
+            )
+            ready_pids = tuple(
+                sorted(int(record["pid"]) for record in ready_records)
+            )
+            await observer.wait_for_ready_workers(
+                ready_records,
+                timeout_seconds=policy.startup_timeout_seconds,
+            )
+            gather_task = asyncio.create_task(
+                http_request_json(
+                    launch.port,
+                    "/gather",
+                    expected_statuses=(200,),
+                    timeout_seconds=request_timeout,
+                )
+            )
+            try:
+                busy_sample = await observer.wait_for_minimum_requests(
+                    4,
+                    timeout_seconds=request_timeout,
+                )
+                response = await asyncio.wait_for(
+                    gather_task,
+                    timeout=request_timeout,
+                )
+            finally:
+                if not gather_task.done():
+                    gather_task.cancel()
+                await asyncio.gather(gather_task, return_exceptions=True)
+
+            state_response = await http_request_json(
+                launch.port,
+                "/execution/state",
+                expected_statuses=(200,),
+                timeout_seconds=request_timeout,
+            )
+            pool_response = await http_request_json(
+                launch.port,
+                "/pool",
+                expected_statuses=(200,),
+                timeout_seconds=request_timeout,
+            )
+            evidence = validate_flask_gather_evidence(
+                response=response,
+                state_record=state_response.payload,
+                observer_sample=busy_sample,
+                pool_record=pool_response.payload,
+                sql_delay_ms=sql_delay_ms,
+            )
+            outcome = await supervisor.stop()
+
+        shutdown_records = supervisor.read_worker_records(
+            directory=artifact_directory,
+            phase="shutdown",
+            expected_run_id=run_id,
+            expected_count=1,
+        )
+        shutdown_pids = tuple(
+            sorted(int(record["pid"]) for record in shutdown_records)
+        )
+        if ready_pids != shutdown_pids:
+            raise WorkerEvidenceError(
+                "Flask gather ready and shutdown worker PIDs do not reconcile"
+            )
+        listening_sockets_after = (
+            (launch.port,)
+            if await loopback_port_is_listening(launch.port)
+            else ()
+        )
+        if listening_sockets_after:
+            raise ProcessSupervisorError(
+                "Flask gather listener survived supervised shutdown"
+            )
+        zero_sample = await observer.wait_for_zero_sessions(
+            timeout_seconds=policy.graceful_timeout_seconds,
+        )
+        verify_isolated_application(isolated)
+        return FlaskGatherScenarioResult(
+            profile_id=profile.id,
+            evidence=evidence,
+            ready_pids=ready_pids,
+            shutdown_pids=shutdown_pids,
+            manager_pid=outcome.pid,
+            descendant_pids=outcome.descendant_pids,
+            returncode=outcome.returncode,
+            graceful_stop=outcome.graceful_stop,
+            forced_cleanup=outcome.forced_cleanup,
+            listening_sockets_after=listening_sockets_after,
+            sessions_after=zero_sample.current_sessions,
+        )
+
+    try:
+        result = await execute()
+    except BaseException as operation_error:
+        try:
+            await observer_connection.disconnect()
+        except BaseException as cleanup_error:
+            raise BaseExceptionGroup(
+                "Flask gather scenario and observer cleanup both failed",
+                [operation_error, cleanup_error],
+            ) from None
+        raise
+    await observer_connection.disconnect()
+    return result
 
 
 async def run_native_concurrency_scenario(

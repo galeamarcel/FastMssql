@@ -6950,10 +6950,10 @@ def test_shared_listener_minimum_does_not_require_perfect_worker_dispatch(
     cases = (
         ("flask-gunicorn-sync", 1, 2, 1),
         ("flask-gunicorn-gthread", 1, 5, 4),
-        ("flask-gunicorn-sync", 8, 8, 2),
-        ("flask-gunicorn-gthread", 8, 8, 2),
+        ("flask-gunicorn-sync", 8, 8, 1),
+        ("flask-gunicorn-gthread", 8, 8, 1),
         ("flask-asgi-uvicorn-asyncio", 1, 4, 1),
-        ("flask-asgi-uvicorn-asyncio", 8, 8, 2),
+        ("flask-asgi-uvicorn-asyncio", 8, 8, 1),
     )
     for family, workers, request_count, expected in cases:
         profile = _profile_by_family(runner, family, workers=workers)
@@ -7024,6 +7024,90 @@ async def test_observed_request_wave_surfaces_http_failure_and_settles(
     assert all(task.done() for task in tasks)
 
 
+@pytest.mark.asyncio
+async def test_observed_request_wave_normalizes_observation_timeout(
+) -> None:
+    """Catch a raw asyncio timeout escaping the runner error taxonomy."""
+
+    runner = _load_production_framework_runner()
+    observer_cancelled = asyncio.Event()
+
+    class UnobservableWorker:
+        async def wait_for_minimum_requests(
+            self,
+            minimum_requests: int,
+            *,
+            timeout_seconds: float,
+        ) -> None:
+            assert minimum_requests == 1
+            assert timeout_seconds == 0.02
+            try:
+                await asyncio.Event().wait()
+            finally:
+                observer_cancelled.set()
+
+    async def successful_request():
+        return runner.LoopbackJsonResponse(
+            status_code=200,
+            payload={"value": 17},
+            elapsed_seconds=0.001,
+        )
+
+    task = asyncio.create_task(successful_request())
+    with pytest.raises(
+        runner.ReadinessTimeoutError,
+        match="SQL observation did not settle within the wave bound",
+    ):
+        await runner.await_observed_request_wave(
+            UnobservableWorker(),
+            (task,),
+            minimum_requests=1,
+            timeout_seconds=0.02,
+        )
+
+    assert task.done()
+    assert observer_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_observed_request_wave_normalizes_response_timeout() -> None:
+    """Catch a raw asyncio timeout when SQL is visible but HTTP never settles."""
+
+    runner = _load_production_framework_runner()
+    request_cancelled = asyncio.Event()
+
+    class ImmediateObserver:
+        async def wait_for_minimum_requests(
+            self,
+            minimum_requests: int,
+            *,
+            timeout_seconds: float,
+        ) -> None:
+            assert minimum_requests == 1
+            assert timeout_seconds == 0.02
+
+    async def stalled_request():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            request_cancelled.set()
+
+    task = asyncio.create_task(stalled_request())
+    with pytest.raises(
+        runner.ReadinessTimeoutError,
+        match="HTTP responses did not settle within the wave bound",
+    ):
+        await runner.await_observed_request_wave(
+            ImmediateObserver(),
+            (task,),
+            minimum_requests=1,
+            timeout_seconds=0.02,
+        )
+
+    assert task.done()
+    assert request_cancelled.is_set()
+
+
 def test_flask_wsgi_profile_selection_is_posix_only_and_complete() -> None:
     """Catch a missing worker count, WSGI class, or false Windows claim."""
 
@@ -7056,6 +7140,7 @@ def _flask_execution_payload(
     active: int,
     maximum_active: int,
     async_thread_token: int | None = None,
+    pid: int = 101,
     delay_ms: int = 250,
     execution_model: str = (
         "Flask WSGI: async view, occupied WSGI worker/thread"
@@ -7068,7 +7153,7 @@ def _flask_execution_payload(
         "delay_ms": delay_ms,
         "execution_model": execution_model,
         "loop_token": loop_token,
-        "pid": 101,
+        "pid": pid,
         "request_sequence": sequence,
         "session_id": 50 + sequence,
         "value": value,
@@ -7302,6 +7387,103 @@ def test_gthread_wsgi_wave_requires_four_threads_and_queues_fifth(
                 maximum_requests=4,
             ),
         )
+
+
+def test_multiworker_wsgi_evidence_preserves_truthful_idle_workers(
+    tmp_path: Path,
+) -> None:
+    """Catch a validator that turns shared-listener idle workers into failure."""
+
+    runner = _load_production_framework_runner()
+    config = replace(
+        _config_with_actual_wheel_hash(runner, tmp_path),
+        database_mode="sql_auth",
+        global_connection_budget=8,
+    )
+    profile = replace(
+        _profile_by_family(runner, "flask-gunicorn-gthread", workers=8),
+        database_mode="sql_auth",
+        platform_system=config.platform_system,
+    )
+    pids = tuple(range(101, 109))
+    ready_records = tuple(
+        {
+            "phase": "ready",
+            "pid": pid,
+            "worker_application_name": f"fm-flask-wsgi-{pid}",
+        }
+        for pid in pids
+    )
+    values = tuple(range(752_101, 752_109))
+    response_pids = (101, 102, 103, 104, 104, 105, 105, 105)
+    response_counts = {101: 1, 102: 1, 103: 1, 104: 2, 105: 3}
+    payloads = tuple(
+        _flask_execution_payload(
+            value=value,
+            sequence=sequence,
+            loop_token=sequence,
+            wsgi_thread_token=((sequence - 1) % 4) + 1,
+            active=response_counts[pid],
+            maximum_active=response_counts[pid],
+            pid=pid,
+        )
+        for sequence, (value, pid) in enumerate(
+            zip(values, response_pids, strict=True),
+            start=1,
+        )
+    )
+    settled = tuple(
+        {
+            "active_other_requests": 0,
+            "completed_requests": response_counts.get(pid, 0),
+            "execution_model": (
+                "Flask WSGI: async view, occupied WSGI worker/thread"
+            ),
+            "maximum_active_requests": response_counts.get(pid, 0),
+            "pid": pid,
+            "wsgi_thread_count": response_counts.get(pid, 0),
+        }
+        for pid in pids
+    )
+    observer_sample = runner.SqlObserverSample(
+        applications=tuple(
+            runner.ObserverApplicationSample(
+                application_name=f"fm-flask-wsgi-{pid}",
+                host_process_ids=(pid,),
+                sessions=1,
+                requests=0,
+            )
+            for pid in pids
+        ),
+        current_sessions=8,
+        current_requests=0,
+        maximum_sessions=8,
+        maximum_requests=5,
+        request_context_tokens=(),
+    )
+
+    evidence = runner.validate_flask_wsgi_wave_evidence(
+        config=config,
+        profile=profile,
+        ready_records=ready_records,
+        response_payloads=payloads,
+        settled_records=settled,
+        expected_values=values,
+        wave_seconds=0.31,
+        sql_delay_ms=250,
+        observer_sample=observer_sample,
+    )
+
+    assert evidence.to_record()["worker_execution"] == [
+        {"maximum_active_requests": 1, "pid": 101, "wsgi_thread_count": 1},
+        {"maximum_active_requests": 1, "pid": 102, "wsgi_thread_count": 1},
+        {"maximum_active_requests": 1, "pid": 103, "wsgi_thread_count": 1},
+        {"maximum_active_requests": 2, "pid": 104, "wsgi_thread_count": 2},
+        {"maximum_active_requests": 3, "pid": 105, "wsgi_thread_count": 3},
+        {"maximum_active_requests": 0, "pid": 106, "wsgi_thread_count": 0},
+        {"maximum_active_requests": 0, "pid": 107, "wsgi_thread_count": 0},
+        {"maximum_active_requests": 0, "pid": 108, "wsgi_thread_count": 0},
+    ]
 
 
 @pytest.mark.asyncio
