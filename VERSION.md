@@ -52,6 +52,21 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Production framework fixed-worker load RED
+
+- Replaced the future Task 9 source-token placeholder with behavioral RED
+  contracts for a fixed set of long-lived HTTP clients, deterministic
+  stride partitioning, exact bounded count/sum/digest evidence and immediate
+  response release instead of one task or one retained payload per operation.
+- Added failing contracts for closed load-plan bounds and explicit extended
+  admission, a fixed-size latency histogram, bounded start/peak/end process,
+  SQL and pool sampling, plus fail-fast cancellation that exits every client
+  context and preserves only a privacy-safe failure type.
+- These tests are intentionally committed before the Task 9 runner
+  implementation. They change no FastMssql/Tiberius runtime, package
+  metadata, displayed `0.7.7` version, release, published artifact or
+  original-repository state.
+
 ### Production framework Task 8 live-status integration
 
 - Closed Task 8 of the production-framework plan on cumulative branch

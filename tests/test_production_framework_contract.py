@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import asyncio
 from dataclasses import FrozenInstanceError, replace
+import gc
 import hashlib
 import importlib.util
 import json
@@ -18,6 +19,7 @@ import time
 import tomllib
 from types import SimpleNamespace
 from typing import Any
+import weakref
 
 import httpx
 import psutil
@@ -10189,21 +10191,318 @@ def test_runner_proves_wheel_isolation_and_privacy() -> None:
 
 
 def test_fixed_worker_load_is_opt_in_and_not_task_per_operation() -> None:
-    source = _required_text(PYTHON_RUNNER)
-    for token in (
-        "--allow-extended",
-        "operations must be between 1 and 99,999",
-        "99,999 operations require --allow-extended",
-        "client_worker_count",
-        "for operation_id in range(worker_id, operations, worker_count)",
-        "maximum_sql_sessions",
-        "rss_peak_bytes",
-        "latency_histogram",
-        "value_digest",
+    runner = _load_production_framework_runner()
+
+    for invalid in (True, False, 0, -1, 100_000, 1.5, "1000"):
+        with pytest.raises(
+            runner.RunnerConfigurationError,
+            match="operations must be between 1 and 99,999",
+        ):
+            runner.FixedWorkerLoadPlan(
+                operations=invalid,
+                allow_extended=True,
+                client_worker_count=8,
+                server_worker_count=4,
+                global_connection_budget=8,
+                request_timeout_seconds=1.0,
+                sample_interval_seconds=0.01,
+            )
+
+    for operations in (1_001, 10_000):
+        with pytest.raises(
+            runner.RunnerConfigurationError,
+            match="operations above 1,000 require --allow-extended",
+        ):
+            runner.FixedWorkerLoadPlan(
+                operations=operations,
+                allow_extended=False,
+                client_worker_count=8,
+                server_worker_count=4,
+                global_connection_budget=8,
+                request_timeout_seconds=1.0,
+                sample_interval_seconds=0.01,
+            )
+
+    with pytest.raises(
+        runner.RunnerConfigurationError,
+        match="99,999 operations require --allow-extended",
     ):
-        assert token in source
-    assert "range(operations)" not in source
-    assert "gather(*(request" not in source
+        runner.FixedWorkerLoadPlan(
+            operations=99_999,
+            allow_extended=False,
+            client_worker_count=8,
+            server_worker_count=4,
+            global_connection_budget=8,
+            request_timeout_seconds=1.0,
+            sample_interval_seconds=0.01,
+        )
+
+    with pytest.raises(
+        runner.RunnerConfigurationError,
+        match="client worker count must be an integer between 1 and 256",
+    ):
+        runner.FixedWorkerLoadPlan(
+            operations=1_000,
+            allow_extended=False,
+            client_worker_count=0,
+            server_worker_count=4,
+            global_connection_budget=8,
+            request_timeout_seconds=1.0,
+            sample_interval_seconds=0.01,
+        )
+
+    with pytest.raises(
+        runner.RunnerConfigurationError,
+        match="load server worker count must be exactly 4",
+    ):
+        runner.FixedWorkerLoadPlan(
+            operations=1_000,
+            allow_extended=False,
+            client_worker_count=8,
+            server_worker_count=2,
+            global_connection_budget=8,
+            request_timeout_seconds=1.0,
+            sample_interval_seconds=0.01,
+        )
+
+
+@pytest.mark.asyncio
+async def test_fixed_worker_load_uses_long_lived_partitioned_clients_and_bounded_evidence(
+) -> None:
+    runner = _load_production_framework_runner()
+    partitions: dict[int, list[int]] = {0: [], 1: [], 2: []}
+    created: list[int] = []
+    entered: list[int] = []
+    exited: list[int] = []
+    response_references: list[weakref.ReferenceType[object]] = []
+    active_requests = 0
+    maximum_active_requests = 0
+    sample_index = 0
+    samples = (
+        (4, 0, 0, 100, 0, 0),
+        (4, 3, 3, 140, 3, 1),
+        (4, 2, 2, 125, 2, 0),
+        (4, 0, 0, 110, 0, 0),
+    )
+
+    class Response:
+        __slots__ = ("value", "__weakref__")
+
+        def __init__(self, value: int) -> None:
+            self.value = value
+
+    class Client:
+        def __init__(self, worker_id: int) -> None:
+            self.worker_id = worker_id
+            created.append(worker_id)
+
+        async def __aenter__(self):
+            entered.append(self.worker_id)
+            return self
+
+        async def __aexit__(self, *_exc_info) -> None:
+            exited.append(self.worker_id)
+
+        async def request_value(self, operation_id: int):
+            nonlocal active_requests, maximum_active_requests
+            partitions[self.worker_id].append(operation_id)
+            active_requests += 1
+            maximum_active_requests = max(maximum_active_requests, active_requests)
+            try:
+                await asyncio.sleep(0.002 * (1 + operation_id % 3))
+                response = Response(operation_id)
+                response_references.append(weakref.ref(response))
+                return response
+            finally:
+                active_requests -= 1
+
+    async def sample_resources():
+        nonlocal sample_index
+        values = samples[min(sample_index, len(samples) - 1)]
+        sample_index += 1
+        return runner.LoadResourceSample(
+            server_child_count=values[0],
+            sql_sessions=values[1],
+            sql_requests=values[2],
+            rss_bytes=values[3],
+            pool_active=values[4],
+            pool_pending=values[5],
+        )
+
+    plan = runner.FixedWorkerLoadPlan(
+        operations=11,
+        allow_extended=False,
+        client_worker_count=3,
+        server_worker_count=4,
+        global_connection_budget=8,
+        request_timeout_seconds=1.0,
+        sample_interval_seconds=0.001,
+    )
+    evidence = await runner.run_fixed_worker_load(
+        plan,
+        client_factory=Client,
+        resource_sampler=sample_resources,
+    )
+    record = evidence.to_record()
+
+    assert created == [0, 1, 2]
+    assert sorted(entered) == [0, 1, 2]
+    assert sorted(exited) == [0, 1, 2]
+    assert partitions == {
+        0: [1, 4, 7, 10],
+        1: [2, 5, 8, 11],
+        2: [3, 6, 9],
+    }
+    assert active_requests == 0
+    assert maximum_active_requests >= 2
+    assert record["operations"] == 11
+    assert record["client_worker_count"] == 3
+    assert record["completed"] == 11
+    assert record["errors"] == 0
+    assert record["value_count"] == 11
+    assert record["value_sum"] == 66
+    assert record["value_digest"] == (
+        "2b70bc5da4b69e6999f3b5613925abe820c09ba095f7147ba32be22576739074"
+    )
+    assert record["expected_value_digest"] == record["value_digest"]
+    assert record["maximum_active_requests"] == maximum_active_requests
+    assert record["maximum_active_requests"] <= 3
+    assert record["latency_histogram"]["count"] == 11
+    assert sum(
+        bucket["count"] for bucket in record["latency_histogram"]["buckets"]
+    ) + record["latency_histogram"]["overflow_count"] == 11
+    assert record["resource_samples"] >= 2
+    assert record["maximum_server_child_count"] == 4
+    assert record["maximum_sql_sessions"] <= 8
+    assert record["maximum_sql_requests"] <= 8
+    assert record["rss_start_bytes"] == 100
+    assert record["rss_peak_bytes"] == 140
+    assert record["rss_end_bytes"] == 110
+    assert record["pool_active_after"] == 0
+    assert record["pool_pending_after"] == 0
+    assert "values" not in record
+    assert "responses" not in record
+
+    gc.collect()
+    assert response_references
+    assert all(reference() is None for reference in response_references)
+
+
+@pytest.mark.asyncio
+async def test_fixed_worker_load_fails_fast_and_settles_every_client() -> None:
+    runner = _load_production_framework_runner()
+    entered: set[int] = set()
+    exited: set[int] = set()
+    calls: list[int] = []
+    all_entered = asyncio.Event()
+    never = asyncio.Event()
+    active_requests = 0
+
+    class SyntheticLoadFailure(RuntimeError):
+        pass
+
+    class Client:
+        def __init__(self, worker_id: int) -> None:
+            self.worker_id = worker_id
+
+        async def __aenter__(self):
+            entered.add(self.worker_id)
+            if len(entered) == 4:
+                all_entered.set()
+            return self
+
+        async def __aexit__(self, *_exc_info) -> None:
+            exited.add(self.worker_id)
+
+        async def request_value(self, operation_id: int):
+            nonlocal active_requests
+            calls.append(operation_id)
+            active_requests += 1
+            try:
+                await all_entered.wait()
+                if operation_id == 2:
+                    raise SyntheticLoadFailure("private failure payload")
+                await never.wait()
+                raise AssertionError("blocked request unexpectedly resumed")
+            finally:
+                active_requests -= 1
+
+    async def sample_resources():
+        return runner.LoadResourceSample(
+            server_child_count=4,
+            sql_sessions=0,
+            sql_requests=0,
+            rss_bytes=100,
+            pool_active=0,
+            pool_pending=0,
+        )
+
+    plan = runner.FixedWorkerLoadPlan(
+        operations=40,
+        allow_extended=False,
+        client_worker_count=4,
+        server_worker_count=4,
+        global_connection_budget=8,
+        request_timeout_seconds=1.0,
+        sample_interval_seconds=0.001,
+    )
+    with pytest.raises(runner.FixedWorkerLoadError) as captured:
+        await runner.run_fixed_worker_load(
+            plan,
+            client_factory=Client,
+            resource_sampler=sample_resources,
+        )
+
+    assert captured.value.failure_type == "SyntheticLoadFailure"
+    assert "private failure payload" not in str(captured.value)
+    assert entered == {0, 1, 2, 3}
+    assert exited == {0, 1, 2, 3}
+    assert sorted(calls) == [1, 2, 3, 4]
+    assert active_requests == 0
+
+
+def test_fixed_worker_latency_histogram_is_bounded_and_validated() -> None:
+    runner = _load_production_framework_runner()
+    histogram = runner.BoundedLatencyHistogram()
+    for elapsed_seconds in (0.0, 0.001, 0.0015, 0.02, 11.0):
+        histogram.observe(elapsed_seconds)
+    for _ in range(100_000):
+        histogram.observe(0.003)
+
+    record = histogram.to_record()
+    assert [bucket["upper_bound_ms"] for bucket in record["buckets"]] == [
+        1,
+        2,
+        5,
+        10,
+        25,
+        50,
+        100,
+        250,
+        500,
+        1_000,
+        2_500,
+        5_000,
+        10_000,
+    ]
+    assert len(record["buckets"]) == 13
+    assert record["count"] == 100_005
+    assert record["buckets"][0]["count"] == 2
+    assert record["buckets"][1]["count"] == 1
+    assert record["buckets"][2]["count"] == 100_000
+    assert record["buckets"][4]["count"] == 1
+    assert record["overflow_count"] == 1
+    assert record["minimum_ms"] == 0.0
+    assert record["maximum_ms"] == 11_000.0
+    assert record["sum_ms"] == pytest.approx(311_022.5)
+    assert not hasattr(histogram, "samples")
+
+    for invalid in (True, -0.001, float("nan"), float("inf")):
+        with pytest.raises(
+            runner.RunnerConfigurationError,
+            match="latency sample must be a finite non-negative number",
+        ):
+            histogram.observe(invalid)
 
 
 def test_shell_runner_builds_one_isolated_wheel_and_never_logs_secrets() -> None:
