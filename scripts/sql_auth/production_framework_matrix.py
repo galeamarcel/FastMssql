@@ -151,6 +151,43 @@ class HttpProbeError(ProcessSupervisorError):
     """A bounded loopback HTTP probe failed or returned invalid data."""
 
 
+class FixedWorkerLoadError(ProcessSupervisorError):
+    """A privacy-safe fixed-worker load failure after complete settlement."""
+
+    def __init__(self, failure_type: str) -> None:
+        if (
+            not isinstance(failure_type, str)
+            or re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", failure_type) is None
+        ):
+            failure_type = "LoadFailure"
+        self.failure_type = failure_type
+        super().__init__(f"fixed-worker load failed ({failure_type})")
+
+
+class _LoadValueMismatch(RuntimeError):
+    pass
+
+
+class _LoadResourceSampleInvalid(RuntimeError):
+    pass
+
+
+class _LoadResourceSamplingFailure(RuntimeError):
+    pass
+
+
+class _LoadConnectionBudgetExceeded(RuntimeError):
+    pass
+
+
+class _LoadServerWorkerMismatch(RuntimeError):
+    pass
+
+
+class _LoadSettlementFailure(RuntimeError):
+    pass
+
+
 def execution_model_labels() -> tuple[str, str, str]:
     """Return only the three approved measured execution-model labels."""
 
@@ -3725,6 +3762,349 @@ class RunnerConfig:
     platform_system: str
 
 
+@dataclass(frozen=True, slots=True)
+class FixedWorkerLoadPlan:
+    """Closed configuration for one bounded fixed-worker load profile."""
+
+    operations: int
+    allow_extended: bool
+    client_worker_count: int
+    server_worker_count: int
+    global_connection_budget: int
+    request_timeout_seconds: float
+    sample_interval_seconds: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.allow_extended, bool):
+            raise RunnerConfigurationError("allow extended must be boolean")
+        validate_operations(
+            self.operations,
+            allow_extended=self.allow_extended,
+        )
+        if (
+            isinstance(self.client_worker_count, bool)
+            or not isinstance(self.client_worker_count, int)
+            or not 1 <= self.client_worker_count <= 256
+        ):
+            raise RunnerConfigurationError(
+                "client worker count must be an integer between 1 and 256"
+            )
+        if (
+            isinstance(self.server_worker_count, bool)
+            or not isinstance(self.server_worker_count, int)
+            or self.server_worker_count != 4
+        ):
+            raise RunnerConfigurationError(
+                "load server worker count must be exactly 4"
+            )
+        if (
+            isinstance(self.global_connection_budget, bool)
+            or not isinstance(self.global_connection_budget, int)
+            or self.global_connection_budget <= 0
+        ):
+            raise RunnerConfigurationError(
+                "global connection budget must be a positive integer"
+            )
+        for field_name in (
+            "request_timeout_seconds",
+            "sample_interval_seconds",
+        ):
+            value = getattr(self, field_name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise RunnerConfigurationError(
+                    f"{field_name} must be a finite positive number"
+                )
+
+
+@dataclass(frozen=True, slots=True)
+class LoadResourceSample:
+    """One bounded, privacy-safe load resource observation."""
+
+    server_child_count: int
+    sql_sessions: int
+    sql_requests: int
+    rss_bytes: int
+    pool_active: int
+    pool_pending: int
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "server_child_count",
+            "sql_sessions",
+            "sql_requests",
+            "pool_active",
+            "pool_pending",
+        ):
+            value = getattr(self, field_name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+            ):
+                raise RunnerConfigurationError(
+                    f"load resource {field_name} must be a non-negative integer"
+                )
+        if (
+            isinstance(self.rss_bytes, bool)
+            or not isinstance(self.rss_bytes, int)
+            or self.rss_bytes <= 0
+        ):
+            raise RunnerConfigurationError(
+                "load resource rss_bytes must be a positive integer"
+            )
+
+
+class FixedWorkerLoadClient(Protocol):
+    async def __aenter__(self) -> FixedWorkerLoadClient: ...
+
+    async def __aexit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: object | None,
+    ) -> object: ...
+
+    async def request_value(self, operation_id: int) -> object: ...
+
+
+class BoundedLatencyHistogram:
+    """A fixed-bucket latency accumulator with operation-independent state."""
+
+    __slots__ = (
+        "_bucket_counts",
+        "_count",
+        "_maximum_ms",
+        "_minimum_ms",
+        "_overflow_count",
+        "_sum_ms",
+    )
+
+    _UPPER_BOUNDS_MS = (
+        1,
+        2,
+        5,
+        10,
+        25,
+        50,
+        100,
+        250,
+        500,
+        1_000,
+        2_500,
+        5_000,
+        10_000,
+    )
+
+    def __init__(self) -> None:
+        self._bucket_counts = [0] * len(self._UPPER_BOUNDS_MS)
+        self._count = 0
+        self._overflow_count = 0
+        self._minimum_ms: float | None = None
+        self._maximum_ms: float | None = None
+        self._sum_ms = 0.0
+
+    def observe(self, elapsed_seconds: float) -> None:
+        if (
+            isinstance(elapsed_seconds, bool)
+            or not isinstance(elapsed_seconds, (int, float))
+            or not math.isfinite(elapsed_seconds)
+            or elapsed_seconds < 0
+        ):
+            raise RunnerConfigurationError(
+                "latency sample must be a finite non-negative number"
+            )
+        elapsed_ms = float(elapsed_seconds) * 1_000.0
+        self._count += 1
+        self._sum_ms += elapsed_ms
+        if self._minimum_ms is None or elapsed_ms < self._minimum_ms:
+            self._minimum_ms = elapsed_ms
+        if self._maximum_ms is None or elapsed_ms > self._maximum_ms:
+            self._maximum_ms = elapsed_ms
+        for index, upper_bound_ms in enumerate(self._UPPER_BOUNDS_MS):
+            if elapsed_ms <= upper_bound_ms:
+                self._bucket_counts[index] += 1
+                break
+        else:
+            self._overflow_count += 1
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "buckets": [
+                {
+                    "count": self._bucket_counts[index],
+                    "upper_bound_ms": upper_bound_ms,
+                }
+                for index, upper_bound_ms in enumerate(self._UPPER_BOUNDS_MS)
+            ],
+            "count": self._count,
+            "maximum_ms": self._maximum_ms,
+            "minimum_ms": self._minimum_ms,
+            "overflow_count": self._overflow_count,
+            "sum_ms": self._sum_ms,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _FixedWorkerSummary:
+    worker_id: int
+    value_count: int
+    value_sum: int
+    value_digest: str
+    expected_value_digest: str
+
+
+@dataclass(slots=True)
+class _FixedWorkerRunState:
+    workers_remaining: int
+    latency_histogram: BoundedLatencyHistogram = field(
+        default_factory=BoundedLatencyHistogram
+    )
+    active_requests: int = 0
+    maximum_active_requests: int = 0
+
+    def request_started(self) -> None:
+        self.active_requests += 1
+        self.maximum_active_requests = max(
+            self.maximum_active_requests,
+            self.active_requests,
+        )
+
+    def request_finished(self) -> None:
+        self.active_requests -= 1
+        if self.active_requests < 0:
+            raise _LoadSettlementFailure
+
+    def worker_finished(self, stop: asyncio.Event) -> None:
+        self.workers_remaining -= 1
+        if self.workers_remaining < 0:
+            raise _LoadSettlementFailure
+        if self.workers_remaining == 0:
+            stop.set()
+
+
+@dataclass(slots=True)
+class _LoadResourceAccumulator:
+    start: LoadResourceSample
+    end: LoadResourceSample
+    sample_count: int
+    maximum_server_child_count: int
+    maximum_sql_sessions: int
+    maximum_sql_requests: int
+    rss_peak_bytes: int
+    maximum_pool_active: int
+    maximum_pool_pending: int
+
+    @classmethod
+    def from_start(cls, sample: LoadResourceSample) -> _LoadResourceAccumulator:
+        return cls(
+            start=sample,
+            end=sample,
+            sample_count=1,
+            maximum_server_child_count=sample.server_child_count,
+            maximum_sql_sessions=sample.sql_sessions,
+            maximum_sql_requests=sample.sql_requests,
+            rss_peak_bytes=sample.rss_bytes,
+            maximum_pool_active=sample.pool_active,
+            maximum_pool_pending=sample.pool_pending,
+        )
+
+    def observe(self, sample: LoadResourceSample) -> None:
+        self.end = sample
+        self.sample_count += 1
+        self.maximum_server_child_count = max(
+            self.maximum_server_child_count,
+            sample.server_child_count,
+        )
+        self.maximum_sql_sessions = max(
+            self.maximum_sql_sessions,
+            sample.sql_sessions,
+        )
+        self.maximum_sql_requests = max(
+            self.maximum_sql_requests,
+            sample.sql_requests,
+        )
+        self.rss_peak_bytes = max(self.rss_peak_bytes, sample.rss_bytes)
+        self.maximum_pool_active = max(
+            self.maximum_pool_active,
+            sample.pool_active,
+        )
+        self.maximum_pool_pending = max(
+            self.maximum_pool_pending,
+            sample.pool_pending,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FixedWorkerLoadEvidence:
+    plan: FixedWorkerLoadPlan
+    completed: int
+    errors: int
+    value_count: int
+    value_sum: int
+    expected_value_sum: int
+    value_digest: str
+    expected_value_digest: str
+    maximum_active_requests: int
+    latency_histogram: BoundedLatencyHistogram = field(repr=False)
+    resources: _LoadResourceAccumulator = field(repr=False)
+    duration_seconds: float
+
+    def to_record(self) -> dict[str, object]:
+        start = self.resources.start
+        end = self.resources.end
+        return {
+            "client_worker_count": self.plan.client_worker_count,
+            "completed": self.completed,
+            "duration_seconds": self.duration_seconds,
+            "errors": self.errors,
+            "expected_value_count": self.plan.operations,
+            "expected_value_digest": self.expected_value_digest,
+            "expected_value_sum": self.expected_value_sum,
+            "fixed_client_workers": True,
+            "global_connection_budget": self.plan.global_connection_budget,
+            "latency_histogram": self.latency_histogram.to_record(),
+            "maximum_active_requests": self.maximum_active_requests,
+            "maximum_pool_active": self.resources.maximum_pool_active,
+            "maximum_pool_pending": self.resources.maximum_pool_pending,
+            "maximum_server_child_count": (
+                self.resources.maximum_server_child_count
+            ),
+            "maximum_sql_requests": self.resources.maximum_sql_requests,
+            "maximum_sql_sessions": self.resources.maximum_sql_sessions,
+            "operations": self.plan.operations,
+            "pending_after": end.pool_pending,
+            "pool_active_after": end.pool_active,
+            "pool_active_start": start.pool_active,
+            "pool_pending_after": end.pool_pending,
+            "pool_pending_start": start.pool_pending,
+            "process_count_end": end.server_child_count,
+            "process_count_start": start.server_child_count,
+            "resource_samples": self.resources.sample_count,
+            "rss_end_bytes": end.rss_bytes,
+            "rss_growth_bytes": self.resources.rss_peak_bytes - start.rss_bytes,
+            "rss_peak_bytes": self.resources.rss_peak_bytes,
+            "rss_start_bytes": start.rss_bytes,
+            "server_child_count_end": end.server_child_count,
+            "server_child_count_start": start.server_child_count,
+            "server_worker_count": self.plan.server_worker_count,
+            "sql_requests_end": end.sql_requests,
+            "sql_requests_start": start.sql_requests,
+            "sql_sessions_end": end.sql_sessions,
+            "sql_sessions_start": start.sql_sessions,
+            "status": "PASS",
+            "value_count": self.value_count,
+            "value_digest": self.value_digest,
+            "value_digest_algorithm": "sha256-worker-stride-v1",
+            "value_sum": self.value_sum,
+            "values_exact": True,
+        }
+
+
 def normalize_platform(platform_name: str) -> str:
     normalized = platform_name.lower()
     if normalized.startswith("linux"):
@@ -3947,7 +4327,11 @@ def validate_operations(
     *,
     allow_extended: bool,
 ) -> int:
-    if not 1 <= operations <= MAX_OPERATIONS:
+    if (
+        isinstance(operations, bool)
+        or not isinstance(operations, int)
+        or not 1 <= operations <= MAX_OPERATIONS
+    ):
         raise RunnerConfigurationError("operations must be between 1 and 99,999")
     if operations == EXTENDED_OPERATIONS and not allow_extended:
         raise RunnerConfigurationError("99,999 operations require --allow-extended")
@@ -3956,6 +4340,265 @@ def validate_operations(
             "operations above 1,000 require --allow-extended"
         )
     return operations
+
+
+def _require_load_sample_bounds(
+    sample: LoadResourceSample,
+    plan: FixedWorkerLoadPlan,
+) -> None:
+    if sample.server_child_count != plan.server_worker_count:
+        raise _LoadServerWorkerMismatch
+    if (
+        sample.sql_sessions > plan.global_connection_budget
+        or sample.sql_requests > plan.global_connection_budget
+        or sample.pool_active > plan.global_connection_budget
+    ):
+        raise _LoadConnectionBudgetExceeded
+
+
+async def _sample_fixed_worker_resources(
+    plan: FixedWorkerLoadPlan,
+    resource_sampler: Callable[[], Awaitable[LoadResourceSample]],
+) -> LoadResourceSample:
+    try:
+        async with asyncio.timeout(plan.request_timeout_seconds):
+            sample = await resource_sampler()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        raise _LoadResourceSamplingFailure from None
+    if not isinstance(sample, LoadResourceSample):
+        raise _LoadResourceSampleInvalid
+    _require_load_sample_bounds(sample, plan)
+    return sample
+
+
+async def _monitor_fixed_worker_resources(
+    plan: FixedWorkerLoadPlan,
+    *,
+    stop: asyncio.Event,
+    accumulator: _LoadResourceAccumulator,
+    resource_sampler: Callable[[], Awaitable[LoadResourceSample]],
+) -> None:
+    while not stop.is_set():
+        try:
+            async with asyncio.timeout(plan.sample_interval_seconds):
+                await stop.wait()
+            return
+        except TimeoutError:
+            sample = await _sample_fixed_worker_resources(
+                plan,
+                resource_sampler,
+            )
+            accumulator.observe(sample)
+
+
+async def _run_fixed_worker_client(
+    plan: FixedWorkerLoadPlan,
+    *,
+    worker_id: int,
+    client_factory: Callable[[int], FixedWorkerLoadClient],
+    state: _FixedWorkerRunState,
+    stop: asyncio.Event,
+    clock: Callable[[], float],
+) -> _FixedWorkerSummary:
+    value_count = 0
+    value_sum = 0
+    value_digest = hashlib.sha256()
+    expected_value_digest = hashlib.sha256()
+    try:
+        async with client_factory(worker_id) as client:
+            for operation_id in range(
+                worker_id + 1,
+                plan.operations + 1,
+                plan.client_worker_count,
+            ):
+                request_started = clock()
+                state.request_started()
+                try:
+                    async with asyncio.timeout(plan.request_timeout_seconds):
+                        response = await client.request_value(operation_id)
+                finally:
+                    state.request_finished()
+                elapsed_seconds = max(0.0, clock() - request_started)
+                try:
+                    value = response.value
+                except Exception:
+                    raise _LoadValueMismatch from None
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value != operation_id
+                ):
+                    raise _LoadValueMismatch
+                value_count += 1
+                value_sum += value
+                value_digest.update(
+                    f"{operation_id}:{value}\n".encode("ascii")
+                )
+                expected_value_digest.update(
+                    f"{operation_id}:{operation_id}\n".encode("ascii")
+                )
+                state.latency_histogram.observe(elapsed_seconds)
+                del response, value
+    finally:
+        state.worker_finished(stop)
+    return _FixedWorkerSummary(
+        worker_id=worker_id,
+        value_count=value_count,
+        value_sum=value_sum,
+        value_digest=value_digest.hexdigest(),
+        expected_value_digest=expected_value_digest.hexdigest(),
+    )
+
+
+def _combined_fixed_worker_digest(
+    summaries: Sequence[_FixedWorkerSummary],
+    *,
+    expected: bool,
+) -> str:
+    digest = hashlib.sha256()
+    for summary in sorted(summaries, key=lambda item: item.worker_id):
+        worker_digest = (
+            summary.expected_value_digest
+            if expected
+            else summary.value_digest
+        )
+        digest.update(
+            f"{summary.worker_id}:{summary.value_count}:{worker_digest}\n".encode(
+                "ascii"
+            )
+        )
+    return digest.hexdigest()
+
+
+def _first_fixed_worker_failure(
+    failure: BaseExceptionGroup,
+) -> Exception | None:
+    pending: list[BaseException] = list(failure.exceptions)
+    while pending:
+        current = pending.pop(0)
+        if isinstance(current, BaseExceptionGroup):
+            pending[0:0] = current.exceptions
+        elif isinstance(current, Exception):
+            return current
+    return None
+
+
+def _fixed_worker_failure_type(failure: Exception) -> str:
+    failure_type = type(failure).__name__.removeprefix("_")
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", failure_type) is None:
+        return "LoadFailure"
+    return failure_type
+
+
+async def run_fixed_worker_load(
+    plan: FixedWorkerLoadPlan,
+    *,
+    client_factory: Callable[[int], FixedWorkerLoadClient],
+    resource_sampler: Callable[[], Awaitable[LoadResourceSample]],
+    clock: Callable[[], float] = time.monotonic,
+) -> FixedWorkerLoadEvidence:
+    """Run one load profile with state bounded by workers and histogram bins."""
+
+    started = clock()
+    stop = asyncio.Event()
+    state = _FixedWorkerRunState(workers_remaining=plan.client_worker_count)
+    try:
+        start_sample = await _sample_fixed_worker_resources(
+            plan,
+            resource_sampler,
+        )
+        resources = _LoadResourceAccumulator.from_start(start_sample)
+        worker_tasks: tuple[asyncio.Task[_FixedWorkerSummary], ...]
+        async with asyncio.TaskGroup() as task_group:
+            task_group.create_task(
+                _monitor_fixed_worker_resources(
+                    plan,
+                    stop=stop,
+                    accumulator=resources,
+                    resource_sampler=resource_sampler,
+                ),
+                name="fastmssql-load-resource-monitor",
+            )
+            worker_tasks = tuple(
+                task_group.create_task(
+                    _run_fixed_worker_client(
+                        plan,
+                        worker_id=worker_id,
+                        client_factory=client_factory,
+                        state=state,
+                        stop=stop,
+                        clock=clock,
+                    ),
+                    name=f"fastmssql-load-client-{worker_id}",
+                )
+                for worker_id in range(plan.client_worker_count)
+            )
+        end_sample = await _sample_fixed_worker_resources(
+            plan,
+            resource_sampler,
+        )
+        resources.observe(end_sample)
+        if (
+            end_sample.sql_requests != 0
+            or end_sample.pool_active != 0
+            or end_sample.pool_pending != 0
+            or state.active_requests != 0
+        ):
+            raise _LoadSettlementFailure
+        summaries = tuple(task.result() for task in worker_tasks)
+        completed = sum(summary.value_count for summary in summaries)
+        value_sum = sum(summary.value_sum for summary in summaries)
+        expected_value_sum = plan.operations * (plan.operations + 1) // 2
+        value_digest = _combined_fixed_worker_digest(
+            summaries,
+            expected=False,
+        )
+        expected_value_digest = _combined_fixed_worker_digest(
+            summaries,
+            expected=True,
+        )
+        if (
+            completed != plan.operations
+            or value_sum != expected_value_sum
+            or value_digest != expected_value_digest
+            or state.maximum_active_requests > plan.client_worker_count
+        ):
+            raise _LoadValueMismatch
+        return FixedWorkerLoadEvidence(
+            plan=plan,
+            completed=completed,
+            errors=0,
+            value_count=completed,
+            value_sum=value_sum,
+            expected_value_sum=expected_value_sum,
+            value_digest=value_digest,
+            expected_value_digest=expected_value_digest,
+            maximum_active_requests=state.maximum_active_requests,
+            latency_histogram=state.latency_histogram,
+            resources=resources,
+            duration_seconds=max(0.0, clock() - started),
+        )
+    except asyncio.CancelledError:
+        stop.set()
+        raise
+    except BaseExceptionGroup as failure_group:
+        stop.set()
+        failure = _first_fixed_worker_failure(failure_group)
+        if failure is None:
+            raise
+        raise FixedWorkerLoadError(
+            _fixed_worker_failure_type(failure)
+        ) from None
+    except FixedWorkerLoadError:
+        stop.set()
+        raise
+    except Exception as failure:
+        stop.set()
+        raise FixedWorkerLoadError(
+            _fixed_worker_failure_type(failure)
+        ) from None
 
 
 def build_server_command(

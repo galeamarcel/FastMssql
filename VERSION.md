@@ -52,6 +52,20 @@ Changes currently integrated in fork history through technical candidate
 
 No release, package-version change, or artifact publication has occurred.
 
+### Production framework fixed-worker load core
+
+- Added the Task 9 fixed-worker load core with one long-lived client context
+  and one persistent request task per configured worker, deterministic stride
+  partitioning, one absolute request timeout per operation and fail-fast
+  cancellation that settles every client and resource-monitor task.
+- Added streaming count/sum/SHA-256 evidence, corrupted-value rejection,
+  fixed-bucket latency accounting and bounded start/peak/end process, SQL,
+  pool and RSS accumulation without retaining operation-sized response or
+  scalar collections.
+- This harness implementation changes no FastMssql/Tiberius runtime, package
+  metadata, displayed `0.7.7` version, release, published artifact or
+  original-repository state.
+
 ### Production framework fixed-worker load RED
 
 - Replaced the future Task 9 source-token placeholder with behavioral RED
